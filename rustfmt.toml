@@ -1,0 +1,3 @@
+# The tree is written to a 100-column budget with compact single-line blocks;
+# `Max` keeps rustfmt from exploding short expressions across five lines.
+use_small_heuristics = "Max"

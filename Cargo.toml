@@ -1,0 +1,44 @@
+[package]
+name = "celastro"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Hybrid document database: SQL, BM25 and vector retrieval in a single query plan"
+license = "AGPL-3.0-only"
+readme = "README.md"
+keywords = ["database", "vector-search", "full-text-search", "hybrid-search", "lsm"]
+categories = ["database-implementations", "database"]
+
+[dependencies]
+# Intentionally none. Celastro is std-only: JSON, bitmaps, term dictionaries,
+# postings, quantization, HNSW and the SQL front end are all in-tree, because
+# the ordinal-space invariant (§4.2) means every index has to speak the
+# segment's own identifier space. Borrowed indexes rarely do.
+
+[lints.clippy]
+# Numeric kernels, blocked decoders and column scans index deliberately: the
+# loop reads as the arithmetic it implements, and rewriting it as a zip of
+# iterators obscures which array the bounds come from.
+needless_range_loop = "allow"
+# `let mut o = Opts::default(); o.field = x;` is how a caller overrides two of
+# twelve knobs. The struct-update alternative is longer and no clearer.
+field_reassign_with_default = "allow"
+
+[lib]
+name = "celastro"
+path = "src/lib.rs"
+
+[[bin]]
+name = "celastro"
+path = "src/bin/celastro.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+# A reachable panic is a bug, not a recoverable condition. Aborting makes that
+# explicit and keeps a corrupt segment from being unwound past.
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
