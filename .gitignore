@@ -16,3 +16,4 @@ flamegraph.svg
 # Editors
 .idea/
 *.swp
+.vscode/
