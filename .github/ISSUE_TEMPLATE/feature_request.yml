@@ -1,0 +1,46 @@
+name: Feature request or design discussion
+description: Something you want to be true, or a design question
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describing a change is welcome. Sending it as a pull request is not —
+        see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+
+        Note that some absences are deliberate. Replication, consensus and
+        cross-shard transactions are listed under "What is deliberately not
+        here" in the README, and any dependency outside `std` is out of the
+        question regardless of what it offers.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you are trying to do that you currently cannot, or can only do
+        awkwardly. Describe the situation rather than the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+      description: If you have a specific design in mind, describe it here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Interaction with the ordinal-space invariant
+      description: >-
+        Every index type inside a segment produces sets in the same `u32` ordinal
+        space. If your proposal touches indexing or query planning, say how it
+        preserves that. Leave blank if unrelated.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

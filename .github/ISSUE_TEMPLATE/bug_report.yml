@@ -1,0 +1,86 @@
+name: Bug report
+description: Wrong results, a panic, corruption, or a plan regression
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security vulnerabilities here — use
+        [private reporting](https://github.com/celastro/celastro/security/advisories/new)
+        instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest SQL script or sequence of statements that shows it. A script
+        that can be run with `cargo run --release -- --file repro.sql` is ideal.
+      render: sql
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: >-
+        Output of `git rev-parse --short HEAD`. There is no `--version` flag, so
+        the commit is what identifies the build.
+      placeholder: 7c26b3b
+    validations:
+      required: true
+
+  - type: input
+    id: rustc
+    attributes:
+      label: rustc version
+      description: Output of `rustc --version`. The minimum supported is 1.75.
+      placeholder: rustc 1.85.0 (4d91de4e4 2025-02-17)
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 15.3 arm64 / Ubuntu 24.04 x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Build profile
+      options:
+        - release
+        - dev
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: explain
+    attributes:
+      label: EXPLAIN ANALYZE output
+      description: >-
+        Required for a plan regression, helpful for anything involving query
+        results or performance. Leave blank if it does not apply.
+      render: text
+
+  - type: textarea
+    id: panic
+    attributes:
+      label: Panic or error output
+      description: >-
+        The full message and backtrace if there was one. `RUST_BACKTRACE=1`
+        works in the dev profile; the release profile aborts on panic.
+      render: text

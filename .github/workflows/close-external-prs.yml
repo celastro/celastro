@@ -1,0 +1,66 @@
+name: Close external pull requests
+
+# celastro does not take patches through pull requests (CONTRIBUTING.md).
+# `pull_request_creation_policy` is set to `collaborators_only` on the repo, so
+# an outside PR should not be creatable in the first place — this is a backstop
+# for the case where that setting is changed, or does not apply to some path
+# into the repo.
+#
+# The trigger is pull_request_target, not pull_request, because a run triggered
+# by a fork gets a read-only token and cannot close anything. pull_request_target
+# runs in the base-repo context, where the token has write access. That trigger
+# is only safe because nothing below checks out, builds or executes the PR's
+# code — keep it that way.
+#
+# There is no checkout and no third-party action here on purpose: the notice
+# lives in the env block, so this workflow pulls in no code it does not own.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+# The repo default for GITHUB_TOKEN is read-only; this elevates just the one
+# scope needed to comment and close.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    # From a fork, and not from someone who is part of the project. Owners,
+    # org members and invited collaborators keep using PRs normally, including
+    # from their own forks.
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          NOTICE: |
+            Thanks for taking the time to write this up.
+
+            **celastro does not accept patches through pull requests**, so this
+            one is being closed automatically rather than left to sit
+            unanswered. That is a project policy, not a judgement about the
+            change itself — see
+            [CONTRIBUTING.md](https://github.com/celastro/celastro/blob/main/CONTRIBUTING.md)
+            for the reasoning.
+
+            What does help, and is genuinely wanted:
+
+            - **Open an issue.** Bug reports with a reproduction are the most
+              useful thing anyone outside the project can contribute.
+            - **Describe the change in an issue** if you believe it should
+              happen. A described diff can be discussed, attributed and
+              implemented; an unsolicited one cannot be merged regardless of
+              quality.
+
+            Your fork is yours to keep under the terms of the AGPL — nothing
+            here restricts what you do with it.
+        run: |
+          gh pr comment "$PR" --repo "$REPO" --body "$NOTICE"
+          gh pr close "$PR" --repo "$REPO"

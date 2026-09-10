@@ -1,0 +1,10 @@
+# Every issue should go through one of the forms above; a blank issue tends to
+# arrive without the commit and repro that make it actionable.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/celastro/celastro/security/advisories/new
+    about: Private advisory. Never report a vulnerability in a public issue.
+  - name: Contributing policy
+    url: https://github.com/celastro/celastro/blob/main/CONTRIBUTING.md
+    about: Issues are welcome; pull requests are not accepted.
