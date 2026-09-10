@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A superseded run answers a question nobody is asking any more.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      # No dependency cache here on purpose: celastro has no dependencies
+      # outside std, so there is nothing to restore and the cache round trip
+      # would cost more than the compile it saves.
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read the floor from the manifest rather than repeating it here, so the
+      # two cannot drift apart.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          test -n "$version" || { echo "no rust-version in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+
+      # Catches the failure that prompted this job: a Cargo.lock written in a
+      # newer lockfile format than the declared floor can parse. Building is
+      # what proves the claim; reading the manifest does not.
+      - name: Check
+        run: cargo +${{ steps.msrv.outputs.version }} check --all-targets
+
+      - name: Cargo.lock is readable at the MSRV without being rewritten
+        run: git diff --exit-code -- Cargo.lock
