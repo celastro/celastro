@@ -237,19 +237,31 @@ fn accept_backoff(kind: ErrorKind, consecutive: u32) -> Backoff {
 /// console refuses to start, because an arbitrary-SQL endpoint behind a
 /// guessable secret is worse than no console at all.
 fn new_token() -> Result<String> {
-    urandom_token().map_err(|e| {
-        Error::Io(std::io::Error::new(
-            e.kind(),
-            format!("cannot read /dev/urandom for the console token: {e}"),
-        ))
-    })
+    token_from(urandom_bytes())
 }
 
-fn urandom_token() -> std::io::Result<String> {
+/// The decision half of [`new_token`], separated from the read so that it can
+/// be tested.
+///
+/// A machine that has `/dev/urandom` cannot be made to lose it, so the refusal
+/// is the one branch no test can reach through the real file — and a branch no
+/// test reaches is a branch anyone can quietly delete. Handing this function
+/// the error the read would have returned is what holds the decision in place.
+fn token_from(bytes: std::io::Result<[u8; 16]>) -> Result<String> {
+    match bytes {
+        Ok(bytes) => Ok(hex(&bytes)),
+        Err(e) => Err(Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot read /dev/urandom for the console token: {e}"),
+        ))),
+    }
+}
+
+fn urandom_bytes() -> std::io::Result<[u8; 16]> {
     let mut source = std::fs::File::open("/dev/urandom")?;
     let mut bytes = [0u8; 16];
     source.read_exact(&mut bytes)?;
-    Ok(hex(&bytes))
+    Ok(bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1900,19 +1912,39 @@ mod tests {
         // A token derived from the wall clock and the pid is searchable by
         // anyone who can read `/proc`, and testable a request at a time by a
         // page that loads `/app.js?t=GUESS` and watches onload versus onerror.
-        // So the token comes from `/dev/urandom`, and the derivation is only
-        // the fallback for a machine that has none.
-        let token = urandom_token().expect("this platform has /dev/urandom");
+        // So the token is kernel randomness, with no derivation to fall back
+        // to — `a_console_without_kernel_randomness_does_not_start` pins the
+        // refusal that replaced it.
+        let token = token_from(urandom_bytes()).expect("this platform has /dev/urandom");
         assert_eq!(token.len(), 32);
         assert!(token.bytes().all(|c| c.is_ascii_hexdigit()), "{token}");
         // Sixteen fresh bytes every time: a repeat is not a flake, it is the
         // whole guarantee failing.
-        let again = urandom_token().expect("this platform has /dev/urandom");
+        let again = token_from(urandom_bytes()).expect("this platform has /dev/urandom");
         assert_ne!(token, again);
-        // There is no fallback to check: `new_token` fails closed rather than
-        // handing out a clock-derived secret, so a machine with no
-        // `/dev/urandom` gets no console instead of a guessable one.
         assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
+
+    #[test]
+    fn a_console_without_kernel_randomness_does_not_start() {
+        // The refusal is the whole of the decision, and it is unreachable
+        // through the real file: this machine has `/dev/urandom` and cannot be
+        // talked out of it. Handed the error the read would have returned,
+        // `token_from` must refuse rather than invent something — restoring
+        // the old clock-and-pid fallback passes every other test in this file,
+        // so this is the one that notices.
+        let refused =
+            token_from(Err(std::io::Error::new(ErrorKind::NotFound, "no such file or directory")));
+        let e = refused.expect_err("a token that cannot be random must not be issued");
+        // The operator has to be able to tell what failed from the message
+        // alone: the console refusing to start is the visible failure the
+        // whole trade is bought with, and it is worthless if it is unreadable.
+        let msg = e.to_string();
+        assert!(msg.contains("/dev/urandom"), "{msg}");
+
+        // The same seam carries the success case, so a token is exactly the
+        // bytes that were read and nothing derived from them.
+        assert_eq!(token_from(Ok([0xab; 16])).expect("bytes in hand"), "ab".repeat(16));
     }
 
     #[test]
