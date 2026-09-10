@@ -1,0 +1,28 @@
+# An allowlist, not a denylist. Excluding target/ and hoping is how a build
+# context silently grows: every new top-level directory would have to be
+# remembered here, and forgetting one costs a slow build rather than an error.
+# Naming the four things the build reads cannot rot that way.
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!LICENSE
+
+# Every entry above is COPYed by the Dockerfile. LICENSE is there because the
+# image ships AGPL-3.0-only object code and object code should carry its
+# licence; it passes through the build stage only so this repository, rather
+# than the checkout's umask, fixes its mode. Nothing is listed here to be
+# merely present.
+#
+# `!src` re-includes the whole subtree on purpose, non-Rust files included.
+# src/serve.rs embeds the browser console with include_str! on
+# serve/index.html, serve/app.js and serve/style.css, so a rule like
+# `src/**/*.html` here would compile-error the build, not slim it.
+#
+# README.md is out. Cargo.toml declares `readme = "README.md"`, but that field
+# is read by `cargo package`, not by the `cargo build` this file runs, and a
+# file kept in the context for a consumer that never receives it is the kind of
+# thing that reads as correct and is not.
+#
+# tests/ is out: the image build is not a test gate. `cargo test --release`
+# stays the gate, run against a checkout.
