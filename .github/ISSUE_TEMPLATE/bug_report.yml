@@ -7,7 +7,8 @@ body:
       value: |
         Please do not report security vulnerabilities here — use
         [private reporting](https://github.com/celastro/celastro/security/advisories/new)
-        instead.
+        instead. That includes anything about the `serve` console reaching SQL
+        without its token.
 
   - type: textarea
     id: what-happened
@@ -17,14 +18,39 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Where you hit it
+      options:
+        - celastro-cli exec / run
+        - celastro-cli repl
+        - celastro-cli serve (browser console)
+        - celastro-cli demo / catalog
+        - celastro (the original REPL binary)
+        - the library, used directly
+        - the container image
+    validations:
+      required: true
+
   - type: textarea
     id: repro
     attributes:
       label: Reproduction
       description: >-
-        The smallest SQL script or sequence of statements that shows it. A script
-        that can be run with `cargo run --release -- --file repro.sql` is ideal.
+        The smallest SQL that shows it. A single statement is fine as
+        `celastro-cli exec 'SELECT ...'`; anything longer is best as a script
+        run with `celastro-cli run repro.sql`. Add `--json` if the shape of the
+        output is part of the report.
       render: sql
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `celastro-cli --version`.
     validations:
       required: true
 
@@ -33,11 +59,8 @@ body:
     attributes:
       label: Commit
       description: >-
-        Output of `git rev-parse --short HEAD`. There is no `--version` flag, so
-        the commit is what identifies the build.
-      placeholder: 7c26b3b
-    validations:
-      required: true
+        Output of `git rev-parse --short HEAD`, if you built from source. Skip
+        it if you are running the container image.
 
   - type: input
     id: rustc
@@ -45,14 +68,12 @@ body:
       label: rustc version
       description: Output of `rustc --version`. The minimum supported is 1.75.
       placeholder: rustc 1.85.0 (4d91de4e4 2025-02-17)
-    validations:
-      required: true
 
   - type: input
     id: platform
     attributes:
       label: Platform
-      placeholder: macOS 15.3 arm64 / Ubuntu 24.04 x86_64
+      placeholder: macOS 15.3 arm64 / Ubuntu 24.04 x86_64 / container on arm64
     validations:
       required: true
 
@@ -63,6 +84,7 @@ body:
       options:
         - release
         - dev
+        - the container image
       default: 0
     validations:
       required: true

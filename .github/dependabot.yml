@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # The container base image, which is the only third-party code the project
+  # ships. Dockerfile pins `rust:1.83-alpine3.21` by tag, and as that file says,
+  # a tag is not a digest — the registry can repoint it, and nothing else here
+  # would notice a toolchain CVE.
+  #
+  # This is build-stage only: the final image is `scratch`, so a base-image
+  # advisory affects what compiled the binary, not what runs it.
+  #
+  # There is no cargo entry because celastro has no dependencies outside std,
+  # and no github-actions entry because Actions is disabled and the workflows
+  # were retired — CI runs off GitHub now.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
