@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>celastro console</title>
+<!-- Everything here is served by this process. No CDN, no web font, no build
+     step: the console has to work on a machine with no route to the internet.
+     The empty-data icon keeps the browser from requesting a favicon we do not
+     serve; it is a URL the browser resolves internally, not a network fetch. -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <h1>celastro <span id="version" class="version"></span></h1>
+  <!-- The one place a screen reader hears what happened: every query outcome,
+       error and partial-result warning is written here. -->
+  <p id="status" class="status" role="status" aria-live="polite">Ready.</p>
+</header>
+
+<div class="layout">
+  <nav class="side" aria-label="Catalog and history">
+    <div class="side-head">
+      <h2 id="coll-h">Collections</h2>
+      <button id="refresh" type="button" class="link small">Refresh</button>
+    </div>
+    <ul id="collections" class="list" aria-labelledby="coll-h">
+      <li class="muted">Loading&hellip;</li>
+    </ul>
+
+    <div class="side-head"><h2 id="hist-h">History</h2></div>
+    <ol id="history" class="list" aria-labelledby="hist-h"></ol>
+    <p class="muted foot">History is kept in this tab only, never on disk &mdash;
+      statements can contain keys, tenant ids and other literals worth not
+      leaving behind.</p>
+    <p class="muted foot">The access token is taken out of the address bar as
+      soon as this page loads and kept in memory, so it is not on screen or in
+      browser history &mdash; and a reload needs the link the CLI printed
+      again.</p>
+  </nav>
+
+  <main>
+    <!-- Deliberately not a form element: a stray submit would navigate, and
+         the token is held only in memory once app.js has stripped it from the
+         URL, so a reload without it leaves the console unable to talk back. -->
+    <div class="editor">
+      <label for="sql">SQL</label>
+      <textarea id="sql" rows="6" spellcheck="false" autocapitalize="off"
+        placeholder="SELECT * FROM articles LIMIT 10;"></textarea>
+      <div class="run-row">
+        <button id="run" type="button" class="primary">Run</button>
+        <span class="hint">Ctrl+Enter &middot; Cmd+Enter</span>
+        <span id="spinner" class="spinner" hidden aria-hidden="true"></span>
+      </div>
+    </div>
+    <section id="results" class="results" aria-label="Results"></section>
+  </main>
+</div>
+</body>
+</html>

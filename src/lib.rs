@@ -37,6 +37,7 @@ pub mod mvcc;
 pub mod plan;
 pub mod residency;
 pub mod segment;
+pub mod serve;
 pub mod shard;
 pub mod sql;
 pub mod text;

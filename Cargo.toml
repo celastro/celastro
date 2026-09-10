@@ -32,6 +32,12 @@ path = "src/lib.rs"
 name = "celastro"
 path = "src/bin/celastro.rs"
 
+# The full command-line tool. `celastro` above stays what it has always been —
+# a REPL and script runner — because its interface is documented and in use.
+[[bin]]
+name = "celastro-cli"
+path = "src/bin/celastro-cli.rs"
+
 [profile.release]
 opt-level = 3
 debug = false
