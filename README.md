@@ -425,7 +425,7 @@ $ cid=$(docker create celastro)
 $ docker export "$cid" | tar -tv
 -rwxr-xr-x 0/0               0 2026-09-10 10:25 .dockerenv
 -rw-r--r-- 0/0           34523 2026-09-10 10:06 LICENSE
--rwxr-xr-x 0/0         1960248 2026-09-10 10:21 celastro-cli
+-rwxr-xr-x 0/0         1856216 2026-09-10 21:15 celastro-cli
 drwxr-xr-x 65532/65532       0 2026-09-10 10:25 data/
 -rw-r--r-- 65532/65532       0 2026-09-10 10:21 data/.keep
 drwxr-xr-x 0/0               0 2026-09-10 10:25 dev/
@@ -458,24 +458,23 @@ it has to own — the data directory — and no more. No shell, no libc, no pack
 manager, nothing to patch, and nothing running as root.
 
 Size. The stable figure is the content, because the compiler is pinned and the
-binary reproduces byte for byte: 1,960,248 bytes of binary and 34,523 of
-licence, about 2.0 MB uncompressed and about 919 kB compressed. What Docker
+binary reproduces byte for byte: 1,856,216 bytes of binary and 34,523 of
+licence, about 1.89 MB uncompressed and about 895 kB compressed. What Docker
 *prints* is neither of those unconditionally — it depends on the image store,
 which `docker info | grep driver-type` names. On Docker 29.1.3 with the
 containerd store (`io.containerd.snapshotter.v1`), `docker images` reports DISK
-USAGE 2.93 MB and CONTENT SIZE 919 kB — disk usage counts the compressed blobs
+USAGE 2.81 MB and CONTENT SIZE 895 kB — disk usage counts the compressed blobs
 *and* the unpacked snapshot — and `docker image inspect --format '{{.Size}}'`
-prints the compressed content size, `918584` on the build behind this
+prints the compressed content size, `895262` on the build behind this
 paragraph. On the older non-containerd store the same field is the uncompressed
-total instead, the 2.0 MB that `docker history` breaks down as 1.97 MB + 41 kB
+total instead, the 1.89 MB that `docker history` breaks down as 1.86 MB + 41 kB
 + 8.19 kB.
 
-Do not hold `.Size` to the byte. Builds of this source with this Dockerfile have
-printed 918581, 918582, 918583, 918584, 918585 and 918586, and two independent
-compiles — the second with `--no-cache`, minutes after the first — put the same
-1,960,248-byte binary with the same SHA-256 inside images whose `.Size` differed.
-Compressing image metadata is not a reproducible operation; compiling this
-source is.
+Do not hold `.Size` to the byte. Two independent `--no-cache` builds of this
+source both printed 895262 here, but on the previous toolchain pin the same
+exercise produced six different values between 918581 and 918586 around an
+identical binary. Compressing image metadata is not a reproducible operation;
+compiling this source is, and the binary size is the number to quote.
 
 `docker run --read-only` works — `demo` and a volume-backed `exec` both complete
 under it — because nothing is written outside the data directory.
