@@ -8,6 +8,15 @@ license = "AGPL-3.0-only"
 readme = "README.md"
 keywords = ["database", "vector-search", "full-text-search", "hybrid-search", "lsm"]
 categories = ["database-implementations", "database"]
+repository = "https://github.com/celastro/celastro"
+# The logo is the only thing here a build never reads, and at half a megabyte
+# it was most of the published tarball: excluding it takes the crate from
+# 830 KiB compressed to 334 KiB. `tests/` stays in, because dropping it saves
+# 24 KiB and costs the ability to run the suite the README quotes against the
+# crate as downloaded — cargo also warns on every publish that it is ignoring
+# the test targets. Note this list is the only thing that trims the package:
+# .dockerignore has no effect on `cargo package`, which ships tracked files.
+exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*"]
 
 [dependencies]
 # Intentionally none. Celastro is std-only: JSON, bitmaps, term dictionaries,
