@@ -30,9 +30,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
-use crate::codec::Rng;
 use crate::engine::{Db, Outcome};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::json;
 use crate::plan::exec::QueryResult;
 use crate::value::Value;
@@ -103,7 +102,7 @@ impl Server {
     pub fn bind(port: u16) -> Result<Server> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         let addr = listener.local_addr()?;
-        Ok(Server { listener, addr, token: new_token() })
+        Ok(Server { listener, addr, token: new_token()? })
     }
 
     /// The address actually bound, which is only known after `bind` when the
@@ -231,20 +230,19 @@ fn accept_backoff(kind: ErrorKind, consecutive: u32) -> Backoff {
 /// thing between a page in the user's browser and a SQL prompt on their
 /// database, so it is the kernel's randomness and nothing cleverer.
 ///
-/// The fallback below is not a secret and is not presented as one. It is a
-/// xorshift over the wall clock and the pid, and anyone local can read the pid
-/// and the process start time out of `/proc` and search what is left, while a
-/// page can test guesses one request at a time. It exists so the console still
-/// starts where `/dev/urandom` cannot be opened, and it says so on stderr.
-fn new_token() -> String {
-    match urandom_token() {
-        Ok(token) => token,
-        Err(e) => {
-            eprintln!("celastro-cli: cannot read /dev/urandom ({e})");
-            eprintln!("celastro-cli: the console token is clock-derived and locally guessable");
-            derived_token()
-        }
-    }
+/// There is deliberately no fallback. A clock-and-pid derivation is searchable
+/// by anyone who can read the pid and the process start time, and testable one
+/// request at a time by a page that loads `/app.js?t=GUESS` and watches onload
+/// against onerror. On a machine where `/dev/urandom` cannot be opened the
+/// console refuses to start, because an arbitrary-SQL endpoint behind a
+/// guessable secret is worse than no console at all.
+fn new_token() -> Result<String> {
+    urandom_token().map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot read /dev/urandom for the console token: {e}"),
+        ))
+    })
 }
 
 fn urandom_token() -> std::io::Result<String> {
@@ -252,18 +250,6 @@ fn urandom_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     source.read_exact(&mut bytes)?;
     Ok(hex(&bytes))
-}
-
-/// The guessable fallback; see [`new_token`].
-fn derived_token() -> String {
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH);
-    let nanos = since_epoch.map(|d| d.as_nanos() as u64).unwrap_or(0);
-    let mut rng = Rng::new(nanos ^ std::process::id() as u64);
-    let mut bytes = [0u8; 16];
-    for chunk in bytes.chunks_mut(8) {
-        chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
-    }
-    hex(&bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1899,8 +1885,8 @@ mod tests {
         // token that is a pure function of the clock is one on a machine whose
         // clock a caller can read — and, when the clock is coarse, two consoles
         // started in the same tick would share it outright.
-        let a = new_token();
-        let b = new_token();
+        let a = new_token().expect("this platform has /dev/urandom");
+        let b = new_token().expect("this platform has /dev/urandom");
         assert_ne!(a, b);
         assert_ne!(a, "0".repeat(32));
         for token in [&a, &b] {
@@ -1923,11 +1909,9 @@ mod tests {
         // whole guarantee failing.
         let again = urandom_token().expect("this platform has /dev/urandom");
         assert_ne!(token, again);
-        // The fallback still produces a token of the right shape, because a
-        // console that cannot start is not a safer console.
-        let derived = derived_token();
-        assert_eq!(derived.len(), 32);
-        assert!(derived.bytes().all(|c| c.is_ascii_hexdigit()), "{derived}");
+        // There is no fallback to check: `new_token` fails closed rather than
+        // handing out a clock-derived secret, so a machine with no
+        // `/dev/urandom` gets no console instead of a guessable one.
         assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
     }
 
