@@ -24,7 +24,7 @@
 # toolchain version, not a byte-identical base. Today it resolves to
 # rust@sha256:0ac946ed7597a9f053a1be2ce38c09aa88b3d7079a91ea491493615294b1f699;
 # write that digest in here instead if you need the stronger property.
-FROM rust:1.83-alpine3.21 AS build
+FROM rust:1.98-alpine3.21 AS build
 
 # The musl crt objects and the linker the compiler drives.
 RUN apk add --no-cache musl-dev
