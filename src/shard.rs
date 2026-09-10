@@ -922,6 +922,14 @@ impl Shard {
     /// rebuilt. Older sealed segments pick the index up through a rolling
     /// rebuild at compaction (§12.3).
     pub fn adopt_catalog(&mut self, coll: Collection) -> Result<()> {
+        // The seal below runs against the *new* definition and can fail — a
+        // vector index whose declared dims disagree with a document already in
+        // the memtable, say. Keep the definition being replaced so that failure
+        // can be undone: left in place, the new one makes every later flush
+        // fail identically, and a shard whose memtable can never be drained
+        // stops accepting writes, never truncates its WAL, and can never be
+        // sealed.
+        let previous = self.coll.clone();
         self.adopt_definition(coll);
         // The tier is part of the index definition, so a DDL change to it has
         // to reach the segments that already exist — not only the ones a later
@@ -931,8 +939,17 @@ impl Shard {
         }
         if self.memtable.is_empty() {
             self.memtable = Memtable::new(&self.coll, self.opts.budget.clone());
-        } else {
-            self.flush()?;
+        } else if let Err(e) = self.flush() {
+            // Roll back only while the memtable is still unsealed: past that
+            // point the new segment was built against the new definition, and
+            // reverting the catalog would misdescribe it.
+            if !self.memtable.is_empty() {
+                self.coll = previous;
+                for h in &self.segments {
+                    self.adopt_segment(&h.segment);
+                }
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -1343,7 +1360,7 @@ impl Shard {
         path: &str,
         terms: &[String],
         t: Timestamp,
-    ) -> (u64, u64, BTreeMap<String, u64>) {
+    ) -> Result<(u64, u64, BTreeMap<String, u64>)> {
         let snap = self.snapshot_at(t);
         let mut df: BTreeMap<String, u64> = BTreeMap::new();
         let mut total_len = 0u64;
@@ -1351,7 +1368,12 @@ impl Shard {
         for s in self.sources(&snap) {
             let vis = s.visibility(t);
             ndocs += vis.popcount() as u64;
-            let handle = s.text_handle(path).unwrap_or_default();
+            // Not `unwrap_or_default()`: an archived segment configured to
+            // refuse reads would then look like a path with no text index, and
+            // its documents would count towards `ndocs` with zero document
+            // frequency — an inflated IDF and a silently mis-ranked answer in
+            // place of the refusal the operator asked for.
+            let handle = s.text_handle(path)?;
             if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
                 total_len += src.total_doc_len();
                 for term in terms {
@@ -1371,7 +1393,7 @@ impl Shard {
                 }
             }
         }
-        (ndocs, total_len, df)
+        Ok((ndocs, total_len, df))
     }
 }
 
@@ -1834,5 +1856,53 @@ mod tests {
         let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
         assert_eq!(s2.num_docs(MAX_TS), 5);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_catalog_whose_seal_fails_leaves_the_shard_still_flushable() {
+        let mut s = shard();
+        for i in 0..10 {
+            s.insert(doc(i)).unwrap();
+        }
+        // Every document in the memtable carries a four-dimensional `emb`, so
+        // sealing it under an index that declares eight fails.
+        let mut wrong = coll();
+        wrong.indexes.retain(|i| i.path != "emb");
+        wrong.indexes.push(IndexDef::new(
+            "e",
+            "emb",
+            IndexKind::Vector { dims: 8, metric: Metric::Cosine },
+            crate::residency::Tier::default(),
+        ));
+        assert!(s.adopt_catalog(wrong).is_err());
+        // The definition it could not seal must not be left behind: with it in
+        // place every later flush fails the same way, so the memtable can never
+        // be drained, the WAL never truncated, and the shard never sealed.
+        assert!(s.flush().unwrap().is_some());
+        assert_eq!(s.num_docs(s.clock.peek()), 10);
+    }
+
+    #[test]
+    fn a_refused_archived_segment_fails_term_stats_instead_of_inflating_idf() {
+        let mgr = Arc::new(ResidencyManager::new(crate::residency::ResidencyOpts {
+            archived_access: crate::residency::ArchivedAccess::Refuse,
+            ..Default::default()
+        }));
+        let mut opts = ShardOpts::default();
+        opts.residency = Some(mgr);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts);
+        for i in 0..10 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        // The segment's bytes now live only in the archive, and this node is
+        // configured to refuse archived reads.
+        let gone = std::env::temp_dir().join("celastro-no-such-archive.seg");
+        s.segments[0].segment.set_source(crate::segment::SegmentSource::Archive(gone));
+        let e = s.term_stats("body", &["vectors".to_string()], MAX_TS).unwrap_err().to_string();
+        // Swallowing this would make the segment look like a path with no text
+        // index: its documents still count towards `ndocs`, so the IDF is
+        // inflated and the query is silently mis-ranked.
+        assert!(e.contains("archived"), "the refusal has to reach the caller: {e}");
     }
 }

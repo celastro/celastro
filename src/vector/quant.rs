@@ -287,6 +287,13 @@ impl Codes {
         };
         i += 1;
         let dims = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // Each dimension carries an eight-byte `(lo, step)` pair and each
+        // scale four bytes, so the bytes left over bound both repeat counts.
+        // Sizing a `Vec` from the raw value instead lets a short header ask
+        // for an allocation the process cannot satisfy.
+        if dims > (b.len() - i) / 8 {
+            return Err(bad());
+        }
         let count = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
         let mut lo = Vec::with_capacity(dims);
         let mut step = Vec::with_capacity(dims);
@@ -295,12 +302,27 @@ impl Codes {
             step.push(get_f32(b, &mut i).ok_or_else(bad)?);
         }
         let ns = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        if ns > (b.len() - i) / 4 {
+            return Err(bad());
+        }
         let mut scale = Vec::with_capacity(ns);
         for _ in 0..ns {
             scale.push(get_f32(b, &mut i).ok_or_else(bad)?);
         }
         let data = get_bytes(b, &mut i).ok_or_else(bad)?.to_vec();
-        Ok(Codes { quantizer: q, dims, count, data, lo, step, scale })
+        let c = Codes { quantizer: q, dims, count, data, lo, step, scale };
+        // `distance` and `decode` slice `data[i * code_len ..]` and read
+        // `scale[i]` for every `i < count`, and no caller bounds-checks first.
+        // A `count` the payload cannot back panics mid-query on a segment that
+        // was accepted at open time.
+        let need = c.count.checked_mul(c.code_len()).ok_or_else(bad)?;
+        if c.data.len() < need {
+            return Err(Error::Storage("codes: data shorter than count".into()));
+        }
+        if c.quantizer == Quantizer::OneBit && c.scale.len() < c.count {
+            return Err(Error::Storage("codes: missing per-vector scales".into()));
+        }
+        Ok(c)
     }
 }
 
@@ -380,6 +402,44 @@ mod tests {
         let deep = rank_agreement(Quantizer::OneBit, Metric::Cosine, 20);
         assert!(deep > shallow, "deeper rerank should help: {shallow} -> {deep}");
         assert!(deep >= 0.90, "1-bit cosine recall@20 after 20x rerank = {deep}");
+    }
+
+    /// Hand-rolled header, because `encode_bytes` cannot describe more vectors
+    /// than the payload carries and that is exactly what has to be rejected.
+    fn hand_encoded(tag: u8, dims: u64, count: u64, nscale: u64, data_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(tag);
+        put_uvarint(&mut out, dims);
+        put_uvarint(&mut out, count);
+        for _ in 0..dims {
+            put_f32(&mut out, 0.0);
+            put_f32(&mut out, 1.0);
+        }
+        put_uvarint(&mut out, nscale);
+        for _ in 0..nscale {
+            put_f32(&mut out, 1.0);
+        }
+        let data = vec![0u8; data_len];
+        put_bytes(&mut out, &data);
+        out
+    }
+
+    #[test]
+    fn a_code_array_shorter_than_the_count_is_rejected_rather_than_slicing_past_the_end() {
+        // Ten Sq8 vectors of four dimensions need forty code bytes.
+        assert!(Codes::decode_bytes(&hand_encoded(0, 4, 10, 0, 8)).is_err());
+        // The same header with the payload it claims decodes, so the rejection
+        // is the short payload and not the hand-rolled framing.
+        assert!(Codes::decode_bytes(&hand_encoded(0, 4, 10, 0, 40)).is_ok());
+    }
+
+    #[test]
+    fn one_bit_codes_missing_a_scale_per_vector_are_rejected_rather_than_indexing_scale() {
+        // The codes themselves are long enough — one byte covers four
+        // dimensions — so it is only `scale[i]`, read for every vector by
+        // `distance`, that the stream fails to supply.
+        assert!(Codes::decode_bytes(&hand_encoded(1, 4, 6, 2, 6)).is_err());
+        assert!(Codes::decode_bytes(&hand_encoded(1, 4, 6, 6, 6)).is_ok());
     }
 
     #[test]

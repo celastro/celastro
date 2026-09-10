@@ -913,7 +913,9 @@ impl SegmentBuilder {
     pub fn build(mut self, id: u64, level: u32, coll: &Collection) -> Result<Segment> {
         self.docs.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
         // A later commit for the same key wins; earlier ones are superseded and
-        // never reach the segment.
+        // never reach the segment. There is no room here for two versions of a
+        // key, so a caller that must keep a superseded one — compaction, when a
+        // pinned `gc_horizon` still needs it — has to build a second segment.
         self.docs.dedup_by(|a, b| {
             if a.sort_key == b.sort_key {
                 if a.commit_ts > b.commit_ts {
@@ -1332,5 +1334,33 @@ mod tests {
         // Same answer as the column, by a slower road.
         let col = s.column("status").unwrap().unwrap();
         assert_eq!(out, col.filter(CmpOp::Eq, &Value::Str("draft".into())));
+    }
+
+    /// Compaction depends on this: it is why a version that a pinned
+    /// `gc_horizon` still needs is written to a different output segment than
+    /// the version that superseded it.
+    #[test]
+    fn a_superseded_version_does_not_survive_beside_the_one_that_replaced_it() {
+        let c = collection();
+        let first = json::parse(
+            r#"{"id":"doc-0001","tenant_id":"t0","body":"first",
+                "embedding":[1,0,0,0,0,0,0,0]}"#,
+        )
+        .unwrap();
+        let second = json::parse(
+            r#"{"id":"doc-0001","tenant_id":"t0","body":"second",
+                "embedding":[0,1,0,0,0,0,0,0]}"#,
+        )
+        .unwrap();
+        let key = "t0\u{1}doc-0001";
+        let mut b = SegmentBuilder::new(BuildOpts::default());
+        // Newest first, so the survivor cannot be an artefact of input order.
+        b.add(PendingDoc { sort_key: key.into(), commit_ts: 20, doc: second });
+        b.add(PendingDoc { sort_key: key.into(), commit_ts: 10, doc: first });
+        let s = b.build(7, 0, &c).unwrap();
+
+        assert_eq!(s.num_docs(), 1);
+        assert_eq!(s.ordinals.commit_ts, vec![20]);
+        assert_eq!(s.document(0).unwrap().path("body").unwrap().as_str(), Some("second"));
     }
 }

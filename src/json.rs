@@ -8,10 +8,16 @@
 use crate::error::{Error, Result};
 use crate::value::Value;
 
+/// The deepest nesting `parse` accepts, and the deepest the writers will
+/// descend. The parser and the writers are both recursive, so without a bound
+/// an input like `"[".repeat(200_000)` overflows the stack and aborts the
+/// process — no `Result` and no `catch_unwind` can contain that.
+const MAX_DEPTH: usize = 128;
+
 pub fn parse(input: &str) -> Result<Value> {
     let mut p = Parser { b: input.as_bytes(), i: 0 };
     p.ws();
-    let v = p.value()?;
+    let v = p.value(0)?;
     p.ws();
     if p.i != p.b.len() {
         return Err(Error::Schema(format!("trailing input at byte {}", p.i)));
@@ -44,11 +50,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Value> {
+    /// `depth` is the number of containers enclosing this value; it is what
+    /// bounds the mutual recursion between `value`, `object` and `array`.
+    fn value(&mut self, depth: usize) -> Result<Value> {
+        if depth >= MAX_DEPTH {
+            let at = self.i;
+            return Err(Error::Schema(format!("nesting deeper than {MAX_DEPTH} at byte {at}")));
+        }
         match self.peek() {
             None => Err(Error::Schema("unexpected end of input".into())),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Value::Str(self.string()?)),
             Some(b't') => {
                 self.lit("true")?;
@@ -75,7 +87,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<Value> {
+    fn object(&mut self, depth: usize) -> Result<Value> {
         self.eat(b'{')?;
         let mut fields = Vec::new();
         self.ws();
@@ -89,7 +101,7 @@ impl<'a> Parser<'a> {
             self.ws();
             self.eat(b':')?;
             self.ws();
-            let v = self.value()?;
+            let v = self.value(depth + 1)?;
             fields.push((k, v));
             self.ws();
             match self.peek() {
@@ -106,7 +118,7 @@ impl<'a> Parser<'a> {
         Ok(Value::obj(fields))
     }
 
-    fn array(&mut self) -> Result<Value> {
+    fn array(&mut self, depth: usize) -> Result<Value> {
         self.eat(b'[')?;
         let mut items = Vec::new();
         self.ws();
@@ -116,7 +128,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.ws();
-            items.push(self.value()?);
+            items.push(self.value(depth + 1)?);
             self.ws();
             match self.peek() {
                 Some(b',') => {
@@ -154,20 +166,27 @@ impl<'a> Parser<'a> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let cp = self.hex4()?;
-                            // Surrogate pair handling.
+                            // Surrogate pair handling. Both halves are
+                            // validated before the arithmetic: a high
+                            // surrogate followed by `A` would otherwise
+                            // evaluate `0x41 - 0xDC00` on a u32, which panics
+                            // in debug and in release wraps around into a
+                            // fabricated character.
                             if (0xD800..0xDC00).contains(&cp) {
-                                if self.peek() == Some(b'\\') {
-                                    self.i += 1;
-                                    self.eat(b'u')?;
-                                    let lo = self.hex4()?;
-                                    let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                    out.push(
-                                        char::from_u32(combined)
-                                            .ok_or_else(|| Error::Schema("bad surrogate".into()))?,
-                                    );
-                                } else {
-                                    out.push('\u{FFFD}');
+                                if self.peek() != Some(b'\\') {
+                                    return Err(Error::Schema("unpaired high surrogate".into()));
                                 }
+                                self.i += 1;
+                                self.eat(b'u')?;
+                                let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(Error::Schema("invalid low surrogate".into()));
+                                }
+                                let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                out.push(
+                                    char::from_u32(combined)
+                                        .ok_or_else(|| Error::Schema("bad surrogate".into()))?,
+                                );
                             } else {
                                 out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                             }
@@ -230,7 +249,14 @@ impl<'a> Parser<'a> {
                 return Ok(Value::Int(i));
             }
         }
-        s.parse::<f64>().map(Value::Float).map_err(|_| Error::Schema(format!("bad number `{s}`")))
+        let f = s.parse::<f64>().map_err(|_| Error::Schema(format!("bad number `{s}`")))?;
+        // `1e999` parses to infinity, and every writer renders a non-finite
+        // float as `null`, so accepting it here would mean a number silently
+        // reads back as null. Refuse it at the door instead.
+        if !f.is_finite() {
+            return Err(Error::Schema(format!("number out of range `{s}`")));
+        }
+        Ok(Value::Float(f))
     }
 }
 
@@ -248,7 +274,7 @@ fn utf8_len(b: u8) -> usize {
 
 pub fn to_string(v: &Value) -> String {
     let mut s = String::new();
-    write_value(v, &mut s);
+    write_value(v, 0, &mut s);
     s
 }
 
@@ -258,7 +284,16 @@ pub fn to_string_pretty(v: &Value) -> String {
     s
 }
 
-fn write_value(v: &Value, out: &mut String) {
+fn write_value(v: &Value, depth: usize, out: &mut String) {
+    // A value built in memory (by `set_path`, say) is not bounded by what the
+    // parser would have accepted, and the writer recurses in step with it.
+    // Emitting `null` past the limit keeps the output valid JSON without
+    // overflowing the stack; nothing `parse` produces can reach here, because
+    // a container at the deepest accepted level has to be empty.
+    if depth >= MAX_DEPTH {
+        out.push_str("null");
+        return;
+    }
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -283,7 +318,7 @@ fn write_value(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                write_value(x, out);
+                write_value(x, depth + 1, out);
             }
             out.push(']');
         }
@@ -295,7 +330,7 @@ fn write_value(v: &Value, out: &mut String) {
                 }
                 write_json_string(k, out);
                 out.push(':');
-                write_value(x, out);
+                write_value(x, depth + 1, out);
             }
             out.push('}');
         }
@@ -303,6 +338,12 @@ fn write_value(v: &Value, out: &mut String) {
 }
 
 fn write_pretty(v: &Value, depth: usize, out: &mut String) {
+    // The same bound as `write_value`, for the same reason: this function
+    // recurses on its own for containers and would never reach that check.
+    if depth >= MAX_DEPTH {
+        out.push_str("null");
+        return;
+    }
     let pad = "  ".repeat(depth);
     let pad1 = "  ".repeat(depth + 1);
     match v {
@@ -334,7 +375,7 @@ fn write_pretty(v: &Value, depth: usize, out: &mut String) {
             out.push_str(&pad);
             out.push('}');
         }
-        _ => write_value(v, out),
+        _ => write_value(v, depth, out),
     }
 }
 
@@ -360,4 +401,65 @@ fn write_json_string(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_invalid_low_surrogate_is_rejected_rather_than_fabricating_a_char() {
+        // `0x41 - 0xDC00` underflows: a debug build panics here, a release
+        // build wraps and stores a character nobody wrote.
+        assert!(parse(r#"{"a":"\ud800\u0041"}"#).is_err());
+        // A second high surrogate is not a valid low half either.
+        assert!(parse(r#""\ud800\ud800""#).is_err());
+        // A well-formed pair still decodes.
+        assert_eq!(parse(r#""😀""#).unwrap(), Value::Str("\u{1F600}".into()));
+    }
+
+    #[test]
+    fn a_high_surrogate_with_no_following_escape_is_rejected() {
+        assert!(parse(r#""\ud800""#).is_err());
+        assert!(parse(r#""\ud800x""#).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_input_is_rejected_instead_of_overflowing_the_stack() {
+        // Unbounded, this recursion aborts the process: a stack overflow is
+        // not a panic, so no Result and no catch_unwind can contain it.
+        let err = parse(&"[".repeat(200_000)).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "{err}");
+        let err = parse(&"{\"a\":".repeat(200_000)).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "{err}");
+    }
+
+    #[test]
+    fn the_depth_limit_still_admits_documents_exactly_at_the_limit() {
+        let ok = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(parse(&ok).is_ok(), "nesting of exactly MAX_DEPTH must parse");
+        let deep = format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        assert!(parse(&deep).is_err());
+    }
+
+    #[test]
+    fn a_value_nested_past_the_writer_limit_is_truncated_not_overflowed() {
+        let mut v = Value::Int(1);
+        for _ in 0..MAX_DEPTH + 1 {
+            v = Value::Array(vec![v]);
+        }
+        let expect = format!("{}null{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert_eq!(to_string(&v), expect);
+    }
+
+    #[test]
+    fn an_out_of_range_number_is_rejected_rather_than_read_back_as_null() {
+        // Accepting these would store infinity, which every writer renders as
+        // `null`: the value you inserted is not the value you read back.
+        assert!(parse("1e999").is_err());
+        assert!(parse("-1e999").is_err());
+        assert!(parse(r#"{"a":1e999}"#).is_err());
+        // The neighbouring finite magnitude is still fine.
+        assert!(parse("1e308").is_ok());
+    }
 }

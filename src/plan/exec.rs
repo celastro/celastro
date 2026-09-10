@@ -61,6 +61,30 @@ pub const MAX_K_PRIME: usize = 1 << 20;
 /// sits just outside `k` is not lost (§5.4).
 const COLLAPSE_AMPLIFICATION: usize = 5;
 
+/// How deep each shard has to go per source, given the planned floor `base`.
+///
+/// Every stage below the gather truncates to this number, so it has to cover
+/// everything the gather then throws away: the `offset` rows skipped before the
+/// page starts, the collapse over-fetch, and the depth a cursor has already
+/// consumed. A depth derived from LIMIT alone makes `LIMIT 10 OFFSET 10` return
+/// zero rows — the shards produce exactly ten candidates and `skip(10)` empties
+/// them. The `MAX_K_PRIME` clamp stays on the outside: `k'` feeds a `Vec`
+/// allocation, so it must not become an out-of-memory lever.
+fn candidate_depth(
+    base: usize,
+    k: usize,
+    offset: usize,
+    collapse_room: usize,
+    cursor_depth: usize,
+) -> usize {
+    let page = k.saturating_add(offset).saturating_mul(collapse_room);
+    let mut depth = base.saturating_mul(collapse_room).max(page);
+    if cursor_depth > 0 {
+        depth = depth.max(cursor_depth.saturating_add(k.saturating_mul(collapse_room)));
+    }
+    depth.min(MAX_K_PRIME)
+}
+
 #[derive(Debug, Clone)]
 pub struct Row {
     pub key: String,
@@ -216,11 +240,9 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     // Resolve the ORDER BY into candidate-generating sources.
     let SourcePlanning { sources, method, weights, rrf_c, k_prime } =
         plan_sources(input.coll, sel, k)?;
-    let mut k_prime = k_prime;
     // `COLLAPSE BY` throws away every child but the best per parent, so the
     // candidate set has to be deep enough that `k` parents survive (§5.4).
     let collapse_room = if sel.collapse.is_some() { COLLAPSE_AMPLIFICATION } else { 1 };
-    k_prime = k_prime.saturating_mul(collapse_room).min(MAX_K_PRIME);
     // `search_after` over an approximate index has no cheap resume: a graph
     // heap cannot be handed "the next k after this distance" without traversing
     // to that depth first. So the cursor carries how deep the reader already
@@ -229,13 +251,10 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     // cost, it is stability: it survives concurrent writes, and it is anchored
     // to the sort tuple rather than to a position.
     let cursor_depth = sel.cursor.as_ref().map(|c| decode_cursor(c).1).unwrap_or(0);
+    let k_prime = candidate_depth(k_prime, k, sel.offset, collapse_room, cursor_depth);
     if cursor_depth > 0 {
-        k_prime = k_prime
-            .max(cursor_depth.saturating_add(k.saturating_mul(collapse_room)))
-            .min(MAX_K_PRIME);
         ex.notes.push(format!(
-            "cursor at depth {cursor_depth}: candidate generation widened to k'={} per shard",
-            k_prime
+            "cursor at depth {cursor_depth}: candidate generation widened to k'={k_prime} per shard"
         ));
     }
     ex.k_prime = k_prime;
@@ -868,6 +887,15 @@ fn scan(
         let after = decode_cursor(cur).2;
         out.retain(|(key, _)| key.as_str() > after.as_str());
     }
+    // `COLLAPSE BY` applies to unranked queries too. Skipping it here would
+    // silently return `k` children of one parent for a statement that asked for
+    // `k` distinct parents — a wrong answer with no error to point at.
+    if let Some(parent_path) = &sel.collapse {
+        // A scan materialises every survivor before ordering, so unlike the
+        // ranked path there is nothing to over-fetch: no amplification.
+        ex.collapse = Some((parent_path.clone(), 1));
+        collapse_by_parent(&mut out, parent_path);
+    }
     let rows: Vec<Row> = out
         .into_iter()
         .skip(sel.offset)
@@ -876,6 +904,25 @@ fn scan(
         .collect();
     ex.fetched_payloads = rows.len();
     Ok((rows, missing))
+}
+
+/// Keep the first row per distinct parent, preserving the order already
+/// established. A row whose parent path is absent or NULL belongs to no group,
+/// so it survives — collapsing them together would fold every unrelated
+/// document into one, which is the same rule the ranked path applies.
+fn collapse_by_parent(rows: &mut Vec<(String, Value)>, parent_path: &str) {
+    let mut seen: Vec<Value> = Vec::new();
+    rows.retain(|(_, doc)| match doc.path(parent_path) {
+        Some(parent) if !parent.is_null() => {
+            if seen.contains(parent) {
+                false
+            } else {
+                seen.push(parent.clone());
+                true
+            }
+        }
+        _ => true,
+    });
 }
 
 /// Whether a shard's key range can hold anything under `prefix`.
@@ -903,15 +950,32 @@ fn fetch(shards: &[Shard], key: &str, ts: Timestamp) -> Result<Option<Value>> {
 
 /// `<sort value>|<depth>|<primary key>`. The depth is what lets the next page
 /// widen candidate generation instead of silently returning the same page.
+///
+/// The sort value is the f32's bit pattern, written as `#` plus eight hex
+/// digits, because `after_cursor` compares it with `<`: a rendering that does
+/// not round-trip exactly is off by an ULP in one direction or the other, which
+/// either re-emits the anchor row on the next page or drops its whole tie
+/// group. A decimal `{:.9}` is nine decimal *places*, and RRF scores sit near
+/// 0.01 where the f32 grid is far finer than 1e-9. The token stays opaque to
+/// callers either way.
 fn encode_cursor(score: f32, depth: usize, key: &str) -> String {
-    format!("{score:.9}|{depth}|{key}")
+    format!("#{:08x}|{depth}|{key}", score.to_bits())
+}
+
+/// The `#`-prefixed bit pattern [`encode_cursor`] writes; a plain decimal is
+/// still read, so a cursor written by hand keeps working.
+fn decode_score(s: &str) -> Option<f32> {
+    match s.strip_prefix('#') {
+        Some(bits) => u32::from_str_radix(bits, 16).ok().map(f32::from_bits),
+        None => s.parse::<f32>().ok(),
+    }
 }
 
 fn decode_cursor(c: &str) -> (Option<f32>, usize, String) {
     let mut it = c.splitn(3, '|');
     match (it.next(), it.next(), it.next()) {
         (Some(s), Some(d), Some(k)) => {
-            (s.parse::<f32>().ok(), d.parse::<usize>().unwrap_or(0), k.to_string())
+            (decode_score(s), d.parse::<usize>().unwrap_or(0), k.to_string())
         }
         // A bare primary key is still accepted: it is what a key-ordered scan
         // hands back, and what a human types.
@@ -925,5 +989,111 @@ fn after_cursor(after: &(Option<f32>, usize, String), score: f32, key: &str) -> 
     match after.0 {
         None => key > after.2.as_str(),
         Some(s) => score < s || (score == s && key > after.2.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(key: &str, json: &str) -> (String, Value) {
+        (key.to_string(), crate::json::parse(json).unwrap())
+    }
+
+    /// `k'` used to come from LIMIT alone, so every stage below the gather
+    /// truncated to ten candidates for `LIMIT 10 OFFSET 10` and the `skip(10)`
+    /// that follows emptied them: page two came back with zero rows.
+    #[test]
+    fn offset_is_part_of_candidate_depth_so_page_two_is_not_empty() {
+        let k = 10;
+        // A pure vector query plans the shallowest floor there is, `k`.
+        assert!(candidate_depth(k, k, 0, 1, 0) >= k);
+        assert!(candidate_depth(k, k, 10, 1, 0) >= 20, "OFFSET 10 needs 20 candidates");
+        assert!(candidate_depth(k, k, 1, 1, 0) >= 11, "even OFFSET 1 costs one more row");
+        // A deliberately shallow user-set `k'` still has to cover the page.
+        assert!(candidate_depth(1, k, 90, 1, 0) >= 100);
+        // COLLAPSE BY multiplies what the gather discards, so it multiplies depth.
+        assert_eq!(candidate_depth(1, k, 10, COLLAPSE_AMPLIFICATION, 0), 100);
+        // A cursor still widens by the depth already consumed.
+        assert_eq!(candidate_depth(100, k, 0, 1, 250), 260);
+        // And the clamp survives all of it: `k'` feeds a `Vec` allocation, so an
+        // absurd OFFSET must not become an out-of-memory lever.
+        assert_eq!(
+            candidate_depth(MAX_K_PRIME, k, usize::MAX, COLLAPSE_AMPLIFICATION, 0),
+            MAX_K_PRIME
+        );
+    }
+
+    /// The cursor's score used to be written with `{:.9}` — nine decimal
+    /// *places*, where an f32 needs nine significant digits. RRF scores sit near
+    /// 0.01, on a grid far finer than 1e-9, so the value read back was an ULP
+    /// off: too high and `after_cursor` re-emits the anchor row on the next
+    /// page, too low and it drops the anchor's whole tie group.
+    #[test]
+    fn a_rounded_cursor_score_does_not_re_emit_or_drop_the_anchor_row() {
+        for rank in 1..=3000u32 {
+            let score = 1.0f32 / (60.0 + rank as f32);
+            let after = decode_cursor(&encode_cursor(score, 10, "doc-0042"));
+            assert_eq!(
+                after.0.map(f32::to_bits),
+                Some(score.to_bits()),
+                "rank {rank} did not round-trip"
+            );
+            assert!(!after_cursor(&after, score, "doc-0042"), "rank {rank}: anchor re-emitted");
+            assert!(!after_cursor(&after, score, "doc-0041"), "rank {rank}: tie ahead re-emitted");
+            assert!(after_cursor(&after, score, "doc-0043"), "rank {rank}: tie group dropped");
+        }
+    }
+
+    /// A negated distance is the sort value of a single-source vector query, so
+    /// the cursor has to survive the sign as well.
+    #[test]
+    fn a_negative_sort_value_round_trips_through_the_cursor() {
+        let score = -(1.0f32 / 3.0);
+        let after = decode_cursor(&encode_cursor(score, 3, "tenant\u{1}doc-7"));
+        assert_eq!(after.0.map(f32::to_bits), Some(score.to_bits()));
+        assert_eq!(after.1, 3);
+        assert_eq!(after.2, "tenant\u{1}doc-7");
+        // A bare primary key is still a valid cursor, and so is a hand-written
+        // decimal score.
+        assert_eq!(decode_cursor("doc-7").2, "doc-7");
+        assert_eq!(decode_cursor("0.5|2|doc-7").0, Some(0.5));
+    }
+
+    /// COLLAPSE BY used to be dropped on the floor for any query without an
+    /// ORDER BY that generates candidates: `COLLAPSE BY parent_id LIMIT 5`
+    /// happily returned five chunks of the same parent.
+    #[test]
+    fn collapse_by_on_an_unranked_scan_is_honoured_rather_than_ignored() {
+        let mut rows = vec![
+            doc("c1", r#"{"parent_id": "p1"}"#),
+            doc("c2", r#"{"parent_id": "p1"}"#),
+            doc("c3", r#"{"parent_id": "p2"}"#),
+            doc("c4", r#"{"parent_id": "p1"}"#),
+            doc("c5", r#"{"parent_id": "p3"}"#),
+        ];
+        collapse_by_parent(&mut rows, "parent_id");
+        assert_eq!(
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["c1", "c3", "c5"]
+        );
+    }
+
+    /// Documents with no parent are not one giant group; collapsing them
+    /// together would delete unrelated rows from the answer.
+    #[test]
+    fn a_missing_or_null_parent_does_not_collapse_unrelated_rows_together() {
+        let mut rows = vec![
+            doc("a", r#"{"other": 1}"#),
+            doc("b", r#"{"parent_id": null}"#),
+            doc("c", r#"{"other": 2}"#),
+            doc("d", r#"{"parent_id": "p"}"#),
+            doc("e", r#"{"parent_id": "p"}"#),
+        ];
+        collapse_by_parent(&mut rows, "parent_id");
+        assert_eq!(
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
     }
 }

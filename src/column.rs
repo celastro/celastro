@@ -110,8 +110,17 @@ impl Bloom {
     }
 
     fn decode(b: &[u8], i: &mut usize) -> Option<Bloom> {
-        let nbits = get_uvarint(b, i)? as usize;
-        let mut bits = vec![0u64; nbits / 64];
+        let nbits = usize::try_from(get_uvarint(b, i)?).ok()?;
+        // `probes` reduces modulo `nbits` while `bits` holds only `nbits / 64`
+        // words, so an `nbits` that is not a whole power-of-two number of words
+        // lets a probe address a word that was never allocated — and that panic
+        // lands in `maybe_contains`, on the query path. The writer emits nothing
+        // but powers of two of at least 64, so anything else is corruption.
+        if nbits != 0 && (nbits < 64 || !nbits.is_power_of_two()) {
+            return None;
+        }
+        let words = bounded_len((nbits / 64) as u64, 8, b.len().saturating_sub(*i))?;
+        let mut bits = vec![0u64; words];
         for w in bits.iter_mut() {
             *w = get_u64(b, i)?;
         }
@@ -201,6 +210,15 @@ impl Column {
         matches!(self.data, ColumnData::MultiStr { .. } | ColumnData::MultiNum { .. })
     }
 
+    /// Where each row's elements begin, for a multi-value column.
+    fn starts(&self) -> Option<&[u32]> {
+        match &self.data {
+            ColumnData::MultiStr { starts, .. } => Some(starts.as_slice()),
+            ColumnData::MultiNum { starts, .. } => Some(starts.as_slice()),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, ord: u32) -> Value {
         let i = ord as usize;
         if !self.present().get(i) {
@@ -272,10 +290,17 @@ impl Column {
                 for (b, (lo, hi)) in z.iter().enumerate() {
                     keep[b] = match op {
                         CmpOp::Eq => lo.as_str() <= v && v <= hi.as_str(),
-                        // A prefix range is [v, v+1) in string order, so the
-                        // block matters iff it straddles that range.
+                        // Every string with prefix `v` sorts at or after `v`,
+                        // so a block whose maximum is below `v` holds none, and
+                        // one whose minimum is above `v` holds none *unless*
+                        // that minimum has the prefix itself. Appending a
+                        // maximal char to `v` is not an upper bound —
+                        // "ab\u{10FFFF}\u{10FFFF}" sorts after "ab\u{10FFFF}"
+                        // and still starts with "ab" — and a live block declared
+                        // dead silently drops 4096 matching documents.
                         CmpOp::Prefix => {
-                            hi.as_str() >= v && lo.as_str() <= &format!("{v}\u{10FFFF}")
+                            let floor_ok = lo.starts_with(v) || lo.as_str() <= v;
+                            floor_ok && hi.as_str() >= v
                         }
                         CmpOp::Lt => lo.as_str() < v,
                         CmpOp::Le => lo.as_str() <= v,
@@ -296,24 +321,24 @@ impl Column {
         match op {
             CmpOp::IsNull | CmpOp::IsNotNull => Bitmap::all(self.num_docs),
             _ => {
-                if self.type_admits(op, lit) {
-                    // A multi-value row with no elements has nothing to compare.
-                    match &self.data {
-                        ColumnData::MultiStr { present, starts, .. }
-                        | ColumnData::MultiNum { present, starts, .. } => {
-                            let mut bm = present.clone();
-                            for i in present.iter() {
-                                if starts[i as usize] == starts[i as usize + 1] {
-                                    bm.clear(i as usize);
-                                }
-                            }
-                            bm
-                        }
-                        _ => self.present().clone(),
-                    }
-                } else {
-                    Bitmap::new(self.num_docs)
+                if !self.type_admits(op, lit) {
+                    return Bitmap::new(self.num_docs);
                 }
+                let mut bm = self.present().clone();
+                // A multi-value row with no elements has nothing to compare
+                // against a scalar literal. Against an array literal it is
+                // still a perfectly comparable (empty) array, which is what
+                // makes `tags <> ['a']` true rather than undefined for `[]`.
+                if !matches!(lit, Value::Array(_)) {
+                    if let Some(starts) = self.starts() {
+                        for i in self.present().iter() {
+                            if starts[i as usize] == starts[i as usize + 1] {
+                                bm.clear(i as usize);
+                            }
+                        }
+                    }
+                }
+                bm
             }
         }
     }
@@ -322,9 +347,15 @@ impl Column {
     fn type_admits(&self, op: CmpOp, lit: &Value) -> bool {
         let probe = match &self.data {
             ColumnData::Bool { .. } => Value::Bool(true),
-            ColumnData::Num { .. } | ColumnData::MultiNum { .. } => Value::Float(0.0),
+            ColumnData::Num { .. } => Value::Float(0.0),
             ColumnData::Ts { .. } => Value::Timestamp(0),
-            ColumnData::Str { .. } | ColumnData::MultiStr { .. } => Value::Str(String::new()),
+            ColumnData::Str { .. } => Value::Str(String::new()),
+            // A multi-value column holds arrays, and [`comparable`] compares an
+            // array with an array literal as a whole rather than element-wise.
+            // Probing with a bare element made `tags <> ['a','b']` undefined
+            // everywhere, so the negation returned nothing at all.
+            ColumnData::MultiNum { .. } => Value::Array(vec![Value::Float(0.0)]),
+            ColumnData::MultiStr { .. } => Value::Array(vec![Value::Str(String::new())]),
         };
         comparable(&probe, op, lit)
     }
@@ -386,6 +417,20 @@ impl Column {
         if op == CmpOp::ArrayContains && !self.is_multi() {
             // A scalar is a one-element array, so containment is equality.
             return self.filter(CmpOp::Eq, lit);
+        }
+        if self.is_multi() && matches!(lit, Value::Array(_)) {
+            // A multi-value column compared with an array literal is a
+            // whole-array comparison, not containment: the value index answers
+            // `element = x`, which says nothing about `tags = ['a','b']`.
+            // Falling through to the scalar branches returned an empty bitmap,
+            // so a document the memtable matched disappeared from the answer the
+            // moment its segment was sealed.
+            for ord in self.present().iter() {
+                if matches(&self.get(ord), op, lit) {
+                    out.set(ord as usize);
+                }
+            }
+            return out;
         }
         if op == CmpOp::ArrayContains || (op == CmpOp::Eq && self.is_multi()) {
             if let ColumnData::MultiStr { index, .. } = &self.data {
@@ -519,11 +564,23 @@ fn cmp_ok(op: CmpOp, o: Option<std::cmp::Ordering>) -> bool {
 fn bloom_key(v: &Value) -> Option<Vec<u8>> {
     match v {
         Value::Str(s) => Some(s.as_bytes().to_vec()),
-        Value::Int(_) | Value::Float(_) => Some(v.as_f64().unwrap().to_le_bytes().to_vec()),
+        Value::Int(_) | Value::Float(_) => Some(num_bloom_key(v.as_f64()?).to_vec()),
         Value::Timestamp(t) => Some(t.to_le_bytes().to_vec()),
         Value::Bool(b) => Some(vec![*b as u8]),
         _ => None,
     }
+}
+
+/// The bloom key of a number, keyed by value rather than by bit pattern.
+///
+/// `-0.0` and `0.0` compare `Equal` everywhere else in the engine, so they must
+/// not hash apart: a segment holding `-0.0` would otherwise fail the bloom probe
+/// for `WHERE n = 0` and be skipped whole, and a false negative is the one
+/// mistake a bloom filter is never allowed to make. Both the add and the probe
+/// path go through here so they cannot drift.
+fn num_bloom_key(x: f64) -> [u8; 8] {
+    let x = if x == 0.0 { 0.0 } else { x };
+    x.to_le_bytes()
 }
 
 // --------------------------------------------------------------------------
@@ -743,7 +800,7 @@ impl ColumnBuilder {
                         let b = i / ZONE_BLOCK;
                         z[b].0 = z[b].0.min(x);
                         z[b].1 = z[b].1.max(x);
-                        bloom.add(&x.to_le_bytes());
+                        bloom.add(&num_bloom_key(x));
                     }
                 }
                 for e in z.iter_mut() {
@@ -782,13 +839,50 @@ fn put_bitmap(out: &mut Vec<u8>, bm: &Bitmap) {
     }
 }
 
+/// The widest ordinal space a decoder will materialise. A segment holds a few
+/// million documents, so anything past this is a damaged length rather than a
+/// long bitmap — and `Bitmap::new` on a damaged length is an allocation the
+/// process answers by aborting.
+const MAX_ORDINALS: usize = 1 << 28;
+
+/// Reject an element count the remaining bytes could not possibly hold, before
+/// anything reserves for it.
+///
+/// Every count below is read out of the buffer and handed straight to
+/// `Vec::with_capacity`, so a corrupt count is an allocation request of
+/// arbitrary size: an abort instead of the `Error::Storage` a damaged segment is
+/// supposed to produce. `min_bytes_each` is the smallest encoded size of one
+/// element.
+fn bounded_len(n: u64, min_bytes_each: usize, remaining: usize) -> Option<usize> {
+    let n = usize::try_from(n).ok()?;
+    if n > remaining / min_bytes_each.max(1) {
+        return None;
+    }
+    Some(n)
+}
+
 fn get_bitmap(b: &[u8], i: &mut usize) -> Option<Bitmap> {
-    let len = get_uvarint(b, i)? as usize;
-    let n = get_uvarint(b, i)? as usize;
+    let len = usize::try_from(get_uvarint(b, i)?).ok()?;
+    if len > MAX_ORDINALS {
+        return None;
+    }
+    // A set ordinal costs at least one byte of delta, so a count past what is
+    // left in the buffer is corruption.
+    let n = get_uvarint(b, i)?;
+    let n = bounded_len(n, 1, b.len().saturating_sub(*i))?;
     let mut bm = Bitmap::new(len);
-    let mut prev = 0u32;
+    let mut prev = 0u64;
     for _ in 0..n {
-        prev += get_uvarint(b, i)? as u32;
+        // `Bitmap::set` bounds-checks only under `debug_assertions`, so an
+        // ordinal past `len` either panics on the word index or sets a bit in
+        // the padding beyond the logical length — after which `filter` walks
+        // that ordinal and indexes a value vector that never had it. Accumulate
+        // in u64 too: `prev += delta as u32` truncates a corrupt delta into a
+        // plausible ordinal instead of rejecting it.
+        prev = prev.checked_add(get_uvarint(b, i)?)?;
+        if prev >= len as u64 {
+            return None;
+        }
         bm.set(prev as usize);
     }
     Some(bm)
@@ -911,6 +1005,10 @@ impl Column {
         let num_docs = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
         let tag = *b.get(i).ok_or_else(bad)?;
         i += 1;
+        // Every count below is decoded from the buffer, so every one of them is
+        // bounded by the bytes that could still hold those elements before it
+        // reaches `Vec::with_capacity`. `rest` is how many bytes are left.
+        let rest = |at: usize| b.len().saturating_sub(at);
         let data = match tag {
             0 => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
@@ -919,27 +1017,34 @@ impl Column {
             }
             1 => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
-                let mut vals = Vec::with_capacity(num_docs);
-                for _ in 0..num_docs {
+                let n = bounded_len(num_docs as u64, 8, rest(i)).ok_or_else(bad)?;
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
                     vals.push(f64::from_bits(get_u64(b, &mut i).ok_or_else(bad)?));
                 }
                 ColumnData::Num { present, vals }
             }
             2 => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
-                let mut vals = Vec::with_capacity(num_docs);
-                for _ in 0..num_docs {
+                let n = bounded_len(num_docs as u64, 1, rest(i)).ok_or_else(bad)?;
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
                     vals.push(get_ivarint(b, &mut i).ok_or_else(bad)?);
                 }
                 ColumnData::Ts { present, vals }
             }
             3 => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
-                let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let n = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let n = bounded_len(n, 1, rest(i)).ok_or_else(bad)?;
                 let mut offsets = Vec::with_capacity(n);
                 let mut prev = 0u32;
                 for _ in 0..n {
-                    prev += get_uvarint(b, &mut i).ok_or_else(bad)? as u32;
+                    // Checked, not truncating: a corrupt delta must be an error,
+                    // not a wrapped offset that slices `data` somewhere else.
+                    let d = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                    let d = u32::try_from(d).map_err(|_| bad())?;
+                    prev = prev.checked_add(d).ok_or_else(bad)?;
                     offsets.push(prev);
                 }
                 let data = get_bytes(b, &mut i).ok_or_else(bad)?.to_vec();
@@ -947,18 +1052,23 @@ impl Column {
             }
             4 => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
-                let ns = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let ns = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let ns = bounded_len(ns, 4, rest(i)).ok_or_else(bad)?;
                 let mut starts = Vec::with_capacity(ns);
                 for _ in 0..ns {
                     starts.push(get_u32(b, &mut i).ok_or_else(bad)?);
                 }
-                let no = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let no = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let no = bounded_len(no, 4, rest(i)).ok_or_else(bad)?;
                 let mut offsets = Vec::with_capacity(no);
                 for _ in 0..no {
                     offsets.push(get_u32(b, &mut i).ok_or_else(bad)?);
                 }
                 let data = get_bytes(b, &mut i).ok_or_else(bad)?.to_vec();
-                let ni = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let ni = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                // An index entry is a length-prefixed key plus a bitmap: three
+                // bytes even when both are empty.
+                let ni = bounded_len(ni, 3, rest(i)).ok_or_else(bad)?;
                 let mut index = BTreeMap::new();
                 for _ in 0..ni {
                     let k = get_str(b, &mut i).ok_or_else(bad)?;
@@ -969,12 +1079,14 @@ impl Column {
             }
             _ => {
                 let present = get_bitmap(b, &mut i).ok_or_else(bad)?;
-                let ns = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let ns = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let ns = bounded_len(ns, 4, rest(i)).ok_or_else(bad)?;
                 let mut starts = Vec::with_capacity(ns);
                 for _ in 0..ns {
                     starts.push(get_u32(b, &mut i).ok_or_else(bad)?);
                 }
-                let nv = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let nv = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let nv = bounded_len(nv, 8, rest(i)).ok_or_else(bad)?;
                 let mut vals = Vec::with_capacity(nv);
                 for _ in 0..nv {
                     vals.push(f64::from_bits(get_u64(b, &mut i).ok_or_else(bad)?));
@@ -986,7 +1098,8 @@ impl Column {
         i += 1;
         let zones = match ztag {
             1 => {
-                let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let n = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let n = bounded_len(n, 16, rest(i)).ok_or_else(bad)?;
                 let mut z = Vec::with_capacity(n);
                 for _ in 0..n {
                     let a = f64::from_bits(get_u64(b, &mut i).ok_or_else(bad)?);
@@ -996,7 +1109,8 @@ impl Column {
                 Zones::Num(z)
             }
             2 => {
-                let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let n = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let n = bounded_len(n, 2, rest(i)).ok_or_else(bad)?;
                 let mut z = Vec::with_capacity(n);
                 for _ in 0..n {
                     let a = get_ivarint(b, &mut i).ok_or_else(bad)?;
@@ -1006,7 +1120,8 @@ impl Column {
                 Zones::Ts(z)
             }
             3 => {
-                let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let n = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                let n = bounded_len(n, 2, rest(i)).ok_or_else(bad)?;
                 let mut z = Vec::with_capacity(n);
                 for _ in 0..n {
                     let a = get_str(b, &mut i).ok_or_else(bad)?;
@@ -1019,8 +1134,94 @@ impl Column {
         };
         let bloom = Bloom::decode(b, &mut i).ok_or_else(bad)?;
         let mismatch = get_bitmap(b, &mut i).ok_or_else(bad)?;
-        Ok(Column { path, ty, num_docs, data, zones, bloom, mismatch })
+        let col = Column { path, ty, num_docs, data, zones, bloom, mismatch };
+        col.validate()?;
+        Ok(col)
     }
+
+    /// Cross-check the decoded pieces against each other.
+    ///
+    /// Each accessor indexes one decoded vector with an ordinal or an offset
+    /// taken from another, so pieces that disagree are not an error that stays
+    /// inside the decoder: they are an out-of-bounds panic on the first query
+    /// that touches the segment. A damaged file has to fail as `Error::Storage`
+    /// at open, not as a crash later on somebody's `SELECT`.
+    fn validate(&self) -> Result<()> {
+        let bad = |m: &str| Error::Storage(format!("column {}: {m}", self.path));
+        if self.present().len() != self.num_docs || self.mismatch.len() != self.num_docs {
+            return Err(bad("presence bitmap does not cover the column"));
+        }
+        let nblocks = self.num_docs.div_ceil(ZONE_BLOCK);
+        let zones_fit = match &self.zones {
+            Zones::None => true,
+            Zones::Num(z) => z.len() == nblocks,
+            Zones::Ts(z) => z.len() == nblocks,
+            Zones::Str(z) => z.len() == nblocks,
+        };
+        // `zone_skip` writes one `keep[b]` per zone entry into a vector sized
+        // from `num_docs`, so a zone map with more entries than the column has
+        // blocks indexes past the end of it.
+        if !zones_fit {
+            return Err(bad("zone map does not cover the column"));
+        }
+        let nd = self.num_docs;
+        match &self.data {
+            ColumnData::Bool { vals, .. } => {
+                if vals.len() != nd {
+                    return Err(bad("boolean values do not cover the column"));
+                }
+            }
+            ColumnData::Num { vals, .. } => {
+                if vals.len() != nd {
+                    return Err(bad("numeric values do not cover the column"));
+                }
+            }
+            ColumnData::Ts { vals, .. } => {
+                if vals.len() != nd {
+                    return Err(bad("timestamp values do not cover the column"));
+                }
+            }
+            ColumnData::Str { offsets, data, .. } => {
+                if offsets.len() != nd + 1 || !nondecreasing(offsets) {
+                    return Err(bad("string offsets do not cover the column"));
+                }
+                if offsets.last().copied().unwrap_or(0) as usize > data.len() {
+                    return Err(bad("string offsets run past the data block"));
+                }
+            }
+            ColumnData::MultiStr { starts, offsets, data, index, .. } => {
+                if starts.len() != nd + 1 || !nondecreasing(starts) {
+                    return Err(bad("array starts do not cover the column"));
+                }
+                // `get` reads `offsets[j]` and `offsets[j + 1]` for every
+                // element `j` a row spans, so the last start must leave one
+                // more offset behind it.
+                if offsets.is_empty() || starts[nd] as usize >= offsets.len() {
+                    return Err(bad("array starts run past the offsets"));
+                }
+                let end = offsets.last().copied().unwrap_or(0) as usize;
+                if !nondecreasing(offsets) || end > data.len() {
+                    return Err(bad("array offsets run past the data block"));
+                }
+                if index.values().any(|bm| bm.len() != nd) {
+                    return Err(bad("value index does not cover the column"));
+                }
+            }
+            ColumnData::MultiNum { starts, vals, .. } => {
+                if starts.len() != nd + 1 || !nondecreasing(starts) {
+                    return Err(bad("array starts do not cover the column"));
+                }
+                if starts[nd] as usize > vals.len() {
+                    return Err(bad("array starts run past the values"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn nondecreasing(v: &[u32]) -> bool {
+    v.windows(2).all(|w| w[0] <= w[1])
 }
 
 /// Is this value *comparable* with the literal under this operator?
@@ -1256,5 +1457,139 @@ mod tests {
                 c.filter(CmpOp::IsNotNull, &Value::Null).popcount()
             );
         }
+    }
+
+    #[test]
+    fn an_array_literal_still_matches_once_the_column_is_sealed() {
+        let rows = [
+            Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            Value::Array(vec![Value::Str("b".into()), Value::Str("a".into())]),
+            Value::Array(vec![Value::Str("a".into())]),
+        ];
+        let mut b = ColumnBuilder::new("tags", ValueType::Array);
+        for (i, v) in rows.iter().enumerate() {
+            b.push(i as u32, Some(v.clone()));
+        }
+        let c = b.finish(rows.len());
+        let lit = Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())]);
+        // The column is an optimisation of `matches`, never a redefinition of
+        // it: a sealed segment must not lose a row the memtable answered with.
+        let (eq, ne) = (c.filter(CmpOp::Eq, &lit), c.filter(CmpOp::Ne, &lit));
+        for (i, v) in rows.iter().enumerate() {
+            assert_eq!(eq.get(i), matches(v, CmpOp::Eq, &lit), "= row {i}");
+            assert_eq!(ne.get(i), matches(v, CmpOp::Ne, &lit), "<> row {i}");
+        }
+        assert_eq!(eq.to_vec(), vec![0]);
+        assert_eq!(ne.to_vec(), vec![1, 2]);
+
+        // The numeric multi-value layout has no value index at all, so it took
+        // the same fall-through to an empty bitmap.
+        let mut nb = ColumnBuilder::new("xs", ValueType::Array);
+        nb.push(0, Some(Value::Array(vec![Value::Int(1), Value::Int(2)])));
+        nb.push(1, Some(Value::Array(vec![Value::Int(1)])));
+        let nc = nb.finish(2);
+        let nlit = Value::Array(vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(nc.filter(CmpOp::Eq, &nlit).to_vec(), vec![0]);
+    }
+
+    #[test]
+    fn a_prefix_zone_keeps_a_block_whose_minimum_sorts_past_the_old_bound() {
+        let mut b = ColumnBuilder::new("s", ValueType::Str);
+        // Both start with "ab" and both sort *after* "ab\u{10FFFF}", which the
+        // zone map used to treat as the top of the prefix range.
+        b.push(0, Some(Value::Str("ab\u{10FFFF}\u{10FFFF}".into())));
+        b.push(1, Some(Value::Str("ab\u{10FFFF}zzz".into())));
+        let c = b.finish(2);
+        assert_eq!(c.zone_skip(CmpOp::Prefix, &Value::Str("ab".into())).unwrap(), vec![true]);
+        assert_eq!(c.filter(CmpOp::Prefix, &Value::Str("ab".into())).to_vec(), vec![0, 1]);
+        // A block that really cannot hold the prefix is still skipped.
+        assert_eq!(c.zone_skip(CmpOp::Prefix, &Value::Str("zz".into())).unwrap(), vec![false]);
+    }
+
+    #[test]
+    fn negative_zero_is_not_a_bloom_false_negative_for_zero() {
+        // Same value, so the same key: this is what stops the add path and the
+        // probe path from drifting apart.
+        assert_eq!(bloom_key(&Value::Float(-0.0)), bloom_key(&Value::Float(0.0)));
+        let mut b = ColumnBuilder::new("n", ValueType::Number);
+        b.push(0, Some(Value::Float(-0.0)));
+        let c = b.finish(1);
+        assert!(c.bloom.maybe_contains(&bloom_key(&Value::Int(0)).unwrap()));
+        assert_eq!(c.filter(CmpOp::Eq, &Value::Int(0)).to_vec(), vec![0]);
+    }
+
+    #[test]
+    fn a_bitmap_ordinal_past_the_decoded_length_is_rejected_not_set_in_the_padding() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 8);
+        put_uvarint(&mut b, 1);
+        put_uvarint(&mut b, 100);
+        let mut i = 0usize;
+        assert!(get_bitmap(&b, &mut i).is_none());
+        // The control: an ordinal the bitmap actually has still decodes.
+        let mut ok = Vec::new();
+        put_uvarint(&mut ok, 8);
+        put_uvarint(&mut ok, 1);
+        put_uvarint(&mut ok, 7);
+        let mut i = 0usize;
+        assert_eq!(get_bitmap(&ok, &mut i).unwrap().to_vec(), vec![7]);
+    }
+
+    #[test]
+    fn a_bitmap_length_past_the_ordinal_cap_is_rejected_before_it_is_allocated() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, MAX_ORDINALS as u64 + 1);
+        put_uvarint(&mut b, 0);
+        let mut i = 0usize;
+        assert!(get_bitmap(&b, &mut i).is_none());
+    }
+
+    /// A hand-built encoding of a two-document numeric column, with the shape
+    /// of the presence bitmap under the test's control.
+    fn encoded_num_column(present_len: u64, present_ord: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_str(&mut b, "n");
+        b.push(ValueType::Number as u8);
+        put_uvarint(&mut b, 2);
+        b.push(1);
+        put_uvarint(&mut b, present_len);
+        put_uvarint(&mut b, 1);
+        put_uvarint(&mut b, present_ord);
+        put_u64(&mut b, 1f64.to_bits());
+        put_u64(&mut b, 2f64.to_bits());
+        b.push(1);
+        put_uvarint(&mut b, 1);
+        put_u64(&mut b, f64::NEG_INFINITY.to_bits());
+        put_u64(&mut b, f64::INFINITY.to_bits());
+        put_uvarint(&mut b, 64);
+        put_u64(&mut b, u64::MAX);
+        put_uvarint(&mut b, 2);
+        put_uvarint(&mut b, 0);
+        b
+    }
+
+    #[test]
+    fn a_present_bitmap_wider_than_the_column_is_rejected_at_decode() {
+        let ok = Column::decode(&encoded_num_column(2, 1)).unwrap();
+        assert_eq!(ok.get(1), Value::Float(2.0));
+        // Ordinal 99 of a two-document column: every predicate walks `present`
+        // and would index `vals[99]` on a two-element vector.
+        assert!(Column::decode(&encoded_num_column(100, 99)).is_err());
+    }
+
+    #[test]
+    fn a_bloom_width_its_probes_cannot_address_is_rejected_at_decode() {
+        // 65 bits is one word, but a probe reduces modulo 65 and can land on
+        // bit 64 — which `maybe_contains` reads out of a second word that was
+        // never allocated, on the query path.
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 65);
+        put_u64(&mut b, u64::MAX);
+        let mut i = 0usize;
+        assert!(Bloom::decode(&b, &mut i).is_none());
+        let mut ok = Vec::new();
+        Bloom::with_capacity(4).encode(&mut ok);
+        let mut i = 0usize;
+        assert_eq!(Bloom::decode(&ok, &mut i).unwrap().nbits, 64);
     }
 }

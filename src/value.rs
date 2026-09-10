@@ -218,6 +218,21 @@ pub fn compare_typed(a: &Value, b: &Value) -> Option<Ordering> {
             }
             Some(x.len().cmp(&y.len()))
         }
+        (Value::Object(x), Value::Object(y)) => {
+            // Fields are normalised to sorted-by-key, so walking the two field
+            // lists in step is a lexicographic comparison of the whole object.
+            for ((kx, vx), (ky, vy)) in x.iter().zip(y.iter()) {
+                match kx.cmp(ky) {
+                    Ordering::Equal => {}
+                    o => return Some(o),
+                }
+                match compare_typed(vx, vy)? {
+                    Ordering::Equal => continue,
+                    o => return Some(o),
+                }
+            }
+            Some(x.len().cmp(&y.len()))
+        }
         _ => None,
     }
 }
@@ -225,6 +240,12 @@ pub fn compare_typed(a: &Value, b: &Value) -> Option<Ordering> {
 /// A total order over values, used only where determinism matters more than
 /// semantics (sorting keys, tie-breaks). Unlike `compare_typed` this never
 /// returns NULL: it orders by type rank first.
+///
+/// It deliberately does not just fall back on `compare_typed(..).unwrap_or(Equal)`.
+/// Every case where `compare_typed` declines to answer — NaN, and any composite
+/// holding values of differing types — would then read as "equal", which both
+/// breaks structural equality (`{"a":1} == {"b":2}`) and hands `sort_by` a
+/// comparator that is not a total order.
 pub fn compare_total(a: &Value, b: &Value) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {
@@ -241,7 +262,50 @@ pub fn compare_total(a: &Value, b: &Value) -> Ordering {
     if ra != rb {
         return ra.cmp(&rb);
     }
-    compare_typed(a, b).unwrap_or(Ordering::Equal)
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int(_), Value::Float(_))
+        | (Value::Float(_), Value::Int(_))
+        | (Value::Float(_), Value::Float(_)) => {
+            let (x, y) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+            if x.is_nan() || y.is_nan() {
+                // A NaN is the only thing `partial_cmp` refuses to place, and
+                // "unordered" read as Equal is what made `Float(NAN)` equal to
+                // `Float(1.0)`. Seat every NaN after every real number and
+                // equal to another NaN. `total_cmp` would do this too, but it
+                // would also split `-0.0` from `0.0`.
+                x.is_nan().cmp(&y.is_nan())
+            } else {
+                // Neither side is NaN, so the fallback is unreachable.
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            for (xi, yi) in x.iter().zip(y.iter()) {
+                match compare_total(xi, yi) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            for ((kx, vx), (ky, vy)) in x.iter().zip(y.iter()) {
+                match kx.cmp(ky) {
+                    Ordering::Equal => {}
+                    o => return o,
+                }
+                match compare_total(vx, vy) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        // Null, Bool, Str and Timestamp against their own rank: `compare_typed`
+        // is total there, and two Nulls are equal.
+        _ => compare_typed(a, b).unwrap_or(Ordering::Equal),
+    }
 }
 
 impl PartialEq for Value {
@@ -254,5 +318,73 @@ impl Eq for Value {}
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&crate::json::to_string(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(fields: &[(&str, Value)]) -> Value {
+        Value::obj(fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    #[test]
+    fn two_objects_with_different_fields_do_not_compare_equal() {
+        let a = obj(&[("a", Value::Int(1))]);
+        let b = obj(&[("b", Value::Int(2))]);
+        assert_ne!(a, b);
+        assert_eq!(compare_total(&a, &b), Ordering::Less);
+        assert_eq!(compare_total(&b, &a), Ordering::Greater);
+        assert_eq!(a, obj(&[("a", Value::Int(1))]));
+    }
+
+    #[test]
+    fn an_object_with_an_extra_field_is_not_equal_to_its_prefix() {
+        let short = obj(&[("a", Value::Int(1))]);
+        let long = obj(&[("a", Value::Int(1)), ("b", Value::Int(2))]);
+        assert_ne!(short, long);
+        assert_eq!(compare_total(&short, &long), Ordering::Less);
+    }
+
+    #[test]
+    fn nested_objects_differing_only_deep_down_are_not_equal() {
+        let a = obj(&[("outer", obj(&[("inner", Value::Str("x".into()))]))]);
+        let b = obj(&[("outer", obj(&[("inner", Value::Str("y".into()))]))]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn nan_does_not_compare_equal_to_an_ordinary_number() {
+        let nan = Value::Float(f64::NAN);
+        assert_ne!(nan, Value::Float(1.0));
+        assert_ne!(nan, Value::Int(1));
+        // NaN sits after every real number and is equal only to itself, so
+        // `sort_by(compare_total)` still sees a total order.
+        assert_eq!(compare_total(&nan, &Value::Float(1.0)), Ordering::Greater);
+        assert_eq!(compare_total(&Value::Float(1.0), &nan), Ordering::Less);
+        assert_eq!(compare_total(&nan, &nan), Ordering::Equal);
+        // Signed zeroes stay equal: the fix must not smuggle in `total_cmp`.
+        assert_eq!(compare_total(&Value::Float(-0.0), &Value::Float(0.0)), Ordering::Equal);
+    }
+
+    #[test]
+    fn values_of_different_types_inside_an_array_do_not_collapse_to_equal() {
+        let a = Value::Array(vec![Value::Int(1)]);
+        let b = Value::Array(vec![Value::Str("x".into())]);
+        assert_ne!(a, b);
+        assert_eq!(compare_total(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn compare_typed_orders_objects_instead_of_answering_null() {
+        let a = obj(&[("a", Value::Int(1))]);
+        let b = obj(&[("a", Value::Int(2))]);
+        assert_eq!(compare_typed(&a, &b), Some(Ordering::Less));
+        assert_eq!(compare_typed(&a, &a), Some(Ordering::Equal));
+        // A type mismatch under the same key is still SQL NULL, as it is for
+        // arrays.
+        let c = obj(&[("a", Value::Str("1".into()))]);
+        assert_eq!(compare_typed(&a, &c), None);
     }
 }

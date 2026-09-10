@@ -77,6 +77,80 @@ impl PartialOrd for RevCand {
     }
 }
 
+/// The visited set for one traversal.
+///
+/// A `vec![false; count]` is allocated and zeroed on every search and every
+/// build-time layer search, even though a traversal touches only about
+/// `ef * m0` nodes: on a million-vector segment that is a megabyte of
+/// zeroing per query per segment, and on the build path it makes sealing
+/// quadratic in the number of vectors. This is an open-addressed set sized to
+/// the traversal instead, so the cost follows the nodes actually visited.
+///
+/// `u32::MAX` marks an empty slot, which is safe because it is already the
+/// graph's "no such node" sentinel (`entry`) and `decode` rejects any node id
+/// that is not below `count`.
+struct Visited {
+    slots: Vec<u32>,
+    mask: usize,
+    len: usize,
+}
+
+impl Visited {
+    const EMPTY: u32 = u32::MAX;
+
+    fn with_capacity(hint: usize) -> Visited {
+        // Linear probing degrades sharply past half full, so reserve twice the
+        // hint. The ceiling keeps a caller that asks for a very wide `ef` from
+        // reserving up front for a traversal it will probably not run;
+        // `insert` grows from there, and doubling makes that amortized cheap.
+        let mut cap = 64usize;
+        while cap < hint.saturating_mul(2) && cap < (1 << 14) {
+            cap *= 2;
+        }
+        Visited { slots: vec![Visited::EMPTY; cap], mask: cap - 1, len: 0 }
+    }
+
+    /// Index of `id`, or of the empty slot it belongs in. Terminates because
+    /// the table is never more than half full.
+    fn slot(slots: &[u32], mask: usize, id: u32) -> usize {
+        // Fibonacci hashing: node ids are dense and consecutive, so the low
+        // bits alone would pile every neighbour list into one probe cluster.
+        let mut idx = ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        while slots[idx] != Visited::EMPTY && slots[idx] != id {
+            idx = (idx + 1) & mask;
+        }
+        idx
+    }
+
+    /// Marks `id` visited, returning true if it had not been seen before.
+    fn insert(&mut self, id: u32) -> bool {
+        let idx = Visited::slot(&self.slots, self.mask, id);
+        if self.slots[idx] == id {
+            return false;
+        }
+        self.slots[idx] = id;
+        self.len += 1;
+        if self.len * 2 >= self.slots.len() {
+            self.grow();
+        }
+        true
+    }
+
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let mask = cap - 1;
+        let mut slots = vec![Visited::EMPTY; cap];
+        for &id in &self.slots {
+            if id != Visited::EMPTY {
+                let idx = Visited::slot(&slots, mask, id);
+                slots[idx] = id;
+            }
+        }
+        self.slots = slots;
+        self.mask = mask;
+    }
+}
+
 pub struct Hnsw {
     pub params: HnswParams,
     pub count: usize,
@@ -244,14 +318,13 @@ impl Hnsw {
         level: usize,
         d_to: &dyn Fn(u32) -> f32,
     ) -> Vec<Cand> {
-        let mut visited = vec![false; self.count];
+        let mut visited = Visited::with_capacity(ef.saturating_mul(2).min(self.count));
         let mut cands: BinaryHeap<RevCand> = BinaryHeap::new();
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
         for &e in eps {
-            if e as usize >= self.count || visited[e as usize] {
+            if e as usize >= self.count || !visited.insert(e) {
                 continue;
             }
-            visited[e as usize] = true;
             let c = Cand { d: d_to(e), id: e };
             cands.push(RevCand(c));
             results.push(c);
@@ -263,10 +336,9 @@ impl Hnsw {
                 }
             }
             for &n in self.neighbors(level, c.id) {
-                if visited[n as usize] {
+                if !visited.insert(n) {
                     continue;
                 }
-                visited[n as usize] = true;
                 let d = d_to(n);
                 let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
                 if results.len() < ef || d < worst {
@@ -337,6 +409,26 @@ impl Hnsw {
         admit: Option<&Bitmap>,
         d_to: &dyn Fn(u32) -> f32,
     ) -> Vec<(u32, f32)> {
+        self.search_budgeted(ef, k, admit, usize::MAX, d_to)
+    }
+
+    /// [`Hnsw::search`] with a hard ceiling on how many nodes level 0 may
+    /// visit.
+    ///
+    /// Filter-aware traversal cannot stop until the result heap holds `ef`
+    /// *admitted* nodes, so at selectivity `s` it visits about `ef / s` nodes,
+    /// and as `s` approaches zero that is a full scan of the segment. The
+    /// budget is what keeps a pathological filter from turning one query into
+    /// that scan; when it binds, the answer degrades to the best the budget
+    /// found, which is the trade `SearchOpts::max_amplification` describes.
+    pub fn search_budgeted(
+        &self,
+        ef: usize,
+        k: usize,
+        admit: Option<&Bitmap>,
+        max_visits: usize,
+        d_to: &dyn Fn(u32) -> f32,
+    ) -> Vec<(u32, f32)> {
         if self.count == 0 || self.entry == u32::MAX {
             return Vec::new();
         }
@@ -348,10 +440,11 @@ impl Hnsw {
         }
         let admitted = |id: u32| admit.map(|b| b.get(id as usize)).unwrap_or(true);
 
-        let mut visited = vec![false; self.count];
+        let mut visited = Visited::with_capacity(ef.saturating_mul(2).min(self.count));
         let mut cands: BinaryHeap<RevCand> = BinaryHeap::new();
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
-        visited[ep as usize] = true;
+        visited.insert(ep);
+        let mut visits = 1usize;
         let c0 = Cand { d: d_to(ep), id: ep };
         cands.push(RevCand(c0));
         if admitted(ep) {
@@ -363,16 +456,19 @@ impl Hnsw {
         // asking for more candidates. A caller cannot receive more than the
         // heap held, and that is the honest answer.
         let ef = ef.max(1);
-        while let Some(RevCand(c)) = cands.pop() {
+        'traverse: while let Some(RevCand(c)) = cands.pop() {
             let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
             if results.len() >= ef && c.d > worst {
                 break;
             }
             for &n in self.neighbors(0, c.id) {
-                if visited[n as usize] {
+                if !visited.insert(n) {
                     continue;
                 }
-                visited[n as usize] = true;
+                if visits >= max_visits {
+                    break 'traverse;
+                }
+                visits += 1;
                 let d = d_to(n);
                 let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
                 // Expansion is unconditional; admission is not. This is the
@@ -430,14 +526,40 @@ impl Hnsw {
 
     pub fn decode(b: &[u8]) -> Result<Hnsw> {
         let bad = || Error::Storage("hnsw: truncated".into());
+        let corrupt = |what: &str| Error::Storage(format!("hnsw: {what}"));
         let mut i = 0usize;
         let count = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // Every node costs at least a level byte and a two-byte degree, so a
+        // count larger than the whole input cannot describe a real graph — and
+        // `i + count` on an unchecked value wraps before any slice bound is
+        // ever consulted.
+        if count > b.len() {
+            return Err(bad());
+        }
         let m = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
         let m0 = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // `count * m0` sizes the level-0 link table. Degrees are stored as
+        // `u16`, so no honest graph has more slots per node than that; without
+        // the bound a stream can ask for a terabyte-scale allocation, which
+        // aborts the process instead of returning an error.
+        if count > 0 && (m0 == 0 || m0 > u16::MAX as usize) {
+            return Err(corrupt("implausible m0"));
+        }
         let efc = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
         let seed = get_u64(b, &mut i).ok_or_else(bad)?;
         let entry = get_u32(b, &mut i).ok_or_else(bad)?;
+        // `search` indexes the graph by `entry` without checking it. The empty
+        // graph legitimately carries the `u32::MAX` sentinel.
+        if entry != u32::MAX && entry as usize >= count {
+            return Err(corrupt("entry out of range"));
+        }
         let max_level = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // Per-node levels are `u8`, so nothing this encoder writes can sit
+        // above 255. `search` walks down from `max_level` one level at a time,
+        // so an unchecked value spins for billions of empty iterations.
+        if max_level > u8::MAX as usize {
+            return Err(corrupt("implausible max_level"));
+        }
         let node_level = b.get(i..i + count).ok_or_else(bad)?.to_vec();
         i += count;
         let mut deg0 = Vec::with_capacity(count);
@@ -447,24 +569,59 @@ impl Hnsw {
             i += 2;
         }
         let params = HnswParams { m, m0, ef_construction: efc, seed };
-        let mut link0 = vec![0u32; count * m0];
+        let slots = count.checked_mul(m0).ok_or_else(|| corrupt("link table overflows"))?;
+        // `try_reserve` rather than `vec![_; slots]`: a corrupt header should
+        // come back as a storage error, not as an allocation failure that
+        // aborts the process.
+        let mut link0: Vec<u32> = Vec::new();
+        link0.try_reserve_exact(slots).map_err(|_| corrupt("link table too large"))?;
+        link0.resize(slots, 0u32);
         for node in 0..count {
             let d = deg0[node] as usize;
+            // A degree above `m0` writes into the *next* node's slots, and off
+            // the end of the table entirely for the last node.
+            if d > m0 {
+                return Err(corrupt("degree exceeds m0"));
+            }
             for j in 0..d {
-                link0[node * m0 + j] = get_u32(b, &mut i).ok_or_else(bad)?;
+                let n = get_u32(b, &mut i).ok_or_else(bad)?;
+                if n as usize >= count {
+                    return Err(corrupt("link out of range"));
+                }
+                link0[node * m0 + j] = n;
             }
         }
         let nlayers = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // Each layer is at least one varint, each node at least five bytes and
+        // each link four, so the remaining input bounds every stream-supplied
+        // repeat count. Reserving on the raw value instead lets a few bytes
+        // request an unbounded allocation.
+        if nlayers > b.len() - i {
+            return Err(bad());
+        }
         let mut upper = Vec::with_capacity(nlayers);
         for _ in 0..nlayers {
             let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+            if n > (b.len() - i) / 5 {
+                return Err(bad());
+            }
             let mut layer = BTreeMap::new();
             for _ in 0..n {
                 let id = get_u32(b, &mut i).ok_or_else(bad)?;
+                if id as usize >= count {
+                    return Err(corrupt("upper node out of range"));
+                }
                 let k = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                if k > (b.len() - i) / 4 {
+                    return Err(bad());
+                }
                 let mut ns = Vec::with_capacity(k);
                 for _ in 0..k {
-                    ns.push(get_u32(b, &mut i).ok_or_else(bad)?);
+                    let x = get_u32(b, &mut i).ok_or_else(bad)?;
+                    if x as usize >= count {
+                        return Err(corrupt("upper link out of range"));
+                    }
+                    ns.push(x);
                 }
                 layer.insert(id, ns);
             }
@@ -609,6 +766,141 @@ mod tests {
             distance::distance(Metric::Cosine, q, &data[i as usize * dims..(i as usize + 1) * dims])
         };
         assert_eq!(g.search(32, 5, None, &d_to), back.search(32, 5, None, &d_to));
+    }
+
+    /// Hand-rolled encoder. `Hnsw::encode` can only produce well-formed
+    /// graphs, and every check below is about a stream that is not.
+    fn hand_encoded(count: u64, m0: u64, entry: u32, deg0: &[u16], links: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uvarint(&mut out, count);
+        put_uvarint(&mut out, 16);
+        put_uvarint(&mut out, m0);
+        put_uvarint(&mut out, 200);
+        put_u64(&mut out, 1);
+        put_u32(&mut out, entry);
+        put_uvarint(&mut out, 0);
+        out.resize(out.len() + count as usize, 0u8);
+        for d in deg0 {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for l in links {
+            put_u32(&mut out, *l);
+        }
+        put_uvarint(&mut out, 0);
+        out
+    }
+
+    #[test]
+    fn an_unbounded_m0_is_rejected_rather_than_requesting_a_terabyte_allocation() {
+        let b = hand_encoded(1, 1 << 40, 0, &[0], &[]);
+        assert!(Hnsw::decode(&b).is_err());
+    }
+
+    #[test]
+    fn a_count_larger_than_the_input_is_rejected_before_the_offset_overflows() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, u64::MAX / 2);
+        put_uvarint(&mut b, 16);
+        put_uvarint(&mut b, 32);
+        put_uvarint(&mut b, 200);
+        put_u64(&mut b, 1);
+        put_u32(&mut b, 0);
+        put_uvarint(&mut b, 0);
+        assert!(Hnsw::decode(&b).is_err());
+    }
+
+    #[test]
+    fn a_degree_larger_than_m0_is_rejected_rather_than_spilling_into_the_next_node() {
+        // Three links in one slot: the third would land past the end of the
+        // whole table, and with more nodes it would silently rewrite the next
+        // node's neighbours.
+        let b = hand_encoded(2, 1, 0, &[3, 0], &[0, 1, 0]);
+        assert!(Hnsw::decode(&b).is_err());
+    }
+
+    #[test]
+    fn an_out_of_range_entry_point_is_rejected_rather_than_panicking_during_search() {
+        let b = hand_encoded(2, 4, 7, &[0, 0], &[]);
+        assert!(Hnsw::decode(&b).is_err());
+    }
+
+    #[test]
+    fn an_out_of_range_link_is_rejected_rather_than_steering_search_off_the_end() {
+        assert!(Hnsw::decode(&hand_encoded(2, 4, 0, &[1, 0], &[9])).is_err());
+        // The same graph with an in-range link decodes, so the rejections
+        // above are the corruption and not the hand-rolled framing.
+        assert!(Hnsw::decode(&hand_encoded(2, 4, 0, &[1, 0], &[1])).is_ok());
+    }
+
+    #[test]
+    fn a_node_reinserted_after_the_visited_set_grows_is_still_reported_as_visited() {
+        let mut v = Visited::with_capacity(4);
+        let n = 5000u32;
+        for i in 0..n {
+            assert!(v.insert(i), "{i} had not been visited yet");
+        }
+        for i in 0..n {
+            assert!(!v.insert(i), "{i} was visited before the table grew");
+        }
+        assert_eq!(v.len, n as usize);
+    }
+
+    #[test]
+    fn a_search_never_returns_the_same_node_twice() {
+        let (n, dims) = (800usize, 16usize);
+        let data = corpus(n, dims);
+        let dist = |a: u32, b: u32| {
+            distance::distance(
+                Metric::Cosine,
+                &data[a as usize * dims..(a as usize + 1) * dims],
+                &data[b as usize * dims..(b as usize + 1) * dims],
+            )
+        };
+        let g = Hnsw::build(n, HnswParams::default(), &dist);
+        let q = &data[0..dims];
+        let d_to = |i: u32| {
+            distance::distance(Metric::Cosine, q, &data[i as usize * dims..(i as usize + 1) * dims])
+        };
+        let got = g.search(200, 200, None, &d_to);
+        let mut ids: Vec<u32> = got.iter().map(|(i, _)| *i).collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "the visited set let a node be expanded twice");
+    }
+
+    #[test]
+    fn a_low_selectivity_filter_stops_at_the_visit_budget_instead_of_scanning_the_segment() {
+        let (n, dims) = (1000usize, 16usize);
+        let data = corpus(n, dims);
+        let dist = |a: u32, b: u32| {
+            distance::distance(
+                Metric::Cosine,
+                &data[a as usize * dims..(a as usize + 1) * dims],
+                &data[b as usize * dims..(b as usize + 1) * dims],
+            )
+        };
+        let g = Hnsw::build(n, HnswParams::default(), &dist);
+        // Two admitted out of a thousand: the result heap can never reach
+        // `ef`, so the distance-based stop never fires and the traversal runs
+        // until the graph is exhausted.
+        let mut admit = Bitmap::new(n);
+        admit.set(3);
+        admit.set(700);
+        let q = &data[0..dims];
+        let seen = std::cell::Cell::new(0usize);
+        let d_to = |i: u32| {
+            seen.set(seen.get() + 1);
+            distance::distance(Metric::Cosine, q, &data[i as usize * dims..(i as usize + 1) * dims])
+        };
+        let full = g.search(64, 10, Some(&admit), &d_to);
+        let unbudgeted = seen.get();
+        seen.set(0);
+        let capped = g.search_budgeted(64, 10, Some(&admit), 32, &d_to);
+        let budgeted = seen.get();
+        assert!(unbudgeted > n / 2, "unbudgeted traversal should scan the segment: {unbudgeted}");
+        assert!(budgeted < n / 4, "the budget should have cut the traversal short: {budgeted}");
+        assert!(capped.len() <= full.len());
     }
 
     #[test]

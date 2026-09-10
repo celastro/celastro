@@ -66,7 +66,14 @@ impl MemtableBudget {
         self.used.fetch_add(n, AtomicOrdering::Relaxed);
     }
     pub fn release(&self, n: usize) {
-        self.used.fetch_sub(n.min(self.used()), AtomicOrdering::Relaxed);
+        // Saturating *and* atomic. The budget is shared by every tablet on the
+        // node, so clamping against a separate `used()` load lets two releases
+        // that read the same total each subtract all of it: `used` wraps past
+        // zero, `under_pressure` is then permanently true, and the node flushes
+        // a segment per document for the rest of its life.
+        let _ = self.used.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |u| {
+            Some(u.saturating_sub(n))
+        });
     }
     pub fn used(&self) -> usize {
         self.used.load(AtomicOrdering::Relaxed)
@@ -388,6 +395,47 @@ mod tests {
         assert!(budget.under_pressure());
         assert!(m.should_flush(&th));
         m.release_budget();
+        assert!(!budget.under_pressure());
+    }
+
+    #[test]
+    fn concurrent_releases_cannot_wrap_the_budget_below_zero() {
+        use std::sync::Barrier;
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 500;
+        let budget = MemtableBudget::new(1024);
+        // Each round hands out one tablet's worth and then has every thread
+        // release it at the same instant. Clamping the subtraction against a
+        // separate load lets more than one of them subtract the whole total,
+        // and the wrap leaves `used` near `usize::MAX` for good.
+        let start = Arc::new(Barrier::new(THREADS + 1));
+        let done = Arc::new(Barrier::new(THREADS + 1));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let b = budget.clone();
+            let start = start.clone();
+            let done = done.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    start.wait();
+                    b.release(100);
+                    done.wait();
+                }
+            }));
+        }
+        let mut wrapped = false;
+        for _ in 0..ROUNDS {
+            budget.add(100);
+            start.wait();
+            done.wait();
+            // Checked here rather than only at the end: once it wraps it stays
+            // wrapped, but the round that did it is the interesting one.
+            wrapped |= budget.used() != 0;
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(!wrapped, "a concurrent release drove the budget past zero");
         assert!(!budget.under_pressure());
     }
 }

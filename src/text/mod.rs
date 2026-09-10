@@ -12,6 +12,7 @@ pub mod scorer;
 
 use std::collections::BTreeMap;
 
+use crate::error::{Error, Result};
 use postings::{DictParts, PostingCursor, TermDict, TermMeta, TermPostings, EXHAUSTED};
 
 /// A cursor over one term's postings, from either backing store.
@@ -186,19 +187,41 @@ impl<'a> TextSource<'a> {
         }
     }
 
-    pub fn cursor(&self, term: &str) -> Option<PostingsRef<'_>> {
+    /// Open a cursor over `term`'s postings. `Ok(None)` means the term is not
+    /// in this source; an error means it is, and its postings are unreadable.
+    ///
+    /// The distinction is the point. The dictionary has just said `doc_freq >
+    /// 0`, so a postings extent that runs off the end of the region, or that
+    /// does not decode, is a corrupt segment — not a missing term. Reporting
+    /// it as "no such term" turns corruption into a quietly smaller result
+    /// set, which is the one failure mode a search index must not have.
+    pub fn try_cursor(&self, term: &str) -> Result<Option<PostingsRef<'_>>> {
         match self {
             TextSource::Sealed { dict, postings, .. } => {
-                let m: TermMeta = dict.get(term)?;
-                let slice = postings
-                    .get(m.postings_off as usize..(m.postings_off + m.postings_len) as usize)?;
-                PostingCursor::open(slice).ok().map(PostingsRef::Encoded)
+                let m: TermMeta = match dict.get(term) {
+                    Some(m) => m,
+                    None => return Ok(None),
+                };
+                let bad = || Error::Storage(format!("postings: `{term}` extent is unreadable"));
+                // Widened before adding: `postings_off + postings_len` computed
+                // in u32 wraps on a corrupt extent, and hands `get` a range that
+                // looks perfectly in bounds.
+                let start = m.postings_off as usize;
+                let end = start.checked_add(m.postings_len as usize).ok_or_else(bad)?;
+                let slice = postings.get(start..end).ok_or_else(bad)?;
+                Ok(Some(PostingsRef::Encoded(PostingCursor::open(slice)?)))
             }
             TextSource::Memory { terms, doc_lens } => {
-                let tp = terms.get(term)?;
-                Some(PostingsRef::Mem(MemCursor::new(tp, doc_lens)))
+                Ok(terms.get(term).map(|tp| PostingsRef::Mem(MemCursor::new(tp, doc_lens))))
             }
         }
+    }
+
+    /// [`try_cursor`](Self::try_cursor) for the callers whose signature cannot
+    /// carry an error. Prefer `try_cursor` in anything that can report one:
+    /// this spelling cannot tell "no such term" from "corrupt postings".
+    pub fn cursor(&self, term: &str) -> Option<PostingsRef<'_>> {
+        self.try_cursor(term).ok().flatten()
     }
 
     pub fn terms_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
@@ -224,5 +247,37 @@ impl<'a> TextSource<'a> {
                 terms.iter().map(|(t, p)| (t.clone(), p.ords.len() as u32)).collect()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::analyzer::Analyzer;
+    use crate::text::postings::InvertedBuilder;
+
+    /// The dictionary says the term has postings, so a postings region that
+    /// cannot hold them is corruption. Swallowing it into `None` would answer
+    /// the query with silently fewer rows instead of failing.
+    #[test]
+    fn unreadable_postings_for_a_known_term_are_an_error_not_a_missing_term() {
+        let mut b = InvertedBuilder::new();
+        for (i, text) in ["alpha beta", "beta gamma", "gamma delta"].iter().enumerate() {
+            let mut toks = Vec::new();
+            Analyzer::Standard.analyze(text, 0, &mut toks);
+            b.add_doc(i as u32, &toks);
+        }
+        let (dict, post, _) = b.finish();
+        let dict = DictParts::parse(&dict).unwrap();
+        let lens = b.doc_lens.clone();
+
+        let src = TextSource::sealed(&dict, &post, &lens);
+        assert!(src.try_cursor("gamma").unwrap().is_some());
+        // A term that really is absent stays `Ok(None)`.
+        assert!(src.try_cursor("epsilon").unwrap().is_none());
+
+        // Same dictionary, no postings behind it.
+        let corrupt = TextSource::sealed(&dict, &[], &lens);
+        assert!(corrupt.try_cursor("gamma").is_err());
     }
 }

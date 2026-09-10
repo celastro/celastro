@@ -19,26 +19,80 @@ use celastro::json;
 use celastro::plan::exec::QueryResult;
 use celastro::value::Value;
 
-fn main() {
-    let mut args = std::env::args().skip(1);
+/// What the command line asked for, once the arguments have been checked
+/// against each other.
+enum Cli {
+    Run { dir: Option<PathBuf>, file: Option<PathBuf>, demo: bool },
+    Help,
+    Reject(String),
+}
+
+fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut dir: Option<PathBuf> = None;
     let mut file: Option<PathBuf> = None;
     let mut demo = false;
+    let mut args = argv.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dir" => dir = args.next().map(PathBuf::from),
             "--file" => file = args.next().map(PathBuf::from),
             "--demo" => demo = true,
-            "-h" | "--help" => {
-                print_help();
-                return;
-            }
-            other => {
-                eprintln!("unknown argument `{other}`");
-                print_help();
-                std::process::exit(2);
-            }
+            "-h" | "--help" => return Cli::Help,
+            other => return Cli::Reject(format!("unknown argument `{other}`")),
         }
+    }
+    // The demo builds its own database, with build options no persistent
+    // database should inherit. Accepting `--dir` alongside it would run the
+    // demo in memory and leave the directory the operator named empty, with
+    // nothing said about it.
+    if demo && dir.is_some() {
+        let msg = "--demo builds its own in-memory database, so it cannot be combined with --dir";
+        return Cli::Reject(msg.to_string());
+    }
+    Cli::Run { dir, file, demo }
+}
+
+/// Save, and turn a failure into a non-zero exit. A discarded `persist` error
+/// is a process that exits 0 having written nothing, which the script that ran
+/// `celastro --dir ./data --file setup.sql` cannot tell apart from success.
+fn persist_status(db: &mut Db) -> i32 {
+    match db.persist() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("could not save: {e}");
+            1
+        }
+    }
+}
+
+fn main() {
+    let (dir, file, demo) = match parse_args(std::env::args().skip(1)) {
+        Cli::Run { dir, file, demo } => (dir, file, demo),
+        Cli::Help => {
+            print_help();
+            return;
+        }
+        Cli::Reject(msg) => {
+            eprintln!("{msg}");
+            print_help();
+            std::process::exit(2);
+        }
+    };
+
+    if demo {
+        // The demo runs with a low flat-tier threshold so that a few hundred
+        // documents actually reach the HNSW tier, and with every vector query
+        // logged, so the recall harness replays real queries rather than
+        // synthesising friendlier ones.
+        let mut opts = DbOpts::default();
+        opts.build.flat_tier_max = 64;
+        opts.recall_sample_rate = 1;
+        let mut db = Db::with_opts(opts);
+        if let Err(e) = run_demo(&mut db) {
+            eprintln!("demo failed: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let mut db = match &dir {
@@ -51,22 +105,6 @@ fn main() {
         },
         None => Db::in_memory(),
     };
-
-    if demo {
-        // The demo runs with a low flat-tier threshold so that a few hundred
-        // documents actually reach the HNSW tier, and with every vector query
-        // logged, so the recall harness replays real queries rather than
-        // synthesising friendlier ones.
-        let mut opts = DbOpts::default();
-        opts.build.flat_tier_max = 64;
-        opts.recall_sample_rate = 1;
-        db = Db::with_opts(opts);
-        if let Err(e) = run_demo(&mut db) {
-            eprintln!("demo failed: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
 
     if let Some(f) = file {
         let text = match std::fs::read_to_string(&f) {
@@ -82,12 +120,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        let _ = db.persist();
-        return;
+        std::process::exit(persist_status(&mut db));
     }
 
     repl(&mut db);
-    let _ = db.persist();
+    std::process::exit(persist_status(&mut db));
 }
 
 fn print_help() {
@@ -406,4 +443,44 @@ fn run_demo(db: &mut Db) -> Result<()> {
 
 fn section(title: &str) {
     println!("\n\x1b[1m── {title} ──\x1b[0m");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_with_a_dir_is_refused_rather_than_running_in_memory_and_saving_nothing() {
+        let argv = vec!["--dir".to_string(), "data".to_string(), "--demo".to_string()];
+        match parse_args(argv) {
+            Cli::Reject(msg) => assert!(msg.contains("--demo") && msg.contains("--dir")),
+            _ => panic!("`--demo` alongside `--dir` must be refused, not silently ignored"),
+        }
+    }
+
+    #[test]
+    fn a_dir_without_demo_is_not_swept_up_by_that_rejection() {
+        match parse_args(vec!["--dir".to_string(), "data".to_string()]) {
+            Cli::Run { dir, demo, .. } => {
+                assert_eq!(dir, Some(PathBuf::from("data")));
+                assert!(!demo);
+            }
+            _ => panic!("`--dir` on its own is a valid invocation"),
+        }
+    }
+
+    #[test]
+    fn a_save_that_cannot_be_written_exits_non_zero_rather_than_reporting_success() {
+        let dir = std::env::temp_dir().join(format!("celastro-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(persist_status(&mut db), 0);
+        // A regular file where the database directory was: the catalog write
+        // now has nowhere to land, which is the failure the exit code has to
+        // carry out to the shell.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert_eq!(persist_status(&mut db), 1);
+        let _ = std::fs::remove_file(&dir);
+    }
 }

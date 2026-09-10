@@ -69,11 +69,28 @@ fn at_cap(num_docs: usize, num_vectors: usize, opts: &CompactionOpts) -> bool {
     num_docs.max(num_vectors) >= opts.segment_cap
 }
 
+/// The horizon version GC actually runs at: a backup pins `gc_horizon`, which
+/// holds it back (§12.5), and otherwise it is now.
+fn retain_horizon(shard: &Shard, now: Timestamp) -> Timestamp {
+    if shard.opts.gc_horizon > 0 {
+        shard.opts.gc_horizon.min(now)
+    } else {
+        now
+    }
+}
+
 pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
-    // 1. Dead ratio, worst first.
+    // 1. Dead ratio, worst first, measured at the horizon a rewrite could
+    // actually collect at rather than at `t`. With `gc_horizon` pinned, rows
+    // that died after it are carried into the output unchanged, so the
+    // rewritten segment has the same ratio at `t`, is selected again on the
+    // next pass, and the scheduler spends its whole budget rebuilding one
+    // segment's graph until the backup finishes. That is the spin the format
+    // clamp below exists to prevent, in its other form.
+    let horizon = retain_horizon(shard, t);
     let mut worst: Option<(u64, f64)> = None;
     for h in &shard.segments {
-        let r = h.dead_ratio(t);
+        let r = h.dead_ratio(horizon);
         if r > opts.dead_ratio && worst.map(|(_, w)| r > w).unwrap_or(true) {
             worst = Some((h.id(), r));
         }
@@ -120,10 +137,12 @@ pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
 /// `retain_from` are dropped; readers that pinned an older snapshot are
 /// unaffected because they hold `Arc`s to the *input* segments, which
 /// [`Shard::install_compaction`] does not unlink while anyone still references
-/// them. A backup pins `gc_horizon`, which holds `retain_from` back (§12.5).
+/// them. A backup pins `gc_horizon`, which holds `retain_from` back (§12.5),
+/// and a version superseded after it is kept as well — in an output segment of
+/// its own, because one segment holds one version per key.
 pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
     let now = shard.clock.peek();
-    let retain_from = if shard.opts.gc_horizon > 0 { shard.opts.gc_horizon.min(now) } else { now };
+    let retain_from = retain_horizon(shard, now);
     let (inputs, out_level) = match job {
         Job::Rewrite { input, .. } => {
             let level = shard
@@ -138,29 +157,67 @@ pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
     };
 
     let (mut docs, carried) = shard.collect_for_compaction(&inputs, retain_from)?;
-    docs.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    // Newest version of a key first, which is what makes the depth below count
+    // versions down from the survivor.
+    docs.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then(b.commit_ts.cmp(&a.commit_ts)));
 
-    // Split at the cap rather than producing one oversized segment: this is
-    // the point of the policy, and it is the only place the cap is enforced.
-    let chunk = opts.segment_cap.max(1);
+    // A pinned horizon makes `collect_for_compaction` carry versions that were
+    // superseded after it, so the same key can arrive here more than once —
+    // and `SegmentBuilder::build` keeps only the newest version of a key.
+    // Writing them into one segment would therefore drop exactly the rows the
+    // horizon was pinned to preserve, silently. So version `d` of every key
+    // goes to output layer `d` instead: each output still holds one version per
+    // key, and a reader at the horizon finds the version that was live for it
+    // because the newer one is not yet visible to it.
+    let mut depths: Vec<usize> = Vec::with_capacity(docs.len());
+    let mut prev: Option<&str> = None;
+    for pd in &docs {
+        let d = match prev {
+            Some(k) if k == pd.sort_key.as_str() => depths[depths.len() - 1] + 1,
+            _ => 0,
+        };
+        prev = Some(pd.sort_key.as_str());
+        depths.push(d);
+    }
+    let mut layers: Vec<Vec<PendingDoc>> = Vec::new();
+    for (pd, d) in docs.into_iter().zip(depths) {
+        while layers.len() <= d {
+            layers.push(Vec::new());
+        }
+        layers[d].push(pd);
+    }
+
     let mut outputs: Vec<Segment> = Vec::new();
-    if docs.is_empty() {
+    if layers.is_empty() {
         shard.install_compaction(&inputs, outputs, &carried)?;
         return Ok(());
     }
+    // Split at the cap rather than producing one oversized segment: this is
+    // the point of the policy, and it is the only place the cap is enforced.
+    let chunk = opts.segment_cap.max(1);
     let coll = shard.coll.clone();
-    let mut rest: Vec<PendingDoc> = docs;
-    while !rest.is_empty() {
-        let take = chunk.min(rest.len());
-        let piece: Vec<PendingDoc> = rest.drain(..take).collect();
-        let id = shard.next_segment_id;
-        shard.next_segment_id += 1;
-        let mut b = SegmentBuilder::new(shard.opts.build);
-        for pd in piece {
-            b.add(pd);
+    // Deepest layer first, so the surviving version of a key still lands in the
+    // highest-numbered output. Only that layer is promoted: a superseded
+    // version stays at the level the merge drained, because a merge that put
+    // `tier_fanout` segments back at its output level would have the tier
+    // trigger re-select its own output forever. Since `k` inputs hold at most
+    // `k` versions of a key, a merge leaves at most `k - 1` segments behind and
+    // the level it drains strictly shrinks.
+    for (depth, layer) in layers.into_iter().enumerate().rev() {
+        let level = if depth == 0 { out_level } else { out_level.saturating_sub(1) };
+        let mut rest = layer;
+        while !rest.is_empty() {
+            let take = chunk.min(rest.len());
+            let piece: Vec<PendingDoc> = rest.drain(..take).collect();
+            let id = shard.next_segment_id;
+            shard.next_segment_id += 1;
+            let mut b = SegmentBuilder::new(shard.opts.build);
+            for pd in piece {
+                b.add(pd);
+            }
+            let seg = b.build(id, level, &coll)?;
+            outputs.push(seg);
         }
-        let seg = b.build(id, out_level, &coll)?;
-        outputs.push(seg);
     }
     shard.install_compaction(&inputs, outputs, &carried)?;
     Ok(())
@@ -218,6 +275,19 @@ mod tests {
             i as f32 / 100.0
         ))
         .unwrap()
+    }
+
+    /// The same document as [`doc`], with a different body — an update to it.
+    fn doc_with_body(i: usize, body: &str) -> Value {
+        json::parse(&format!(
+            r#"{{"id":"d{i:05}","tenant_id":"t0","body":"{body}","emb":[0.0,1.0,0.5,0.25]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn body_at(s: &Shard, key: &str, t: Timestamp) -> Option<String> {
+        let doc = s.get(key, t).unwrap()?;
+        doc.path("body").and_then(|v| v.as_str()).map(|b| b.to_string())
     }
 
     fn shard_with(n_segments: usize, per: usize) -> Shard {
@@ -356,6 +426,67 @@ mod tests {
         // invisible, so a reader at the horizon could still see it.
         assert!(s.get(&format!("t0{KEY_SEP}d00000"), s.clock.peek()).unwrap().is_none());
         assert!(s.get(&format!("t0{KEY_SEP}d00000"), horizon).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pinned_gc_horizon_does_not_rewrite_the_same_segment_forever() {
+        let mut s = shard_with(1, 100);
+        // A backup pins the horizon, and then most of the segment dies.
+        let horizon = s.clock.peek();
+        for i in 0..40 {
+            s.delete(&format!("t0{KEY_SEP}d{i:05}")).unwrap();
+        }
+        s.opts.gc_horizon = horizon;
+
+        let t = s.clock.peek();
+        let opts = CompactionOpts::default();
+        assert!(s.segments[0].dead_ratio(t) > 0.3, "the rows are dead as of now...");
+        // ...but not one of them may be collected yet, so a rewrite would
+        // reproduce the segment it read, the planner would select it again on
+        // the next pass, and the whole job budget would go on rebuilding one
+        // segment's graph for as long as the backup runs.
+        assert!(plan(&s, t, &opts).is_none(), "nothing to reclaim at the pinned horizon");
+        assert_eq!(run_to_quiescence(&mut s, &opts, 64).unwrap(), 0);
+        assert_eq!(s.segments.len(), 1);
+        assert_eq!(s.segments[0].segment.num_docs(), 100);
+
+        // Releasing the horizon reclaims them, in one job.
+        s.opts.gc_horizon = 0;
+        assert_eq!(run_to_quiescence(&mut s, &opts, 64).unwrap(), 1);
+        assert_eq!(s.segments.len(), 1);
+        assert_eq!(s.segments[0].segment.num_docs(), 60);
+    }
+
+    #[test]
+    fn merging_an_updated_key_keeps_the_version_a_pinned_horizon_still_reads() {
+        let mut s = shard_with(1, 4);
+        // The horizon is pinned first, and only then is the key updated: the
+        // old version dies *after* the horizon, so a reader there must still
+        // see it. An update is not a delete — nothing marks the new version
+        // dead, so the old one only survives if it reaches its own segment.
+        let horizon = s.clock.peek();
+        s.insert(doc_with_body(0, "second version")).unwrap();
+        s.flush().unwrap();
+        s.opts.gc_horizon = horizon;
+
+        let key = format!("t0{KEY_SEP}d00000");
+        assert_eq!(
+            body_at(&s, &key, horizon).as_deref(),
+            Some("doc 0 text"),
+            "PRE-MERGE: the reader at the horizon sees the version that was live for it"
+        );
+
+        let opts = CompactionOpts { tier_fanout: 2, ..Default::default() };
+        assert_eq!(run_to_quiescence(&mut s, &opts, 8).unwrap(), 1, "one merge, and no spin");
+
+        // Two outputs, because one segment holds at most one version of a key.
+        assert_eq!(s.segments.len(), 2);
+        assert_eq!(body_at(&s, &key, horizon).as_deref(), Some("doc 0 text"));
+        assert_eq!(body_at(&s, &key, s.clock.peek()).as_deref(), Some("second version"));
+        // Exactly one version is visible at either timestamp: retaining the
+        // superseded row must not double-count the key.
+        assert_eq!(s.num_docs(horizon), 4);
+        assert_eq!(s.num_docs(s.clock.peek()), 4);
     }
 
     #[test]

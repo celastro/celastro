@@ -285,7 +285,28 @@ impl Db {
     /// `(partition_key, primary_key)`.
     pub fn create_collection(&mut self, coll: Collection, splits: &[String]) -> Result<()> {
         let name = coll.name.clone();
+        // The catalog entry has to go in first, so that a duplicate name is
+        // refused before anything is written to disk — which means every
+        // failure below has to take it back out. A collection that is in the
+        // catalog but has no shards answers `already exists` to CREATE and
+        // `no such collection` to every read and write, until a restart.
         self.catalog.create(coll.clone())?;
+        let shards = match self.build_shards(&coll, splits) {
+            Ok(s) => s,
+            Err(e) => {
+                self.catalog.collections.remove(&name);
+                return Err(e);
+            }
+        };
+        self.shards.insert(name, shards);
+        self.persist_catalog()?;
+        Ok(())
+    }
+
+    /// Build the shard set for a new collection: `n` split points make `n+1`
+    /// shards. Separate from [`Db::create_collection`] so that a failure part
+    /// way through has one place to unwind from.
+    fn build_shards(&self, coll: &Collection, splits: &[String]) -> Result<Vec<Shard>> {
         let mut shards = Vec::with_capacity(splits.len() + 1);
         for i in 0..=splits.len() {
             let lo = if i == 0 { None } else { Some(splits[i - 1].clone()) };
@@ -293,7 +314,7 @@ impl Db {
             let mut sh = Shard::new(coll.clone(), self.clock.clone(), self.shard_opts())
                 .with_key_range(lo.clone(), hi.clone());
             if let Some(dir) = &self.dir {
-                let sdir = dir.join("collections").join(&name).join(format!("shard-{i:04}"));
+                let sdir = dir.join("collections").join(&coll.name).join(format!("shard-{i:04}"));
                 fs::create_dir_all(&sdir)?;
                 fs::write(
                     sdir.join("RANGE"),
@@ -303,9 +324,7 @@ impl Db {
             }
             shards.push(sh);
         }
-        self.shards.insert(name, shards);
-        self.persist_catalog()?;
-        Ok(())
+        Ok(shards)
     }
 
     pub fn add_index(&mut self, collection: &str, idx: IndexDef) -> Result<()> {
@@ -467,7 +486,7 @@ impl Db {
                 let mut total_len = 0u64;
                 let mut df: BTreeMap<String, u64> = BTreeMap::new();
                 for s in self.shards(collection)? {
-                    let (n, tl, d) = s.term_stats(path, terms, ts);
+                    let (n, tl, d) = s.term_stats(path, terms, ts)?;
                     num_docs += n;
                     total_len += tl;
                     for (t, c) in d {
@@ -829,14 +848,30 @@ impl Db {
             return Err(Error::Plan(format!("no index `{index}` on collection `{collection}`")));
         };
         let from = def.tier;
-        // The baseline moves whatever happens; the effective tier moves only if
-        // the files can follow it.
+        let declared_before = def.declared_tier;
+        // The baseline restates the intent, so a later access will not undo it;
+        // the effective tier moves only if the files can follow it.
         def.declared_tier = tier;
-        self.catalog
-            .activity
-            .entry((collection.to_string(), index.to_string()))
-            .and_modify(|a| a.demoted_by = None);
-        self.commit_tiers(collection, &[(index.to_string(), tier)])?;
+        let key = (collection.to_string(), index.to_string());
+        let demoted_before = self.catalog.activity.get(&key).and_then(|a| a.demoted_by);
+        if let Some(a) = self.catalog.activity.get_mut(&key) {
+            a.demoted_by = None;
+        }
+        if let Err(e) = self.commit_tiers(collection, &[(index.to_string(), tier)]) {
+            // `commit_tiers` restores the effective tier and nothing else. Without
+            // these two the caller is told the move failed while the catalog keeps
+            // a baseline the files never took and a retention pin that was dropped
+            // — and the next unrelated successful persist writes both to disk.
+            if let Ok(c) = self.catalog.get_mut(collection) {
+                if let Some(d) = c.indexes.iter_mut().find(|i| i.name == index) {
+                    d.declared_tier = declared_before;
+                }
+            }
+            if let Some(a) = self.catalog.activity.get_mut(&key) {
+                a.demoted_by = demoted_before;
+            }
+            return Err(e);
+        }
         Ok(from)
     }
 
@@ -1395,4 +1430,81 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("celastro-engine-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn a_collection_whose_shards_cannot_be_built_is_not_left_in_the_catalog() {
+        let dir = tmp("create-rollback");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        // A regular file where the collection's shard directories have to go,
+        // so the first `create_dir_all` inside `create_collection` fails.
+        fs::create_dir_all(dir.join("collections")).unwrap();
+        fs::write(dir.join("collections").join("notes"), b"not a directory").unwrap();
+
+        assert!(db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").is_err());
+        // Without the rollback the catalog keeps an entry with no shards, and
+        // the database answers `already exists` and `no such collection` to the
+        // same collection until it is restarted.
+        assert!(db.catalog.get("notes").is_err());
+        assert!(db.shards("notes").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_tier_change_rolls_back_the_declared_tier_and_the_retention_pin() {
+        let dir = tmp("tier-rollback");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert(
+            "notes",
+            Value::obj(vec![
+                ("id".into(), Value::Str("a".into())),
+                ("body".into(), Value::Str("segments and postings".into())),
+            ]),
+        )
+        .unwrap();
+        db.execute("FLUSH notes").unwrap();
+
+        // Take away the directory the sealed segment would be archived into,
+        // so the file move that `SET TIER 'archived'` asks for fails.
+        let shard = dir.join("collections").join("notes").join("shard-0000");
+        fs::remove_dir_all(shard.join("archive")).unwrap();
+
+        let segments = fs::read_dir(shard.join("segments")).unwrap().count();
+        assert!(segments > 0, "the flush has to leave a sealed segment for the move to fail on");
+
+        let key = ("notes".to_string(), "notes_body".to_string());
+        db.catalog.activity.get_mut(&key).unwrap().demoted_by =
+            Some(lifecycle::Trigger::SinceCreation);
+        let def = db.catalog.get("notes").unwrap().index_by_name("notes_body").unwrap();
+        let (tier_before, declared_before) = (def.tier, def.declared_tier);
+
+        assert!(db.set_index_tier("notes", "notes_body", Tier::Archived).is_err());
+
+        let after = db.catalog.get("notes").unwrap().index_by_name("notes_body").unwrap();
+        assert_eq!(after.tier, tier_before);
+        assert_eq!(after.declared_tier, declared_before);
+        assert_eq!(
+            db.catalog.activity[&key].demoted_by,
+            Some(lifecycle::Trigger::SinceCreation),
+            "an age demotion is a retention pin; a failed ALTER must not drop it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

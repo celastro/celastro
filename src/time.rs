@@ -151,10 +151,14 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
         return None;
     }
     let d: i64 = s.get(8..10)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    // `days_from_civil` normalises an impossible day instead of rejecting it, so
+    // without a real month length here "2026-02-31" would parse as 2026-03-03 —
+    // a range query would silently mean another day, and a caller that rewrites
+    // the coerced value would store one.
+    if !(1..=12).contains(&mo) || !(1..=days_in_month(y, mo)).contains(&d) {
         return None;
     }
-    let mut micros = days_from_civil(y, mo as u32, d as u32) * 86_400_000_000;
+    let mut micros = days_from_civil(y, mo as u32, d as u32).checked_mul(86_400_000_000)?;
     if b.len() > 10 {
         if b[10] != b'T' && b[10] != b' ' {
             return None;
@@ -162,22 +166,58 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
         let rest = &s[11..];
         let rest = rest.strip_suffix('Z').unwrap_or(rest);
         let mut parts = rest.split(':');
-        let h: i64 = parts.next()?.parse().ok()?;
-        let mi: i64 = parts.next().unwrap_or("0").parse().ok()?;
+        let h = parse_time_field(parts.next()?, 23)?;
+        let mi = parse_time_field(parts.next().unwrap_or("0"), 59)?;
         let sec_part = parts.next().unwrap_or("0");
+        // 60 seconds is allowed so a leap second reads as the following second
+        // rather than being rejected outright.
         let (sec, frac) = match sec_part.split_once('.') {
             Some((a, f)) => {
+                if f.is_empty() || !f.bytes().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
                 let mut f = f.to_string();
                 while f.len() < 6 {
                     f.push('0');
                 }
-                (a.parse::<i64>().ok()?, f.get(0..6)?.parse::<i64>().ok()?)
+                // All ASCII digits and at least six of them, so both the slice
+                // and the parse are infallible.
+                (parse_time_field(a, 60)?, f[0..6].parse::<i64>().ok()?)
             }
-            None => (sec_part.parse::<i64>().ok()?, 0),
+            None => (parse_time_field(sec_part, 60)?, 0),
         };
-        micros += (h * 3600 + mi * 60 + sec) * 1_000_000 + frac;
+        // Each field is range-checked, so the clock offset itself cannot
+        // overflow; the add is checked because the date half is caller-sized.
+        micros = micros.checked_add((h * 3600 + mi * 60 + sec) * 1_000_000 + frac)?;
     }
     Some(micros)
+}
+
+/// One clock field: one or two ASCII digits, no larger than `max`. The bound is
+/// load-bearing — an hour or a seconds count arrives straight from SQL text, and
+/// unbounded `h * 3600 * 1_000_000` overflows i64, which panics under
+/// `cargo test` and wraps to a wrong instant in a release build.
+fn parse_time_field(s: &str, max: i64) -> Option<i64> {
+    if s.is_empty() || s.len() > 2 || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let v: i64 = s.parse().ok()?;
+    (v <= max).then_some(v)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// Length of a month in the proleptic Gregorian calendar, so that parsing can
+/// reject days that never existed.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if is_leap_year(y) => 29,
+        _ => 28,
+    }
 }
 
 fn div_floor(a: i64, b: i64) -> (i64, i64) {
@@ -226,6 +266,39 @@ mod tests {
         }
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso8601("1970-01-02"), Some(86_400_000_000));
+    }
+
+    /// These strings reach `parse_iso8601` straight from SQL text, so an
+    /// unbounded field is an overflow panic in debug and a wrong instant in
+    /// release.
+    #[test]
+    fn an_out_of_range_clock_field_is_rejected_rather_than_overflowing_the_micros_multiply() {
+        assert_eq!(parse_iso8601("1970-01-01T99999999999999:00:00"), None);
+        assert_eq!(parse_iso8601("1970-01-01T00:00:99999999999999999"), None);
+        assert_eq!(parse_iso8601("1970-01-01T24:00:00"), None);
+        assert_eq!(parse_iso8601("1970-01-01T00:60:00"), None);
+        assert_eq!(parse_iso8601("1970-01-01T00:00:61"), None);
+        assert_eq!(parse_iso8601("1970-01-01T-5:00:00"), None);
+        // A leap second still parses, as the second that follows it.
+        assert_eq!(parse_iso8601("1970-01-01T00:00:60"), Some(60_000_000));
+        assert_eq!(parse_iso8601("1970-01-01T23:59:59.999999Z"), Some(86_399_999_999));
+    }
+
+    /// `days_from_civil` normalises, so an unvalidated day silently becomes a
+    /// different date instead of a parse failure.
+    #[test]
+    fn a_day_past_the_end_of_its_month_is_rejected_rather_than_rolling_into_the_next() {
+        assert_eq!(parse_iso8601("2026-02-31"), None);
+        assert_eq!(parse_iso8601("2026-04-31"), None);
+        assert_eq!(parse_iso8601("2026-01-32"), None);
+        assert_eq!(parse_iso8601("2026-01-00"), None);
+        // Leap years, including the century rules on either side of 2000.
+        assert_eq!(parse_iso8601("2026-02-29"), None);
+        assert_eq!(parse_iso8601("1900-02-29"), None);
+        assert!(parse_iso8601("2024-02-29").is_some());
+        assert!(parse_iso8601("2000-02-29").is_some());
+        assert!(parse_iso8601("2026-01-31").is_some());
+        assert!(parse_iso8601("2026-04-30").is_some());
     }
 
     /// A snapshot pinned by `peek` must be closed: nothing may later commit at

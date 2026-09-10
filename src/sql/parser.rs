@@ -9,9 +9,15 @@ use crate::sql::ast::*;
 use crate::sql::lexer::{lex, Tok};
 use crate::value::{Value, ValueType};
 
+/// How deeply a predicate or literal may nest. `primary_expr` recurses into
+/// `expr` once per `(`, so without a cap an input like `((((...))))` overflows
+/// the stack long before it runs out of tokens. Real queries nest a handful of
+/// levels.
+const MAX_EXPR_DEPTH: usize = 128;
+
 pub fn parse(sql: &str, params: &[Value]) -> Result<Statement> {
     let toks = lex(sql)?;
-    let mut p = Parser { t: toks, i: 0, params };
+    let mut p = Parser { t: toks, i: 0, params, depth: 0 };
     let s = p.statement()?;
     p.eat_punct(";");
     p.expect_eof()?;
@@ -22,6 +28,8 @@ struct Parser<'a> {
     t: Vec<Tok>,
     i: usize,
     params: &'a [Value],
+    /// Current recursive-descent depth; see `MAX_EXPR_DEPTH`.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -33,6 +41,20 @@ impl<'a> Parser<'a> {
         let t = self.t.get(self.i).cloned().unwrap_or(Tok::Eof);
         self.i += 1;
         t
+    }
+
+    /// Counts one level of recursive descent. Every caller must pair this with
+    /// `leave` on the paths that return a value.
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(Error::Sql(format!("expression nests deeper than {MAX_EXPR_DEPTH}")));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
     }
 
     fn expect_eof(&self) -> Result<()> {
@@ -180,8 +202,8 @@ impl<'a> Parser<'a> {
                     self.expect_punct("=")?;
                     let v = self.literal()?;
                     match key.to_ascii_lowercase().as_str() {
-                        "k" => k = v.as_i64().unwrap_or(10) as usize,
-                        "samples" => samples = v.as_i64().unwrap_or(32) as usize,
+                        "k" => k = positive_usize(&key, &v)?,
+                        "samples" => samples = positive_usize(&key, &v)?,
                         other => return Err(Error::Sql(format!("unknown option `{other}`"))),
                     }
                     if !self.eat_punct(",") {
@@ -227,10 +249,19 @@ impl<'a> Parser<'a> {
                     self.expect_punct("(")?;
                     let p = self.path()?;
                     self.expect_punct(")")?;
-                    if let Some(c) = columns.iter_mut().find(|c: &&mut DeclaredColumn| c.path == p)
-                    {
-                        c.primary_key = true;
-                        c.not_null = true;
+                    match columns.iter_mut().find(|c: &&mut DeclaredColumn| c.path == p) {
+                        Some(c) => {
+                            c.primary_key = true;
+                            c.not_null = true;
+                        }
+                        // Dropping the constraint here would leave the engine to
+                        // default the key to `id`, silently keying the collection
+                        // on a field no document has.
+                        None => {
+                            return Err(Error::Sql(format!(
+                                "PRIMARY KEY (`{p}`) names a column that was not declared"
+                            )))
+                        }
                     }
                 } else {
                     let path = self.path()?;
@@ -573,11 +604,9 @@ impl<'a> Parser<'a> {
             let key = self.ident()?;
             let val = if self.eat_punct("=") { Some(self.literal()?) } else { None };
             match key.to_ascii_lowercase().as_str() {
-                "exact" => w.exact = val.and_then(|v| v.as_bool()).unwrap_or(true),
-                "exact_scoring" => w.exact_scoring = val.and_then(|v| v.as_bool()).unwrap_or(true),
-                "partial_results" => {
-                    w.partial_results = val.and_then(|v| v.as_bool()).unwrap_or(true)
-                }
+                "exact" => w.exact = bool_option(&key, val)?,
+                "exact_scoring" => w.exact_scoring = bool_option(&key, val)?,
+                "partial_results" => w.partial_results = bool_option(&key, val)?,
                 "ef_search" => w.ef_search = val.and_then(|v| v.as_i64()).map(|x| x as usize),
                 "deadline_ms" => w.deadline_ms = val.and_then(|v| v.as_i64()).map(|x| x as u64),
                 other => return Err(Error::Sql(format!("unknown WITH option `{other}`"))),
@@ -780,14 +809,20 @@ impl<'a> Parser<'a> {
 
     fn not_expr(&mut self) -> Result<Expr> {
         if self.eat_kw("NOT") {
-            return Ok(Expr::Not(Box::new(self.not_expr()?)));
+            self.enter()?;
+            let inner = self.not_expr();
+            self.leave();
+            return Ok(Expr::Not(Box::new(inner?)));
         }
         self.primary_expr()
     }
 
     fn primary_expr(&mut self) -> Result<Expr> {
         if self.eat_punct("(") {
-            let e = self.expr()?;
+            self.enter()?;
+            let e = self.expr();
+            self.leave();
+            let e = e?;
             self.expect_punct(")")?;
             return Ok(e);
         }
@@ -876,6 +911,15 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------- literals
 
     fn literal(&mut self) -> Result<Value> {
+        // Array literals and unary minus recurse through here, so the cap that
+        // protects predicates protects `[[[[...]]]]` too.
+        self.enter()?;
+        let v = self.literal_inner();
+        self.leave();
+        v
+    }
+
+    fn literal_inner(&mut self) -> Result<Value> {
         // `now()` and `now() ± interval '...'`.
         if self.is_kw("now") {
             self.i += 1;
@@ -940,11 +984,17 @@ impl<'a> Parser<'a> {
             Tok::Str(s) => Ok(Value::Str(s)),
             Tok::Int(i) => Ok(Value::Int(i)),
             Tok::Float(f) => Ok(Value::Float(f)),
-            Tok::Param(n) => self
-                .params
-                .get(n - 1)
-                .cloned()
-                .ok_or_else(|| Error::Sql(format!("parameter ${n} was not bound"))),
+            Tok::Param(n) => {
+                // Parameters are 1-based: `$0` would underflow the index and
+                // wrap to `usize::MAX` in release.
+                if n == 0 {
+                    return Err(Error::Sql("parameter references start at $1".into()));
+                }
+                self.params
+                    .get(n - 1)
+                    .cloned()
+                    .ok_or_else(|| Error::Sql(format!("parameter ${n} was not bound")))
+            }
             Tok::Ident(s) if s.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
             Tok::Ident(s) if s.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
             Tok::Ident(s) if s.eq_ignore_ascii_case("null") => Ok(Value::Null),
@@ -982,6 +1032,26 @@ impl<'a> Parser<'a> {
         // An overflow here wraps in release and silently reverses the sign of
         // the comparison, so an absurd interval quietly returns the wrong rows.
         n.checked_mul(mult).ok_or_else(|| Error::Sql(format!("interval `{s}` is out of range")))
+    }
+}
+
+/// `WITH (partial_results)` is the bare-flag spelling, so an absent value means
+/// true. A value that is present but not a boolean is a mistake: reading
+/// `exact = 0` as true would set the flag to the opposite of what was written.
+fn bool_option(key: &str, val: Option<Value>) -> Result<bool> {
+    match val {
+        None => Ok(true),
+        Some(v) => v.as_bool().ok_or_else(|| Error::Sql(format!("`{key}` must be a boolean"))),
+    }
+}
+
+/// A negative count would wrap to `usize::MAX` in the `as usize` cast, and the
+/// recall harness then grows its query Vec until the process is killed; zero
+/// asks for a measurement of nothing.
+fn positive_usize(key: &str, v: &Value) -> Result<usize> {
+    match v.as_i64() {
+        Some(n) if n > 0 => Ok(n as usize),
+        _ => Err(Error::Sql(format!("`{key}` must be a positive integer"))),
     }
 }
 
@@ -1159,5 +1229,69 @@ mod tests {
             let e = parse(sql, &[]).unwrap_err().to_string();
             assert!(e.contains(needle), "`{sql}` gave `{e}`, expected to mention `{needle}`");
         }
+    }
+
+    #[test]
+    fn param_zero_is_rejected_instead_of_underflowing_the_binding_index() {
+        let e = parse("SELECT * FROM a WHERE x = $0", &[Value::Int(1)]).unwrap_err();
+        assert!(e.to_string().contains("$1"), "{e}");
+        let s = sel("SELECT * FROM a WHERE x = $1", &[Value::Int(7)]);
+        assert!(matches!(s.predicate, Some(Expr::Compare { lit: Value::Int(7), .. })));
+    }
+
+    #[test]
+    fn measure_recall_rejects_counts_that_would_wrap_to_a_huge_usize() {
+        for sql in [
+            "MEASURE RECALL ON t WITH (samples = -1)",
+            "MEASURE RECALL ON t WITH (k = -1)",
+            "MEASURE RECALL ON t WITH (k = 0)",
+            "MEASURE RECALL ON t WITH (samples = 'lots')",
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains("positive"), "`{sql}` gave `{e}`");
+        }
+        let s = parse("MEASURE RECALL ON t WITH (k = 5, samples = 8)", &[]).unwrap();
+        assert!(matches!(s, Statement::MeasureRecall { k: 5, samples: 8, .. }));
+    }
+
+    #[test]
+    fn a_non_boolean_with_flag_errors_rather_than_turning_the_flag_on() {
+        for sql in [
+            "SELECT * FROM a WITH (exact = 0)",
+            "SELECT * FROM a WITH (partial_results = 'false')",
+            "SELECT * FROM a WITH (exact_scoring = 1)",
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains("must be a boolean"), "`{sql}` gave `{e}`");
+        }
+        // The bare-flag spelling has no value at all and still means true.
+        assert!(sel("SELECT * FROM a WITH (exact)", &[]).with.exact);
+        assert!(!sel("SELECT * FROM a WITH (exact = false)", &[]).with.exact);
+    }
+
+    #[test]
+    fn a_primary_key_naming_an_undeclared_column_is_refused_not_dropped() {
+        let e = parse("CREATE COLLECTION t (id TEXT, PRIMARY KEY (slug))", &[]).unwrap_err();
+        let e = e.to_string();
+        assert!(e.contains("slug") && e.contains("not declared"), "{e}");
+        let c = match parse("CREATE COLLECTION t (id TEXT, PRIMARY KEY (id))", &[]).unwrap() {
+            Statement::CreateCollection(c) => c,
+            other => panic!("expected CREATE COLLECTION, got {other:?}"),
+        };
+        assert!(c.columns[0].primary_key && c.columns[0].not_null);
+    }
+
+    #[test]
+    fn nesting_past_the_depth_cap_errors_instead_of_overflowing_the_stack() {
+        let deep = format!("SELECT * FROM a WHERE {}x = 1{}", "(".repeat(300), ")".repeat(300));
+        let e = parse(&deep, &[]).unwrap_err().to_string();
+        assert!(e.contains("nests deeper"), "{e}");
+        // Literals recurse through the same counter.
+        let arr = format!("SELECT * FROM a WHERE x = {}1{}", "[".repeat(300), "]".repeat(300));
+        let e = parse(&arr, &[]).unwrap_err().to_string();
+        assert!(e.contains("nests deeper"), "{e}");
+        // Nesting a human would write is unaffected.
+        let ok = format!("SELECT * FROM a WHERE {}x = 1{}", "(".repeat(8), ")".repeat(8));
+        assert!(parse(&ok, &[]).is_ok(), "{ok}");
     }
 }

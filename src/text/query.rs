@@ -249,7 +249,7 @@ impl QParser {
                     // move it out of the range it is meant to open. Folding is
                     // not optional though: the dictionary holds `cafe`, so a
                     // merely lowercased `café` opens an empty range.
-                    return Ok(TextQuery::Prefix(crate::text::analyzer::fold(&w)));
+                    return Ok(TextQuery::Prefix(fold_prefix(self.analyzer, &w)));
                 }
                 let terms = self.analyzer.terms(&w);
                 Ok(match terms.len() {
@@ -263,6 +263,19 @@ impl QParser {
                 other.map(|t| t.text()).unwrap_or_else(|| "end of input".into())
             ))),
         }
+    }
+}
+
+/// Fold a prefix exactly the way the field's analyzer folded the terms it
+/// indexed. *Which* folding is as load-bearing as folding at all: `Keyword`
+/// only trims and lowercases, so a keyword field holds `o'reilly` and `café`,
+/// and the standard folding — which drops apostrophes and strips accents —
+/// would compile `O'Rei*` to `orei` and open a dictionary range that term can
+/// never be in.
+fn fold_prefix(analyzer: Analyzer, w: &str) -> String {
+    match analyzer {
+        Analyzer::Keyword => w.trim().to_lowercase(),
+        Analyzer::Standard | Analyzer::English => crate::text::analyzer::fold(w),
     }
 }
 
@@ -314,6 +327,22 @@ mod tests {
         assert_eq!(
             TextQuery::parse("O'Rei*", Analyzer::Standard).unwrap(),
             TextQuery::Prefix("orei".into())
+        );
+    }
+
+    /// A keyword field indexes `O'Reilly` as `o'reilly` and `Café` as `café`.
+    /// Folding the prefix the standard way instead drops the apostrophe and
+    /// the accent, and opens a dictionary range those terms cannot be in — the
+    /// prefix matches nothing, forever.
+    #[test]
+    fn a_keyword_prefix_keeps_what_the_keyword_analyzer_kept() {
+        assert_eq!(
+            TextQuery::parse("O'Rei*", Analyzer::Keyword).unwrap(),
+            TextQuery::Prefix("o'rei".into())
+        );
+        assert_eq!(
+            TextQuery::parse("Café*", Analyzer::Keyword).unwrap(),
+            TextQuery::Prefix("café".into())
         );
     }
 

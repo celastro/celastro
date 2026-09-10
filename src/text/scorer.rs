@@ -600,7 +600,7 @@ fn build<'a>(
     let empty = || Built { scorer: None, excluded: Bitmap::new(n), negation_only: false };
     Ok(match q {
         TextQuery::Empty => empty(),
-        TextQuery::Term(t) => match src.cursor(t) {
+        TextQuery::Term(t) => match src.try_cursor(t)? {
             None => empty(),
             Some(cur) => Built {
                 scorer: Some(Box::new(TermScorer::new(
@@ -619,24 +619,38 @@ fn build<'a>(
             if terms.len() >= PREFIX_EXPANSION_LIMIT {
                 *truncated = true;
             }
-            let kids: Vec<Box<dyn Scorer + 'a>> = terms
-                .iter()
-                .filter_map(|t| {
-                    let cur = src.cursor(t)?;
-                    // A prefix term the coordinator never saw has no global df;
-                    // fall back to the local one so the expansion is at least
-                    // internally consistent.
-                    let idf = if stats.doc_freq.contains_key(t) {
-                        stats.idf(t)
-                    } else {
-                        let nd = stats.num_docs.max(1) as f64;
-                        let df = src.doc_freq(t).max(1) as f64;
-                        (1.0 + (nd - df + 0.5) / (df + 0.5)).ln() as f32
-                    };
-                    Some(Box::new(TermScorer::new(cur, idf, src.doc_lens(), avgdl, params))
-                        as Box<dyn Scorer + 'a>)
-                })
-                .collect();
+            let mut kids: Vec<Box<dyn Scorer + 'a>> = Vec::with_capacity(terms.len());
+            for t in &terms {
+                let Some(cur) = src.try_cursor(t)? else { continue };
+                let idf = if stats.doc_freq.contains_key(t) {
+                    stats.idf(t)
+                } else {
+                    // A prefix term the coordinator never saw has no global df,
+                    // because `TextQuery::leaf_terms` deliberately skips
+                    // `Prefix`, so this mixes the segment's own df with the
+                    // global document count. It is internally consistent within
+                    // one segment, but scores from a prefix expansion are still
+                    // NOT comparable across shards (§8.2) — making them so needs
+                    // the coordinator to gather df for the expanded terms, which
+                    // cannot be decided here.
+                    //
+                    // The floor is load-bearing, not cosmetic. A `num_docs`
+                    // smaller than the local df — a stale statistics cache, or a
+                    // segment newer than the gather — drives the log negative,
+                    // and with a non-positive `max_score` the pivot loop in
+                    // `DisjunctionScorer::advance` (which needs `sum >
+                    // threshold`, and the threshold starts at zero) never finds
+                    // a pivot at all: the prefix query returns nothing instead of
+                    // returning its matches cheaply ranked. The floor is the idf
+                    // the formula gives a term that occurs in every document,
+                    // which is the smallest value it can legitimately produce.
+                    let nd = stats.num_docs.max(1) as f64;
+                    let df = src.doc_freq(t).max(1) as f64;
+                    let floor = (1.0 + 0.5 / (nd + 0.5)).ln() as f32;
+                    ((1.0 + (nd - df + 0.5) / (df + 0.5)).ln() as f32).max(floor)
+                };
+                kids.push(Box::new(TermScorer::new(cur, idf, src.doc_lens(), avgdl, params)));
+            }
             if kids.is_empty() {
                 empty()
             } else {
@@ -650,7 +664,7 @@ fn build<'a>(
         TextQuery::Phrase(terms) => {
             let mut cursors = Vec::with_capacity(terms.len());
             for t in terms {
-                match src.cursor(t) {
+                match src.try_cursor(t)? {
                     Some(c) => cursors.push(c),
                     None => return Ok(empty()),
                 }
@@ -706,6 +720,12 @@ fn build<'a>(
         TextQuery::Any(parts) => {
             let mut kids: Vec<Box<dyn Scorer + 'a>> = Vec::new();
             let mut union_excluded = Bitmap::new(n);
+            // Whether a branch *was* a negation, not whether it happened to
+            // exclude anything. A negated term that matches nothing yields an
+            // empty exclusion bitmap, and keying off the bitmap's contents
+            // there skips the refusal below and quietly answers the positive
+            // branch alone — the exact mis-answer the refusal exists to avoid.
+            let mut saw_negation = false;
             for p in parts {
                 let b = build(p, src, stats, params, avgdl, truncated)?;
                 match b.scorer {
@@ -718,9 +738,7 @@ fn build<'a>(
                         });
                     }
                     None if b.negation_only => {
-                        // `a OR NOT b` needs the complement of `b`, which no
-                        // posting list can generate. Refusing is better than
-                        // quietly answering `a`.
+                        saw_negation = true;
                         union_excluded.or_inplace(&b.excluded);
                     }
                     None => {}
@@ -729,10 +747,16 @@ fn build<'a>(
             if kids.is_empty() {
                 // Every positive branch matched nothing, so what is left *is*
                 // the negation: `nothing OR NOT y` is `NOT y`.
-                let neg = !union_excluded.is_empty();
-                return Ok(Built { scorer: None, excluded: union_excluded, negation_only: neg });
+                return Ok(Built {
+                    scorer: None,
+                    excluded: union_excluded,
+                    negation_only: saw_negation,
+                });
             }
-            if !union_excluded.is_empty() {
+            if saw_negation {
+                // `a OR NOT b` needs the complement of `b`, which no posting
+                // list can generate. Refusing is better than quietly
+                // answering `a`.
                 return Err(Error::Sql(
                     "a negation cannot be one side of an OR: `a OR NOT b` would have to \
                      enumerate every document that is not `b`. Put the negation outside the \
@@ -753,23 +777,31 @@ fn build<'a>(
         TextQuery::All(parts) => {
             let mut kids: Vec<Box<dyn Scorer + 'a>> = Vec::new();
             let mut excluded = Bitmap::new(n);
-            let mut all_negation = !parts.is_empty();
+            let mut saw_negation = false;
             for p in parts {
+                // A conjunct that analysed away to nothing is not a constraint.
+                // `the AND fox` parses to `All([Empty, Term(fox)])`, and letting
+                // that `Empty` empty the conjunction makes the broader query
+                // return fewer rows than `fox` alone. `Any` already drops such
+                // branches, and `TextQuery::is_empty` already calls an `All`
+                // empty only when *every* part is.
+                if p.is_empty() {
+                    continue;
+                }
                 let b = build(p, src, stats, params, avgdl, truncated)?;
                 excluded.or_inplace(&b.excluded);
                 match b.scorer {
-                    Some(s) => {
-                        all_negation = false;
-                        kids.push(s);
-                    }
+                    Some(s) => kids.push(s),
                     // A conjunct that matches nothing empties the conjunction —
                     // unless it was a negation, which only filters.
-                    None if b.negation_only => {}
+                    None if b.negation_only => saw_negation = true,
                     None => return Ok(empty()),
                 }
             }
             match kids.len() {
-                0 => Built { scorer: None, excluded, negation_only: all_negation },
+                // Only a bare negation reaches here as "everything except";
+                // a conjunction of nothing at all matches nothing.
+                0 => Built { scorer: None, excluded, negation_only: saw_negation },
                 1 => Built {
                     scorer: Some(kids.into_iter().next().unwrap()),
                     excluded,
@@ -1087,6 +1119,72 @@ mod tests {
         let bm = evaluate_to_bitmap(c, DOCS.len());
         assert!(!bm.get(0) && !bm.get(3) && !bm.get(7));
         assert_eq!(bm.popcount(), DOCS.len() - 3);
+    }
+
+    /// A stopword conjunct analyses to `Empty`, and letting `Empty` empty the
+    /// whole conjunction makes `the AND fox` return nothing at all while `fox`
+    /// alone returns matches — a strictly broader query answering with strictly
+    /// fewer rows.
+    #[test]
+    fn a_stopword_conjunct_does_not_annihilate_the_conjunction() {
+        let (dict, post, lens) = build();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        let st = stats(&src);
+        let q = TextQuery::parse("the AND fox", Analyzer::English).unwrap();
+        assert_eq!(q, TextQuery::All(vec![TextQuery::Empty, TextQuery::Term("fox".into())]));
+        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let got = evaluate_to_bitmap(c, DOCS.len());
+        assert_eq!(got.to_vec(), vec![0, 5]);
+
+        let bare = TextQuery::parse("fox", Analyzer::English).unwrap();
+        let c = compile(&bare, &src, &st, Bm25Params::default()).unwrap();
+        assert_eq!(got.to_vec(), evaluate_to_bitmap(c, DOCS.len()).to_vec());
+    }
+
+    /// The refusal of `a OR NOT b` used to be keyed off the exclusion bitmap
+    /// being non-empty. A negated term that matches nothing excludes nothing,
+    /// so the refusal was skipped and the query quietly answered `a` — neither
+    /// the promised refusal nor the complement it asked for.
+    #[test]
+    fn an_or_branch_negation_is_refused_even_when_it_excludes_nothing() {
+        let (dict, post, lens) = build();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        let st = stats(&src);
+        let q = TextQuery::parse("quick OR -nonexistentterm", Analyzer::English).unwrap();
+        let e = match compile(&q, &src, &st, Bm25Params::default()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a refusal"),
+        };
+        assert!(e.contains("negation cannot be one side of an OR"), "{e}");
+    }
+
+    /// A prefix expansion has no global df, so it scores against the local one.
+    /// When `num_docs` is smaller than that df — a stale statistics cache — the
+    /// idf goes negative, and a non-positive `max_score` gives WAND's pivot loop
+    /// nothing to pivot on: the query returns no rows rather than its matches.
+    #[test]
+    fn a_stale_global_doc_count_does_not_make_a_prefix_query_return_nothing() {
+        let (dict, post, lens) = build();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        // Deliberately inconsistent with the segment: four documents hold
+        // `graph`, and the coordinator thinks the collection has one document.
+        let st = GlobalStats {
+            num_docs: 1,
+            avg_doc_len: src.total_doc_len() as f64 / src.num_docs().max(1) as f64,
+            doc_freq: Default::default(),
+            exact: false,
+        };
+        let q = TextQuery::parse("graph*", Analyzer::English).unwrap();
+        assert_eq!(q, TextQuery::Prefix("graph".into()));
+        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        assert_eq!(evaluate_to_bitmap(c, DOCS.len()).to_vec(), vec![1, 2, 6, 8]);
+
+        // And the same query through the pruning collector, which is where the
+        // threshold the pivot is compared against actually comes from.
+        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 4);
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|h| h.score > 0.0), "{got:?}");
     }
 
     #[test]

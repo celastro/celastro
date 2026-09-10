@@ -83,6 +83,12 @@ pub fn lex(input: &str) -> Result<Vec<Tok>> {
             while i < cs.len() && cs[i] != '"' {
                 i += 1;
             }
+            // Without this an unterminated quote runs to the end of the input
+            // and `SELECT * FROM t WHERE "status = 'x'` swallows the whole
+            // predicate into one identifier instead of being reported.
+            if i >= cs.len() {
+                return Err(Error::Sql("unterminated quoted identifier".into()));
+            }
             out.push(Tok::Ident(cs[start..i].iter().collect()));
             i += 1;
             continue;
@@ -165,6 +171,16 @@ mod tests {
         assert_eq!(t[3], Tok::Punct("<=>"));
         assert_eq!(t[5], Tok::Punct("<#>"));
         assert_eq!(t[7], Tok::Punct("<="));
+    }
+
+    #[test]
+    fn an_unterminated_quoted_identifier_is_an_error_not_a_run_on_ident() {
+        let e = lex("SELECT * FROM \"articles").unwrap_err().to_string();
+        assert!(e.contains("unterminated"), "{e}");
+        let e = lex("SELECT * FROM t WHERE \"status = 'x'").unwrap_err().to_string();
+        assert!(e.contains("unterminated"), "{e}");
+        // A closed quote still yields one identifier, spaces and all.
+        assert_eq!(lex("\"a b\"").unwrap()[0], Tok::Ident("a b".into()));
     }
 
     #[test]

@@ -365,12 +365,23 @@ pub fn decode_policies(b: &[u8], i: &mut usize) -> Result<BTreeMap<String, Lifec
     for _ in 0..n {
         let name = get_str(b, i).ok_or_else(bad)?;
         let collection = get_str(b, i).ok_or_else(bad)?;
+        // A count is a length prefix like any other, so it is bounded by the
+        // bytes actually left before anything is reserved: every element costs
+        // at least one byte. Reserving first turns a corrupt `1 << 60` into a
+        // `capacity overflow` panic, where the loop below would have reported
+        // the truncation these decoders exist to report.
         let ni = get_uvarint(b, i).ok_or_else(bad)? as usize;
+        if ni > b.len().saturating_sub(*i) {
+            return Err(bad());
+        }
         let mut indexes = Vec::with_capacity(ni);
         for _ in 0..ni {
             indexes.push(get_str(b, i).ok_or_else(bad)?);
         }
         let nr = get_uvarint(b, i).ok_or_else(bad)? as usize;
+        if nr > b.len().saturating_sub(*i) {
+            return Err(bad());
+        }
         let mut rules = Vec::with_capacity(nr);
         for _ in 0..nr {
             let to = Tier::from_u8(*b.get(*i).ok_or_else(bad)?);
@@ -614,5 +625,29 @@ mod tests {
         let back = decode_activity(&b, &mut i).unwrap();
         assert_eq!(back[&("c".to_string(), "a".to_string())].created_micros, 7);
         assert_eq!(back[&("c".to_string(), "a".to_string())].last_access_micros, 9);
+    }
+
+    #[test]
+    fn a_hostile_index_count_is_refused_before_it_is_reserved() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 1);
+        put_str(&mut b, "p");
+        put_str(&mut b, "c");
+        // Far more indexes than there are bytes left to hold them.
+        put_uvarint(&mut b, 1u64 << 60);
+        let mut i = 0;
+        assert!(decode_policies(&b, &mut i).is_err());
+    }
+
+    #[test]
+    fn a_hostile_rule_count_is_refused_before_it_is_reserved() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 1);
+        put_str(&mut b, "p");
+        put_str(&mut b, "c");
+        put_uvarint(&mut b, 0);
+        put_uvarint(&mut b, 1u64 << 60);
+        let mut i = 0;
+        assert!(decode_policies(&b, &mut i).is_err());
     }
 }

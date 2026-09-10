@@ -165,13 +165,28 @@ pub fn fuse(
                             FusionMethod::Rrf => s.weight / (rrf_c + rank as f32),
                             FusionMethod::Linear => {
                                 let (lo, hi) = norms[i];
-                                let span = (hi - lo).max(1e-9);
-                                let unit = (raw - lo) / span;
-                                // Normalise to "bigger is better" so that a
-                                // distance and a BM25 score can be added at all.
-                                let unit = match s.direction {
-                                    Direction::HigherIsBetter => unit,
-                                    Direction::LowerIsBetter => 1.0 - unit,
+                                let span = hi - lo;
+                                let unit = if span > 0.0 {
+                                    let unit = (raw - lo) / span;
+                                    // Normalise to "bigger is better" so that a
+                                    // distance and a BM25 score can be added at
+                                    // all.
+                                    match s.direction {
+                                        Direction::HigherIsBetter => unit,
+                                        Direction::LowerIsBetter => 1.0 - unit,
+                                    }
+                                } else {
+                                    // A source with one candidate, or with every
+                                    // score equal, has no spread to normalise
+                                    // against. Dividing by an epsilon instead
+                                    // gives unit 0.0, which the flip above turns
+                                    // into full credit for a distance source and
+                                    // none at all for a text one — a sole
+                                    // perfect text hit would contribute zero.
+                                    // Such a candidate is both the best and the
+                                    // worst of its source, so it scores 1.0
+                                    // whichever way the source points.
+                                    1.0
                                 };
                                 s.weight * unit
                             }
@@ -308,6 +323,29 @@ mod tests {
         // breaks it.
         assert!((out[0].score - out[1].score).abs() < 1e-6);
         assert_eq!(out[0].key, "a");
+    }
+
+    /// A source with nothing to normalise against used to be normalised anyway:
+    /// `span.max(1e-9)` made its unit score 0.0, and the direction flip turned
+    /// that into full credit for a distance source and none at all for a text
+    /// one. A sole perfect text hit therefore contributed exactly nothing while
+    /// a vector source in the identical state contributed everything.
+    #[test]
+    fn a_lone_candidate_scores_the_same_whichever_way_its_source_points() {
+        let t = text(vec![c("a-text-only", 9.9)]);
+        let v = vector(vec![c("b-vector-only", 0.02)]);
+        let (out, _) = fuse(vec![t, v], FusionMethod::Linear, 60.0, 2);
+        let a = out.iter().find(|f| f.key == "a-text-only").unwrap();
+        let b = out.iter().find(|f| f.key == "b-vector-only").unwrap();
+        assert!(a.score > 0.0, "a sole hit must get credit, not zero: {}", a.score);
+        assert!((a.score - b.score).abs() < 1e-6, "text {} vs vector {}", a.score, b.score);
+
+        // The same holds when a source has several candidates that all tie:
+        // every one of them is both the best and the worst of that source.
+        let (flat, _) =
+            fuse(vec![text(vec![c("x", 4.0), c("y", 4.0)])], FusionMethod::Linear, 60.0, 2);
+        assert!(flat[0].score > 0.0, "an all-equal source must not score zero");
+        assert!((flat[0].score - flat[1].score).abs() < 1e-6);
     }
 
     #[test]
