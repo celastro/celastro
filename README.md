@@ -285,7 +285,10 @@ them first:
 
 That combination makes the distributed exit criterion testable now:
 `exact_mode_is_bit_identical_across_shard_counts` runs the same corpus at 1, 3
-and 6 shards and compares fused scores bit for bit.
+and 6 shards and compares fused scores bit for bit, and
+`exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`
+does the same for the global statistics themselves, under a workload that
+leaves dead rows behind for each shard to collect on its own schedule.
 
 ---
 
@@ -308,7 +311,13 @@ the candidate union differs with the shard count and the fusion differs with it
 — even in exact mode, where ANN and statistics are removed as sources of
 variance. Bit-identical results across shard counts hold only at `k'` above the
 candidate count, which is what `exact_mode_is_bit_identical_across_shard_counts`
-pins.
+pins. The statistics half of that claim holds only in exact mode: the two-phase
+gather masks all three of `num_docs`, the length sum and `doc_freq` by snapshot
+visibility, so the triple is a function of the live corpus alone. The cached
+statistics the default path reads are counted over physical rows instead —
+uniformly, which is what keeps `doc_freq ≤ num_docs` and IDF non-negative, but
+physical rows move with flush and compaction timing, and so with the shard
+count.
 
 **`search_after` over an approximate index is not cheaper than `OFFSET`.** A
 graph search has no resume primitive: an HNSW heap cannot restart from a
@@ -753,7 +762,10 @@ guarantee:
 | hybrid queries provably correct | `hybrid_retrieval_is_a_union_of_all_three_modes`, `text_match_is_a_must_in_where_and_a_should_in_hybrid` |
 | harness trusted | `the_recall_harness_catches_a_deliberate_regression` |
 | recall@10 ≥ 0.95 under sustained deletes | `recall_at_10_holds_under_sustained_deletes` (40% deleted, before / after / post-compaction) |
-| exact mode bit-identical across shard counts | `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards) |
+| exact mode bit-identical across shard counts | `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards), `exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes` (linear fusion, so a length norm can reach the assertion) |
+| exact global statistics are a function of the live corpus | `exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `shard::tests::the_length_numerator_matches_a_brute_force_fold_at_every_snapshot` |
+| cached statistics sum over every unit and shard, and stay internally coherent | `engine::tests::the_cached_statistics_sum_over_every_unit_of_every_shard` (`doc_freq ≤ num_docs`, so IDF cannot go negative) |
+| IDF is total: no statistics make it negative | `text::scorer::tests::idf_is_never_negative_however_incoherent_the_statistics` |
 | approximate mode within tolerance | `approximate_mode_across_shard_counts_stays_within_recall_tolerance` |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |

@@ -1148,10 +1148,22 @@ impl Shard {
         // `drain_into(0)` keeps every row, and only the versions
         // `SegmentBuilder::build`'s dedup already threw away are dropped, by
         // keeping layer 0. Collecting at `now` here would make a seal a
-        // version-GC pass, and a seal is not one: `term_stats` sums
-        // `total_doc_len` over physical rows, so BM25's avgdl would move
-        // whenever a shard happened to seal, and a snapshot read below the
-        // seal would lose rows it could read a moment earlier.
+        // version-GC pass, and a seal is not one: a snapshot read below the
+        // seal would lose rows it could read a moment earlier. Note which
+        // rows those are — `drain_into(0)` keeps every *tombstoned* row, so a
+        // delete is untouched by a seal and survives to be collected by a
+        // compaction; what a seal would drop, were it to collect, is a
+        // version some later write had already superseded, and that is what
+        // `layers.truncate(1)` below does. Scoring enters into it only on the
+        // exact path now: `term_stats` masks by visibility on both halves of
+        // the quotient, so a seal moves no *exact* score whatever it drops.
+        // The default path still moves. Its statistics come from
+        // `TextSource::all_terms`, which reads the memtable's physical
+        // `ords.len()` before a seal and the built dictionary's deduplicated
+        // count after it, so the very truncation described above drops a
+        // superseded version out of `doc_freq` and shifts IDF — the residual
+        // `CachedStats` documents, and the reason `WITH (exact_scoring)`
+        // exists.
         let retain_from = self.retain_from(self.clock.peek());
         let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
         let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
@@ -1488,6 +1500,16 @@ impl Shard {
     /// searchable unit. This is the exact two-phase gather of §8.2 — in a
     /// cluster it is a broadcast; here it is a loop, but it is the same
     /// quantity and the same guarantee.
+    ///
+    /// All three numbers are masked by visibility at `t`, so for `t >=`
+    /// [`Shard::retain_floor`] the triple is a pure function of the keys live
+    /// at `t`, their field lengths and their postings: independent of how many
+    /// physical versions or tombstones are resident, of when any shard sealed,
+    /// and of whether a compaction has run. Below the floor it stays
+    /// best-effort in exactly the sense [`Shard::get`] documents — a
+    /// compaction has physically dropped versions dead before the horizon and
+    /// their lengths went with them — and a pinned `gc_horizon` holds the
+    /// floor back and keeps those reads exact too.
     pub fn term_stats(
         &self,
         path: &str,
@@ -1508,7 +1530,21 @@ impl Shard {
             // place of the refusal the operator asked for.
             let handle = s.text_handle(path)?;
             if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
-                total_len += src.total_doc_len();
+                // Sum only visible lengths, for the same reason the
+                // `doc_freq` loop below counts only visible postings: this is
+                // the numerator of an average whose denominator is
+                // `vis.popcount()`. Reading the source-wide sum instead
+                // divides physical rows by live ones, and the quotient moves
+                // whenever a seal drops a superseded version or a compaction
+                // drops a dead one — which happens at each shard's own
+                // threshold, so it moves with the shard count.
+                //
+                // The denominator is still diluted: `ndocs` counts every
+                // visible document in the unit, including those carrying no
+                // text on `path`, for which this now contributes zero. So
+                // `avgdl` is the average over the collection, not over the
+                // documents that have this field.
+                total_len += src.visible_doc_len(&vis);
                 for term in terms {
                     if let Some(mut c) = src.cursor(term) {
                         // Count only visible postings: a document frequency
@@ -1655,14 +1691,14 @@ mod tests {
 
     #[test]
     fn an_unpinned_flush_does_not_move_the_scoring_statistics() {
-        // A seal is not a version-GC pass, and this is why it must not become
-        // one. `term_stats` masks `ndocs` by visibility but sums
-        // `total_doc_len` over *physical* rows, so a seal that dropped the
-        // tombstoned row would shrink the numerator of BM25's avgdl while the
-        // denominator stayed put — every score in the collection moves the
-        // moment a shard happens to seal. And since each shard seals on its
-        // own `should_flush` threshold, the same workload would then score
-        // differently at different shard counts.
+        // `term_stats` masks both halves of avgdl's quotient by visibility, so
+        // `before == after` here says the statistics are a function of the
+        // live corpus and not of what happens to be resident. It used to say
+        // something weaker and wrong: the numerator was summed over *physical*
+        // rows, so the equality held only because a seal is forbidden to drop
+        // the tombstoned row — a rule about collection standing in for a
+        // property of the statistic. `before.1` counted the deleted document's
+        // length; it no longer does.
         let mut s = shard();
         for i in 0..30 {
             s.insert(doc(i)).unwrap();
@@ -1675,7 +1711,7 @@ mod tests {
         s.flush().unwrap();
         let after = s.term_stats("body", &terms, s.clock.peek()).unwrap();
         assert_eq!(before.0, 29, "one of the 30 is deleted");
-        assert_eq!(before.1, 150, "but its length still counts, before and after");
+        assert_eq!(before.1, 145, "and its length goes with it: 29 bodies of five terms");
         assert_eq!(before, after, "the seal moved the scoring statistics");
     }
 
@@ -1685,15 +1721,17 @@ mod tests {
         // reaches: with nothing pinned the seal keeps layer 0 and nothing else,
         // so it emits one segment holding the newest version of every key —
         // exactly the dedup `SegmentBuilder::build` always did. Keeping the
-        // superseded version instead splits the seal in two and carries the
-        // dead version's length back into `total_doc_len`, which is the
-        // numerator of BM25's avgdl for the whole collection. Only a pin may
-        // ask for that, and a shard that happened to seal must not.
+        // superseded version instead splits the seal in two, which is a thing
+        // only a pin may ask for.
         //
-        // Its own test rather than an update folded into the one above: there
-        // `before == after` holds exactly, and it should, while an update
-        // legitimately drops a version the write path had already superseded —
-        // so folding one in could only be paid for by loosening that equality.
+        // `before.1` used to be 151 against an `after.1` of 146: the memtable
+        // physically held both versions of the updated document, the seal
+        // dropped the superseded one, and the numerator of BM25's avgdl fell
+        // by five for the whole collection. That five-point step was written
+        // down as correct, and it was the bug — the dead version was invisible
+        // at the very snapshot the number was gathered at. Masked, the
+        // superseded version contributes nothing before the seal either, so
+        // the two agree and the seal moves nothing at all.
         let mut s = shard();
         for i in 0..30 {
             s.insert(doc(i)).unwrap();
@@ -1704,14 +1742,103 @@ mod tests {
         assert_eq!(s.opts.gc_horizon, 0, "nothing is pinned");
         let terms = ["document".to_string()];
         let before = s.term_stats("body", &terms, s.clock.peek()).unwrap();
-        assert_eq!(before.1, 151, "the memtable still physically holds both versions");
+        assert_eq!(before.1, 146, "the superseded version is already invisible");
 
         s.flush().unwrap();
         assert_eq!(s.segments.len(), 1, "an unpinned seal is one segment, always");
         let after = s.term_stats("body", &terms, s.clock.peek()).unwrap();
         assert_eq!(after.0, 30, "the update superseded a document, it did not add one");
         assert_eq!(after.1, 146, "29 bodies of five terms and the one-term rewrite");
-        assert_eq!(after.2, before.2, "and no document gained or lost the term");
+        assert_eq!(after, before, "and the seal moved nothing");
+    }
+
+    #[test]
+    fn the_length_numerator_matches_a_brute_force_fold_at_every_snapshot() {
+        // The property the two constants above are instances of, and the only
+        // pin in this file that covers *historical* reads. At every timestamp
+        // a write landed at — and either side of it — `term_stats`'s length
+        // sum must equal a fold of `doc_lens` over exactly the ordinals
+        // `visibility(t)` marks live. That is what the numerator of avgdl is
+        // defined to be, and it has to survive a seal and a compaction
+        // unchanged, so the fold is re-run after each with the horizon pinned
+        // below every write: below the retain floor a compaction has already
+        // dropped rows and the equality is only best-effort, and pinning is
+        // how that qualifier is taken off the table.
+        fn fold(s: &Shard, t: Timestamp) -> u64 {
+            let snap = s.snapshot_at(t);
+            let mut total = 0u64;
+            for unit in s.sources(&snap) {
+                let vis = unit.visibility(t);
+                let handle = unit.text_handle("body").unwrap();
+                if let Some(src) = handle.as_ref().and_then(|h| h.source("body")) {
+                    let lens = src.doc_lens();
+                    for o in vis.iter() {
+                        total += lens.get(o as usize).copied().unwrap_or(0) as u64;
+                    }
+                }
+            }
+            total
+        }
+
+        let mut s = shard();
+        let pin = s.clock.peek().max(1);
+        let mut rng = crate::codec::Rng::new(7);
+        let mut stamps: Vec<Timestamp> = Vec::new();
+        let mut live: Vec<usize> = Vec::new();
+        // Counted, not inferred. `live.len() < 120` would be satisfied by
+        // deletes alone — the update arm pushes nothing onto `live` — so it
+        // cannot see whether either arm was taken, and a change to `Rng` or to
+        // the branch weights could silently empty one of them while the guard
+        // stayed green.
+        let (mut ndel, mut nupd) = (0usize, 0usize);
+        for i in 0..120usize {
+            match rng.next_u64() % 4 {
+                0 if live.len() > 4 => {
+                    let k = live.remove(rng.next_u64() as usize % live.len());
+                    s.delete(&format!("t{}{KEY_SEP}d{k:04}", k % 3)).unwrap();
+                    ndel += 1;
+                }
+                1 if !live.is_empty() => {
+                    let k = live[rng.next_u64() as usize % live.len()];
+                    let mut d = doc(k);
+                    d.set_path("body", Value::Str("rewritten ".repeat(1 + k % 4)));
+                    s.insert(d).unwrap();
+                    nupd += 1;
+                }
+                _ => {
+                    s.insert(doc(i)).unwrap();
+                    live.push(i);
+                }
+            }
+            stamps.push(s.clock.peek());
+        }
+        assert!(
+            ndel > 0 && nupd > 0,
+            "the mix has to contain updates and deletes to mean anything: {ndel} deletes, \
+             {nupd} updates"
+        );
+
+        let terms = ["document".to_string(), "rewritten".to_string()];
+        let check = |s: &Shard, stage: &str| {
+            for &ts in &stamps {
+                for t in [ts.saturating_sub(1), ts, ts + 1] {
+                    assert_eq!(
+                        s.term_stats("body", &terms, t).unwrap().1,
+                        fold(s, t),
+                        "{stage}: the numerator disagrees with the fold at {t}"
+                    );
+                }
+            }
+        };
+
+        check(&s, "in the memtable");
+        s.opts.gc_horizon = pin;
+        s.flush().unwrap();
+        check(&s, "after a seal");
+        let copts = crate::compaction::CompactionOpts { tier_fanout: 2, ..Default::default() };
+        crate::compaction::run_to_quiescence(&mut s, &copts, 16).unwrap();
+        assert!(!s.segments.is_empty());
+        check(&s, "after a compaction");
     }
 
     #[test]

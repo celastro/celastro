@@ -6,6 +6,8 @@
 //! any amount of unloading, faulting in, demoting and archiving, the same
 //! query returns the same rows.
 
+use std::collections::BTreeMap;
+
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::lifecycle::{Every, IndexActivity, LifecyclePolicy, Rule, Trigger, Unit};
 use celastro::residency::{ArchivedAccess, Placement, Tier};
@@ -229,6 +231,48 @@ fn unloading_an_idle_index_frees_memory_and_the_next_query_is_unchanged() {
     let after: Vec<String> = db.query(sql).unwrap().rows.iter().map(|r| r.key.clone()).collect();
     assert_eq!(before, after, "unloading is a memory decision, never a correctness one");
     assert!(db.residency().unloads() > 0 && db.residency().loads() > 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_cold_text_index_still_reports_the_right_visible_length() {
+    // The exact-statistics gather reaches the text index through
+    // `text_handle`, so an unloaded component has to be faulted back in rather
+    // than read as "no text on this path" — which would count the segment's
+    // documents towards `num_docs` with no length and no postings, deflating
+    // avgdl and inflating IDF for the whole collection. The numbers must not
+    // depend on residency, and the fault-in has to actually happen.
+    let d = dir("cold-stats");
+    let mut o = DbOpts::default();
+    o.residency.active_idle_unload = Some(std::time::Duration::from_secs(0));
+    o.residency.cached_idle_unload = std::time::Duration::from_secs(0);
+    let mut db = Db::open(&d, o).unwrap();
+    setup(&mut db, 400);
+    // Deleted rows make the visible length differ from the physical one, which
+    // is the quantity residency could plausibly disturb.
+    for i in (0..400).step_by(5) {
+        db.delete_key("items", &format!("d-{i:04}")).unwrap();
+    }
+
+    let want = BTreeMap::from([("body".to_string(), vec!["postings".to_string()])]);
+    let ts = db.clock.peek();
+    let hot = db.gather_stats("items", &want, ts, true).unwrap();
+    assert_eq!(hot["body"].num_docs, 320, "400 written, one in five deleted");
+    assert!(components(&db).iter().any(|c| c.starts_with("text:")), "the gather decoded it");
+
+    let msg = ack(&mut db, "UNLOAD IDLE ON items");
+    assert!(!components(&db).iter().any(|c| c.starts_with("text:")), "{msg}");
+    let loads = db.residency().loads();
+
+    let cold = db.gather_stats("items", &want, ts, true).unwrap();
+    assert!(db.residency().loads() > loads, "the gather faults the text index back in");
+    assert_eq!(cold["body"].num_docs, hot["body"].num_docs);
+    assert_eq!(
+        cold["body"].avg_doc_len.to_bits(),
+        hot["body"].avg_doc_len.to_bits(),
+        "a statistic is not a residency decision"
+    );
+    assert_eq!(cold["body"].doc_freq, hot["body"].doc_freq);
     let _ = std::fs::remove_dir_all(&d);
 }
 

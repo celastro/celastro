@@ -82,6 +82,43 @@ impl Default for DbOpts {
     }
 }
 
+/// The periodically refreshed global statistics of §8.2. All three numbers —
+/// `num_docs`, `total_doc_len` and `doc_freq` — are counted over *physical*
+/// rows, tombstones and superseded versions included, and that uniformity is
+/// the point: it is what makes them mutually coherent. `doc_freq` counts
+/// postings within the same units `num_docs` counts rows of, so
+/// `doc_freq[t] <= num_docs` holds by construction, and BM25's IDF therefore
+/// cannot go negative on this path. Masking one half alone would buy a live
+/// `avgdl` at the price of that invariant, trading a bounded, monotone,
+/// ranking-preserving error in the length norm for a sign flip in the term
+/// weight — every document holding the term ranking *below* every document
+/// that does not.
+///
+/// The two approximations that remain are different in kind and only one of
+/// them converges. Staleness — up to [`STATS_REFRESH_WRITES`] writes behind —
+/// is what §8.2 licenses: a fresh cache has none of it. Counting dead rows
+/// does not converge; it grows without bound as tombstones accumulate, and it
+/// lands in both halves of BM25 here: `doc_freq` over-counts, so IDF is
+/// deflated, and `total_doc_len / num_docs` is an average over physical rather
+/// than live rows, so the length norm is rescaled. Both also leave
+/// default-mode scores dependent on the shard count, because
+/// `TextSource::all_terms` on a sealed source reports the doc frequency baked
+/// into the dictionary at build time, which moves with flush and compaction
+/// timing. `WITH (exact_scoring)` is the documented way to buy all of that
+/// off; [`Shard::term_stats`] masks all three numbers at one snapshot, so the
+/// exact triple is a function of the live corpus alone.
+///
+/// The alternative considered and rejected was to mask the cache too. Masking
+/// the length sum is cheap — one visibility bitmap and one masked sum per
+/// unit — but masking `doc_freq` with it, which coherence would then require,
+/// replaces an O(#distinct terms) read of dictionary counts with an
+/// O(#postings) cursor walk carrying a visibility test per posting. Measured
+/// at 13-19x the current refresh on corpora of 50k-200k documents, and the
+/// cost scales with the corpus rather than with the write volume that
+/// triggers it, so it does not amortize away. It would land as a stall on the
+/// first default-mode text query after every [`STATS_REFRESH_WRITES`] writes
+/// — `refresh_stats_if_stale` runs on the query path, not the write path —
+/// which is precisely the latency this cache exists to avoid.
 #[derive(Debug, Clone, Default)]
 struct CachedStats {
     num_docs: u64,
@@ -474,9 +511,12 @@ impl Db {
     ///
     /// `exact` performs the two-phase gather: ask every shard for the document
     /// frequency of exactly these terms, counting only postings visible at the
-    /// snapshot. Otherwise the cached, periodically refreshed numbers are used —
-    /// stale, and counting tombstones, which is precisely the approximation the
-    /// design accepts by default.
+    /// snapshot, and dividing a visible length sum by a visible document count.
+    /// Otherwise the cached, periodically refreshed numbers are used — stale,
+    /// and counted over physical rows so that they count tombstones, which is
+    /// precisely the approximation the design accepts by default. See
+    /// [`CachedStats`] for where that residual error lands in BM25 and why the
+    /// cache counts uniformly rather than masking one number of the three.
     pub fn gather_stats(
         &mut self,
         collection: &str,
@@ -546,10 +586,20 @@ impl Db {
             return Ok(());
         }
         let mut c = CachedStats { refreshed_at_writes: self.writes, ..Default::default() };
-        let ts = self.clock.peek();
         for s in self.shards(collection)? {
-            let snap = s.snapshot_at(ts);
+            // No pinned read timestamp: `Shard::sources` returns every unit in
+            // the snapshot whatever its `ts`, and the counts below are over
+            // physical rows, so there is nothing here for a timestamp to
+            // select. Threading one in would only suggest these numbers were
+            // as-of something, which is the misreading that makes a masked
+            // `num_docs` look safe.
+            let snap = s.snapshot();
             for unit in s.sources(&snap) {
+                // All three numbers are over physical rows, which is what
+                // keeps them mutually coherent — see [`CachedStats`]. Masking
+                // one alone would be worse than masking none: a live
+                // `num_docs` under a physical `doc_freq` makes `df > n`
+                // reachable, and that is a sign flip in IDF, not a rescaling.
                 c.num_docs += unit.num_docs() as u64;
                 let handle = unit.text_handle(path)?;
                 if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
@@ -1549,6 +1599,105 @@ mod tests {
         assert!(shards[1].memtable.is_empty(), "the second shard had nothing to seal");
         assert!(shards[1].segments.is_empty());
         assert_eq!(flushed, 1, "one shard sealed: not two segments, and not two shards");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cached_statistics_sum_over_every_unit_of_every_shard() {
+        // The only test in the tree that asserts on the cached statistics
+        // path, and it has to carry the whole of it: three shards, and two
+        // non-empty units in each (a sealed segment and a live memtable), so
+        // that `refresh_stats_if_stale`'s accumulation is constrained per unit
+        // AND per shard. With one shard and one contributing unit — what the
+        // path used to be tested with — `+=` and `=` are indistinguishable,
+        // and so is "read the first shard and stop".
+        //
+        // The numbers are absolute, not compared against a second gather.
+        // Comparing the cached triple against the exact one pins only that
+        // they agree, and a mutation that moves both is invisible to it.
+        //
+        // Every number here is over PHYSICAL rows, tombstones and superseded
+        // versions included, which is what [`CachedStats`] documents and what
+        // keeps `doc_freq <= num_docs` true by construction. That invariant is
+        // the point of the last assertion: it is what makes IDF non-negative
+        // on this path, and its absence inverts BM25 rather than blurring it.
+        let dir = tmp("cached-stats-sum");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute(
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['n0300', 'n0600'])",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        // `alpha` and `zeta` are terms the english analyzer leaves alone, so
+        // the key the dictionary holds is the key the gather asks for.
+        let note = |id: String, body: String| {
+            Value::obj(vec![("id".into(), Value::Str(id)), ("body".into(), Value::Str(body))])
+        };
+        // 900 rows spread evenly over the three shards by the split points,
+        // then sealed, so every shard owns exactly one segment.
+        for i in 0..900usize {
+            let body = if i % 5 == 0 { "alpha zeta" } else { "alpha" };
+            db.insert("notes", note(format!("n{i:04}"), body.into())).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        // 300 more, keyed to interleave with the first batch rather than to
+        // sort past its end, so all three memtables take rows. No flush: this
+        // is the second non-empty unit each shard needs.
+        for i in (0..900usize).step_by(3) {
+            db.insert("notes", note(format!("n{i:04}x"), "alpha".into())).unwrap();
+        }
+        // And tombstones, so the cache is exercised over a corpus whose
+        // physical rows and live rows have parted company.
+        for i in (0..900usize).step_by(11) {
+            db.delete_key("notes", &format!("n{i:04}")).unwrap();
+        }
+
+        let shards = db.shards("notes").unwrap();
+        assert_eq!(shards.len(), 3, "the two split points make three shards");
+        for (i, s) in shards.iter().enumerate() {
+            assert_eq!(s.segments.len(), 1, "shard {i} sealed exactly one segment");
+            assert!(!s.memtable.is_empty(), "shard {i} also carries live memtable rows");
+        }
+
+        let want =
+            BTreeMap::from([("body".to_string(), vec!["alpha".to_string(), "zeta".to_string()])]);
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want, ts, false).unwrap();
+        let g = &g["body"];
+        assert!(!g.exact, "this is the cached path");
+
+        // Absolute, and every one of them is a sum the refresh has to get
+        // right across six units and three shards.
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            c.num_docs, 1200,
+            "900 sealed rows and 300 memtable rows; a delete of a sealed row lands in the \
+             delete set, not as a new physical row, so the tombstones add nothing here"
+        );
+        assert_eq!(
+            c.total_doc_len, 1380,
+            "in the segments 180 two-term bodies and 720 one-term ones, and 300 one-term \
+             bodies in the memtables"
+        );
+        assert_eq!(c.doc_freq["alpha"], 1200, "every physical row holds it");
+        assert_eq!(c.doc_freq["zeta"], 180, "and one row in five of the sealed batch");
+
+        assert_eq!(g.num_docs, 1200);
+        assert_eq!(g.avg_doc_len.to_bits(), (1380.0f64 / 1200.0).to_bits());
+        // The invariant the uniformity buys, and the reason it is worth
+        // buying: `doc_freq` is counted over the same physical rows
+        // `num_docs` counts, so it can never exceed it, and IDF's logarithm
+        // therefore never takes an argument below one. Under heavy deletes a
+        // masked `num_docs` over an unmasked `doc_freq` breaks exactly this,
+        // and a negative IDF does not blur the ranking, it reverses it.
+        for (t, df) in &g.doc_freq {
+            assert!(*df <= g.num_docs, "df({t}) = {df} exceeds num_docs = {}", g.num_docs);
+            assert!(g.idf(t) > 0.0, "idf({t}) = {} is not positive", g.idf(t));
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

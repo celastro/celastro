@@ -4,8 +4,10 @@
 //! |---|---|
 //! | hybrid queries provably correct; harness trusted | [`hybrid_retrieval_is_a_union_of_all_three_modes`], [`the_recall_harness_catches_a_deliberate_regression`] |
 //! | recall@10 ≥ 0.95 under sustained deletes | [`recall_at_10_holds_under_sustained_deletes`] |
-//! | in exact mode, results bit-identical regardless of shard count | [`exact_mode_is_bit_identical_across_shard_counts`] |
+//! | in exact mode, results bit-identical regardless of shard count | [`exact_mode_is_bit_identical_across_shard_counts`], [`exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`], [`exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`] |
 //! | state survives a reopen | [`a_database_survives_reopen`] |
+
+use std::collections::BTreeMap;
 
 use celastro::codec::Rng;
 use celastro::engine::{Db, DbOpts, Outcome};
@@ -439,6 +441,156 @@ fn exact_mode_is_bit_identical_across_shard_counts() {
 
     let one = run(&[]);
     let three = run(&["t1", "t2"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+    assert_eq!(one.len(), 20);
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+}
+
+#[test]
+fn exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes() {
+    // The primary pin for the exact-mode invariant, asserted on the statistic
+    // itself rather than through a fused score. The test above cannot see a
+    // BM25 statistic at all — see the comment on it — so a shard-count
+    // dependent `avg_doc_len` sat under a green suite. Here the quantity is
+    // compared directly, by bits.
+    //
+    // Updates and deletes are both needed, because they are what makes a
+    // physical row differ from a live one: a seal drops a version the write
+    // path had already superseded, a compaction drops a deleted one, and each
+    // shard reaches its own threshold at its own moment. A statistic summed
+    // over physical rows therefore acquires a dependency on the shard count,
+    // which is exactly what this asserts is absent.
+    let dims = 16;
+    let n = 900;
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        // Small enough that the shards seal at their own pace rather than all
+        // holding everything in one memtable until the final `FLUSH`.
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        for i in 0..n {
+            let d = c.doc(i);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(7) {
+            let mut d = c.doc(i);
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete_key("items", &format!("t{}\u{1}doc-{i:05}", i % 3)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+
+        let want = BTreeMap::from([(
+            "body".to_string(),
+            vec!["fusion".to_string(), "traversal".to_string()],
+        )]);
+        let ts = db.clock.peek();
+        let s = db.gather_stats("items", &want, ts, true).unwrap();
+        let g = &s["body"];
+        // By bits: an average is a float, and "identical" has to mean it.
+        (g.num_docs, g.avg_doc_len.to_bits(), g.doc_freq.clone())
+    };
+
+    let one = run(&[]);
+    let three = run(&["t1", "t2"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+    // An absolute anchor first, because the three legs are otherwise compared
+    // only against each other. `Db::gather_stats` answers `(0, bits of 1.0,
+    // {})` when it finds no documents, so a change that made the analyzed
+    // dictionary stop matching these terms, or made `text_handle` quietly
+    // return `None`, would agree at every shard count and pass green.
+    assert_eq!(one.0, 818, "900 written, one in eleven deleted");
+    assert_eq!(
+        one.2,
+        BTreeMap::from([("fusion".to_string(), 258u64), ("traversal".to_string(), 140)]),
+        "both terms are really in the corpus, at their real frequencies"
+    );
+    assert!(
+        f64::from_bits(one.1) > 2.0,
+        "and the length norm is a real average, not the num_docs == 0 fallback of 1.0"
+    );
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+}
+
+#[test]
+fn exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes() {
+    // The sibling the test above needed, and the reason it needed one: that
+    // test pins fusion and `k'`, which is what it is good for, but it is
+    // structurally blind to BM25. Three changes had to be made before a
+    // length-norm shift could reach an assertion at all, and all three are
+    // load-bearing — drop any one and this test passes with the bug present:
+    //
+    //   * `method => 'linear'`. RRF scores by rank, so a uniform score shift
+    //     is invisible unless it flips one, and it never did.
+    //   * per-document length variance. `plan::fusion::fuse` min-max
+    //     normalises each source over the merged candidate set, and
+    //     `Corpus::doc` draws bodies from five templates — with a handful of
+    //     distinct lengths, normalisation maps the shifted scores straight
+    //     back onto the same bits.
+    //   * updates, deletes and a small `max_bytes`. With no dead row there is
+    //     nothing for a physical-row sum to over-count, and with every shard
+    //     holding everything until the final `FLUSH` the over-count would be
+    //     the same at every shard count anyway.
+    //   * where the splits fall. This is the fourth ingredient and the most
+    //     fragile one: with the fix reverted and the three-way split taken on
+    //     tenant boundaries alone (`["t1", "t2"]`), the 1-vs-3 leg PASSED and
+    //     only the 1-vs-6 leg fired — min-max normalisation in
+    //     `plan::fusion::fuse` absorbed the shift for that particular split.
+    //     Cutting the second boundary through the middle of a tenant instead
+    //     gives the two shard sets genuinely different seal schedules over the
+    //     same keys, and both legs then discriminate. Verified by reverting
+    //     `src/shard.rs`'s `visible_doc_len` call and watching the 1-vs-3
+    //     assertion fail on the last five rows.
+    let dims = 16;
+    let n = 900;
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        let varied = |c: &mut Corpus, i: usize| {
+            let mut d = c.doc(i);
+            let base = d.path("body").unwrap().as_str().unwrap().to_string();
+            let filler = "padding ".repeat(1 + i % 9);
+            d.set_path("body", Value::Str(format!("{base} {filler}")));
+            d
+        };
+        for i in 0..n {
+            let d = varied(&mut c, i);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(7) {
+            let mut d = varied(&mut c, i);
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete_key("items", &format!("t{}\u{1}doc-{i:05}", i % 3)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        let q = vec_literal(&c.query_near(2, 0.03));
+        // Same `k` guard as the test above, for the same reason.
+        let sql = format!(
+            "SELECT id FROM items \
+             ORDER BY hybrid(text_match(body, 'fusion candidates traversal'), embedding <=> {q}, \
+                             method => 'linear', k => 100000) \
+             LIMIT 20 WITH (exact, exact_scoring)"
+        );
+        let r = db.query(&sql).unwrap();
+        r.rows.iter().map(|x| (x.key.clone(), x.score.unwrap().to_bits())).collect::<Vec<_>>()
+    };
+
+    let one = run(&[]);
+    let three = run(&["t1", "t2\u{1}doc-00450"]);
     let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
     assert_eq!(one.len(), 20);
     assert_eq!(one, three, "1 shard vs 3 shards");

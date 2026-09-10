@@ -131,6 +131,41 @@ impl Bitmap {
         (0..n).map(|i| (self.words[i] & other.words[i]).count_ones() as usize).sum()
     }
 
+    /// Sum of `vals` over the ordinals this bitmap marks set.
+    ///
+    /// Word-wise rather than one `get` per ordinal: an all-ones word is the
+    /// common case in a segment with few deletes, and summing its 64 lengths
+    /// as a slice keeps that case at the speed of the unmasked sum it
+    /// replaces. `vals` shorter than the bitmap contributes zero past its end
+    /// — `doc_lens` is ordinal-dense, because `InvertedBuilder::add_doc` pads
+    /// with zeros up to `ord` for every document, so the short case only
+    /// arises from a segment with no doclens region at all — the
+    /// `unwrap_or_default` in `Segment::text_index`. It is a silent contract all
+    /// the same: a future sparse or skip-encoded length store would
+    /// under-count here rather than fail.
+    pub fn masked_sum(&self, vals: &[u32]) -> u64 {
+        let mut total = 0u64;
+        for (wi, &w) in self.words.iter().enumerate() {
+            if w == 0 {
+                continue;
+            }
+            let base = wi * 64;
+            if w == !0u64 && base + 64 <= vals.len() {
+                total += vals[base..base + 64].iter().map(|&v| v as u64).sum::<u64>();
+                continue;
+            }
+            let mut cur = w;
+            while cur != 0 {
+                let b = cur.trailing_zeros() as usize;
+                cur &= cur - 1;
+                if let Some(&v) = vals.get(base + b) {
+                    total += v as u64;
+                }
+            }
+        }
+        total
+    }
+
     pub fn iter(&self) -> BitmapIter<'_> {
         BitmapIter { bm: self, word: 0, cur: if self.words.is_empty() { 0 } else { self.words[0] } }
     }
@@ -209,6 +244,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn masked_sum_matches_a_naive_loop() {
+        // Including the cases the word-wise fast path exists to get wrong: a
+        // full word that runs past the end of `vals` must not take the slice
+        // branch, and a final word with bits beyond `len` must not contribute.
+        for len in [0usize, 1, 63, 64, 65, 129, 200] {
+            let patterns: Vec<Bitmap> = vec![
+                Bitmap::new(len),
+                Bitmap::all(len),
+                Bitmap::from_sorted(len, (0..len as u32).filter(|i| i % 2 == 0)),
+                Bitmap::from_sorted(len, (0..len as u32).filter(|i| i + 1 == len as u32)),
+                Bitmap::from_sorted(len, (0..len as u32).skip(len.saturating_sub(3))),
+            ];
+            for b in &patterns {
+                for vlen in [0usize, len / 2, len, len + 7] {
+                    // Two magnitudes, because the fast path and the slow path
+                    // reach the same total by different arithmetic: the slow
+                    // one widens each element to u64 before adding, the fast
+                    // one sums a whole word's worth at once. Only wide values
+                    // can tell them apart — a full word of these overflows 32
+                    // bits, so a fast path that accumulated narrowly and
+                    // widened at the end would disagree here and nowhere in
+                    // the small-value cases below it.
+                    for scale in [1u32, u32::MAX / 20] {
+                        let vals: Vec<u32> =
+                            (0..vlen).map(|i| ((i as u32 % 17) + 1) * scale).collect();
+                        let want: u64 = (0..len)
+                            .filter(|i| b.get(*i))
+                            .map(|i| vals.get(i).copied().unwrap_or(0) as u64)
+                            .sum();
+                        assert_eq!(b.masked_sum(&vals), want, "len={len} vlen={vlen} x{scale}");
+                    }
+                }
+            }
+        }
+        // The same asymmetry stated as a single fact, at the widest input the
+        // element type admits: `total` is u64 and every branch has to reach it
+        // that way.
+        assert_eq!(
+            Bitmap::all(64).masked_sum(&[u32::MAX; 64]),
+            64 * u32::MAX as u64,
+            "the word-wise fast path must widen before it adds"
+        );
+        // `masked_sum` reads whole words, so it inherits rather than
+        // re-checks the tail invariant: every constructor clears the bits of
+        // the final word that sit beyond `len`, and a stray one there would
+        // silently add a document length that does not exist.
+        let vals: Vec<u32> = vec![1; 128];
+        assert_eq!(Bitmap::all(70).masked_sum(&vals), 70, "no bit past `len` contributes");
     }
 
     #[test]

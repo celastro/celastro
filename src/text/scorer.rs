@@ -46,9 +46,50 @@ pub struct GlobalStats {
 }
 
 impl GlobalStats {
+    /// IDF for a term the coordinator gathered a global `df` for. A term it
+    /// never saw has `df == 0`, the most informative a term can be, which is
+    /// the right answer for a term that occurs nowhere and is scored nowhere.
     pub fn idf(&self, term: &str) -> f32 {
-        let n = self.num_docs.max(1) as f64;
-        let df = self.doc_freq.get(term).copied().unwrap_or(0) as f64;
+        self.idf_for_df(self.doc_freq.get(term).copied().unwrap_or(0))
+    }
+
+    /// BM25's IDF against an externally supplied `df`, for the one caller that
+    /// has a document frequency the coordinator did not gather (prefix
+    /// expansion, see `build`).
+    ///
+    /// `num_docs` is taken from `self` rather than passed alongside `doc_freq`,
+    /// and that is the entire point of the signature. Two adjacent `u64`
+    /// parameters that nothing type-checks against each other are a trap: the
+    /// arguments are interchangeable to the compiler, and exchanging them is
+    /// silent — the result stays finite and positive, and even keeps rare
+    /// terms above common ones, so it fails no smoke test while collapsing the
+    /// weight of a term in 1 of 1000 documents from 6.50 to 0.29. One
+    /// parameter has no order to get wrong. It also states the invariant this
+    /// file exists to hold (§8.2): the document count always comes from the
+    /// query's global statistics, never from a segment.
+    ///
+    /// The `df` is clamped to `num_docs`, so the log's argument never falls
+    /// below one and the result is never negative.
+    ///
+    /// The clamp is not a guard against a caller's mistake, it is what the
+    /// formula means at the boundary. IDF measures how much seeing a term
+    /// narrows the collection down; a term in every document narrows it down
+    /// by nothing, so `df == n` is the least informative a term can be and
+    /// `ln(1 + 0.5/(n+0.5))` is the smallest value the formula can
+    /// legitimately produce. "More documents hold the term than exist" is not
+    /// more extreme than that, it is not a quantity at all — and the
+    /// unclamped formula answers it by turning the score negative, which does
+    /// not make the term merely uninformative, it makes every document that
+    /// contains it rank *below* every document that does not.
+    ///
+    /// `df > n` reaches here whenever the two numbers come from different
+    /// corpora: a prefix expansion has no global `df` and mixes the segment's
+    /// own against the collection's `num_docs`, and any statistics source that
+    /// counts postings and documents at different instants can do the same.
+    pub fn idf_for_df(&self, doc_freq: u64) -> f32 {
+        let n = self.num_docs.max(1);
+        let df = doc_freq.min(n) as f64;
+        let n = n as f64;
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln() as f32
     }
 }
@@ -634,20 +675,16 @@ fn build<'a>(
                     // the coordinator to gather df for the expanded terms, which
                     // cannot be decided here.
                     //
-                    // The floor is load-bearing, not cosmetic. A `num_docs`
-                    // smaller than the local df — a stale statistics cache, or a
-                    // segment newer than the gather — drives the log negative,
-                    // and with a non-positive `max_score` the pivot loop in
+                    // The clamp inside `idf` is load-bearing here, not
+                    // cosmetic. A `num_docs` smaller than the local df — a
+                    // stale statistics cache, or a segment newer than the
+                    // gather — would drive the log negative, and with a
+                    // non-positive `max_score` the pivot loop in
                     // `DisjunctionScorer::advance` (which needs `sum >
                     // threshold`, and the threshold starts at zero) never finds
                     // a pivot at all: the prefix query returns nothing instead of
-                    // returning its matches cheaply ranked. The floor is the idf
-                    // the formula gives a term that occurs in every document,
-                    // which is the smallest value it can legitimately produce.
-                    let nd = stats.num_docs.max(1) as f64;
-                    let df = src.doc_freq(t).max(1) as f64;
-                    let floor = (1.0 + 0.5 / (nd + 0.5)).ln() as f32;
-                    ((1.0 + (nd - df + 0.5) / (df + 0.5)).ln() as f32).max(floor)
+                    // returning its matches cheaply ranked.
+                    stats.idf_for_df(src.doc_freq(t) as u64)
                 };
                 kids.push(Box::new(TermScorer::new(cur, idf, src.doc_lens(), avgdl, params)));
             }
@@ -684,7 +721,9 @@ fn build<'a>(
                 });
             }
             // A phrase is at most as frequent as its rarest term, so its idf is
-            // at least the maximum of its terms'.
+            // at least the maximum of its terms'. The `0.0` seed was a second
+            // hand-rolled floor against a negative term idf; `idf`'s clamp
+            // makes it inert, and it stays only as the identity of `max`.
             let idf = terms.iter().map(|t| stats.idf(t)).fold(0.0f32, f32::max);
             Built {
                 scorer: Some(Box::new(PhraseScorer::new(
@@ -1185,6 +1224,112 @@ mod tests {
         let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 4);
         assert_eq!(got.len(), 4);
         assert!(got.iter().all(|h| h.score > 0.0), "{got:?}");
+    }
+
+    /// `df > num_docs` is not a hypothetical: the statistics cache counts
+    /// tombstoned postings, so a term that every live document holds can be
+    /// reported more often than there are documents. Unclamped, the log's
+    /// argument drops below one and every document holding the term ranks
+    /// *below* every document that does not — BM25 run backwards. Clamped, the
+    /// term lands where a term in every document belongs: informative of
+    /// nothing, but still worth more than absence.
+    #[test]
+    fn idf_is_never_negative_however_incoherent_the_statistics() {
+        let floor = |n: u64| (1.0f64 + 0.5 / (n.max(1) as f64 + 0.5)).ln() as f32;
+        let idf =
+            |n: u64, df: u64| GlobalStats { num_docs: n, ..Default::default() }.idf_for_df(df);
+        for n in [0u64, 1, 2, 40, 1_000, u32::MAX as u64] {
+            for df in [0u64, 1, n / 2, n, n + 1, n * 3 + 7, u64::MAX] {
+                let v = idf(n, df);
+                assert!(v.is_finite() && v > 0.0, "idf({n}, {df}) = {v}");
+                assert!(v >= floor(n), "idf({n}, {df}) = {v} is below the every-document floor");
+            }
+            // And the clamp is exactly the floor the prefix branch used to
+            // compute by hand, to the bit, so it changes no score that was
+            // already well defined.
+            assert_eq!(idf(n, n + 1).to_bits(), floor(n).to_bits());
+        }
+    }
+
+    /// What the formula's shape does not pin is which count is which.
+    /// `num_docs` and `doc_freq` are both document counts, so an implementation
+    /// that exchanges them still returns something finite, positive, and even
+    /// still ordered: the clamp turns every exchanged call into the
+    /// every-document floor of `df`, which falls as `df` rises, so rare terms
+    /// keep beating common ones and "a rarer term scores higher" catches
+    /// nothing. The collection axis is what an exchange destroys — exchanged,
+    /// `num_docs` reaches the formula only through the clamp, so widening the
+    /// collection around a fixed `df` stops changing the answer. That is the
+    /// second assertion, and it is the one that fails.
+    #[test]
+    fn idf_rises_with_the_collection_and_falls_with_the_term() {
+        let st = |n: u64| GlobalStats { num_docs: n, ..Default::default() };
+        // A term is worth less the more of the collection holds it.
+        assert!(st(1_000).idf_for_df(1) > st(1_000).idf_for_df(900));
+        // And worth more the more documents could have held it and did not.
+        assert!(
+            st(1_000).idf_for_df(1) > st(10).idf_for_df(1),
+            "1 of 1000 documents ({}) must outweigh 1 of 10 ({})",
+            st(1_000).idf_for_df(1),
+            st(10).idf_for_df(1),
+        );
+    }
+
+    /// A prefix expansion scores each expanded term against the *segment's*
+    /// df, because `TextQuery::leaf_terms` skips `Prefix` and the coordinator
+    /// therefore gathers no global df for any of them (§8.2). Reaching for the
+    /// global map anyway is not a smaller mistake than it sounds: every
+    /// expanded term misses, every miss is `df == 0`, and `df == 0` is the
+    /// maximum idf — so the whole expansion is weighted identically and the
+    /// ranking within it collapses to term frequency.
+    ///
+    /// Here `alphabet` holds 1 document of 10 and `alpha` holds 8, so the one
+    /// document with the rare term must beat the document that repeats the
+    /// common one three times. Against a global df it loses to it instead.
+    ///
+    /// This pins the *choice of df*, not the cross-shard consequence: prefix
+    /// scores still are not comparable between shards, and making them so
+    /// needs the coordinator to gather df for expanded terms — a separate
+    /// backlog item, not something this file can decide.
+    #[test]
+    fn a_prefix_expansion_ranks_by_each_terms_own_document_frequency() {
+        const DOCS: &[&str] = &[
+            "alpha alpha alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alphabet",
+            "unrelated",
+        ];
+        let mut b = InvertedBuilder::new();
+        for (i, d) in DOCS.iter().enumerate() {
+            let mut toks = Vec::new();
+            Analyzer::English.analyze(d, 0, &mut toks);
+            b.add_doc(i as u32, &toks);
+        }
+        let (dict, post, _) = b.finish();
+        let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
+        let lens = b.doc_lens.clone();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        assert_eq!((src.doc_freq("alpha"), src.doc_freq("alphabet")), (8, 1));
+
+        // An empty `doc_freq` is not a contrivance: it is exactly what a
+        // prefix query gets, since its terms are never gathered.
+        let st = GlobalStats {
+            num_docs: DOCS.len() as u64,
+            avg_doc_len: src.total_doc_len() as f64 / DOCS.len() as f64,
+            doc_freq: Default::default(),
+            exact: false,
+        };
+        let q = TextQuery::parse("alpha*", Analyzer::English).unwrap();
+        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 2);
+        assert_eq!(got[0].ord, 8, "expected the rare expanded term to win: {got:?}");
+        assert_eq!(got[1].ord, 0, "{got:?}");
     }
 
     #[test]

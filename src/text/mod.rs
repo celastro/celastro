@@ -176,6 +176,15 @@ impl<'a> TextSource<'a> {
         self.doc_lens().iter().map(|&l| l as u64).sum()
     }
 
+    /// Sum of document lengths over the ordinals `vis` marks visible, which is
+    /// the numerator of BM25's `avgdl` at that snapshot. `total_doc_len` is
+    /// the same sum over *physical* rows: pair it only with a physical
+    /// document count, because over a masked denominator it gives the average
+    /// of a corpus that does not exist.
+    pub fn visible_doc_len(&self, vis: &crate::bitmap::Bitmap) -> u64 {
+        vis.masked_sum(self.doc_lens())
+    }
+
     /// Local document frequency. The scorer uses *global* statistics for `idf`
     /// (§8.2); this is only for planning and for the exact-statistics gather.
     pub fn doc_freq(&self, term: &str) -> u32 {
