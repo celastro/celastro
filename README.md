@@ -464,8 +464,14 @@ Bug reports and patches are welcome. Two conventions the tree follows:
 - **No dependencies outside `std`.** This is the point of the project, not an
   accident of the environment.
 
-`cargo test` before opening a pull request. `cargo fmt` and `cargo clippy
---all-targets -- -D warnings` are both run in CI.
+Before a change lands: `cargo test`, `cargo fmt --all -- --check`, and
+`cargo clippy --all-targets -- -D warnings`. A change also has to build on the
+crate's declared `rust-version`, and must not rewrite `Cargo.lock` — a lockfile
+written in a format that floor cannot parse makes the floor a lie.
+
+These are gates, not suggestions, but they are enforced by the maintainer's
+build rather than by anything in this repository. Nothing here will run them for
+you, so run them yourself.
 
 ---
 

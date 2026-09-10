@@ -36,8 +36,8 @@ soft "no" that becomes yes for a good enough diff. It is structural:
   free of outside copyright keeps relicensing and dual-licensing decisions
   simple, and there is no mechanism here for negotiating that per contributor.
 
-A PR opened from a fork will be closed automatically with a pointer to this
-file. That is a policy response, not a review.
+A PR opened from a fork will be closed with a pointer to this file. That is a
+policy response, not a review.
 
 ## Your fork
 
