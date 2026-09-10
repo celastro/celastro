@@ -552,18 +552,40 @@ impl Db {
                     },
                 );
             } else {
+                // The key is computed before the refresh so that the `&mut
+                // self` borrow ends with it, leaving the cached entry readable
+                // by reference below. Nothing else in this arm needs `&mut
+                // self`, and reading it by reference is the whole point:
+                // `doc_freq` is the collection's entire vocabulary, and a
+                // query wants the handful of terms it asked for. Cloning it
+                // here cost 3.6 ms per query at 50k documents and 16.7 ms at
+                // 200k — more than the exact gather this cache exists to
+                // avoid.
+                let key = cache_key(collection, path);
                 self.refresh_stats_if_stale(collection, path)?;
-                let c = self.stats.get(&cache_key(collection, path)).cloned().unwrap_or_default();
-                let mut df = BTreeMap::new();
-                for t in terms {
-                    df.insert(t.clone(), c.doc_freq.get(t).copied().unwrap_or(0));
-                }
+                // `refresh_stats_if_stale` inserts an entry whenever one is
+                // missing, so `None` is unreachable; it is still spelled out,
+                // and with the same all-zero defaults the previous
+                // `unwrap_or_default()` produced, so that a future early
+                // return from the refresh cannot turn into a panic here.
+                let (num_docs, total_doc_len, df): (u64, u64, BTreeMap<String, u64>) =
+                    match self.stats.get(&key) {
+                        Some(c) => (
+                            c.num_docs,
+                            c.total_doc_len,
+                            terms
+                                .iter()
+                                .map(|t| (t.clone(), c.doc_freq.get(t).copied().unwrap_or(0)))
+                                .collect(),
+                        ),
+                        None => (0, 0, terms.iter().map(|t| (t.clone(), 0)).collect()),
+                    };
                 out.insert(
                     path.clone(),
                     GlobalStats {
-                        num_docs: c.num_docs,
-                        avg_doc_len: if c.num_docs > 0 {
-                            c.total_doc_len as f64 / c.num_docs as f64
+                        num_docs,
+                        avg_doc_len: if num_docs > 0 {
+                            total_doc_len as f64 / num_docs as f64
                         } else {
                             1.0
                         },
