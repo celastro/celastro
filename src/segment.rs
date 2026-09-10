@@ -891,6 +891,37 @@ pub struct SegmentBuilder {
     opts: BuildOpts,
 }
 
+/// Split documents into one layer per version depth: the newest version of a
+/// key in layer 0, the one it superseded in layer 1, and so on. This is the
+/// inverse of the dedup in [`SegmentBuilder::build`] — a caller holding two
+/// versions of a key that a pinned horizon still needs builds one segment per
+/// layer, because one segment holds one version per key.
+///
+/// The sort is part of the contract, not a convenience: the depth is counted by
+/// comparing each document with its immediate predecessor, so it is only right
+/// on input ordered by `(sort_key ASC, commit_ts DESC)`, and callers hand these
+/// documents over in whatever order they happened to be stored in.
+pub(crate) fn layer_by_version(mut docs: Vec<PendingDoc>) -> Vec<Vec<PendingDoc>> {
+    docs.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then(b.commit_ts.cmp(&a.commit_ts)));
+    let mut layers: Vec<Vec<PendingDoc>> = Vec::new();
+    let mut depth = 0;
+    for pd in docs {
+        // Compare against the document just placed — `depth` still holds where
+        // it went, so it is the last element of that layer. Keeping the key
+        // itself instead would mean cloning one per document, on a path that
+        // runs over every flush and every compaction input.
+        depth = match layers.get(depth).and_then(|l| l.last()) {
+            Some(prev) if prev.sort_key == pd.sort_key => depth + 1,
+            _ => 0,
+        };
+        while layers.len() <= depth {
+            layers.push(Vec::new());
+        }
+        layers[depth].push(pd);
+    }
+    layers
+}
+
 impl SegmentBuilder {
     pub fn new(opts: BuildOpts) -> SegmentBuilder {
         SegmentBuilder { docs: Vec::new(), opts }

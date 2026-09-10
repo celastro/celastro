@@ -662,6 +662,23 @@ pub struct ShardOpts {
     pub placement: Placement,
 }
 
+/// What a seal wrote. The ids are ascending, so the last is the segment
+/// holding the surviving version of every key. `segment_ids` is empty when a
+/// pinned horizon's drain collected every row — the memtable was still sealed,
+/// the manifest still moved and the WAL was still truncated, which is why
+/// "sealed nothing" cannot be spelled `None`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    pub segment_ids: Vec<u64>,
+}
+
+impl Sealed {
+    /// The segment holding the surviving version of every key this seal wrote.
+    pub fn newest(&self) -> Option<u64> {
+        self.segment_ids.last().copied()
+    }
+}
+
 pub struct Shard {
     pub coll: Collection,
     /// This shard's half-open key range `[lo, hi)`, from the tablet map.
@@ -684,6 +701,18 @@ pub struct Shard {
     /// metrics of §12.1.
     pub flushes: u64,
     pub compactions: u64,
+    /// The horizon the last version-collecting operation actually ran at,
+    /// maxed over every flush and compaction since this shard was opened. At
+    /// or above it nothing has been collected; below it a snapshot read may
+    /// have lost versions it could once see. Process-local, like the flush and
+    /// compaction counters: a reopened shard starts at zero.
+    ///
+    /// It is also the only place the collection is visible, and a holder of an
+    /// older timestamp — a client, another node — cannot consult it before
+    /// reading. That is why the default must not narrow further than it
+    /// already has: an unpinned seal forgets only versions a write had already
+    /// superseded, never a row that a snapshot below the seal can still read.
+    pub retain_floor: Timestamp,
     /// Segments removed from the manifest whose files are still referenced by
     /// a reader. Swept whenever the last reference goes away; without this the
     /// files are simply never unlinked.
@@ -707,6 +736,7 @@ impl Shard {
             wal: None,
             flushes: 0,
             compactions: 0,
+            retain_floor: 0,
             retiring: Vec::new(),
         }
     }
@@ -897,6 +927,16 @@ impl Shard {
         Ok(Some(ts))
     }
 
+    /// The version of `key` live at `t`.
+    ///
+    /// Reads at a `t` below [`Shard::retain_floor`] are best-effort: a version
+    /// that a write had already superseded before the last seal or compaction
+    /// may have been forgotten there, and this returns whatever survived.
+    /// Holding history across those operations means pinning `opts.gc_horizon`
+    /// (§12.5), which is what both collectors read through
+    /// [`Shard::retain_from`]. A row that is merely *deleted* is not in that
+    /// class at the default: an unpinned seal still writes it, so a snapshot
+    /// below the delete keeps reading it until a compaction collects.
     pub fn get(&self, key: &str, t: Timestamp) -> Result<Option<Value>> {
         match self.locate(key, t) {
             None => Ok(None),
@@ -1046,6 +1086,19 @@ impl Shard {
         out
     }
 
+    /// The horizon version GC actually runs at: a backup pins `gc_horizon`,
+    /// which holds it back (§12.5), and otherwise it is now. Compaction
+    /// collects at it; a flush collects at it only while something is pinned,
+    /// because a seal is not a GC pass. Both read it from here, and both
+    /// report it through [`Shard::retain_floor`], so it lives in one place.
+    pub fn retain_from(&self, now: Timestamp) -> Timestamp {
+        if self.opts.gc_horizon > 0 {
+            self.opts.gc_horizon.min(now)
+        } else {
+            now
+        }
+    }
+
     pub fn maybe_flush(&mut self) -> Result<bool> {
         if self.memtable.should_flush(&self.opts.thresholds) {
             self.flush()?;
@@ -1055,33 +1108,82 @@ impl Shard {
         }
     }
 
-    /// Seal the memtable into a segment.
+    /// Seal the memtable into segments.
     ///
     /// The tablet leader builds small segments itself at flush: fast, local,
     /// and it keeps the freshness path simple (§4.5). Large merged segments go
-    /// to compaction instead. Until the built segment is committed, the frozen
-    /// memtable stays searchable — which is why it is moved to `frozen` before
-    /// the build rather than after.
-    pub fn flush(&mut self) -> Result<Option<u64>> {
+    /// to compaction instead. Until the built segments are committed the
+    /// memtable stays searchable — which is why it is swapped out after the
+    /// build rather than before.
+    ///
+    /// Version GC happens here under the same rule as in [`compaction::run`],
+    /// but only as far as a pin asks for: a row already dead at
+    /// [`Shard::retain_from`] is not written at all *when a horizon is
+    /// pinned*, and a version superseded after that horizon is kept — in a
+    /// segment of its own, because one segment holds one version per key. So
+    /// only a pinned `gc_horizon` can make one flush emit several segments.
+    /// Unpinned, the seal writes the newest version of every key, dead or not,
+    /// and each row's tombstone is re-resolved into the segment's delete log,
+    /// exactly as it always was. Compaction stays the only collector.
+    ///
+    /// `None` means nothing was sealed, and it means only that: the memtable
+    /// was empty. [`Sealed`] carries the ids a seal did write, newest last,
+    /// and is empty when a pinned drain collected every row — which is still a
+    /// seal, and `Db::flush` still counts it.
+    ///
+    /// [`compaction::run`]: crate::compaction::run
+    pub fn flush(&mut self) -> Result<Option<Sealed>> {
         if self.memtable.is_empty() {
             return Ok(None);
         }
         // Build first. A build that fails must leave the shard exactly as it
         // was — not with the memtable already swapped out and its contents
-        // stranded in a frozen list nothing will ever retry.
-        let id = self.next_segment_id;
-        let mut b = SegmentBuilder::new(self.opts.build);
-        for pd in self.memtable.drain_into(self.opts.gc_horizon) {
-            b.add(pd);
+        // stranded in a list nothing will ever retry. The segment ids are part
+        // of that: they come from a local counter that is committed only once
+        // every build has succeeded.
+        // The horizon this seal collects at. A pinned `gc_horizon` holds it
+        // back (§12.5), and a version superseded after it is kept — in a
+        // segment of its own, because one segment holds one version per key.
+        // With nothing pinned the seal collects no more than it ever did:
+        // `drain_into(0)` keeps every row, and only the versions
+        // `SegmentBuilder::build`'s dedup already threw away are dropped, by
+        // keeping layer 0. Collecting at `now` here would make a seal a
+        // version-GC pass, and a seal is not one: `term_stats` sums
+        // `total_doc_len` over physical rows, so BM25's avgdl would move
+        // whenever a shard happened to seal, and a snapshot read below the
+        // seal would lose rows it could read a moment earlier.
+        let retain_from = self.retain_from(self.clock.peek());
+        let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
+        let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
+        if self.opts.gc_horizon == 0 {
+            // Exactly the old dedup: layer 0 holds the newest version of every
+            // key, which is the one `SegmentBuilder::build` used to keep.
+            layers.truncate(1);
         }
-        let seg = b.build(id, 0, &self.coll)?;
+        let mut next_id = self.next_segment_id;
+        let mut built: Vec<Segment> = Vec::new();
+        // Deepest layer first, so the surviving version of a key lands in the
+        // highest-numbered output. Not a correctness property — at most one
+        // version of a key satisfies `commit_ts <= t < delete_ts`, so `locate`
+        // finds the right one whichever ids the layers get — but it is where
+        // `locate`'s newest-first scan stops soonest, and it is what makes
+        // `Sealed::newest` the survivor's segment.
+        for layer in layers.into_iter().rev() {
+            let mut b = SegmentBuilder::new(self.opts.build);
+            for pd in layer {
+                b.add(pd);
+            }
+            built.push(b.build(next_id, 0, &self.coll)?);
+            next_id += 1;
+        }
 
         // A delete recorded against a memtable ordinal has to be re-resolved
-        // against the sealed segment, which renumbers. Resolving by key alone
+        // against the sealed segments, which renumber. Resolving by key alone
         // is wrong: an update writes a *second* version of the key and marks
-        // the first dead, and the sealed segment keeps only the survivor — so a
+        // the first dead, and each sealed segment holds one of them — so a
         // key-only match would mark the surviving version deleted and lose the
-        // document. Match the version by its commit timestamp.
+        // document. Match the version by its commit timestamp; an entry whose
+        // row was collected at the drain simply matches nothing.
         let deletes: Vec<(String, Timestamp, Timestamp)> = self
             .memtable
             .delete_entries()
@@ -1091,18 +1193,35 @@ impl Shard {
             })
             .collect();
 
-        self.next_segment_id += 1;
-        self.adopt_segment(&seg);
-        let path = self.persist_segment(&seg)?;
-        let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
-        for (key, version_ts, delete_ts) in deletes {
-            if let Some(ord) = handle.segment.ordinals.find(&key) {
-                if handle.segment.ordinals.commit_ts[ord as usize] == version_ts {
-                    handle.mark_deleted(ord, delete_ts);
+        // Every fallible step first, into a local list, exactly as
+        // `install_compaction` does: a persist that fails on the second output
+        // must not leave the first one live in `self.segments` while the
+        // memtable still holds all of its rows, because then the same key is
+        // reachable twice and a retry makes the duplicate permanent.
+        let mut handles: Vec<Arc<SegmentHandle>> = Vec::new();
+        for seg in built {
+            self.adopt_segment(&seg);
+            let path = self.persist_segment(&seg)?;
+            let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
+            for (key, version_ts, delete_ts) in &deletes {
+                if let Some(ord) = handle.segment.ordinals.find(key) {
+                    if handle.segment.ordinals.commit_ts[ord as usize] == *version_ts {
+                        handle.mark_deleted(ord, *delete_ts);
+                    }
                 }
             }
+            handles.push(handle);
         }
-        self.segments.push(handle);
+
+        // Nothing below here may fail before the memtable is swapped out: this
+        // is the one point at which the seal becomes reader-visible.
+        self.next_segment_id = next_id;
+        let sealed = Sealed { segment_ids: handles.iter().map(|h| h.id()).collect() };
+        self.segments.extend(handles);
+        // Id order is what `locate`'s newest-first scan reads as version order,
+        // so state it here rather than leaving it to the loop direction —
+        // `install_compaction` sorts for the same reason.
+        self.segments.sort_by_key(|h| h.id());
         self.manifest_version += 1;
         self.flushes += 1;
 
@@ -1111,11 +1230,17 @@ impl Shard {
             Memtable::new(&self.coll, self.opts.budget.clone()),
         );
         old.release_budget();
+        // Only now has anything been forgotten: until the swap the memtable
+        // still held every row, and `persist_manifest` failing below does not
+        // put them back. Claiming the floor earlier would claim a collection
+        // that had not happened yet, and the field's contract is that at or
+        // above it nothing has been collected.
+        self.retain_floor = self.retain_floor.max(retain_from);
         self.persist_manifest()?;
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
         }
-        Ok(Some(id))
+        Ok(Some(sealed))
     }
 
     fn persist_segment(&self, seg: &Segment) -> Result<Option<PathBuf>> {
@@ -1246,6 +1371,7 @@ impl Shard {
         input_ids: &[u64],
         outputs: Vec<Segment>,
         carried_deletes: &[(String, Timestamp, Timestamp)],
+        retain_from: Timestamp,
     ) -> Result<()> {
         let mut handles = Vec::new();
         for seg in outputs {
@@ -1266,6 +1392,13 @@ impl Shard {
         self.segments.retain(|h| !input_ids.contains(&h.id()));
         self.segments.extend(handles);
         self.segments.sort_by_key(|h| h.id());
+        // The commit point: the merged, collected set is reader-visible from
+        // here, so the floor has to be up before `persist_manifest` below can
+        // fail. Raising it in `run`, next to `collect_for_compaction`, would
+        // claim a collection that a later `build` error could still abandon.
+        // Both of `run`'s call sites come through here, including the one that
+        // installs no outputs at all — which still collected.
+        self.retain_floor = self.retain_floor.max(retain_from);
         self.manifest_version += 1;
         self.compactions += 1;
         self.persist_manifest()?;
@@ -1497,6 +1630,212 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_re_resolves_across_the_segments_a_pinned_flush_emits() {
+        // The same re-resolution as above, but under a pin, where one seal can
+        // emit several segments and the tombstone has to find its row in
+        // whichever of them the version landed in. Resolving by key alone
+        // would mark a *different* version dead.
+        let mut s = shard();
+        for i in 0..30 {
+            s.insert(doc(i)).unwrap();
+        }
+        let key = format!("t2{KEY_SEP}d0029");
+        let horizon = s.clock.peek();
+        s.delete(&key).unwrap();
+        s.opts.gc_horizon = horizon;
+        s.flush().unwrap();
+        let t = s.clock.peek();
+        assert!(s.get(&key, t).unwrap().is_none());
+        // Summed over segments, because a pinned flush may emit more than one.
+        assert_eq!(s.segments.iter().map(|h| h.dead_count(t)).sum::<usize>(), 1);
+        // The renumbered ordinal was matched by version, not by key: the row
+        // is still there and the reader at the horizon still reads it.
+        assert!(s.get(&key, horizon).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unpinned_flush_does_not_move_the_scoring_statistics() {
+        // A seal is not a version-GC pass, and this is why it must not become
+        // one. `term_stats` masks `ndocs` by visibility but sums
+        // `total_doc_len` over *physical* rows, so a seal that dropped the
+        // tombstoned row would shrink the numerator of BM25's avgdl while the
+        // denominator stayed put — every score in the collection moves the
+        // moment a shard happens to seal. And since each shard seals on its
+        // own `should_flush` threshold, the same workload would then score
+        // differently at different shard counts.
+        let mut s = shard();
+        for i in 0..30 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.delete(&format!("t2{KEY_SEP}d0029")).unwrap();
+        assert_eq!(s.opts.gc_horizon, 0, "nothing is pinned");
+        let t = s.clock.peek();
+        let terms = ["document".to_string()];
+        let before = s.term_stats("body", &terms, t).unwrap();
+        s.flush().unwrap();
+        let after = s.term_stats("body", &terms, s.clock.peek()).unwrap();
+        assert_eq!(before.0, 29, "one of the 30 is deleted");
+        assert_eq!(before.1, 150, "but its length still counts, before and after");
+        assert_eq!(before, after, "the seal moved the scoring statistics");
+    }
+
+    #[test]
+    fn an_unpinned_seal_of_an_update_emits_exactly_one_segment() {
+        // The other half of the rule above, and the half only an update
+        // reaches: with nothing pinned the seal keeps layer 0 and nothing else,
+        // so it emits one segment holding the newest version of every key —
+        // exactly the dedup `SegmentBuilder::build` always did. Keeping the
+        // superseded version instead splits the seal in two and carries the
+        // dead version's length back into `total_doc_len`, which is the
+        // numerator of BM25's avgdl for the whole collection. Only a pin may
+        // ask for that, and a shard that happened to seal must not.
+        //
+        // Its own test rather than an update folded into the one above: there
+        // `before == after` holds exactly, and it should, while an update
+        // legitimately drops a version the write path had already superseded —
+        // so folding one in could only be paid for by loosening that equality.
+        let mut s = shard();
+        for i in 0..30 {
+            s.insert(doc(i)).unwrap();
+        }
+        let mut updated = doc(1);
+        updated.set_path("body", Value::Str("rewritten".into()));
+        s.insert(updated).unwrap();
+        assert_eq!(s.opts.gc_horizon, 0, "nothing is pinned");
+        let terms = ["document".to_string()];
+        let before = s.term_stats("body", &terms, s.clock.peek()).unwrap();
+        assert_eq!(before.1, 151, "the memtable still physically holds both versions");
+
+        s.flush().unwrap();
+        assert_eq!(s.segments.len(), 1, "an unpinned seal is one segment, always");
+        let after = s.term_stats("body", &terms, s.clock.peek()).unwrap();
+        assert_eq!(after.0, 30, "the update superseded a document, it did not add one");
+        assert_eq!(after.1, 146, "29 bodies of five terms and the one-term rewrite");
+        assert_eq!(after.2, before.2, "and no document gained or lost the term");
+    }
+
+    #[test]
+    fn a_horizon_pinned_ahead_of_the_clock_collects_no_further_than_now() {
+        // A pin holds collection *back*; pinned ahead of the clock it cannot
+        // hold anything forward, so `retain_from` clamps it to now. Without the
+        // clamp the floor would name an instant the shard has not reached and
+        // claim a collection over versions that do not exist yet — and every
+        // read below that instant would be reported best-effort when nothing
+        // had in fact been forgotten.
+        let mut s = shard();
+        for i in 0..10 {
+            s.insert(doc(i)).unwrap();
+        }
+        let now = s.clock.peek();
+        // Far enough ahead to be unreachable during the test, and far short of
+        // `MAX_TS`, which is the "never deleted" sentinel rather than a time.
+        let future = now + (1 << 40);
+        s.opts.gc_horizon = future;
+        assert_eq!(s.retain_from(now), now, "a pin above the clock is a pin at the clock");
+
+        s.flush().unwrap();
+        assert!(
+            s.retain_floor <= s.clock.peek(),
+            "the floor names {}, an instant the shard has not reached",
+            s.retain_floor
+        );
+    }
+
+    #[test]
+    fn a_pinned_flush_that_collects_every_row_still_reports_a_seal() {
+        // The memtable was swapped out, the manifest moved and the WAL was
+        // truncated, so `FLUSH` must not answer "0 shard(s) flushed". `None`
+        // means one thing and one thing only: there was nothing to seal.
+        let mut s = shard();
+        for i in 0..5 {
+            s.insert(doc(i)).unwrap();
+        }
+        for i in 0..5 {
+            s.delete(&format!("t{}{KEY_SEP}d{i:04}", i % 3)).unwrap();
+        }
+        // Pinned at an instant every one of those rows is already dead at, so
+        // the drain collects the whole memtable.
+        s.opts.gc_horizon = s.clock.peek();
+        let before = s.flushes;
+        let sealed = s.flush().unwrap().expect("a non-empty memtable always seals");
+        assert!(sealed.segment_ids.is_empty(), "every row was collected at the drain");
+        assert!(sealed.newest().is_none());
+        assert_eq!(s.flushes, before + 1, "the seal happened and has to be counted");
+        assert!(s.memtable.is_empty());
+        assert!(s.segments.is_empty());
+        assert_eq!(s.flush().unwrap(), None, "and now there really is nothing to seal");
+    }
+
+    #[test]
+    fn an_unpinned_flush_keeps_a_snapshot_below_it_readable() {
+        // Collecting at `now` would make a delete take effect retroactively for
+        // every reader below it, at the default, with no pin asked for and
+        // nothing a holder of the older timestamp could consult to find out.
+        // A seal forgets only what a write already superseded.
+        let mut s = shard();
+        for i in 0..10 {
+            s.insert(doc(i)).unwrap();
+        }
+        let key = format!("t0{KEY_SEP}d0003");
+        let before_delete = s.clock.peek();
+        s.delete(&key).unwrap();
+        s.flush().unwrap();
+        assert!(
+            s.get(&key, before_delete).unwrap().is_some(),
+            "the seal took the row away from a snapshot that was reading it"
+        );
+        assert!(s.get(&key, s.clock.peek()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_flush_that_fails_partway_installs_nothing() {
+        // Two outputs, and the second one cannot be written: a directory sits
+        // where its file goes. Installing the first anyway would leave its rows
+        // reachable both from the segment list and from the memtable, which
+        // still holds every one of them — the same key visible twice, and a
+        // retry that makes the duplicate permanent by putting it in the
+        // manifest.
+        let dir = std::env::temp_dir().join(format!("celastro-halfflush-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        let horizon = s.clock.peek();
+        s.opts.gc_horizon = horizon;
+        // Superseded after the pin, so the seal has to emit one segment per
+        // version: two.
+        let mut updated = doc(7);
+        updated.set_path("body", Value::Str("rewritten".into()));
+        s.insert(updated).unwrap();
+
+        // Ids ascend in write order, so this is the second file the flush
+        // writes; the first has already been persisted when it fails.
+        let blocked = dir.join("segments").join(format!("{:016x}.seg", s.next_segment_id + 1));
+        fs::create_dir_all(&blocked).unwrap();
+
+        assert!(s.flush().is_err(), "the blocked path has to surface as an error");
+        assert!(s.segments.is_empty(), "a half-flush installed a segment");
+        assert!(!s.memtable.is_empty(), "the rows are still where the retry will find them");
+        // Ids come from a counter committed only once every build has
+        // succeeded, so the failed seal left them reusable rather than leaking
+        // the two it had spoken for.
+        assert_eq!(s.next_segment_id, 1, "the failed seal leaked segment ids");
+        assert_eq!(s.num_docs(s.clock.peek()), 20);
+        assert_eq!(s.num_docs(horizon), 20);
+
+        // And the retry, once the path is free, lands the whole seal.
+        fs::remove_dir_all(&blocked).unwrap();
+        assert!(s.flush().unwrap().is_some());
+        assert!(s.memtable.is_empty());
+        assert_eq!(s.num_docs(s.clock.peek()), 20);
+        assert_eq!(s.num_docs(horizon), 20);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reopen_replays_the_wal() {
         let dir = std::env::temp_dir().join(format!("celastro-wal-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1570,6 +1909,63 @@ mod tests {
         assert_eq!(s.num_docs(t), 20);
         let got = s.get(&format!("t1{KEY_SEP}d0007"), t).unwrap().unwrap();
         assert_eq!(got.path("body").unwrap().as_str(), Some("rewritten"));
+    }
+
+    #[test]
+    fn a_flush_at_a_pinned_horizon_keeps_the_version_the_horizon_reads() {
+        // The horizon is pinned first and only then is the key updated, so the
+        // old version dies *after* the horizon and a reader there must still
+        // see it. Both versions are in one memtable, and one segment holds one
+        // version per key — so the seal has to emit two, exactly as a merge
+        // does in `merging_an_updated_key_keeps_the_version_a_pinned_horizon_
+        // still_reads`. Sealing them into one segment drops the older version
+        // and, because the survivor commits after the horizon, the reader there
+        // loses the key entirely.
+        let mut s = shard();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        let horizon = s.clock.peek();
+        s.opts.gc_horizon = horizon;
+        let mut updated = doc(7);
+        updated.set_path("body", Value::Str("rewritten".into()));
+        s.insert(updated).unwrap();
+
+        let key = format!("t1{KEY_SEP}d0007");
+        let body_at = |s: &Shard, t| -> Option<String> {
+            s.get(&key, t).unwrap().map(|d| d.path("body").unwrap().as_str().unwrap().to_string())
+        };
+        let old = body_at(&s, horizon).expect("PRE-FLUSH: the horizon reader sees the old version");
+        assert!(old.contains("about vectors"), "{old}");
+
+        let sealed = s.flush().unwrap().expect("a non-empty memtable seals");
+        assert_eq!(
+            body_at(&s, horizon).as_deref(),
+            Some(old.as_str()),
+            "the flush changed what the horizon reader sees"
+        );
+        assert_eq!(body_at(&s, s.clock.peek()).as_deref(), Some("rewritten"));
+        assert_eq!(s.segments.len(), 2, "one segment per retained version");
+        // The layer order is a claim `Sealed::newest` makes, so pin it: the
+        // survivor goes to the highest id, which is the one `locate`'s
+        // newest-first scan reaches first. Dropping the `.rev()` in `flush`
+        // puts the superseded version there instead.
+        assert_eq!(sealed.segment_ids.len(), 2);
+        let newest = sealed.newest().unwrap();
+        assert_eq!(newest, s.segments.iter().map(|h| h.id()).max().unwrap());
+        let seg_body = |id: u64| -> String {
+            let h = s.segments.iter().find(|h| h.id() == id).unwrap();
+            let ord = h.segment.ordinals.find(&key).expect("both segments hold the updated key");
+            let d = h.segment.document(ord).unwrap();
+            d.path("body").unwrap().as_str().unwrap().to_string()
+        };
+        assert_eq!(seg_body(newest), "rewritten", "the survivor is not in the newest segment");
+        let oldest = *sealed.segment_ids.first().unwrap();
+        assert!(seg_body(oldest).contains("about vectors"), "{}", seg_body(oldest));
+        // Exactly one version is visible at either timestamp: retaining the
+        // superseded row must not double-count the key.
+        assert_eq!(s.num_docs(horizon), 20);
+        assert_eq!(s.num_docs(s.clock.peek()), 20);
     }
 
     #[test]

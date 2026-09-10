@@ -280,14 +280,18 @@ impl Memtable {
     }
 
     /// Hand the contents to a segment builder. Documents already dead at
-    /// `gc_horizon` are dropped rather than written — the flush is the cheapest
-    /// place in the system to forget something.
-    pub fn drain_into(&self, gc_horizon: Timestamp) -> Vec<PendingDoc> {
+    /// `retain_from` — the horizon the caller is collecting at, which a pinned
+    /// `gc_horizon` holds back — are dropped rather than written: the flush is
+    /// the cheapest place in the system to forget something. `0` collects
+    /// nothing, which is what an unpinned seal passes: forgetting a row a
+    /// snapshot below the seal can still read is compaction's decision to
+    /// make, not a seal's.
+    pub fn drain_into(&self, retain_from: Timestamp) -> Vec<PendingDoc> {
         let d = self.deletes.read().unwrap();
         self.docs
             .iter()
             .enumerate()
-            .filter(|(i, _)| !d.is_deleted_at(*i as u32, gc_horizon))
+            .filter(|(i, _)| !d.is_deleted_at(*i as u32, retain_from))
             .map(|(_, d)| PendingDoc {
                 sort_key: d.sort_key.clone(),
                 commit_ts: d.commit_ts,

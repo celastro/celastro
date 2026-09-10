@@ -441,6 +441,11 @@ impl Db {
             .ok_or_else(|| Error::Plan(format!("no such collection `{collection}`")))?;
         let mut n = 0;
         for s in shards.iter_mut() {
+            // Count shards that sealed, not segments written: a pinned horizon
+            // can make one seal emit several, or — if the drain collected
+            // every row — none at all, and the memtable was swapped out, the
+            // manifest bumped and the WAL truncated in every one of those
+            // cases. `FLUSH` reports work done, so it counts seals.
             if s.flush()?.is_some() {
                 n += 1;
             }
@@ -1504,6 +1509,46 @@ mod tests {
             Some(lifecycle::Trigger::SinceCreation),
             "an age demotion is a retention pin; a failed ALTER must not drop it"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flush_counts_the_shards_that_sealed_not_the_segments_they_wrote() {
+        // `FLUSH` reports work done, and a seal is the unit of that work: the
+        // memtable was swapped out, the manifest bumped and the WAL truncated,
+        // once, however many segments came out of it. Two shards here, only
+        // one of which has anything to seal, and it seals under a pin that
+        // makes it emit *two* segments — because the update superseded a
+        // version a reader at the horizon still needs, and one segment holds
+        // one version per key. So 1 is the only honest answer: counting the
+        // segments written says 2, and counting every shard walked says 2 as
+        // well, and that second one would report a shard as flushed whose
+        // memtable was empty.
+        let dir = tmp("flush-counts-seals");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        assert_eq!(db.shards("notes").unwrap().len(), 2, "the split makes two shards");
+
+        let note = |body: &str| {
+            Value::obj(vec![
+                ("id".into(), Value::Str("a".into())),
+                ("body".into(), Value::Str(body.into())),
+            ])
+        };
+        // Both writes sort below the split point, so the second shard never
+        // takes a row.
+        db.insert("notes", note("first")).unwrap();
+        let horizon = db.clock.peek();
+        db.shards.get_mut("notes").unwrap()[0].opts.gc_horizon = horizon;
+        db.insert("notes", note("second")).unwrap();
+
+        let flushed = db.flush("notes").unwrap();
+        let shards = db.shards("notes").unwrap();
+        assert_eq!(shards[0].segments.len(), 2, "the pinned seal has to emit two segments");
+        assert!(shards[1].memtable.is_empty(), "the second shard had nothing to seal");
+        assert!(shards[1].segments.is_empty());
+        assert_eq!(flushed, 1, "one shard sealed: not two segments, and not two shards");
 
         let _ = fs::remove_dir_all(&dir);
     }

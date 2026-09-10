@@ -9,7 +9,7 @@ libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
 graph, SQL parser, JSON parser and binary codecs are all in the tree.
 
 ```
-cargo test --release                     # 206 tests
+cargo test --release                     # 354 tests
 cargo run --release -- --demo            # guided tour over a small corpus
 cargo run --release -- --dir ./data      # persistent REPL
 cargo run --release -- --file script.sql # run a script
@@ -414,6 +414,9 @@ guarantee:
 | filtered-search strategy selection | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, middling_selectivity_picks_filter_aware}` |
 | visibility under deletes and updates | `mvcc::tests::*`, `shard::tests::*` |
 | segments survive a reopen | `a_database_survives_reopen` |
+| every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
+| an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |
+| a flush that emits several segments installs all of them or none | `shard::tests::a_flush_that_fails_partway_installs_nothing` |
 | one replica holds a `minimal` index, whatever the replica count | `exactly_one_replica_holds_a_minimal_index`, `the_holder_count_does_not_grow_with_the_replica_count` |
 | every node agrees on the holder without being told | `the_designation_is_agreed_without_coordination_and_is_stable` |
 | a non-holder caches it and still answers | `a_node_that_is_not_the_holder_treats_minimal_as_cached` |
