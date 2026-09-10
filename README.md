@@ -9,7 +9,7 @@ libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
 graph, SQL parser, JSON parser and binary codecs are all in the tree.
 
 ```
-cargo test --release                     # 354 tests
+cargo test --release                     # 364 tests
 cargo run --release -- --demo            # guided tour over a small corpus
 cargo run --release -- --dir ./data      # persistent REPL
 cargo run --release -- --file script.sql # run a script
