@@ -34,6 +34,27 @@ longer weighted by how much dead data happens to be on disk beside it. Anything
 comparing scores against a stored threshold needs re-baselining; anything
 comparing them against each other does not.
 
+**Upgrading from 0.2.0.** Fix a data-loss bug, and two things break.
+
+A `DELETE` whose `text_match` predicate was cut by the expansion cap used to
+run. In the negated shape that is not a short answer, it is a wrong one: a
+truncated exclusion set deletes documents the predicate asked to spare, and
+0.2.0 destroyed 488 rows in a case whose correct answer was none. Such a
+statement is now REFUSED and nothing is written. If you relied on it completing,
+spell the prefix as narrower pieces — each deletes exactly what it names.
+
+A prefix query also used to answer differently depending on how the data
+happened to be laid out on disk. The expansion cap applied per storage unit, so
+`WHERE text_match(body,'a*')` returned 2199, 3928 or 3953 rows of the same 6000
+matching documents at one, three and six shards. The expansion is now resolved
+once against the live corpus, so the answer is the same everywhere — and, where
+the cap binds, smaller than the largest of those. It is a real trade and the
+number is in the prefix section below.
+
+Breaking for library users: `GlobalStats` gained `expansions` and `QueryResult`
+gained `truncated_prefixes`, so struct literals of either need updating. Both
+are now `#[non_exhaustive]`, so the next field will not break you.
+
 ---
 
 ## The load-bearing idea
