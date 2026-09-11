@@ -352,7 +352,10 @@ of dead ones is stepped over rather than paid for; filtering a fixed-size
 physical window afterwards was measured to recover 213 of 300 matching documents
 on a smaller fixture, and to still move with the compaction schedule. A wide
 prefix is still a partial answer — the cap binds — but the partiality is now a
-property of the collection instead of the flush and compaction schedule.
+property of the data instead of the flush and compaction schedule. A statement
+that constrains the partition key is expanded over that partition: the budget is
+per statement, so spending it on another tenant's vocabulary expanded a
+tenant-scoped query out of its own partition and answered zero rows.
 
 The mask is not a tax. Stepping over a dead term costs about a microsecond,
 measured as the slope between a 10000-term and a 50000-term dead run in front of
@@ -432,15 +435,19 @@ polarities — so the refusal covers both shapes and names the leaf that was cut
 Delete by key, or narrow the prefix until it expands to at most 512 terms and
 delete the pieces; that loop deletes exactly what each piece names.
 
-One statement may name at most eight *distinct* prefixes, counted per indexed
-path. Each distinct one costs a dictionary walk in every unit of every shard
-plus up to 512 gathered frequencies, and nothing in the `text_match` grammar
-bounds how many a query string holds: 24 of them measured at 1.2 s and gathered
-12288 terms into a 4096-entry statistics cache, which then evicted its own
-entries so the identical statement never warmed. Repeats of one prefix on one
-path are expanded once and cost nothing more. Over the bound the statement is
-refused rather than quietly trimmed — a silent aggregate cap would be the same
-failure one level up.
+One statement may name at most eight distinct `(path, prefix)` pairs, *summed*
+over its indexed paths. Each distinct one costs a dictionary walk in every unit
+of every shard plus up to 512 gathered frequencies, and nothing in the
+`text_match` grammar bounds how many a query string holds: 24 of them measured
+at 1.2 s and gathered 12288 terms into a 4096-entry statistics cache, which then
+evicted its own entries so the identical statement never warmed. Repeats of one
+prefix on one path are expanded and gathered once, which is what the limit
+counts — though each occurrence is still evaluated separately in every unit, so
+spelling one prefix 256 times is a slow statement that this bound admits. The
+same prefix on two paths is two enumerations and counts twice, because a term
+list is only valid for the dictionary it came from. Over the bound the statement
+is refused rather than quietly trimmed — a silent aggregate cap would be the
+same failure one level up.
 
 **`search_after` over an approximate index is not cheaper than `OFFSET`.** A
 graph search has no resume primitive: an HNSW heap cannot restart from a
@@ -536,7 +543,7 @@ else.
 
 ```
 docker build -t celastro .
-docker run --rm celastro version       # celastro-cli 0.1.0
+docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
 ```
 

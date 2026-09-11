@@ -87,7 +87,14 @@ impl TextQuery {
         self.prefixes_under(false, out)
     }
 
-    fn prefixes_under(&self, negated: bool, out: &mut Vec<(String, bool)>) {
+    /// [`leaf_prefixes`](Self::leaf_prefixes) with the sign SEEDED, for a
+    /// caller that already knows this query string sits under a negation it
+    /// cannot see — SQL's own `NOT` wraps the whole `text_match` call, so the
+    /// sign the mini-language records is only half of the leaf's real
+    /// polarity. Seeding composes the two for free: the `Not` arm below flips,
+    /// so `NOT text_match(body, '-a*')` comes back positive, which is what a
+    /// double negation is.
+    pub(crate) fn prefixes_under(&self, negated: bool, out: &mut Vec<(String, bool)>) {
         match self {
             TextQuery::Prefix(p) => out.push((p.clone(), negated)),
             TextQuery::Term(_) | TextQuery::Phrase(_) | TextQuery::Empty => {}

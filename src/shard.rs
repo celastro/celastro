@@ -823,6 +823,43 @@ impl Shard {
         None
     }
 
+    /// The newest version of `key` anywhere in the shard, visible or not, with
+    /// its own commit timestamp.
+    ///
+    /// [`Shard::locate`]'s sibling for WAL replay, and the difference is the
+    /// visibility argument: `locate(key, MAX_TS)` finds the newest version not
+    /// yet deleted, which is the right question for the write path and the
+    /// wrong one for a replay that has to decide whether a record's effect is
+    /// already on disk.
+    fn latest_version(&self, key: &str) -> Option<(Loc, Timestamp)> {
+        let mut best: Option<(Loc, Timestamp)> = None;
+        let mut consider = |loc: Loc, ts: Timestamp| {
+            if best.map(|(_, b)| ts > b).unwrap_or(true) {
+                best = Some((loc, ts));
+            }
+        };
+        if let Some(ord) = self.memtable.find(key) {
+            if let Some(ts) = self.memtable.ordinals.commit_ts.get(ord as usize) {
+                consider(Loc::Mem(ord), *ts);
+            }
+        }
+        for (i, f) in self.frozen.iter().enumerate() {
+            if let Some(ord) = f.find(key) {
+                if let Some(ts) = f.ordinals.commit_ts.get(ord as usize) {
+                    consider(Loc::Frozen(i, ord), *ts);
+                }
+            }
+        }
+        for h in &self.segments {
+            if let Some(ord) = h.segment.ordinals.find(key) {
+                if let Some(ts) = h.segment.ordinals.commit_ts.get(ord as usize) {
+                    consider(Loc::Seg(h.id(), ord), *ts);
+                }
+            }
+        }
+        best
+    }
+
     fn mark_superseded(&mut self, target: Loc, ts: Timestamp) {
         match target {
             Loc::Mem(ord) => self.memtable.mark_deleted(ord, ts),
@@ -1087,10 +1124,11 @@ impl Shard {
     }
 
     /// The horizon version GC actually runs at: a backup pins `gc_horizon`,
-    /// which holds it back (§12.5), and otherwise it is now. Compaction
-    /// collects at it; a flush collects at it only while something is pinned,
-    /// because a seal is not a GC pass. Both read it from here, and both
-    /// report it through [`Shard::retain_floor`], so it lives in one place.
+    /// which holds it back (§12.5), and otherwise it is now. Compaction DRAINS
+    /// at it; a flush drains at it only while something is pinned — unpinned it
+    /// keeps every row and drops superseded versions instead, by keeping layer
+    /// 0. Both read it from here, and both report it through
+    /// [`Shard::retain_floor`], so it lives in one place.
     pub fn retain_from(&self, now: Timestamp) -> Timestamp {
         if self.opts.gc_horizon > 0 {
             self.opts.gc_horizon.min(now)
@@ -1124,7 +1162,10 @@ impl Shard {
     /// only a pinned `gc_horizon` can make one flush emit several segments.
     /// Unpinned, the seal writes the newest version of every key, dead or not,
     /// and each row's tombstone is re-resolved into the segment's delete log,
-    /// exactly as it always was. Compaction stays the only collector.
+    /// exactly as it always was. Compaction stays the only collector of
+    /// TOMBSTONED rows; superseded versions go here, as they always did — which
+    /// is why an unpinned seal still raises [`Shard::retain_floor`], and why a
+    /// snapshot below that floor may have lost versions it could once see.
     ///
     /// `None` means nothing was sealed, and it means only that: the memtable
     /// was empty. [`Sealed`] carries the ids a seal did write, newest last,
@@ -1354,13 +1395,44 @@ impl Shard {
             s.clock.observe(r.ts);
             match r.kind {
                 WAL_INSERT => {
-                    // Unconditionally, not only when the record says it
-                    // superseded something. A crash between writing the segment
-                    // and truncating the WAL replays inserts whose documents are
-                    // already sealed; without this the key ends up live twice.
-                    // On a genuine first insert this is a no-op.
-                    if let Some(p) = s.locate(&r.key, MAX_TS) {
-                        s.mark_superseded(p, r.ts);
+                    // A crash between writing the segments and truncating the
+                    // WAL replays inserts whose documents are already sealed,
+                    // so replay has to converge on the post-seal state rather
+                    // than add to it.
+                    //
+                    // The question is whether THIS record's effect is already
+                    // on disk, and the answer is "the key already carries a
+                    // version at or after this record's ts". At: the seal wrote
+                    // this very version. After: a later version of the key is
+                    // sealed and this one was superseded before the seal — the
+                    // version an unpinned seal deliberately forgets, which
+                    // replay must not resurrect. Either way, re-applying the
+                    // record makes the key live twice.
+                    //
+                    // `>=`, not `==`, for that second case, and
+                    // `latest_version` rather than `locate(key, MAX_TS)` for a
+                    // third: a seal under a pinned `gc_horizon` emits one
+                    // segment per version layer, so the key's newest version is
+                    // no longer the only one on disk. Superseding whatever is
+                    // VISIBLE then wrote a tombstone onto the newest layer at
+                    // the OLDEST record's timestamp — below that version's own
+                    // commit — and left the older layer live beside the
+                    // memtable copy it had just re-inserted, so every key read
+                    // twice at exactly the horizon the pin exists to preserve.
+                    //
+                    // This rests on the WAL being truncated by the seal as a
+                    // whole: a record whose ts is BELOW a sealed version of the
+                    // same key was necessarily in the memtable when that seal
+                    // ran, so the seal either wrote it into a layer or
+                    // collapsed it on purpose. There is no third case.
+                    let prev = s.latest_version(&r.key);
+                    if prev.map(|(_, ts)| ts >= r.ts).unwrap_or(false) {
+                        continue;
+                    }
+                    // A genuine post-seal write: supersede the newest version,
+                    // which is now strictly older than this record.
+                    if let Some((loc, _)) = prev {
+                        s.mark_superseded(loc, r.ts);
                     }
                     if let Some(d) = r.doc {
                         s.coll.observe_doc(&d);
@@ -1501,6 +1573,8 @@ impl Shard {
 
     /// Terms beginning with `prefix` that at least one document LIVE AT `t`
     /// holds, unioned into `out` across every searchable unit in the snapshot.
+    /// `key_prefix` narrows "live" further to one partition, for a statement
+    /// that names one.
     ///
     /// This is a dictionary read rather than a statistic — it answers which
     /// terms the query names, and [`Shard::term_stats`] then measures how many
@@ -1519,9 +1593,13 @@ impl Shard {
     /// See [`TextSource::live_terms_with_prefix`](crate::text::TextSource::live_terms_with_prefix).
     ///
     /// Each unit is asked for its own first `limit` LIVE terms, and the union
-    /// of those, cut at `limit`, is EXACTLY the collection's first `limit` live
-    /// matching terms. The argument is monotonicity, not a coincidence, and the
-    /// cap makes it non-obvious enough to write down:
+    /// of those, cut at `limit`, is EXACTLY the first `limit` live matching
+    /// terms of the collection — or, with `key_prefix`, of the partition the
+    /// statement named. Either way it is a property of the DATA and not of the
+    /// layout, which is the property that matters; the argument below runs over
+    /// whichever live set was selected, since "live" is one predicate applied
+    /// identically at both levels. It is monotonicity, not a coincidence, and
+    /// the cap makes it non-obvious enough to write down:
     ///
     /// * live in some unit at `t` implies live globally at `t`, because the
     ///   global `df` is the sum of the per-unit visibility-masked `df`s taken
@@ -1550,24 +1628,52 @@ impl Shard {
     /// `text_handle` is the FALLIBLE spelling for the same reason
     /// [`Shard::term_stats`] uses it: an archived segment configured to refuse
     /// reads must surface the refusal, not look like a path carrying no index
-    /// and silently drop its terms out of the expansion.
+    /// and silently drop its terms out of the expansion. A unit holding
+    /// nothing visible at `t` is skipped before that call and so does not
+    /// surface its refusal — which is the same answer either way, since the
+    /// terms it could refuse to name are terms it holds no visible document
+    /// for.
     pub fn prefix_terms(
         &self,
         path: &str,
         prefix: &str,
         t: Timestamp,
         limit: usize,
+        key_prefix: Option<&str>,
         out: &mut BTreeSet<String>,
     ) -> Result<()> {
         let snap = self.snapshot_at(t);
         for s in self.sources(&snap) {
+            // Once per unit, not once per term. For a segment this is the
+            // cached bitmap [`Shard::term_stats`] reads at the same `t`; for
+            // the memtable it is the same O(n) build the gather already pays
+            // on every query.
+            let mut vis = s.visibility(t);
+            // AND in the statement's partition, when it names one. Narrowing
+            // the live set cannot drop a term the answer needs: the partition
+            // prefix restricts every row the statement can return, so a term
+            // held by no document inside it contributes nothing — and what it
+            // does otherwise is DISPLACE one that does, out of a cap the
+            // statement then spends on another tenant's vocabulary. It costs
+            // the fast path in `live_terms_with_prefix` on any unit holding
+            // more than one partition, which is the same trade the liveness
+            // mask itself already makes.
+            if let Some(kp) = key_prefix {
+                vis.and_inplace(&s.key_prefix(kp));
+            }
+            // Before the handle, not after. A unit with nothing visible at `t`
+            // can contribute no term — `live_terms_with_prefix` over an empty
+            // mask yields nothing — so the whole unit is skippable, and
+            // skipping it before `text_handle` avoids decoding its dictionary.
+            // That is not a micro-optimisation: a seal under a pinned
+            // `gc_horizon` emits one segment per version layer, so a hot key
+            // updated n times leaves n units of which all but one are entirely
+            // invisible at any single `t`, and the walk below is per unit.
+            if vis.popcount() == 0 {
+                continue;
+            }
             let handle = s.text_handle(path)?;
             if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
-                // Once per unit, not once per term. For a segment this is the
-                // cached bitmap [`Shard::term_stats`] reads at the same `t`;
-                // for the memtable it is the same O(n) build the gather
-                // already pays on every query.
-                let vis = s.visibility(t);
                 for term in src.live_terms_with_prefix(prefix, limit, &vis) {
                     out.insert(term);
                 }
@@ -1612,11 +1718,22 @@ impl Shard {
         for s in self.sources(&snap) {
             let vis = s.visibility(t);
             ndocs += vis.popcount() as u64;
+            // A unit with nothing visible at `t` contributes zero to all three
+            // numbers — no documents, `visible_doc_len` over an empty mask is
+            // zero, and the `df` loop counts only visible postings — so skip
+            // it before paying for its dictionary. See [`Shard::prefix_terms`]
+            // for why a shard can hold many such units at once.
+            if vis.popcount() == 0 {
+                continue;
+            }
             // Not `unwrap_or_default()`: an archived segment configured to
             // refuse reads would then look like a path with no text index, and
             // its documents would count towards `ndocs` with zero document
             // frequency — an inflated IDF and a silently mis-ranked answer in
-            // place of the refusal the operator asked for.
+            // place of the refusal the operator asked for. The skip above is
+            // not that hole: a unit it skips added nothing to `ndocs` either,
+            // so there is no inflated denominator to go with the missing
+            // frequencies.
             let handle = s.text_handle(path)?;
             if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
                 // Sum only visible lengths, for the same reason the
@@ -1635,7 +1752,17 @@ impl Shard {
                 // documents that have this field.
                 total_len += src.visible_doc_len(&vis);
                 for term in terms {
-                    if let Some(mut c) = src.cursor(term) {
+                    // FALLIBLE, for the same reason `text_handle` above is. An
+                    // extent the dictionary says exists but that does not
+                    // decode is corruption, and `cursor` cannot tell that from
+                    // "this unit does not hold the term": answering `df = 0`
+                    // both inflates this term's IDF against its neighbours and
+                    // gets cached, so every later query in the epoch reads the
+                    // zero — including queries that never touch the damaged
+                    // unit. `live_terms_with_prefix` lets an unreadable extent
+                    // through to the gather precisely so the error is raised
+                    // here.
+                    if let Some(mut c) = src.try_cursor(term)? {
                         // Count only visible postings: a document frequency
                         // that counts tombstones drifts as deletes accumulate.
                         let mut n = 0u64;
@@ -1756,26 +1883,53 @@ mod tests {
 
     #[test]
     fn a_delete_re_resolves_across_the_segments_a_pinned_flush_emits() {
-        // The same re-resolution as above, but under a pin, where one seal can
-        // emit several segments and the tombstone has to find its row in
-        // whichever of them the version landed in. Resolving by key alone
-        // would mark a *different* version dead.
+        // The same re-resolution as above, but under a pin, where one seal
+        // emits one segment per version layer and the tombstone has to find its
+        // row in whichever of them the version landed in. Resolving by key
+        // alone marks a *different* version dead.
+        //
+        // The UPDATE is what makes that reachable, and the test used to lack
+        // it: thirty distinct keys and one delete gives every key one version,
+        // so `layer_by_version` produced one layer and the pinned seal emitted
+        // one segment — the multi-segment case the name claims, structurally
+        // out of reach, with assertions the single-segment test above already
+        // makes. Dropping the `commit_ts == version_ts` guard from `flush`'s
+        // re-resolution failed five tests and never this one.
+        //
+        // Note where the update goes: superseded AFTER the horizon, or the
+        // pinned drain finds the old version already dead at the pin, collects
+        // it, and the seal is single-segment again.
         let mut s = shard();
         for i in 0..30 {
             s.insert(doc(i)).unwrap();
         }
         let key = format!("t2{KEY_SEP}d0029");
+        let upd = format!("t1{KEY_SEP}d0007");
         let horizon = s.clock.peek();
         s.delete(&key).unwrap();
+        let mut updated = doc(7);
+        updated.set_path("body", Value::Str("rewritten".into()));
+        s.insert(updated).unwrap();
         s.opts.gc_horizon = horizon;
         s.flush().unwrap();
         let t = s.clock.peek();
+        assert_eq!(s.segments.len(), 2, "one segment per retained version layer");
         assert!(s.get(&key, t).unwrap().is_none());
-        // Summed over segments, because a pinned flush may emit more than one.
-        assert_eq!(s.segments.iter().map(|h| h.dead_count(t)).sum::<usize>(), 1);
         // The renumbered ordinal was matched by version, not by key: the row
         // is still there and the reader at the horizon still reads it.
         assert!(s.get(&key, horizon).unwrap().is_some());
+        // And the update, which is the leg only a multi-segment seal has. Its
+        // tombstone names the OLDER version; resolved by key alone it lands on
+        // the survivor in the newer segment and the document disappears.
+        let got = s.get(&upd, t).unwrap().expect("the surviving version was marked dead");
+        assert_eq!(got.path("body").unwrap().as_str(), Some("rewritten"));
+        assert!(s.get(&upd, horizon).unwrap().is_some(), "the horizon lost the old version");
+        assert_eq!(s.num_docs(t), 29);
+        assert_eq!(s.num_docs(horizon), 30);
+        // Two tombstones survive the seal, summed over the segments it emitted:
+        // the delete, and the one the update wrote against the version the pin
+        // is still holding.
+        assert_eq!(s.segments.iter().map(|h| h.dead_count(t)).sum::<usize>(), 2);
     }
 
     #[test]
@@ -2260,29 +2414,92 @@ mod tests {
         assert!(e.contains("separator"), "{e}");
     }
 
-    #[test]
-    fn replay_is_idempotent_when_a_crash_lands_between_seal_and_truncate() {
-        let dir = std::env::temp_dir().join(format!("celastro-replay-{}", std::process::id()));
+    /// Replay after a crash in the seal/truncate window has to reproduce the
+    /// state the seal left, whatever shape that is, so the two shapes are
+    /// tested side by side and against the PRE-CRASH counts rather than
+    /// literals.
+    ///
+    /// The UPDATE is what this needed and what it used to lack: the test was
+    /// twelve DISTINCT inserts, so no key ever had two versions,
+    /// `layer_by_version` produced one layer, and the pinned multi-segment seal
+    /// R4 added was structurally unreachable from it — that path landed with no
+    /// replay coverage at all. Under a pin the seal emits one segment per
+    /// version layer, and the replay arm's old `locate(key, MAX_TS)` then wrote a
+    /// tombstone onto the NEWEST layer at the OLDEST version's timestamp and
+    /// left the older layer live beside the memtable copy it had just
+    /// re-inserted: four keys read as eight at exactly the horizon the pin
+    /// exists to hold, and the next seal made it permanent.
+    ///
+    /// The unpinned leg is not decoration. The obvious repair — skip a record
+    /// whose `(key, ts)` is already sealed, otherwise supersede the greatest
+    /// version BELOW it — fixes the pinned case and breaks this one, because an
+    /// unpinned seal DROPS the superseded version, so `(key, v1.ts)` is nowhere
+    /// and v1 is re-inserted and never superseded. Without this leg that
+    /// version of the fix looks correct.
+    fn replay_reproduces_the_seal(pin: bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "celastro-replay-{}-{}",
+            if pin { "pinned" } else { "unpinned" },
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let clock = Arc::new(Hlc::new());
         let wal_bytes;
+        let horizon;
+        let (pre_max, pre_pin);
+        let mut opts = ShardOpts::default();
         {
-            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+            let mut s = Shard::new(coll(), clock.clone(), ShardOpts::default());
             s.attach_dir(&dir).unwrap();
-            for i in 0..12 {
+            for i in 0..4 {
                 s.insert(doc(i)).unwrap();
+            }
+            // Pinned at an instant where every key holds its FIRST version, so
+            // the update below leaves two live layers rather than one.
+            horizon = s.clock.peek();
+            for i in 0..4 {
+                let mut d = doc(i);
+                d.set_path("body", Value::Str(format!("rewritten {i}")));
+                s.insert(d).unwrap();
             }
             s.wal.as_mut().unwrap().sync().unwrap();
             wal_bytes = fs::read(dir.join("wal.log")).unwrap();
+            if pin {
+                s.opts.gc_horizon = horizon;
+                opts.gc_horizon = horizon;
+            }
             s.flush().unwrap();
             s.persist_manifest().unwrap();
+            assert_eq!(
+                s.segments.len(),
+                if pin { 2 } else { 1 },
+                "one segment per retained version layer"
+            );
+            pre_max = s.num_docs(MAX_TS);
+            pre_pin = s.num_docs(horizon);
         }
-        // The segment and manifest are durable, the WAL truncation is not:
-        // exactly the window a crash lands in.
+        // The segments and manifest are durable, the WAL truncation is not.
         fs::write(dir.join("wal.log"), &wal_bytes).unwrap();
-        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
-        assert_eq!(s2.num_docs(MAX_TS), 12, "replaying sealed writes must not duplicate them");
+        let mut s2 = Shard::open(coll(), Arc::new(Hlc::new()), opts, &dir).unwrap();
+        assert_eq!(s2.num_docs(MAX_TS), pre_max, "at the tip");
+        assert_eq!(s2.num_docs(horizon), pre_pin, "at the pin");
+        // And it stays fixed: a duplicate pair survives the next seal, because
+        // the memtable copy is dead only above the pin, so it is written into a
+        // fresh segment and outlives the WAL that could explain it.
+        s2.flush().unwrap();
+        assert_eq!(s2.num_docs(horizon), pre_pin, "and the next seal does not fix it either");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_is_idempotent_when_a_crash_lands_between_seal_and_truncate() {
+        replay_reproduces_the_seal(false);
+    }
+
+    #[test]
+    fn replay_is_idempotent_when_a_pinned_seal_emitted_one_segment_per_version() {
+        replay_reproduces_the_seal(true);
     }
 
     /// The differential test behind "shredding is a physical decision, not a
@@ -2495,6 +2712,119 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_seals_invisible_units_cost_the_read_path_nothing_and_change_nothing() {
+        // A seal under a pinned `gc_horizon` emits one segment per version
+        // layer, so a key updated `n` times leaves `n` units of which all but
+        // one hold nothing visible at any single `t`. Every cost this read path
+        // has is per unit — one `visibility`, one text handle, one dictionary
+        // walk, one cursor per term — so the fan-out multiplies all of them: a
+        // two-term gather over 202 such units measured 10.0 ms against 139 us
+        // for the same live corpus in one segment, and compaction cannot
+        // collapse them while the pin holds.
+        //
+        // Skipping a unit with an empty visibility mask deletes that multiplier
+        // (10.0 ms to 322 us on the same fixture), and this test is the guard
+        // that it is NEUTRAL, which is the risk the skip introduces: the
+        // answers below must be the ones the unpinned single-segment shard
+        // gives, term for term. It is not a regression test for a defect — the
+        // skip is a cost fix — so it does not fail on the unskipped code.
+        let live = |pin: bool| {
+            let mut s = shard();
+            for i in 0..6 {
+                s.insert(doc(i)).unwrap();
+            }
+            let horizon = s.clock.peek();
+            // Six versions of ONE key, every one of them retained under the
+            // pin, so the seal emits one layer per version.
+            for v in 0..6 {
+                let mut d = doc(3);
+                d.set_path("body", Value::Str(format!("vector revision {v}")));
+                s.insert(d).unwrap();
+            }
+            if pin {
+                s.opts.gc_horizon = horizon;
+            }
+            s.flush().unwrap();
+            let t = s.clock.peek();
+            let mut terms = BTreeSet::new();
+            s.prefix_terms("body", "vec", t, 512, None, &mut terms).unwrap();
+            let stats = s.term_stats("body", &["vector".to_string()], t).unwrap();
+            (s.segments.len(), s.num_docs(t), terms, stats)
+        };
+
+        let (n_pinned, docs_pinned, terms_pinned, stats_pinned) = live(true);
+        let (n_plain, docs_plain, terms_plain, stats_plain) = live(false);
+        assert!(n_pinned > 1, "the pinned seal has to emit the layers: {n_pinned}");
+        assert_eq!(n_plain, 1, "and the unpinned one must not");
+        assert_eq!(docs_pinned, docs_plain, "the same live corpus either way");
+        assert_eq!(terms_pinned, terms_plain, "the same live vocabulary");
+        assert_eq!(stats_pinned, stats_plain, "and the same triple: ndocs, length sum, df");
+    }
+
+    #[test]
+    fn a_postings_extent_the_dictionary_names_but_cannot_decode_fails_the_gather() {
+        // `term_stats` opened postings with the INFALLIBLE `cursor`, which
+        // cannot tell "this unit does not hold the term" from "this term's
+        // extent does not decode". The second answered `df = 0` — an inflated
+        // IDF against every other term, and a zero that `Db::fill_term_stats`
+        // then caches for the rest of the epoch, including for queries that
+        // never touch the damaged unit. A query whose predicate leaves this
+        // unit with no survivors never opens a cursor on the scoring path, so
+        // nothing else raises it either.
+        //
+        // Region checksums catch random damage before any of this, which is why
+        // this test does not truncate the file: it makes the damage CONSISTENT,
+        // the way a directory entry lost or wrongly sized by a builder skew
+        // would be. The dictionary still names `vectors` and still says where
+        // its postings are; the region it points into is now empty.
+        //
+        // It also pins the promise `sealed_has_live_posting` makes when it lets
+        // an unreadable extent through the prefix walk as "live": that the
+        // gather which follows opens the same extent and raises there.
+        let dir = std::env::temp_dir().join(format!("celastro-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        for i in 0..8 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        let bytes = s.segments[0].segment.encode().unwrap();
+
+        // Rewrite the `text/body/postings.blk` directory entry to claim a
+        // zero-length region, with that region's checksum and the footer's own
+        // recomputed so every integrity check still passes.
+        let name = b"text/body/postings.blk";
+        let at = bytes.windows(name.len()).position(|w| w == name).expect("region name");
+        let mut patched = bytes.clone();
+        let lo = at + name.len();
+        patched[lo + 8..lo + 16].copy_from_slice(&0u64.to_le_bytes());
+        patched[lo + 16..lo + 20].copy_from_slice(&crate::codec::crc32(&[]).to_le_bytes());
+        let n = patched.len();
+        // `[body][footer][flen u32][crc u32][MAGIC]`, and only the footer moved.
+        let flen = u32::from_le_bytes(patched[n - 12..n - 8].try_into().unwrap()) as usize;
+        let fstart = n - 12 - flen;
+        let crc = crate::codec::crc32(&patched[fstart..n - 12]);
+        patched[n - 8..n - 4].copy_from_slice(&crc.to_le_bytes());
+
+        let path = dir.join("patched.seg");
+        fs::write(&path, &patched).unwrap();
+        let seg = crate::segment::Segment::open(SegmentSource::File(path)).unwrap();
+        let mut s2 = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s2.adopt_segment(&seg);
+        s2.segments.push(SegmentHandle::new(seg, DeleteLog::new(), None));
+
+        let e = s2.term_stats("body", &["vector".to_string()], MAX_TS).unwrap_err().to_string();
+        assert!(e.contains("unreadable"), "the corruption has to reach the caller: {e}");
+
+        // The control: the same shard with the same segment intact answers.
+        let (ndocs, _, df) = s.term_stats("body", &["vector".to_string()], MAX_TS).unwrap();
+        assert_eq!(ndocs, 8);
+        assert_eq!(df.get("vector"), Some(&8), "and a healthy gather is unaffected");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_refused_archived_segment_fails_term_stats_instead_of_inflating_idf() {
         let mgr = Arc::new(ResidencyManager::new(crate::residency::ResidencyOpts {
             archived_access: crate::residency::ArchivedAccess::Refuse,
@@ -2530,7 +2860,7 @@ mod tests {
         // being invisible the day the gather skips a path with nothing to
         // measure, and by then the expansion is short and nothing says so.
         let mut out = BTreeSet::new();
-        let e = s.prefix_terms("body", "vec", MAX_TS, 512, &mut out).unwrap_err().to_string();
+        let e = s.prefix_terms("body", "vec", MAX_TS, 512, None, &mut out).unwrap_err().to_string();
         assert!(e.contains("archived"), "the refusal has to reach the caller: {e}");
     }
 }

@@ -1071,6 +1071,110 @@ fn a_prefix_query_names_the_live_vocabulary_not_the_physical_one() {
     assert!(r.truncated_prefixes.is_empty(), "{:?}", r.truncated_prefixes);
 }
 
+/// A partitioned collection of `n` documents per tenant, each holding `zed`
+/// plus one distinct term. Tenant `ta`'s terms sort BEFORE tenant `tb`'s, so a
+/// global expansion cut at the cap keeps only `ta`'s and `tb` is expanded out
+/// of its own query.
+fn partitioned_prefix_fixture(splits: &[&str], per_tenant: usize) -> Db {
+    let splits_sql = if splits.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " WITH (splits = [{}])",
+            splits.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
+        )
+    };
+    let mut db = Db::with_opts(DbOpts::default());
+    db.execute(&format!(
+        "CREATE COLLECTION items (tenant_id TEXT NOT NULL, id TEXT PRIMARY KEY) \
+         PARTITION BY (tenant_id){splits_sql}"
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english')",
+    )
+    .unwrap();
+    for (tenant, base) in [("ta", 0usize), ("tb", 90_000usize)] {
+        for i in 0..per_tenant {
+            db.insert(
+                "items",
+                Value::obj(vec![
+                    ("tenant_id".into(), Value::Str(tenant.into())),
+                    ("id".into(), Value::Str(format!("{tenant}{i:05}"))),
+                    ("body".into(), Value::Str(format!("zed a{:05}", base + i))),
+                ]),
+            )
+            .unwrap();
+        }
+    }
+    db.execute("FLUSH items").unwrap();
+    db
+}
+
+#[test]
+fn a_prefix_is_expanded_over_the_partition_the_statement_names() {
+    // The cap is a per-STATEMENT budget, and before this it was spent over the
+    // whole collection however narrowly the statement was scoped. 600 terms per
+    // tenant against a 512-term cap: the global first 512 are all `ta`'s, so a
+    // query that named `tb` and nothing else resolved to 512 terms no document
+    // it can return holds, and answered ZERO rows — while `tb`'s own partition
+    // held 600 matching live terms. The truncation note fired and was
+    // unactionable, since the caller had already narrowed as far as the schema
+    // allows.
+    //
+    // Both layouts, because the pre-change behaviour was only ever right by
+    // accident: at more than one shard a shard holding only `tb` spent its
+    // whole cap on `tb`'s terms and the answer looked correct, so the defect
+    // showed as a 512-to-0 regression when the expansion stopped depending on
+    // the layout. Scoping it to the partition is what makes the answer
+    // independent of BOTH.
+    for splits in [&[][..], &["tb"][..]] {
+        let mut db = partitioned_prefix_fixture(splits, 600);
+        let n = splits.len() + 1;
+
+        let tb = db
+            .query(
+                "SELECT id FROM items WHERE tenant_id = 'tb' AND text_match(body, 'a*') \
+                 LIMIT 100000",
+            )
+            .unwrap();
+        assert_eq!(tb.rows.len(), 512, "`tb`'s own first 512 live terms, {n} shard(s)");
+        assert!(
+            keys(&tb).iter().all(|k| k.starts_with("tb")),
+            "and nothing from the other partition"
+        );
+
+        // The other tenant is unaffected, which is the control: its terms were
+        // the ones winning the global cut, so a scoping bug there is invisible.
+        let ta = db
+            .query(
+                "SELECT id FROM items WHERE tenant_id = 'ta' AND text_match(body, 'a*') \
+                 LIMIT 100000",
+            )
+            .unwrap();
+        assert_eq!(ta.rows.len(), 512, "{n} shard(s)");
+        assert!(keys(&ta).iter().all(|k| k.starts_with("ta")));
+
+        // An unscoped statement still gets the collection-wide cut, unchanged:
+        // narrowing follows the statement, it is not a new default.
+        let all =
+            db.query("SELECT id FROM items WHERE text_match(body, 'a*') LIMIT 100000").unwrap();
+        assert_eq!(all.rows.len(), 512, "{n} shard(s)");
+        assert!(keys(&all).iter().all(|k| k.starts_with("ta")), "the global first 512");
+
+        // And a prefix that fits INSIDE the partition says nothing was cut,
+        // even though the collection-wide vocabulary is twice the cap.
+        let narrow = db
+            .query(
+                "SELECT id FROM items WHERE tenant_id = 'tb' AND text_match(body, 'a9000*') \
+                 LIMIT 100000",
+            )
+            .unwrap();
+        assert_eq!(narrow.rows.len(), 10, "`a90000`..`a90009`");
+        assert!(narrow.truncated_prefixes.is_empty(), "{:?}", narrow.truncated_prefixes);
+    }
+}
+
 #[test]
 fn a_truncated_exclusion_says_rows_were_kept_not_that_rows_are_missing() {
     // Truncating an EXCLUSION set does not lose rows. It fails to remove them,

@@ -63,19 +63,39 @@ pub struct Expansion {
     pub used: PrefixUse,
 }
 
-/// The polarity (or polarities) one prefix leaf was written in.
+/// The polarity (or polarities) one prefix leaf was written in, and what a cut
+/// of its expansion therefore COSTS.
 ///
-/// Both flags can be set: one statement may spell `a*` in one clause and `-a*`
-/// in another, they resolve to the same term list, and truncating it then does
-/// both kinds of damage at once.
+/// Two pairs, not one, because spelling and consequence are different facts and
+/// a SQL `NOT` separates them. `NOT text_match(body, 'a*')` is spelled `a*` —
+/// that is the only string the caller can find in their own statement — but it
+/// behaves as an exclusion, so cutting its expansion keeps rows rather than
+/// losing them. Deriving the consequence from the spelling reports the inverse
+/// of what happened for exactly that statement.
+///
+/// Either pair may have both flags set: one statement may spell `a*` in one
+/// clause and `-a*` in another, they resolve to the same term list, and
+/// truncating it then does both kinds of damage at once.
+///
+/// `#[non_exhaustive]` because the consequence pair was added after the
+/// spelling pair, and the next distinction should not need a third release.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrefixUse {
-    /// Used as a matching leaf. Cutting its expansion LOSES rows.
+    /// Written WITHOUT a leading `-` inside the `text_match` string. Says how
+    /// to render the leaf, not what a cut costs — see `loses_rows`.
     pub positive: bool,
-    /// Used under a `Not`, where the expansion is the EXCLUSION set. Cutting it
-    /// KEEPS rows the query asked to drop — the opposite consequence, which is
-    /// why the two cannot share one message.
+    /// Written WITH a leading `-` inside the `text_match` string.
     pub negated: bool,
+    /// The leaf matches, so cutting its expansion LOSES rows: the answer is
+    /// short. True when the spelling and the enclosing SQL agree in sign — a
+    /// plain `a*`, or `NOT text_match(body, '-a*')`.
+    pub loses_rows: bool,
+    /// The leaf excludes, so cutting its expansion KEEPS rows the query asked
+    /// to drop — the opposite consequence, which is why the two cannot share
+    /// one message. True for `-a*` and equally for `NOT text_match(body,
+    /// 'a*')`.
+    pub keeps_rows: bool,
 }
 
 /// Collection-wide term statistics, gathered by the coordinator and attached
@@ -609,11 +629,18 @@ impl Scorer for BitmapScorer {
 ///
 /// Applied by the coordinator to the UNION over every unit of every shard
 /// (`Db::run_select`), so the terms a prefix names are the lexicographically
-/// first `PREFIX_EXPANSION_LIMIT` of the collection's LIVE matching vocabulary
-/// at the query's snapshot — a property of the collection, not of its layout.
-/// Applied per unit, which is what the fallback arm of `build` still does, the
-/// union of the per-unit cuts grows with the number of units and the query
-/// means something different after a flush.
+/// first `PREFIX_EXPANSION_LIMIT` of the LIVE matching vocabulary at the
+/// query's snapshot — a property of the DATA, not of its layout. Applied per
+/// unit, which is what the fallback arm of `build` still does, the union of
+/// the per-unit cuts grows with the number of units and the query means
+/// something different after a flush.
+///
+/// The vocabulary is the collection's, or — for a statement that names a
+/// partition key equality — that PARTITION's. Expanding over the whole
+/// collection for a partition-scoped statement spends the cap on terms no row
+/// the statement can return holds, which expands a tenant out of its own
+/// query; scoping it is still layout-independent, so everything below carries
+/// over unchanged over the smaller live set.
 ///
 /// "Live" is the second half of the same property and it is not decoration.
 /// Each unit enumerates only terms a visible document still holds, and it
@@ -706,7 +733,7 @@ struct Built<'a> {
 
 /// `vis` is the unit's visibility bitmap at the query's pinned `t`, and it is
 /// required rather than optional because the one place it is read — the
-/// no-coordinator prefix arm of [`build`] — must use the SAME liveness
+/// no-coordinator prefix arm below — must use the SAME liveness
 /// predicate, at the same instant, as `Shard::prefix_terms` and
 /// `Shard::term_stats`. One liveness rule in the crate, not two.
 pub fn compile<'a>(
@@ -1401,6 +1428,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dead_run_does_not_spend_the_prefix_cap_in_the_no_coordinator_arm() {
+        // `vis` is a REQUIRED argument on `compile`/`build`, and it exists for
+        // exactly one line: the no-coordinator prefix arm, which masks its own
+        // dictionary enumeration by visibility. Every other fixture in this
+        // module supplies `all_live`, which is honest about those sources —
+        // they have no deletes — and therefore cannot exercise the mask at all.
+        // Deleting the masking left the whole suite green.
+        //
+        // 520 dead terms sorting before 80 live ones, against a cap of 512: an
+        // unmasked walk spends the entire budget on terms no visible document
+        // holds, returns nothing, and reports truncation while doing it — an
+        // empty answer plus a warning that is false in both halves.
+        let vocab = 600usize;
+        let mut b = InvertedBuilder::new();
+        for i in 0..vocab {
+            let mut toks = Vec::new();
+            Analyzer::English.analyze(&format!("a{i:05}"), 0, &mut toks);
+            b.add_doc(i as u32, &toks);
+        }
+        let (dict, post, _) = b.finish();
+        let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
+        let lens = b.doc_lens.clone();
+        let mut vis = Bitmap::new(vocab);
+        for o in 520..vocab {
+            vis.set(o);
+        }
+        // 80 live documents, not 600: the statistics describe the live corpus,
+        // which is what makes `num_docs` and the mask one consistent snapshot.
+        let st = GlobalStats { num_docs: 80, avg_doc_len: 1.0, ..Default::default() };
+        let q = TextQuery::parse("a*", Analyzer::English).unwrap();
+
+        // Both walks, because `live_terms_with_prefix` has two independent
+        // implementations and a sealed-only fixture pins one of them.
+        let sealed = TextSource::sealed(&dict, &post, &lens);
+        let mem = TextSource::Memory { terms: &b.terms, doc_lens: &b.doc_lens };
+        for (name, src) in [("sealed", sealed), ("memtable", mem)] {
+            let c = compile(&q, &src, &vis, &st, Bm25Params::default()).unwrap();
+            assert!(!c.prefix_truncated, "{name}: 80 live terms is under the cap");
+            // The exact hit set, not a count: the right NUMBER of wrong terms
+            // would pass a popcount, since the caller masks by `vis` anyway.
+            assert_eq!(
+                evaluate_to_bitmap(c, vocab).to_vec(),
+                (520..vocab as u32).collect::<Vec<u32>>(),
+                "{name}: the live terms, all of them and only them"
+            );
+        }
+    }
+
     /// With no coordinator to ask, a prefix expansion has no global df, so it
     /// scores against the unit's own. When `num_docs` is smaller than that df —
     /// a stale statistics cache, or a segment newer than the gather — the idf
@@ -1541,14 +1617,17 @@ mod tests {
         let src = TextSource::sealed(&dict, &post, &lens);
         assert_eq!((src.doc_freq("alpha"), src.doc_freq("alphabet")), (8, 1));
 
-        // An empty `doc_freq` is not a contrivance: it is exactly what a
-        // prefix query gets, since its terms are never gathered.
+        // Empty `doc_freq` and empty `expansions` together are what a DIRECT
+        // `compile` caller gets, and are what put this test on the fallback arm
+        // — see the doc comment. Through `Db::run_select` both arrive
+        // populated: the coordinator resolves every prefix and merges its terms
+        // into the gather, so "a prefix query's terms are never gathered",
+        // which this comment used to assert as a present-tense fact, describes
+        // the defect that change removed.
         let st = GlobalStats {
             num_docs: DOCS.len() as u64,
             avg_doc_len: src.total_doc_len() as f64 / DOCS.len() as f64,
             doc_freq: Default::default(),
-            // No `expansions` either, which is what puts this test on the
-            // fallback arm — see the doc comment.
             expansions: Default::default(),
             exact: false,
         };

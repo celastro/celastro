@@ -47,7 +47,12 @@ const STATS_REFRESH_WRITES: u64 = 512;
 /// one masked walk to get it back.
 const STATS_TERM_CAP: usize = 4096;
 
-/// How many DISTINCT prefixes one statement may name, counted per indexed path.
+/// How many distinct `(path, prefix)` pairs one statement may name, SUMMED
+/// over its indexed paths.
+///
+/// Summed, not per path: `Db::run_select` compares the total against this, and
+/// a rule stated per path is a rule an operator cannot use — five prefixes on
+/// each of two paths is inside a per-path eight and outside this one.
 ///
 /// Distinct is the whole cost model, and the bound and its refusal have to say
 /// the same thing: `Db::run_select` resolves each `(path, prefix)` pair ONCE
@@ -66,8 +71,14 @@ const STATS_TERM_CAP: usize = 4096;
 /// evict each other out of a [`STATS_TERM_CAP`]-entry map.
 ///
 /// The value is exactly the number of full-cap expansions that fit that cache,
-/// so any statement this admits can hold all of its terms at once and a repeat
-/// of it is warm. Over it the statement is REFUSED rather than quietly cut:
+/// so a statement whose leaves are ALL prefixes on one path holds every term it
+/// names at once and a repeat of it is warm. The cache is per path, and the fit
+/// covers the expanded terms alone: a statement that also names `n` ordinary
+/// terms on the same path overruns by `n`, and since eviction is oldest-fill
+/// first over a sorted fill order, the `n` lexicographically first terms of the
+/// merged list are dropped and re-gathered by every repeat. That is one masked
+/// walk for `n` terms per query, not the 12288-term thrash this bound exists to
+/// stop. Over it the statement is REFUSED rather than quietly cut:
 /// this change exists to stop prefix queries from silently answering less than
 /// they were asked, and a silent aggregate cap would be the same failure one
 /// level up.
@@ -632,15 +643,19 @@ impl Db {
     /// physical versions or tombstones happen to be resident. `exact` performs
     /// the two-phase gather on this query — in a cluster a broadcast, here a
     /// loop. Otherwise the cache answers, which is the same gather run only at
-    /// the refresh points [`STATS_REFRESH_WRITES`] sets, and only for terms no
-    /// earlier query in this epoch has already paid for. The difference
-    /// between the two arms is staleness — the cached triple is a set of live
-    /// sums at ONE instant, at most [`STATS_REFRESH_WRITES`] writes behind
-    /// this query, never a mixture of instants — plus one difference of
-    /// spelling: for a term no unit holds the exact arm omits the entry and
-    /// the cached arm stores an explicit `0`, which `GlobalStats::idf` reads
-    /// identically. See [`CachedStats`] for why staleness alone does not put
-    /// the shard count back into the answer.
+    /// the refresh points a fixed write count sets (512 writes), and only for
+    /// terms no earlier query in this epoch has already paid for. The
+    /// difference between the two arms is staleness — the cached triple is a
+    /// set of live sums at ONE instant, at most that many writes behind this
+    /// query, never a mixture of instants — plus one difference of spelling:
+    /// for a term no unit holds the exact arm omits the entry and the cached
+    /// arm stores an explicit `0`, which `GlobalStats::idf` reads identically.
+    ///
+    /// Staleness alone does not put the shard count back into the answer,
+    /// because what a score needs is a `df` and the `num_docs` it is divided by
+    /// measured at ONE instant: a stale-but-coherent triple still describes one
+    /// corpus, whatever its layout, while a fresh `df` beside a `num_docs` from
+    /// a different instant does not describe any corpus at all.
     ///
     /// `ts` must be a timestamp this query pins, not one stored earlier — on
     /// the cached arm the triple gathered at it is written into epoch-lived
@@ -650,23 +665,31 @@ impl Db {
     /// on `fill_term_stats`.
     ///
     /// The term list per path is taken as a SET: a repeat is ignored rather
-    /// than counted twice. See [`term_set`] for why that is a fix and not a
-    /// convenience.
+    /// than counted twice. That is a fix and not a convenience — the shard
+    /// gather walks one posting cursor per element of the slice it is handed
+    /// and accumulates into the same entry, so `["dup", "dup"]` came back at
+    /// twice its real frequency: `df = 160` against `num_docs = 80` on a corpus
+    /// all holding `dup`, which is a negative logarithm and the IDF clamp, the
+    /// LOWEST weight there is, for a term the corpus is full of.
     ///
     /// # Panics
     ///
     /// With `exact: false`, `ts` must be at or above the last commit this
     /// engine took. That is a precondition, not a quality note, and a
     /// `debug_assert!` holds callers to it: a historical timestamp panics in a
-    /// debug build. The distinction worth being explicit about, because an
-    /// assertion that fires only in debug is otherwise the worst of both
-    /// worlds, is WHOSE answer it spoils. This arm does not merely answer the
-    /// caller who passed the old `ts` inaccurately — it writes the triple it
-    /// gathered into epoch-lived state that every later query in the epoch
-    /// reads, so one historical read mis-scores queries that asked for nothing
-    /// of the kind and cannot tell. A wrong answer confined to the caller
-    /// would be a documentation matter; one that escapes to other callers is a
-    /// contract.
+    /// debug build. In release, where that assertion is not compiled, the
+    /// timestamp is RAISED to the last commit instead, so the call answers
+    /// something fresh rather than writing a past corpus into the cache. Both
+    /// halves are stated because an assertion that fires only in debug is
+    /// otherwise the worst of both worlds.
+    ///
+    /// What makes it a contract rather than a quality note is WHOSE answer it
+    /// spoils. This arm does not merely answer the caller who passed the old
+    /// `ts` inaccurately — it writes the triple it gathered into epoch-lived
+    /// state that every later query in the epoch reads, so one historical read
+    /// mis-scores queries that asked for nothing of the kind and cannot tell. A
+    /// wrong answer confined to the caller would be a documentation matter; one
+    /// that escapes to other callers is a contract.
     ///
     /// `exact: true` has no such precondition and is the supported way to read
     /// the past: it writes nothing, and at a `ts` below
@@ -725,6 +748,20 @@ impl Db {
                     "a historical `as_of` must be read with `exact: true`: it would poison the \
                      cache for every later query in the epoch"
                 );
+                // And self-enforcing in release, where the assertion is not
+                // compiled and this is a PUBLIC method one word of a doc
+                // comment away from being called with a historical `ts`. Raised
+                // rather than refused: `last_commit` is a valid pin by the
+                // argument `fill_term_stats` makes — it is at or above every
+                // commit issued so far, so the set it selects is "everything
+                // committed" — which turns the misuse into a merely-fresh read
+                // instead of an epoch every later query mis-scores from. A
+                // conforming caller is already at or above it, so this is a
+                // no-op for them.
+                //
+                // Below the `debug_assert!`, not above it: shadowing `ts` first
+                // would delete both the debug panic and the test that pins it.
+                let ts = ts.max(self.last_commit);
                 // Reset first, then fill: a refresh point starts a new epoch
                 // by emptying the entry, and filling into an entry that is
                 // about to be emptied would pay for a masked walk and discard
@@ -933,7 +970,8 @@ impl Db {
             // empty; `run_select` now merges the resolved expansion into
             // `want` before this runs, so what reaches here empty is a prefix
             // that matched no live term, or a path whose leaves are all
-            // negated.
+            // negated — TERMS and prefixes alike, since a negated expansion is
+            // an exclusion set and an exclusion set is enumerated, not scored.
             let (n, tl, d) = s.term_stats(path, &gather, ts)?;
             num_docs += n;
             total_doc_len += tl;
@@ -1132,13 +1170,15 @@ impl Db {
                 // EXCLUDED. No acknowledgement fixes that, because by the time
                 // it is read the rows are gone.
                 //
-                // Nor can the two be told apart here and only the dangerous one
-                // refused. The polarity on the leaf is the polarity inside the
-                // `text_match` string, and SQL's own `NOT` wraps the whole call
-                // (`Parser::not_expr`), so a positive leaf under it over-deletes
-                // exactly as a negated one does; one statement may also spell
-                // both. A rule that guesses the direction would be wrong
-                // silently, in the direction that loses data.
+                // Nor are the two told apart here and only the dangerous one
+                // refused. The direction IS known — `required_prefixes` records
+                // the effective polarity, SQL's own `NOT` included, which is
+                // what lets the SELECT report name a consequence — but knowing
+                // it buys nothing for a statement that cannot be taken back.
+                // One statement may spell a prefix both ways and get one term
+                // list, a positive leaf that is merely SHORT still deletes a
+                // set nobody named, and the caller's remedy is the same either
+                // way. So the refusal is on the CUT, not on the sign.
                 //
                 // So: refuse, which is what this repository does everywhere the
                 // alternative is doing something irreversible quietly — the
@@ -1816,9 +1856,12 @@ impl Db {
         // exists to stop doing quietly, and a statement that names more than
         // the statistics cache can hold is a statement the operator wants to
         // see. The bound is exactly the number of full-cap expansions that fit
-        // in `STATS_TERM_CAP`, so a statement inside it can always warm.
+        // in `STATS_TERM_CAP`, which is a per-PATH cache — so the number is
+        // where it is for that reason, while what it really bounds is the
+        // aggregate expansion cost below, which is path-independent.
         //
-        // What is counted is DISTINCT prefixes per path, because that is what
+        // What is counted is distinct `(path, prefix)` PAIRS, summed over the
+        // statement's paths, because that is what
         // is paid for: the loop below resolves each `(path, prefix)` pair once
         // and every clause that spells it reads the same expansion. The
         // message says so. It used to say "this statement has N prefix
@@ -1833,12 +1876,28 @@ impl Db {
                 "this statement names {distinct} distinct prefixes across its indexed paths \
                  and the limit is {PREFIX_LEAVES_LIMIT}; each DISTINCT one expands against \
                  every unit of every shard and gathers up to {PREFIX_EXPANSION_LIMIT} document \
-                 frequencies, so {} terms would not fit the {STATS_TERM_CAP}-term statistics \
-                 cache. Repeats of one prefix on one path are expanded once and cost nothing \
-                 more. Split the statement, or narrow the prefixes.",
-                distinct * PREFIX_EXPANSION_LIMIT
+                 frequencies, which is the cost this bounds — {PREFIX_LEAVES_LIMIT} is how \
+                 many full-cap expansions fit the {STATS_TERM_CAP}-term statistics cache each \
+                 indexed path keeps. Repeats of one prefix on one path are expanded and \
+                 gathered once, which is what this limit counts; each occurrence is still \
+                 evaluated separately in every unit. Split the statement, or narrow the \
+                 prefixes."
             )));
         }
+        // The same prune execution applies, applied to the EXPANSION too. A
+        // prefix is resolved once for the whole statement, so resolving it over
+        // the whole collection spends a per-statement cap on terms belonging to
+        // partitions the statement cannot return a row from: with 600 terms per
+        // tenant and a 512-term cap, a query scoped to the second tenant was
+        // expanded entirely out of its own partition and answered zero rows.
+        //
+        // Safe because this prefix restricts EVERY row the statement can
+        // return — `partition_constraint` derives it only from a top-level
+        // conjunctive equality, never from a disjunct or a negation — and
+        // `run_select` already ANDs the same `key_prefix` into the filter of
+        // every unit. A term no document in the partition holds could only have
+        // displaced one that is.
+        let part = exec::partition_constraint(&coll, sel.predicate.as_ref());
         let mut expansions: BTreeMap<String, BTreeMap<String, Expansion>> = BTreeMap::new();
         for (path, prefixes) in prefixes_by_path {
             for (p, used) in prefixes {
@@ -1860,7 +1919,14 @@ impl Db {
                 // exists to refuse.
                 let mut union: BTreeSet<String> = BTreeSet::new();
                 for s in self.shards(&sel.collection)? {
-                    s.prefix_terms(&path, &p, ts, PREFIX_EXPANSION_LIMIT + 1, &mut union)?;
+                    s.prefix_terms(
+                        &path,
+                        &p,
+                        ts,
+                        PREFIX_EXPANSION_LIMIT + 1,
+                        part.as_deref(),
+                        &mut union,
+                    )?;
                 }
                 // Over LIVE terms, so it says the honest thing: the
                 // collection really does hold more than `cap` matching terms a
@@ -1871,7 +1937,31 @@ impl Db {
                 let terms: Vec<String> = union.into_iter().take(PREFIX_EXPANSION_LIMIT).collect();
                 // The expanded terms join the statement's own terms, so the
                 // gather is still one pass per path over one deduplicated list.
-                want.entry(path.clone()).or_default().extend(terms.iter().cloned());
+                //
+                // The entry is created unconditionally and only the EXTEND is
+                // conditional, so a path whose every prefix is negated stays in
+                // `want` and `gather_stats` still produces a `GlobalStats` for
+                // it. Without an entry there the loop below has nowhere to
+                // attach the resolved `expansions`, every unit falls onto
+                // `scorer::build`'s no-coordinator arm, and the per-unit
+                // expansion this whole path exists to replace comes back.
+                let w = want.entry(path.clone()).or_default();
+                // A leaf written `-a*` is compiled under `TextQuery::Not`,
+                // whose scorer arm keeps the document ids and drops the scores,
+                // so a `df` gathered for its terms is never read — the same
+                // rule `leaf_terms` follows for a negated TERM, applied where a
+                // prefix expansion joins the gather. Measured at 512 entries
+                // per negation-only statement, which is an eighth of the cache
+                // filled with terms nothing can score. The terms still go into
+                // `Expansion` below either way: that list IS the exclusion set.
+                //
+                // Safe because a term absent from `doc_freq` scores
+                // `idf_for_df(0)` — the largest weight there is, and positive —
+                // so the disjunction's pivot still reaches every posting and
+                // the exclusion bitmap is identical.
+                if used.positive {
+                    w.extend(terms.iter().cloned());
+                }
                 expansions
                     .entry(path.clone())
                     .or_default()
@@ -2889,6 +2979,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(debug_assertions))]
+    fn a_historical_timestamp_is_raised_to_the_last_commit_where_the_assertion_is_gone() {
+        // The other half of the test below, in the build downstream users
+        // actually ship. `debug_assert!` compiles away in release, so the
+        // misuse it describes used to run to completion there: the gather at
+        // the historical `ts` was written into the epoch entry with
+        // `measured_at_writes` set to the LIVE write counter, so the next
+        // ordinary query's coherence check said the triple was current and kept
+        // the historical `df` beside freshly gathered globals — `df = 0` for a
+        // term 57 of 60 documents hold, which is the incoherent `df`/`n`
+        // pairing this whole arm exists to make unreachable, and it inverted a
+        // ranking for queries that asked for nothing historical.
+        let dir = tmp("stats-historical-ts-release");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..60usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    // Disjoint groups: `rare` is the term whose ranking a
+                    // poisoned `df` for `alpha` would invert.
+                    ("body".into(), Value::Str(if i < 3 { "rare" } else { "alpha" }.into())),
+                ]),
+            )
+            .unwrap();
+        }
+        let want = BTreeMap::from([("body".to_string(), vec!["alpha".to_string()])]);
+        let historical = db.last_commit - 1;
+        assert!(historical > 0);
+
+        let g = db.gather_stats("notes", &want, historical, false).unwrap();
+        let g = &g["body"];
+        assert_eq!(g.num_docs, 60, "raised to the last commit, not answered at the past");
+        assert_eq!(g.doc_freq.get("alpha"), Some(&57));
+
+        // And the epoch entry it wrote is the live corpus, so an ordinary query
+        // that follows reads a coherent triple.
+        let later = db.gather_stats("notes", &want, db.last_commit, false).unwrap();
+        assert_eq!(later["body"].num_docs, 60);
+        assert_eq!(later["body"].doc_freq.get("alpha"), Some(&57));
+
+        // The ranking that inverted: three `rare` documents must outrank the
+        // fifty-seven `alpha` ones.
+        let r = db
+            .query(
+                "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'alpha rare'), \
+                 method => 'linear', k => 100000) LIMIT 3",
+            )
+            .unwrap();
+        let got: Vec<&str> = r.rows.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(got, vec!["n0000", "n0001", "n0002"], "the rarer term wins");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "a historical `as_of` must be read with `exact: true`")]
     fn a_historical_timestamp_on_the_default_arm_is_a_caller_error_and_not_an_approximation() {
@@ -3238,31 +3388,49 @@ mod tests {
         }
         // Deliberately NO flush: this has to be the memtable's own `BTreeMap`
         // range walk, not a dictionary block walk.
-        let rows = |db: &mut Db| {
-            let mut ks: Vec<String> = db
-                .query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000")
-                .unwrap()
-                .rows
-                .iter()
-                .map(|r| r.key.clone())
-                .collect();
+        let run = |db: &mut Db| {
+            let r =
+                db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000").unwrap();
+            let mut ks: Vec<String> = r.rows.iter().map(|x| x.key.clone()).collect();
             ks.sort();
-            ks
+            (ks, r.truncated_prefixes)
         };
-        let got = rows(&mut db);
+        let (got, cut) = run(&mut db);
         assert_eq!(got.len(), PREFIX_EXPANSION_LIMIT);
         assert_eq!(got.first().map(String::as_str), Some("n00000"), "the FIRST 512 of 600");
         assert_eq!(got.last().map(String::as_str), Some("n00511"), "not the last 512");
+        assert_eq!(cut.len(), 1, "600 live terms against a cap of 512: {cut:?}");
 
         // And with one document deleted, which takes the masked arm rather
         // than the every-document-is-visible fast path: `a00000` is now held by
         // nobody, so it must not spend a slot — the answer shifts by exactly
         // one term at BOTH ends.
         assert!(db.delete_key("notes", "n00000").unwrap());
-        let got = rows(&mut db);
+        let (got, cut) = run(&mut db);
         assert_eq!(got.len(), PREFIX_EXPANSION_LIMIT);
         assert_eq!(got.first().map(String::as_str), Some("n00001"));
         assert_eq!(got.last().map(String::as_str), Some("n00512"), "the dead term freed a slot");
+        // The VERDICT, which is the only thing this leg can say that the leg
+        // above cannot. The rows alone cannot separate filter-before-take from
+        // filter-after-take here, because the coordinator asks each unit for
+        // `cap + 1` and that spare slot absorbs exactly one displaced dead
+        // term: both orders return the same 512 keys, and only the truncation
+        // flag differs — 599 live terms reach the union under one and 512 under
+        // the other.
+        assert_eq!(cut.len(), 1, "599 live terms is still more than the cap: {cut:?}");
+
+        // A dead RUN longer than the cap, which is where the two orders part
+        // company on the ROWS as well. 520 dead terms sort before every live
+        // one, so filter-after-take spends the whole budget stepping through
+        // corpses and answers with nothing — a silently EMPTY result for a
+        // query whose honest answer is 80 rows and no warning at all.
+        for i in 1..520usize {
+            assert!(db.delete_key("notes", &format!("n{i:05}")).unwrap());
+        }
+        let (got, cut) = run(&mut db);
+        assert_eq!(got.len(), 80, "the live terms, all of them: `a00520`..`a00599`");
+        assert_eq!(got.first().map(String::as_str), Some("n00520"));
+        assert!(cut.is_empty(), "80 live terms is under the cap, so nothing was cut: {cut:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3303,7 +3471,46 @@ mod tests {
                 .is_ok(),
             "one prefix spelled twelve times is one expansion and is admitted"
         );
+
+        // And SUMMED across paths, which nothing pinned: the check is
+        // `.values().map(len).sum()`, while the constant's headline and README
+        // both said "per indexed path" — a rule under which four-plus-four is
+        // the same as five-plus-five, and an operator who split their statement
+        // by it was refused again with no way to work out why.
+        let dir2 = tmp("prefix-leaf-budget-two-paths");
+        let mut db2 = Db::open(&dir2, DbOpts::default()).unwrap();
+        db2.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for (name, path) in [("notes_body", "body"), ("notes_title", "title")] {
+            db2.execute(&format!(
+                "CREATE INDEX {name} ON notes USING fulltext ({path}) \
+                 WITH (analyzer = 'english')"
+            ))
+            .unwrap();
+        }
+        db2.insert(
+            "notes",
+            Value::obj(vec![
+                ("id".into(), Value::Str("n0".into())),
+                ("body".into(), Value::Str("zed".into())),
+                ("title".into(), Value::Str("zed".into())),
+            ]),
+        )
+        .unwrap();
+        let two = |n: usize| {
+            let leaves = (0..n).map(|i| format!("a{i:05}*")).collect::<Vec<_>>().join(" ");
+            format!(
+                "SELECT id FROM notes WHERE text_match(body, '{leaves}') \
+                 AND text_match(title, '{leaves}') LIMIT 5"
+            )
+        };
+        let half = PREFIX_LEAVES_LIMIT / 2;
+        assert!(db2.query(&two(half)).is_ok(), "{half} on each of two paths is the budget");
+        let e = db2.query(&two(half + 1)).unwrap_err().to_string();
+        assert!(e.contains(&(2 * (half + 1)).to_string()), "the summed count: {e}");
+        assert!(e.contains("across its indexed paths"), "and it says the count is summed: {e}");
+
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -3613,6 +3820,173 @@ mod tests {
             text.matches("documents are missing from this answer").count(),
             1,
             "the query-level statement belongs in the plan once:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_query_on_an_unindexed_path_leaves_nothing_behind_in_the_statistics_map() {
+        // `Db::stats` is keyed `collection/path` and nothing ever removes an
+        // entry from the outer map — `STATS_TERM_CAP` bounds the terms INSIDE
+        // one entry, not how many entries there are. `analyzer_for` falls back
+        // to "standard" for any path, so a `text_match` naming a path with no
+        // index used to parse, reach `gather_stats`, and have an entry created
+        // for it a moment before `eval_expr` failed the statement. One
+        // statement can name as many such paths as it has bytes for, and each
+        // one is retained for the life of the process.
+        let dir = tmp("unindexed-path-stats");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert(
+            "notes",
+            Value::obj(vec![
+                ("id".into(), Value::Str("n1".into())),
+                ("body".into(), Value::Str("zed".into())),
+            ]),
+        )
+        .unwrap();
+
+        // One statement, several fresh paths, one error to the caller.
+        let clauses: Vec<String> =
+            (0..8).map(|i| format!("text_match(ghost{i:04}{}, 'x')", "z".repeat(64))).collect();
+        let sql = format!("SELECT id FROM notes WHERE {} LIMIT 5", clauses.join(" OR "));
+        let e = db.query(&sql).unwrap_err().to_string();
+        // The message stays exactly where it was: this declines to NAME the
+        // path, it does not move the refusal to the coordinator.
+        assert!(e.contains("no full-text index on"), "{e}");
+        assert!(db.stats.is_empty(), "a failed query retained {} entries", db.stats.len());
+
+        // A prefix on an unindexed path is out of the budget too, since the
+        // budget counts expansions that get paid for.
+        let many: Vec<String> =
+            (0..12).map(|i| format!("text_match(ghost{i:04}, 'a* b*')")).collect();
+        let sql = format!("SELECT id FROM notes WHERE {} LIMIT 5", many.join(" OR "));
+        let e = db.query(&sql).unwrap_err().to_string();
+        assert!(e.contains("no full-text index on"), "not the prefix budget: {e}");
+        assert!(db.stats.is_empty(), "{} entries", db.stats.len());
+
+        // The indexed path still works and still caches, which is the control.
+        let r = db.query("SELECT id FROM notes WHERE text_match(body, 'zed') LIMIT 5").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(db.stats.len(), 1, "the one path that has an index");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_negated_expansion_is_resolved_but_not_gathered() {
+        // A negated prefix's expansion is the EXCLUSION set: it decides which
+        // documents are dropped, so it has to be resolved at the coordinator
+        // like any other — but nothing SCORES it, so its document frequencies
+        // are never read. Gathering them anyway cost a masked posting walk per
+        // term per unit and filled 512 of the path's 4096 cache slots with
+        // terms that cannot be looked up, so one admitted negation-only
+        // statement displaced the whole cache and the next ranked query paid a
+        // fresh gather for its own terms.
+        let dir = tmp("negated-expansion-gather");
+        let mut db = cap_fixture(&dir, 600);
+        let key = cache_key("notes", "body");
+
+        let r = db
+            .query("SELECT id FROM notes WHERE text_match(body, 'zed -a*') LIMIT 100000")
+            .unwrap();
+        // 600 terms against a cap of 512: the exclusion set is short, so the 88
+        // documents it failed to exclude are still here. Unchanged by this —
+        // the expansion is still resolved globally, only the gather is skipped.
+        assert_eq!(r.rows.len(), 88, "the coordinator's global cut, not a per-unit one");
+        assert_eq!(r.truncated_prefixes.len(), 1, "{:?}", r.truncated_prefixes);
+        let c = db.stats.get(&key).unwrap();
+        assert_eq!(c.doc_freq.get("zed"), Some(&600), "the positive clause is still gathered");
+        let a: Vec<&String> = c.doc_freq.keys().filter(|t| t.starts_with('a')).collect();
+        assert!(a.is_empty(), "frequencies nothing can read: {} of them", a.len());
+
+        // A PURE negation keeps its path in `want` even with nothing to gather,
+        // or `gather_stats` produces no entry for it, the resolved expansion
+        // has nowhere to attach, and every unit re-expands the prefix against
+        // its own dictionary — which would answer 0 rows here, since each
+        // unit's 200 terms fit under the cap.
+        let dir2 = tmp("negated-expansion-pure");
+        let mut db2 = cap_fixture(&dir2, 600);
+        let r =
+            db2.query("SELECT id FROM notes WHERE text_match(body, '-a*') LIMIT 100000").unwrap();
+        assert_eq!(r.rows.len(), 88, "the global cut, not each unit's own");
+        assert!(db2.stats.get(&cache_key("notes", "body")).unwrap().doc_freq.is_empty());
+
+        // And the positive spelling still gathers, which is the control: this
+        // turns on the leaf's sign, not on prefixes as a class.
+        let dir3 = tmp("negated-expansion-control");
+        let mut db3 = cap_fixture(&dir3, 600);
+        db3.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5").unwrap();
+        let c = db3.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            c.doc_freq.keys().filter(|t| t.starts_with('a')).count(),
+            PREFIX_EXPANSION_LIMIT,
+            "a matching expansion IS scored"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+        let _ = fs::remove_dir_all(&dir3);
+    }
+
+    #[test]
+    fn a_cut_prefix_under_a_sql_not_reports_the_consequence_that_shape_has() {
+        // The half the mini-language's `-a*` arm was built to prevent, reached
+        // by the OTHER spelling. `Expr::Not` is evaluated as `eval_defined(..)
+        // andnot matched`, so a SHORT `matched` yields MORE rows — `NOT
+        // text_match(body, 'a*')` over documents that ALL hold an `a*` term
+        // must return nothing, and a cut expansion leaves the surplus behind.
+        // The report used to read the consequence off the sign inside the
+        // query string, where there is none, so it said "documents are
+        // missing" about a statement holding extra ones. A caller acting on
+        // that widens the prefix and keeps more.
+        let dir = tmp("prefix-cut-under-sql-not");
+        let mut db = cap_fixture(&dir, PREFIX_EXPANSION_LIMIT + 200);
+
+        let neg =
+            db.query("SELECT id FROM notes WHERE NOT text_match(body, 'a*') LIMIT 2000").unwrap();
+        // Every document holds its own `a#####`, so the honest answer is zero
+        // rows. The 200 that are here are the cut's surplus, and they are the
+        // reason the message has to name this direction.
+        assert_eq!(neg.rows.len(), 200, "the cut exclusion set left rows behind");
+        assert_eq!(neg.truncated_prefixes.len(), 1, "{:?}", neg.truncated_prefixes);
+        let m = &neg.truncated_prefixes[0];
+        assert!(
+            m.contains("should have excluded are still in this answer"),
+            "the consequence this shape had: {m}"
+        );
+        assert!(m.contains("text_match(body, 'a*')"), "the caller's own spelling: {m}");
+        assert!(!m.contains("'-a*'"), "a spelling this statement never wrote: {m}");
+
+        // Same rows through the mini-language, and — now — the same message.
+        // Which of the two spellings a caller reaches for cannot decide what
+        // they are told happened.
+        let mini =
+            db.query("SELECT id FROM notes WHERE text_match(body, 'zed -a*') LIMIT 2000").unwrap();
+        assert_eq!(mini.rows.len(), neg.rows.len());
+        assert!(
+            mini.truncated_prefixes[0].contains("should have excluded are still in this answer"),
+            "{:?}",
+            mini.truncated_prefixes
+        );
+
+        // A double negation matches again, so the cut is short rather than
+        // surplus. This is why the sign is FLIPPED and not OR-ed: OR-ing the
+        // SQL `NOT` into an already-negated leaf leaves it negated, and the
+        // message stays inverted in the rarer shape.
+        let dbl = db
+            .query("SELECT id FROM notes WHERE NOT text_match(body, 'zed -a*') LIMIT 2000")
+            .unwrap();
+        assert_eq!(dbl.rows.len(), PREFIX_EXPANSION_LIMIT, "512 of 712: rows are MISSING");
+        assert!(
+            dbl.truncated_prefixes[0].contains("documents are missing from this answer"),
+            "{:?}",
+            dbl.truncated_prefixes
         );
 
         let _ = fs::remove_dir_all(&dir);

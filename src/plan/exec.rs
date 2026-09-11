@@ -170,7 +170,16 @@ fn truncated_prefixes(stats: &BTreeMap<String, GlobalStats>) -> Vec<String> {
             // remove them, so the answer has extra ones. Saying "documents are
             // missing" there is not a vague warning, it is the opposite of
             // what happened.
-            let consequence = match (e.used.positive, e.used.negated) {
+            //
+            // Read off the CONSEQUENCE pair, not the spelling pair. The two
+            // differ for any leaf under SQL's own `NOT`, which wraps the whole
+            // `text_match` call and so cannot be seen from inside the query
+            // string: `NOT text_match(body, 'a*')` is spelled positively and
+            // excludes. Deriving this from `positive`/`negated` printed
+            // "documents are missing" for a statement that had kept extra
+            // ones, and a caller acting on that widens the prefix and keeps
+            // more.
+            let consequence = match (e.used.loses_rows, e.used.keeps_rows) {
                 (_, false) => "so documents are missing from this answer",
                 (false, true) => {
                     "so documents this query should have excluded are still in this answer"
@@ -180,9 +189,13 @@ fn truncated_prefixes(stats: &BTreeMap<String, GlobalStats>) -> Vec<String> {
                      excluded are still in it"
                 }
             };
+            // "more terms match", not "the collection matches more": the
+            // expansion is resolved over the partition the statement named
+            // when it names one, so the set this verdict was taken over is not
+            // always the whole collection.
             out.push(format!(
-                "text_match({path}, {leaf}) expanded to {} terms and was cut there: the \
-                 collection matches more, {consequence}",
+                "text_match({path}, {leaf}) expanded to {} terms and was cut there: more \
+                 terms than that match what this statement can see, {consequence}",
                 e.terms.len()
             ));
         }
@@ -226,6 +239,19 @@ pub struct ExecInput<'a> {
 pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |path: &str, q: &str| {
+        // A path with no full-text index has nothing to gather, and naming one
+        // is not merely wasted work. `analyzer_for` falls back to "standard"
+        // rather than reporting an unindexed path, so any string a caller puts
+        // in a `text_match` parses and enters this map; `Db::gather_stats` then
+        // creates a `CachedStats` entry keyed on it, in a map nothing evicts
+        // from, before `eval_expr` reaches the leaf and returns `no full-text
+        // index on ...`. One 1 MiB statement naming a thousand fresh paths
+        // retains a thousand entries and returns one error. Refusing here would
+        // move the error off `eval_expr`, which words it better; declining to
+        // NAME the path leaves the message exactly where it was.
+        if coll.fulltext_index(path).is_none() {
+            return;
+        }
         let an = Analyzer::parse(coll.analyzer_for(path));
         if let Ok(tq) = TextQuery::parse(q, an) {
             let mut terms = Vec::new();
@@ -234,7 +260,10 @@ pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<S
         }
     };
     if let Some(e) = &sel.predicate {
-        walk_text_match(e, &mut |p, q| add(p, q));
+        // The SQL sign is ignored here and used in `required_prefixes`: this
+        // one gathers DOCUMENT FREQUENCIES, and `leaf_terms` already declines
+        // to descend into a negation because a negated term is never scored.
+        walk_text_match(e, false, &mut |p, q, _| add(p, q));
     }
     if let Some(OrderBy::Hybrid(h)) = &sel.order {
         for s in &h.sources {
@@ -264,35 +293,62 @@ pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<S
 /// Each prefix is carried once per path with a [`PrefixUse`] recording every
 /// polarity the statement used it in. One term list serves both — `a*` and
 /// `-a*` name the same terms — but they differ in what a CUT costs, so the
-/// polarity has to survive the deduplication that merges them.
+/// polarity has to survive the deduplication that merges them. Polarity here is
+/// the mini-language's sign XOR the sign of the SQL around the call, which is
+/// why the walk carries one: `NOT text_match(body, 'a*')` is spelled
+/// positively and excludes, and both facts have to be recorded separately.
 pub fn required_prefixes(
     coll: &Collection,
     sel: &Select,
 ) -> BTreeMap<String, BTreeMap<String, PrefixUse>> {
     let mut out: BTreeMap<String, BTreeMap<String, PrefixUse>> = BTreeMap::new();
-    let mut add = |path: &str, q: &str| {
+    let mut add = |path: &str, q: &str, sql_negated: bool| {
+        // As in [`required_terms`], and for the same reason. It also takes an
+        // unindexed path out of the `PREFIX_LEAVES_LIMIT` count, which is
+        // right: that bound counts expansions that will be PAID for, and a
+        // prefix on a path with no dictionary to walk costs nothing before the
+        // statement fails.
+        if coll.fulltext_index(path).is_none() {
+            return;
+        }
         let an = Analyzer::parse(coll.analyzer_for(path));
         if let Ok(tq) = TextQuery::parse(q, an) {
             let mut ps = Vec::new();
-            tq.leaf_prefixes(&mut ps);
+            // Seeded with the sign of the SQL around the call, so `effective`
+            // is the leaf's real polarity: the mini-language's `-` XOR the
+            // enclosing `NOT`.
+            tq.prefixes_under(sql_negated, &mut ps);
             let e = out.entry(path.to_string()).or_default();
-            for (p, negated) in ps {
+            for (p, effective) in ps {
                 let u = e.entry(p).or_default();
-                if negated {
+                // How it was WRITTEN, which is the seed taken back out. This
+                // is the only string a caller can find in their own statement,
+                // so it is what the report renders.
+                if effective != sql_negated {
                     u.negated = true;
                 } else {
                     u.positive = true;
+                }
+                // What a CUT costs, which is the effective sign and nothing
+                // else. `NOT text_match(body, 'a*')` is spelled positively and
+                // excludes; deriving one from the other reports the inverse.
+                if effective {
+                    u.keeps_rows = true;
+                } else {
+                    u.loses_rows = true;
                 }
             }
         }
     };
     if let Some(e) = &sel.predicate {
-        walk_text_match(e, &mut |p, q| add(p, q));
+        walk_text_match(e, false, &mut |p, q, n| add(p, q, n));
     }
     if let Some(OrderBy::Hybrid(h)) = &sel.order {
         for s in &h.sources {
             if let HybridSource::Text { path, query } = s {
-                add(path, query);
+                // A ranking source is never under a `NOT`: it is named by
+                // ORDER BY, not by the predicate.
+                add(path, query, false);
             }
         }
     }
@@ -300,15 +356,26 @@ pub fn required_prefixes(
     out
 }
 
-fn walk_text_match(e: &Expr, f: &mut impl FnMut(&str, &str)) {
+/// Every `text_match` in a predicate, with the sign of the SQL around it.
+///
+/// The sign is not decoration. `Expr::Not` is evaluated as `eval_defined(inner)
+/// andnot matched`, so a SHORT `matched` yields MORE rows, not fewer — a cut
+/// prefix under a SQL `NOT` has the consequence of an exclusion however it was
+/// spelled inside the `text_match` string. Without this flag the only polarity
+/// anyone downstream can see is the one the mini-language records, which is
+/// half the answer.
+///
+/// `And` and `Or` pass the sign through unchanged: under a `Not` they are De
+/// Morgan, and De Morgan preserves each LEAF's effective sign.
+fn walk_text_match(e: &Expr, negated: bool, f: &mut impl FnMut(&str, &str, bool)) {
     match e {
-        Expr::TextMatch { path, query } => f(path, query),
+        Expr::TextMatch { path, query } => f(path, query, negated),
         Expr::And(v) | Expr::Or(v) => {
             for x in v {
-                walk_text_match(x, f);
+                walk_text_match(x, negated, f);
             }
         }
-        Expr::Not(x) => walk_text_match(x, f),
+        Expr::Not(x) => walk_text_match(x, !negated, f),
         _ => {}
     }
 }
@@ -316,7 +383,12 @@ fn walk_text_match(e: &Expr, f: &mut impl FnMut(&str, &str)) {
 /// The partition-key equality this query is constrained on, if any. Partition
 /// pruning is the primary defence against fan-out (§8.4), so it is looked for
 /// before anything else runs.
-fn partition_constraint(coll: &Collection, e: Option<&Expr>) -> Option<String> {
+///
+/// `pub(crate)` because the coordinator needs the same answer BEFORE execution
+/// starts: a prefix is expanded once for the whole statement, and expanding it
+/// over the whole collection spends the cap on terms no document the statement
+/// can return holds.
+pub(crate) fn partition_constraint(coll: &Collection, e: Option<&Expr>) -> Option<String> {
     let pk = coll.partition_key.as_ref()?;
     fn find(e: &Expr, pk: &str) -> Option<Value> {
         match e {
@@ -1178,12 +1250,25 @@ mod tests {
         (key.to_string(), crate::json::parse(json).unwrap())
     }
 
+    /// The flags `required_prefixes` records for one occurrence of a prefix
+    /// leaf: `spelled_negated` is the `-` inside the `text_match` string,
+    /// `sql_negated` is a `NOT` the SQL wrapped the whole call in.
+    fn used(spelled_negated: bool, sql_negated: bool) -> PrefixUse {
+        let effective = spelled_negated != sql_negated;
+        PrefixUse {
+            positive: !spelled_negated,
+            negated: spelled_negated,
+            loses_rows: !effective,
+            keeps_rows: effective,
+        }
+    }
+
     /// One cut leaf on `body`, used in the polarities the flags describe.
-    fn cut(positive: bool, negated: bool) -> BTreeMap<String, GlobalStats> {
+    fn cut(used: PrefixUse) -> BTreeMap<String, GlobalStats> {
         let e = crate::text::scorer::Expansion {
             terms: vec!["a1".to_string(), "a2".to_string()],
             truncated: true,
-            used: PrefixUse { positive, negated },
+            used,
         };
         let g = GlobalStats {
             expansions: BTreeMap::from([("a".to_string(), e)]),
@@ -1202,13 +1287,13 @@ mod tests {
             v.pop().unwrap()
         };
 
-        let m = one(cut(true, false));
+        let m = one(cut(used(false, false)));
         assert!(m.contains("text_match(body, 'a*')"), "{m}");
         assert!(m.contains("documents are missing from this answer"), "{m}");
 
         // A cut EXCLUSION set keeps rows rather than losing them, so both
         // halves of this line differ from the one above.
-        let m = one(cut(false, true));
+        let m = one(cut(used(true, false)));
         assert!(m.contains("text_match(body, '-a*')"), "{m}");
         assert!(!m.contains("'a*'"), "the sign is not optional: {m}");
         assert!(m.contains("should have excluded are still in this answer"), "{m}");
@@ -1219,7 +1304,10 @@ mod tests {
         // it told the reader that `'a*'` had kept rows it should have
         // excluded: a claim about a clause that does not exist, while the
         // clause that really did keep them went unnamed.
-        let m = one(cut(true, true));
+        let mut both = used(false, false);
+        both.negated = true;
+        both.keeps_rows = true;
+        let m = one(cut(both));
         assert!(m.contains("text_match(body, 'a*' and '-a*')"), "both spellings: {m}");
         assert!(
             m.contains(
@@ -1228,6 +1316,36 @@ mod tests {
             ),
             "{m}"
         );
+    }
+
+    /// SQL's own `NOT` wraps the whole `text_match` call, so the sign inside
+    /// the query string is only half of the leaf's polarity. The report used to
+    /// read the consequence off the spelling alone, which made `NOT
+    /// text_match(body, 'a*')` — a statement that KEPT rows it had asked to
+    /// exclude — say that documents were missing, and a caller acting on that
+    /// widens the prefix and keeps more.
+    #[test]
+    fn a_cut_leaf_under_a_sql_not_reports_the_consequence_the_sql_gave_it() {
+        let one = |st| {
+            let mut v = truncated_prefixes(&st);
+            assert_eq!(v.len(), 1, "{v:?}");
+            v.pop().unwrap()
+        };
+
+        // `NOT text_match(body, 'a*')`: spelled positively, behaves as an
+        // exclusion. Both halves have to come from different flags — the
+        // caller's own spelling, and the consequence the SQL gave it.
+        let m = one(cut(used(false, true)));
+        assert!(m.contains("text_match(body, 'a*')"), "the caller's spelling: {m}");
+        assert!(!m.contains("'-a*'"), "a spelling they never wrote: {m}");
+        assert!(m.contains("should have excluded are still in this answer"), "{m}");
+
+        // `NOT text_match(body, '-a*')` is a double negation, so it matches
+        // again and a cut loses rows. Flipping the sign rather than OR-ing it
+        // is what makes this line right.
+        let m = one(cut(used(true, true)));
+        assert!(m.contains("text_match(body, '-a*')"), "the caller's spelling: {m}");
+        assert!(m.contains("documents are missing from this answer"), "{m}");
     }
 
     /// `k'` used to come from LIMIT alone, so every stage below the gather

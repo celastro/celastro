@@ -12,8 +12,9 @@
 //!   collection. This is the only way to catch the silent regressions from
 //!   deletes, quantization and compaction-policy changes: none of them fails a
 //!   test, and none of them shows up in a benchmark on fresh data.
-//! * [`compare_shardings`] — the distributed exit criterion. In exact mode,
-//!   results must be bit-identical regardless of shard count.
+//! * Shard-count comparison — the distributed exit criterion. In exact mode,
+//!   results must be bit-identical regardless of shard count. Lives in the
+//!   integration suite rather than here; this module carries the recall half.
 
 use std::collections::BTreeSet;
 

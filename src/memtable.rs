@@ -236,7 +236,7 @@ impl Memtable {
 
     /// Evaluate a structured predicate. There are no columns here — the
     /// memtable is small and mutable, so predicates run over the values
-    /// directly, through the same [`matches`] used by the variant fallback and
+    /// directly, through the same [`matches()`] used by the variant fallback and
     /// mirrored by every column implementation.
     pub fn filter(&self, path: &str, op: CmpOp, lit: &Value) -> Bitmap {
         self.eval(path, op, lit, false)
