@@ -24,6 +24,16 @@ filtered-search strategy selection, storage tiers with lifecycle policies, and
 transactions are not here — see
 [What is deliberately not here](#what-is-deliberately-not-here).
 
+**Upgrading from 0.1.0.** Absolute BM25 scores move. The default query path
+used to derive its statistics from physical rows, which counted superseded and
+tombstoned versions and so drifted with flush and compaction timing — and, since
+those are per shard, with the shard count. It now measures the live corpus, so
+the same documents in the same order come back with different numbers against
+them. Relative ranking is what this corrects rather than disturbs: a term is no
+longer weighted by how much dead data happens to be on disk beside it. Anything
+comparing scores against a stored threshold needs re-baselining; anything
+comparing them against each other does not.
+
 ---
 
 ## The load-bearing idea
