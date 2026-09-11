@@ -5,6 +5,7 @@
 //! | hybrid queries provably correct; harness trusted | [`hybrid_retrieval_is_a_union_of_all_three_modes`], [`the_recall_harness_catches_a_deliberate_regression`] |
 //! | recall@10 ≥ 0.95 under sustained deletes | [`recall_at_10_holds_under_sustained_deletes`] |
 //! | in exact mode, results bit-identical regardless of shard count | [`exact_mode_is_bit_identical_across_shard_counts`], [`exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`], [`exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`] |
+//! | in default mode, a freshly refreshed gather matches `WITH (exact_scoring)` for Term and Phrase queries, and the triple is identical at every shard count fresh or stale (not prefix queries, which reach the gather on neither path) | [`default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`], [`default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`] |
 //! | state survives a reopen | [`a_database_survives_reopen`] |
 
 use std::collections::BTreeMap;
@@ -515,6 +516,197 @@ fn exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes(
         f64::from_bits(one.1) > 2.0,
         "and the length norm is a real average, not the num_docs == 0 fallback of 1.0"
     );
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+}
+
+#[test]
+fn default_statistics_are_identical_across_shard_counts_under_updates_and_deletes() {
+    // The sibling of `exact_statistics_...` above, on the path almost every
+    // query actually takes. The exact path buys its invariance with a gather
+    // per query; this one is what the default costs, and until the cached
+    // statistics became live sums at one instant it did not have it. Measured
+    // on the code this test was written against, this exact corpus answered
+    // 831 documents at one shard, 853 at three and 965 at six, with
+    // df{fusion} 270 / 271 / 295 and df{traversal} 140 / 145 / 168, against an
+    // exact 818 / 258 / 140 at all three: the cache counted physical rows, and
+    // how many of those survive is each shard's own seal and compaction
+    // decision.
+    //
+    // THE TRAP, and it is easy to fall into: `Db::run_select` gathers EXACT
+    // statistics when `sel.with.exact_scoring || sel.with.exact`, so borrowing
+    // the `WITH (exact, exact_scoring)` idiom from the tests above and
+    // dropping only `exact_scoring` still measures the exact path, and the
+    // test passes without proving anything. This one calls `gather_stats`
+    // with `exact: false` directly, and its score-level sibling below passes
+    // no `WITH` clause at all.
+    //
+    // The low `max_bytes`, the rewrites and the deletes are all load-bearing:
+    // without per-shard seal schedules over dead rows the three legs agree for
+    // the wrong reason.
+    let dims = 16;
+    let n = 900;
+
+    let want = || {
+        BTreeMap::from([("body".to_string(), vec!["fusion".to_string(), "traversal".to_string()])])
+    };
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        for i in 0..n {
+            let d = c.doc(i);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(7) {
+            let mut d = c.doc(i);
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete_key("items", &format!("t{}\u{1}doc-{i:05}", i % 3)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        // Compaction as well as a seal, because they drop different rows: a
+        // seal drops a superseded version, a compaction drops a deleted one,
+        // and both run on each shard's own schedule.
+        db.execute("COMPACT items").unwrap();
+
+        let ts = db.clock.peek();
+        let s = db.gather_stats("items", &want(), ts, false).unwrap();
+        let g = &s["body"];
+        assert!(!g.exact, "this leg has to be measuring the cached path");
+        let cached = (g.num_docs, g.avg_doc_len.to_bits(), g.doc_freq.clone());
+
+        // And the exact triple on the same corpus at the same instant, to be
+        // the absolute anchor: three legs compared only against each other
+        // pass just as happily on three equal wrong numbers.
+        let s = db.gather_stats("items", &want(), ts, true).unwrap();
+        let g = &s["body"];
+        let exact = (g.num_docs, g.avg_doc_len.to_bits(), g.doc_freq.clone());
+
+        // The stale leg. These writes are far short of `STATS_REFRESH_WRITES`,
+        // so the next gather reads the cache without rebuilding it. That read
+        // is deliberately NOT expected to match the corpus any more — it is
+        // expected to match what the last refresh point measured, at every
+        // shard count. Staleness is the residual this design keeps; a
+        // shard-count dependence is the one it removes, and this is what
+        // separates them.
+        for i in n..n + 200 {
+            let d = c.doc(i);
+            db.insert("items", d).unwrap();
+        }
+        let ts = db.clock.peek();
+        let s = db.gather_stats("items", &want(), ts, false).unwrap();
+        let g = &s["body"];
+        let stale = (g.num_docs, g.avg_doc_len.to_bits(), g.doc_freq.clone());
+
+        (cached, exact, stale)
+    };
+
+    let one = run(&[]);
+    let three = run(&["t1", "t2\u{1}doc-00450"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+
+    // The anchor: at one shard the cached triple is the exact triple. Nothing
+    // about the shard count can make this true by accident, and it is what
+    // stops the equality assertions below from passing on a cache that has
+    // quietly stopped finding these terms at all.
+    assert_eq!(one.0, one.1, "a fresh cache answers what the exact gather answers");
+    assert_eq!(one.0 .0, 818, "900 written, one in eleven deleted");
+    assert_eq!(
+        one.0 .2,
+        BTreeMap::from([("fusion".to_string(), 258u64), ("traversal".to_string(), 140)]),
+        "both terms are really in the corpus, at their real frequencies"
+    );
+    assert!(
+        f64::from_bits(one.0 .1) > 2.0,
+        "and the length norm is a real average, not the num_docs == 0 fallback of 1.0"
+    );
+
+    assert_eq!(one.0, three.0, "cached, 1 shard vs 3 shards");
+    assert_eq!(one.0, six.0, "cached, 1 shard vs 6 shards");
+    assert_eq!(one.1, three.1, "exact, 1 shard vs 3 shards");
+    assert_eq!(one.1, six.1, "exact, 1 shard vs 6 shards");
+
+    // The stale read is still the value the refresh point measured, and it is
+    // still the same at every shard count.
+    assert_eq!(one.2, one.0, "no refresh point passed, so the cache did not move");
+    assert_eq!(one.2, three.2, "stale, 1 shard vs 3 shards");
+    assert_eq!(one.2, six.2, "stale, 1 shard vs 6 shards");
+}
+
+#[test]
+fn default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes() {
+    // The score-level pin for the statistic the test above asserts directly,
+    // and the sibling of `exact_mode_is_bit_identical_...`: the same workload,
+    // the same four load-bearing ingredients described there, but with NO
+    // `WITH` clause, so the query takes the path an ordinary query takes.
+    //
+    // The trap again, because it is the one way to write this test and prove
+    // nothing: `Db::run_select` gathers exact statistics for
+    // `sel.with.exact_scoring || sel.with.exact`, so `WITH (exact)` alone
+    // silently upgrades the STATISTICS too. `k => 100000` on its own is
+    // enough to neutralise per-shard `k'` truncation, which is what the
+    // `WITH` clause was doing for the exact tests.
+    //
+    // The assertion is on score BITS, not on order, and deliberately so: on
+    // this fixture all twenty scores differed at both 1-vs-3 and 1-vs-6 before
+    // the fix while the top-20 ORDER happened to survive, because these
+    // documents have homogeneous term composition and a uniform statistic
+    // shift is then a monotone rescaling that min-max normalisation absorbs.
+    // Order is not generally safe: on a corpus of heterogeneous term
+    // composition (4000 documents, cubic-zipf vocabulary, 200 two-term
+    // queries) six shards reordered the top 10 for 17 queries and returned a
+    // different document SET for 6 of them, against 0 of 200 with
+    // `WITH (exact_scoring)` on the identical corpus.
+    let dims = 16;
+    let n = 900;
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        let varied = |c: &mut Corpus, i: usize| {
+            let mut d = c.doc(i);
+            let base = d.path("body").unwrap().as_str().unwrap().to_string();
+            let filler = "padding ".repeat(1 + i % 9);
+            d.set_path("body", Value::Str(format!("{base} {filler}")));
+            d
+        };
+        for i in 0..n {
+            let d = varied(&mut c, i);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(7) {
+            let mut d = varied(&mut c, i);
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete_key("items", &format!("t{}\u{1}doc-{i:05}", i % 3)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        db.execute("COMPACT items").unwrap();
+        // Text only: a vector source would put an ANN traversal between the
+        // statistic and the assertion, and this is a test about the statistic.
+        let sql = "SELECT id FROM items \
+                   ORDER BY hybrid(text_match(body, 'fusion traversal'), \
+                                   method => 'linear', k => 100000) \
+                   LIMIT 20";
+        let r = db.query(sql).unwrap();
+        r.rows.iter().map(|x| (x.key.clone(), x.score.unwrap().to_bits())).collect::<Vec<_>>()
+    };
+
+    let one = run(&[]);
+    let three = run(&["t1", "t2\u{1}doc-00450"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+    assert_eq!(one.len(), 20);
     assert_eq!(one, three, "1 shard vs 3 shards");
     assert_eq!(one, six, "1 shard vs 6 shards");
 }

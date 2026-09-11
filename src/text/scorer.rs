@@ -1226,13 +1226,23 @@ mod tests {
         assert!(got.iter().all(|h| h.score > 0.0), "{got:?}");
     }
 
-    /// `df > num_docs` is not a hypothetical: the statistics cache counts
-    /// tombstoned postings, so a term that every live document holds can be
-    /// reported more often than there are documents. Unclamped, the log's
-    /// argument drops below one and every document holding the term ranks
-    /// *below* every document that does not — BM25 run backwards. Clamped, the
-    /// term lands where a term in every document belongs: informative of
-    /// nothing, but still worth more than absence.
+    /// `df > num_docs` is not a hypothetical, and the reason is no longer the
+    /// one it used to be: the statistics cache counted tombstoned postings,
+    /// and now it does not — `Db::gather_stats` sums masked, live frequencies
+    /// on both arms. What keeps this total rather than merely tidy is that
+    /// `num_docs` and `doc_freq` reach a scorer through several routes and
+    /// only one of them is that gather. A prefix expansion supplies its own
+    /// `df` from a segment's physical dictionary — tombstones included —
+    /// against a `num_docs` the coordinator gathered live and possibly
+    /// earlier, which is the route `build` documents in place and
+    /// `a_stale_global_doc_count_does_not_make_a_prefix_query_return_nothing`
+    /// pins; and `GlobalStats` is a public struct with public fields, so a
+    /// caller may hand the scorer any pair of numbers at all. Unclamped, the
+    /// log's argument drops below one and every
+    /// document holding the term ranks *below* every document that does not —
+    /// BM25 run backwards. Clamped, the term lands where a term in every
+    /// document belongs: informative of nothing, but still worth more than
+    /// absence.
     #[test]
     fn idf_is_never_negative_however_incoherent_the_statistics() {
         let floor = |n: u64| (1.0f64 + 0.5 / (n.max(1) as f64 + 0.5)).ln() as f32;

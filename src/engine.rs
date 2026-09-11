@@ -13,7 +13,8 @@
 //! real — and, more usefully, to make the distributed exit criterion testable
 //! now: *in exact mode, results are bit-identical regardless of shard count*.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +38,14 @@ use crate::value::Value;
 /// interval" (§8.2) — this is that interval, in writes rather than seconds,
 /// because writes are what actually move the numbers.
 const STATS_REFRESH_WRITES: u64 = 512;
+
+/// How many terms the statistics cache keeps per indexed path. `doc_freq` is
+/// filled on demand by the queries that ask for it, so without a cap it grows
+/// towards the vocabulary — the corpus-wide dictionary this cache stopped
+/// holding. Four thousand covers the head of any realistic query distribution;
+/// past it the oldest fill is dropped and the next query that wants it pays
+/// one masked walk to get it back.
+const STATS_TERM_CAP: usize = 4096;
 
 /// How coarsely the per-index access clocks are written to disk. The lifecycle
 /// DSL's finest unit is a minute, so persisting to within a minute is exact at
@@ -83,48 +92,125 @@ impl Default for DbOpts {
 }
 
 /// The periodically refreshed global statistics of §8.2. All three numbers —
-/// `num_docs`, `total_doc_len` and `doc_freq` — are counted over *physical*
-/// rows, tombstones and superseded versions included, and that uniformity is
-/// the point: it is what makes them mutually coherent. `doc_freq` counts
-/// postings within the same units `num_docs` counts rows of, so
-/// `doc_freq[t] <= num_docs` holds by construction, and BM25's IDF therefore
-/// cannot go negative on this path. Masking one half alone would buy a live
-/// `avgdl` at the price of that invariant, trading a bounded, monotone,
-/// ranking-preserving error in the length norm for a sign flip in the term
-/// weight — every document holding the term ranking *below* every document
-/// that does not.
+/// `num_docs`, `total_doc_len` and `doc_freq` — are masked sums at one
+/// instant: exactly the triple [`Shard::term_stats`] answers on the exact
+/// path, summed over every shard of the collection, gathered at a timestamp
+/// the current query pins. What the cache buys is not a cheaper *kind* of
+/// number; it is not gathering one per query.
 ///
-/// The two approximations that remain are different in kind and only one of
-/// them converges. Staleness — up to [`STATS_REFRESH_WRITES`] writes behind —
-/// is what §8.2 licenses: a fresh cache has none of it. Counting dead rows
-/// does not converge; it grows without bound as tombstones accumulate, and it
-/// lands in both halves of BM25 here: `doc_freq` over-counts, so IDF is
-/// deflated, and `total_doc_len / num_docs` is an average over physical rather
-/// than live rows, so the length norm is rescaled. Both also leave
-/// default-mode scores dependent on the shard count, because
-/// `TextSource::all_terms` on a sealed source reports the doc frequency baked
-/// into the dictionary at build time, which moves with flush and compaction
-/// timing. `WITH (exact_scoring)` is the documented way to buy all of that
-/// off; [`Shard::term_stats`] masks all three numbers at one snapshot, so the
-/// exact triple is a function of the live corpus alone.
+/// `doc_freq` is therefore not a vocabulary. It holds only terms some query
+/// has asked for, filled on demand by `fill_term_stats` and capped at
+/// [`STATS_TERM_CAP`] entries evicted oldest first. The cap bounds what is
+/// RETAINED and never what is answered: the fill returns the triple it
+/// gathered, because a single query may ask for more terms than the cap holds
+/// and would otherwise evict its own terms before they were read back.
 ///
-/// The alternative considered and rejected was to mask the cache too. Masking
-/// the length sum is cheap — one visibility bitmap and one masked sum per
-/// unit — but masking `doc_freq` with it, which coherence would then require,
-/// replaces an O(#distinct terms) read of dictionary counts with an
-/// O(#postings) cursor walk carrying a visibility test per posting. Measured
-/// at 13-19x the current refresh on corpora of 50k-200k documents, and the
-/// cost scales with the corpus rather than with the write volume that
-/// triggers it, so it does not amortize away. It would land as a stall on the
-/// first default-mode text query after every [`STATS_REFRESH_WRITES`] writes
-/// — `refresh_stats_if_stale` runs on the query path, not the write path —
-/// which is precisely the latency this cache exists to avoid.
-#[derive(Debug, Clone, Default)]
+/// Every fill rewrites the two globals from the same [`Shard::term_stats`]
+/// call that produced its frequencies, which is what keeps a freshly measured
+/// `df` coherent with the `num_docs` it is about to be divided by — and it is
+/// free, because that call computed them anyway. Gathering the two halves
+/// separately is what sends IDF negative: a `df` counted over one corpus and
+/// an `n` counted over another makes `df > n` reachable, and that is a sign
+/// flip in the term weight, not a rescaling. The same reasoning is why a fill
+/// that re-anchors the globals drops every frequency measured before them:
+/// they were measured over a different corpus, so keeping them would put the
+/// two halves back on different instants by another route.
+///
+/// So what this path answers is a set of live sums at ONE instant, and the one
+/// error that remains is the one §8.2 licenses: staleness, up to
+/// [`STATS_REFRESH_WRITES`] writes. Stale, never mixed. It is worth being
+/// exact about why that is a different kind of error from the physical
+/// counting it replaced. Refresh points are chosen by a write counter, not by
+/// any shard's seal or compaction threshold, so one shard and six reach them
+/// after the same writes and measure the same live corpus there. A stale
+/// answer is a live quantity evaluated at an earlier instant — the *same*
+/// earlier instant however many shards there are. A count over physical rows
+/// is not: how many dead versions survive is each shard's own decision, so it
+/// moved with the shard count and no refresh interval, however short,
+/// converged it.
+///
+/// Mixing the two would not have been a second-order residual, which is why it
+/// is not accepted as one. Staleness is bounded in the quantity it is measured
+/// in: at most [`STATS_REFRESH_WRITES`] documents of drift. The error in IDF
+/// is a function of `df / num_docs`, so a drift of 511 documents is nothing
+/// against a million and everything against five hundred — measured, a term in
+/// 60% of a 500-document corpus came back weighted 804x too light, where
+/// leaving the globals alone would have been 3.1x. A bound that improves with
+/// corpus size is not a bound for a database with no minimum corpus size.
+///
+/// Two approximations are *not* addressed here, and both are shared with
+/// `WITH (exact_scoring)` rather than particular to this cache. Prefix
+/// expansion is not covered: `TextQuery::leaf_terms` deliberately skips it, so
+/// an expanded term is never asked for on either path and `TextScorer::compile`
+/// falls back to the segment's own physical dictionary count. And `avgdl` is
+/// diluted by documents that carry no text on the path, which
+/// [`Shard::term_stats`] documents where the dilution happens. So what this
+/// buys is parity with `WITH (exact_scoring)` for Term and Phrase queries, not
+/// blanket invariance.
+///
+/// A note on the cadence, now that staleness is the only residual and the
+/// cadence is the only knob left: `refreshed_at_writes` is compared against
+/// `Db::writes`, which counts writes to the whole ENGINE rather than to this
+/// collection, so traffic on an unrelated collection ages this entry. The
+/// load-bearing property is that the counter is shard-count independent, not
+/// that it is per collection: an engine-wide counter only makes an epoch end
+/// sooner, and it ends sooner by the same amount at every shard count. But it
+/// does mean the interval is an upper bound on how fresh these numbers can be,
+/// not a description of how fresh they are.
+///
+/// And a note on what the cache costs, because "not gathering one per query"
+/// is the hit price only. A miss gathers, and a gather is a corpus-linear pass
+/// — one visibility bitmap and one masked length sum per unit — plus the
+/// posting walk for the missing terms, which is very nearly what the exact arm
+/// costs. Measured at 50k documents over two units, release, one term: a hit
+/// 1 us, a miss 106-220 us, `WITH (exact_scoring)` 104-171 us. At an epoch
+/// boundary, two terms, the two arms alternated in one process so that neither
+/// always pays to warm the other: 870-1215 us cached against 786-1266 us
+/// exact, which is the same number. So the cache pays for itself in proportion
+/// to term repetition in the query mix; a stream of entirely distinct terms
+/// gets the exact path's cost with the default path's staleness; and the
+/// default path never costs MORE than the exact path for the same query, which
+/// is the sentence that makes the staleness a straight win rather than a
+/// trade. Against the walk of every term in every dictionary this replaced,
+/// the shape that holds at every fixture is that a gather is linear in
+/// (units x live documents) rather than in (units x vocabulary) — the RATIO
+/// between the two is a property of the fixture's vocabulary, not of the
+/// design, which is why no ratio is quoted here.
+/// What the statistics path answers with, before it is dressed as a
+/// [`GlobalStats`]: `num_docs`, the length sum, and one document frequency per
+/// term the query asked about. The three travel together everywhere because
+/// they are only meaningful together — see [`CachedStats`] for why a `df` and
+/// the `num_docs` it is divided by must have been measured at one instant.
+type StatsTriple = (u64, u64, BTreeMap<String, u64>);
+
+#[derive(Debug)]
 struct CachedStats {
     num_docs: u64,
     total_doc_len: u64,
     doc_freq: BTreeMap<String, u64>,
+    /// The terms of `doc_freq` in the order they were filled, oldest first.
+    /// A `BTreeMap` orders by term, which is the wrong order to evict in; this
+    /// is the right one, and it is the whole of what the cap needs.
+    ///
+    /// It is dropped wherever `doc_freq` is dropped, and the two places that
+    /// do so both drop both. Keep this one and the map stops being bounded at
+    /// all: the queue is only ever drained by over-cap eviction, so it grows
+    /// without limit, and once it is longer than the map the eviction loop
+    /// pops names that are no longer present — removing nothing while draining
+    /// the queue.
+    fill_order: VecDeque<String>,
+    /// `Db::writes` at the last epoch reset. The refresh gate.
     refreshed_at_writes: u64,
+    /// `Db::writes` when the numbers below were measured, meaningful only when
+    /// `anchored`. Equal to `Db::writes` means no insert and no delete has
+    /// landed since, in any collection, so the live corpus has not moved and a
+    /// further gather measures the same one.
+    measured_at_writes: u64,
+    /// Whether the globals have been measured in this epoch. An epoch starts
+    /// unanchored, and the first fill of the epoch measures them. This cannot
+    /// be inferred from `num_docs == 0`, which is the honest answer for an
+    /// empty collection.
+    anchored: bool,
 }
 
 /// A logged vector query, for the continuous recall measurement of §12.1.
@@ -509,14 +595,53 @@ impl Db {
 
     /// Global term statistics for this query's terms (§8.2).
     ///
-    /// `exact` performs the two-phase gather: ask every shard for the document
-    /// frequency of exactly these terms, counting only postings visible at the
-    /// snapshot, and dividing a visible length sum by a visible document count.
-    /// Otherwise the cached, periodically refreshed numbers are used — stale,
-    /// and counted over physical rows so that they count tombstones, which is
-    /// precisely the approximation the design accepts by default. See
-    /// [`CachedStats`] for where that residual error lands in BM25 and why the
-    /// cache counts uniformly rather than masking one number of the three.
+    /// Both arms answer the same *kind* of number: `num_docs`, the length sum
+    /// and `doc_freq`, each masked by visibility at `ts`, so the triple is a
+    /// function of the corpus live at that instant and not of how many
+    /// physical versions or tombstones happen to be resident. `exact` performs
+    /// the two-phase gather on this query — in a cluster a broadcast, here a
+    /// loop. Otherwise the cache answers, which is the same gather run only at
+    /// the refresh points [`STATS_REFRESH_WRITES`] sets, and only for terms no
+    /// earlier query in this epoch has already paid for. The difference
+    /// between the two arms is staleness — the cached triple is a set of live
+    /// sums at ONE instant, at most [`STATS_REFRESH_WRITES`] writes behind
+    /// this query, never a mixture of instants — plus one difference of
+    /// spelling: for a term no unit holds the exact arm omits the entry and
+    /// the cached arm stores an explicit `0`, which `GlobalStats::idf` reads
+    /// identically. See [`CachedStats`] for why staleness alone does not put
+    /// the shard count back into the answer.
+    ///
+    /// `ts` must be a timestamp this query pins, not one stored earlier — on
+    /// the cached arm the triple gathered at it is written into epoch-lived
+    /// state every later query in the epoch reads, so a historical `as_of`
+    /// read would poison it for every one of them. A time-travel caller must
+    /// pass `exact: true`, which writes nothing. The rule and the reason are
+    /// on `fill_term_stats`.
+    ///
+    /// The term list per path is taken as a SET: a repeat is ignored rather
+    /// than counted twice. See [`term_set`] for why that is a fix and not a
+    /// convenience.
+    ///
+    /// # Panics
+    ///
+    /// With `exact: false`, `ts` must be at or above the last commit this
+    /// engine took. That is a precondition, not a quality note, and a
+    /// `debug_assert!` holds callers to it: a historical timestamp panics in a
+    /// debug build. The distinction worth being explicit about, because an
+    /// assertion that fires only in debug is otherwise the worst of both
+    /// worlds, is WHOSE answer it spoils. This arm does not merely answer the
+    /// caller who passed the old `ts` inaccurately — it writes the triple it
+    /// gathered into epoch-lived state that every later query in the epoch
+    /// reads, so one historical read mis-scores queries that asked for nothing
+    /// of the kind and cannot tell. A wrong answer confined to the caller
+    /// would be a documentation matter; one that escapes to other callers is a
+    /// contract.
+    ///
+    /// `exact: true` has no such precondition and is the supported way to read
+    /// the past: it writes nothing, and at a `ts` below
+    /// [`Shard::retain_floor`] it is best-effort in exactly the sense
+    /// [`Shard::term_stats`] documents, which a pinned `gc_horizon` makes
+    /// exact again.
     pub fn gather_stats(
         &mut self,
         collection: &str,
@@ -526,6 +651,11 @@ impl Db {
     ) -> Result<BTreeMap<String, GlobalStats>> {
         let mut out = BTreeMap::new();
         for (path, terms) in want {
+            // Once, here, for both arms: the shard gather walks a posting list
+            // per element of the slice it is handed, so a term named twice is
+            // counted twice. [`term_set`] has the consequences.
+            let terms = term_set(terms);
+            let terms: &[String] = &terms;
             if exact {
                 let mut num_docs = 0u64;
                 let mut total_len = 0u64;
@@ -552,24 +682,50 @@ impl Db {
                     },
                 );
             } else {
-                // The key is computed before the refresh so that the `&mut
-                // self` borrow ends with it, leaving the cached entry readable
-                // by reference below. Nothing else in this arm needs `&mut
-                // self`, and reading it by reference is the whole point:
-                // `doc_freq` is the collection's entire vocabulary, and a
-                // query wants the handful of terms it asked for. Cloning it
-                // here cost 3.6 ms per query at 50k documents and 16.7 ms at
-                // 200k — more than the exact gather this cache exists to
-                // avoid.
+                // The rule on the doc comment, as a test failure rather than
+                // a sentence: this arm writes what it gathers into state the
+                // whole epoch reads, so the timestamp has to be one this query
+                // pinned. `run_select` passes `clock.peek().max(last_commit)`.
+                debug_assert!(
+                    ts >= self.last_commit,
+                    "a historical `as_of` must be read with `exact: true`: it would poison the \
+                     cache for every later query in the epoch"
+                );
+                // Reset first, then fill: a refresh point starts a new epoch
+                // by emptying the entry, and filling into an entry that is
+                // about to be emptied would pay for a masked walk and discard
+                // it.
+                self.reset_stats_if_stale(collection, path);
+                let fresh = self.fill_term_stats(collection, path, terms, ts)?;
+                // The answer comes from the fill whenever the fill gathered
+                // anything, and NOT from reading the cache back. Those are
+                // different numbers: the entry cap evicts oldest first, and
+                // `required_terms` hands over a sorted list, so a common term
+                // early in the alphabet is filled first, sits at the front of
+                // `fill_order`, and is evicted by its own query as soon as
+                // that query carries [`STATS_TERM_CAP`] other terms — which
+                // one query may, nothing bounds the count. Read back, it would
+                // answer `df = 0`, the highest weight there is, for a term the
+                // corpus is full of. The cap is a bound on what is retained.
+                //
+                // Read by reference in the other arm. It used to clone the
+                // entry, back when the entry was the collection's whole
+                // vocabulary, and that cost 2.4 ms per query at 50k documents
+                // and 18.6 ms at 200k — more than the exact gather the cache
+                // exists to avoid. [`STATS_TERM_CAP`] bounds it now, so the
+                // clone would be smaller; it would still be copying up to four
+                // thousand entries to read two or three.
                 let key = cache_key(collection, path);
-                self.refresh_stats_if_stale(collection, path)?;
-                // `refresh_stats_if_stale` inserts an entry whenever one is
-                // missing, so `None` is unreachable; it is still spelled out,
-                // and with the same all-zero defaults the previous
-                // `unwrap_or_default()` produced, so that a future early
-                // return from the refresh cannot turn into a panic here.
-                let (num_docs, total_doc_len, df): (u64, u64, BTreeMap<String, u64>) =
-                    match self.stats.get(&key) {
+                // `None` means the fill gathered nothing, which it does only
+                // when every term is already cached under globals measured in
+                // this epoch — so the cache holds an entry for every one of
+                // them and nothing was evicted, and both defaults below are
+                // unreachable. They are spelled out rather than unwrapped so
+                // that a future early return cannot turn into a panic on the
+                // query path.
+                let (num_docs, total_doc_len, df): StatsTriple = match fresh {
+                    Some(t) => t,
+                    None => match self.stats.get(&key) {
                         Some(c) => (
                             c.num_docs,
                             c.total_doc_len,
@@ -579,7 +735,8 @@ impl Db {
                                 .collect(),
                         ),
                         None => (0, 0, terms.iter().map(|t| (t.clone(), 0)).collect()),
-                    };
+                    },
+                };
                 out.insert(
                     path.clone(),
                     GlobalStats {
@@ -598,42 +755,204 @@ impl Db {
         Ok(out)
     }
 
-    fn refresh_stats_if_stale(&mut self, collection: &str, path: &str) -> Result<()> {
+    /// Start a new statistics epoch if the engine has taken
+    /// [`STATS_REFRESH_WRITES`] writes since the last one started.
+    ///
+    /// The gate is a write counter and nothing else — no shard's seal
+    /// schedule, no segment count, no elapsed time. That is what makes a stale
+    /// read shard-count independent rather than merely approximate: every
+    /// shard count crosses the same thresholds after the same writes, so they
+    /// all measure the corpus at the same points in its history.
+    ///
+    /// This gathers nothing, and that is the change it is worth being explicit
+    /// about. It used to sum the globals here as well, and the sum was dead on
+    /// every query that carries terms: the reset empties `doc_freq`, so the
+    /// fill that follows always has something missing and always re-anchors
+    /// the globals itself, over the same shards at the same timestamp.
+    /// Measured at a real epoch boundary, 50k documents over two units,
+    /// release: the two passes cost 410-508 us and 923-1041 us, and the one
+    /// pass that replaces them costs 870-1215 us. So it is the whole of the
+    /// first pass that goes, not a fraction of the second — the pass that
+    /// remains does the posting walk either way, and the globals it needs it
+    /// computed anyway. The prefix-only query, whose term list is empty and
+    /// which was the one caller this pass was ever live for, now takes its
+    /// globals from the fill's empty-slice gather, in one pass rather than
+    /// two.
+    fn reset_stats_if_stale(&mut self, collection: &str, path: &str) {
         let key = cache_key(collection, path);
         let stale = match self.stats.get(&key) {
             None => true,
             Some(c) => self.writes.saturating_sub(c.refreshed_at_writes) >= STATS_REFRESH_WRITES,
         };
         if !stale {
-            return Ok(());
+            return;
         }
-        let mut c = CachedStats { refreshed_at_writes: self.writes, ..Default::default() };
+        // The empty `doc_freq` is the epoch boundary, and it is deliberate: a
+        // frequency measured in the previous epoch must not be read against
+        // globals measured in this one, so the reset drops every fill — and
+        // `fill_order` with it, in the same statement, because the two are
+        // only ever correct together.
+        self.stats.insert(
+            key,
+            CachedStats {
+                num_docs: 0,
+                total_doc_len: 0,
+                doc_freq: BTreeMap::new(),
+                fill_order: VecDeque::new(),
+                refreshed_at_writes: self.writes,
+                measured_at_writes: 0,
+                anchored: false,
+            },
+        );
+    }
+
+    /// Gather what the cache cannot coherently answer for `terms`, re-anchor
+    /// the globals on the same gather, and return the triple this query is to
+    /// be answered with — `None` when it gathered nothing, which means the
+    /// cache already holds the whole answer.
+    ///
+    /// Returning the answer rather than leaving the caller to read the cache
+    /// back is what decouples the answer from residency. The entry cap evicts
+    /// oldest first and a single query may ask for more terms than the cap
+    /// holds, so a term this very call filled can be gone by the time the call
+    /// returns; it is still in the triple, because the triple is built before
+    /// the eviction loop runs.
+    ///
+    /// What it gathers is decided by whether the cached frequencies and the
+    /// globals about to be written would be from the same instant. `Db::writes`
+    /// counts every insert and every delete, so `measured_at_writes ==
+    /// self.writes` proves the live corpus has not moved since the cached
+    /// entries were measured, and gathering only the missing terms leaves the
+    /// entry coherent. Otherwise it gathers ALL of `terms` and drops every
+    /// earlier frequency: they belong to an earlier corpus than the globals
+    /// this call is about to write, and a `df` divided by an `n` it was never
+    /// measured against is not a stale answer but an incoherent one — `df > n`
+    /// and the IDF clamp are reachable from it, and the error is a function of
+    /// `df/n`, so it is unbounded as the corpus is small. That costs at most
+    /// one gather of exactly this query's terms, which is exactly what
+    /// `WITH (exact_scoring)` would have cost: the default path never costs
+    /// more than the exact path for the same query, and usually costs nothing.
+    ///
+    /// One drift survives and it is not a write: a lifecycle transition that
+    /// makes a segment refuse reads changes what [`Shard::term_stats`] can see
+    /// without touching `Db::writes`. That is a refusal rather than a drift,
+    /// and it is the same on the exact path.
+    ///
+    /// THE RULE, and it is the one plausible-looking optimisation that
+    /// silently undoes everything above: `ts` must be a timestamp pinned by
+    /// the CURRENT query — `run_select` computes it as
+    /// `clock.peek().max(last_commit)`. Never store the timestamp a refresh
+    /// used and re-read at it later. [`Shard::term_stats`] is a pure function
+    /// of the live corpus only at or above [`Shard::retain_floor`], and
+    /// `retain_from` returns `now` when no `gc_horizon` is pinned, so a seal
+    /// or a compaction walks the floor up past any stored timestamp and the
+    /// triple gathered at it becomes best-effort — worse, best-effort in a way
+    /// that depends on when each shard happened to compact, which is precisely
+    /// the dependence this cache was rebuilt to remove. A stored `as_of` would
+    /// look like a free win and would put the bug straight back.
+    ///
+    /// That the numeric `ts` differs between shard counts is harmless: the
+    /// clock advances only on insert and delete, seals and compactions read it
+    /// with `peek`, and the pin is at or above every commit issued so far — so
+    /// the set it selects is "everything committed" whatever the number is.
+    fn fill_term_stats(
+        &mut self,
+        collection: &str,
+        path: &str,
+        terms: &[String],
+        ts: Timestamp,
+    ) -> Result<Option<StatsTriple>> {
+        let key = cache_key(collection, path);
+        let (missing, anchored, same_instant) = match self.stats.get(&key) {
+            Some(c) => (
+                terms.iter().filter(|t| !c.doc_freq.contains_key(*t)).cloned().collect::<Vec<_>>(),
+                c.anchored,
+                c.anchored && c.measured_at_writes == self.writes,
+            ),
+            None => (terms.to_vec(), false, false),
+        };
+        if missing.is_empty() && anchored {
+            // Everything asked for is already cached, under globals measured
+            // in this epoch. Nothing is gathered, so nothing can be evicted,
+            // so the cache is the answer and the caller may read it.
+            return Ok(None);
+        }
+        // Either the corpus has not moved since the cached frequencies were
+        // measured — in which case the globals this gather produces are the
+        // ones already stored and only the missing terms need measuring — or
+        // it has, and every cached frequency belongs to an older corpus than
+        // the globals about to be written over it.
+        let (gather, stale_generation) =
+            if same_instant { (missing, false) } else { (terms.to_vec(), true) };
+        let writes = self.writes;
+        let mut num_docs = 0u64;
+        let mut total_doc_len = 0u64;
+        let mut df: BTreeMap<String, u64> = BTreeMap::new();
         for s in self.shards(collection)? {
-            // No pinned read timestamp: `Shard::sources` returns every unit in
-            // the snapshot whatever its `ts`, and the counts below are over
-            // physical rows, so there is nothing here for a timestamp to
-            // select. Threading one in would only suggest these numbers were
-            // as-of something, which is the misreading that makes a masked
-            // `num_docs` look safe.
-            let snap = s.snapshot();
-            for unit in s.sources(&snap) {
-                // All three numbers are over physical rows, which is what
-                // keeps them mutually coherent — see [`CachedStats`]. Masking
-                // one alone would be worse than masking none: a live
-                // `num_docs` under a physical `doc_freq` makes `df > n`
-                // reachable, and that is a sign flip in IDF, not a rescaling.
-                c.num_docs += unit.num_docs() as u64;
-                let handle = unit.text_handle(path)?;
-                if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
-                    c.total_doc_len += src.total_doc_len();
-                    for (t, df) in src.all_terms() {
-                        *c.doc_freq.entry(t).or_insert(0) += df as u64;
-                    }
-                }
+            // An empty `gather` is not a wasted call: `term_stats` then does
+            // one `visibility` and one masked length sum per unit and enters
+            // no posting cursor at all, which is how a prefix-only query —
+            // `TextQuery::leaf_terms` skips `Prefix`, so its term list is
+            // empty — gets real globals for one cheap pass.
+            let (n, tl, d) = s.term_stats(path, &gather, ts)?;
+            num_docs += n;
+            total_doc_len += tl;
+            for (t, c) in d {
+                *df.entry(t).or_insert(0) += c;
             }
         }
-        self.stats.insert(key, c);
-        Ok(())
+        let Some(c) = self.stats.get_mut(&key) else { return Ok(None) };
+        if stale_generation {
+            // Dropped, not read. Both together: see `CachedStats::fill_order`.
+            c.doc_freq.clear();
+            c.fill_order.clear();
+        }
+        // Overwriting the globals from this same call is load-bearing, not an
+        // optimisation. It is what makes the frequency just measured coherent
+        // with the `num_docs` it will be divided by; leave the old globals in
+        // place and a burst of writes carrying a new term gives a `df`
+        // gathered over the corpus as it is now against an `n` gathered over
+        // the corpus as it was, which is how `df > n` and a negative IDF
+        // become reachable.
+        c.num_docs = num_docs;
+        c.total_doc_len = total_doc_len;
+        c.measured_at_writes = writes;
+        c.anchored = true;
+        for t in &gather {
+            // An explicit `0` for a term no unit holds. Leaving it out would
+            // mean every query for a term that is not in the corpus re-walks
+            // every unit looking for it, forever.
+            //
+            // The `is_none` guard cannot fire as the code stands, and it is
+            // kept deliberately rather than by oversight: `gather` is either
+            // `missing`, which is by construction the terms NOT in the map, or
+            // all of `terms` after the branch above cleared the map, and
+            // [`term_set`] has already made `terms` distinct. It is the one
+            // statement that keeps `fill_order` in step with `doc_freq`, they
+            // are only ever correct together, and a desync is silent until the
+            // eviction loop stops bounding the map. It costs a comparison.
+            if c.doc_freq.insert(t.clone(), df.get(t).copied().unwrap_or(0)).is_none() {
+                c.fill_order.push_back(t.clone());
+            }
+        }
+        // The answer, built BEFORE the eviction below: every term asked for,
+        // from the frequencies just gathered merged with the cached ones that
+        // survived. After the eviction this would be a different map.
+        let answer: BTreeMap<String, u64> =
+            terms.iter().map(|t| (t.clone(), c.doc_freq.get(t).copied().unwrap_or(0))).collect();
+        while c.doc_freq.len() > STATS_TERM_CAP {
+            match c.fill_order.pop_front() {
+                Some(t) => {
+                    c.doc_freq.remove(&t);
+                }
+                None => break,
+            }
+        }
+        // Deliberately NOT bumping `refreshed_at_writes`. The epoch clock has
+        // to keep running: a query stream that keeps asking for fresh terms
+        // would otherwise reset it on every query and pin the globals — and
+        // every frequency filled under them — to an epoch that never ends.
+        Ok(Some((num_docs, total_doc_len, answer)))
     }
 
     // ------------------------------------------------------------ execution
@@ -1426,6 +1745,36 @@ impl Db {
     }
 }
 
+/// The caller's term list as a set, borrowed when it already is one.
+///
+/// [`Db::gather_stats`] is public, on a published crate, and takes a
+/// `Vec<String>` per path — so `["dup", "dup"]` is expressible, and before
+/// this it was double counted on BOTH arms. [`Shard::term_stats`] walks one
+/// posting cursor per element of the slice it is handed and accumulates into
+/// the same `df` entry, so a term named twice came back at twice its real
+/// frequency: on a corpus of 80 documents all holding `dup`, `df = 160`
+/// against `num_docs = 80`. That is not a stale answer, it is `df > num_docs`,
+/// a negative logarithm and the IDF clamp — the lowest weight there is — for a
+/// term the corpus is full of.
+///
+/// Deduplicating at the boundary fixes both arms in one place and is the only
+/// place that has to know. No SQL query could reach it — `required_terms` ends
+/// `sort(); dedup();` — so this is the public API's defect alone, which is
+/// exactly why it needed fixing rather than documenting: a direct caller has
+/// no reason to suspect the list is not a list.
+///
+/// Sorted and distinct is the SQL shape, and it borrows: the query path pays
+/// one comparison per term and no allocation. The other shape keeps
+/// first-occurrence order instead of sorting, because order decides which fill
+/// [`STATS_TERM_CAP`] evicts first and that is the caller's to choose.
+fn term_set(terms: &[String]) -> Cow<'_, [String]> {
+    if terms.windows(2).all(|w| w[0] < w[1]) {
+        return Cow::Borrowed(terms);
+    }
+    let mut seen: BTreeSet<&String> = BTreeSet::new();
+    Cow::Owned(terms.iter().filter(|t| seen.insert(t)).cloned().collect())
+}
+
 fn cache_key(collection: &str, path: &str) -> String {
     format!("{collection}/{path}")
 }
@@ -1626,24 +1975,29 @@ mod tests {
     }
 
     #[test]
-    fn the_cached_statistics_sum_over_every_unit_of_every_shard() {
-        // The only test in the tree that asserts on the cached statistics
-        // path, and it has to carry the whole of it: three shards, and two
-        // non-empty units in each (a sealed segment and a live memtable), so
-        // that `refresh_stats_if_stale`'s accumulation is constrained per unit
-        // AND per shard. With one shard and one contributing unit — what the
-        // path used to be tested with — `+=` and `=` are indistinguishable,
-        // and so is "read the first shard and stop".
+    fn the_cached_statistics_are_live_sums_over_every_unit_of_every_shard() {
+        // The only test that pins the cached triple to absolute numbers, and
+        // the only one that constrains the accumulation per unit AND per
+        // shard: three shards, and two non-empty units in each (a sealed
+        // segment and a live memtable). With one shard and one contributing
+        // unit — what the path used to be tested with — `+=` and `=` are
+        // indistinguishable, and so is "read the first shard and stop". Its
+        // siblings below cover the epoch, the fill, the cap and coherence, but
+        // every one of them compares against a second gather or a bound.
         //
         // The numbers are absolute, not compared against a second gather.
         // Comparing the cached triple against the exact one pins only that
         // they agree, and a mutation that moves both is invisible to it.
         //
-        // Every number here is over PHYSICAL rows, tombstones and superseded
-        // versions included, which is what [`CachedStats`] documents and what
-        // keeps `doc_freq <= num_docs` true by construction. That invariant is
-        // the point of the last assertion: it is what makes IDF non-negative
-        // on this path, and its absence inverts BM25 rather than blurring it.
+        // These numbers used to be over PHYSICAL rows — 1200 documents, and
+        // `doc_freq["alpha"] == 1200` — and that WAS the bug this path had.
+        // A physical count includes the versions a seal superseded and the
+        // rows a compaction has not yet collected, and how many of those exist
+        // is each shard's own decision, taken at its own thresholds: the
+        // statistic therefore moved with the shard count, and the default
+        // path's scores moved with it. Every number below is now masked by
+        // visibility at the query's timestamp, so it counts the 1118 documents
+        // that are actually there.
         let dir = tmp("cached-stats-sum");
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
         db.execute(
@@ -1673,7 +2027,8 @@ mod tests {
             db.insert("notes", note(format!("n{i:04}x"), "alpha".into())).unwrap();
         }
         // And tombstones, so the cache is exercised over a corpus whose
-        // physical rows and live rows have parted company.
+        // physical rows and live rows have parted company — which is the whole
+        // difference this test is here to see.
         for i in (0..900usize).step_by(11) {
             db.delete_key("notes", &format!("n{i:04}")).unwrap();
         }
@@ -1692,34 +2047,1105 @@ mod tests {
         let g = &g["body"];
         assert!(!g.exact, "this is the cached path");
 
-        // Absolute, and every one of them is a sum the refresh has to get
-        // right across six units and three shards.
+        // Absolute, and every one of them is a sum the gather has to get right
+        // across six units and three shards.
         let c = db.stats.get(&cache_key("notes", "body")).unwrap();
         assert_eq!(
-            c.num_docs, 1200,
-            "900 sealed rows and 300 memtable rows; a delete of a sealed row lands in the \
-             delete set, not as a new physical row, so the tombstones add nothing here"
+            c.num_docs, 1118,
+            "900 sealed rows and 300 memtable rows, less the 82 keys deleted; the deletes are \
+             the point — a physical count answers 1200 here, because a tombstone hides a row \
+             without removing it"
         );
         assert_eq!(
-            c.total_doc_len, 1380,
-            "in the segments 180 two-term bodies and 720 one-term ones, and 300 one-term \
-             bodies in the memtables"
+            c.total_doc_len, 1281,
+            "1080 in the segments (180 two-term bodies and 720 one-term ones) and 300 in the \
+             memtables, less the 17 two-term and 65 one-term bodies deleted"
         );
-        assert_eq!(c.doc_freq["alpha"], 1200, "every physical row holds it");
-        assert_eq!(c.doc_freq["zeta"], 180, "and one row in five of the sealed batch");
+        assert_eq!(c.doc_freq["alpha"], 1118, "every live row holds it");
+        assert_eq!(c.doc_freq["zeta"], 163, "one row in five of the sealed batch, less 17 deleted");
+        assert_eq!(
+            c.doc_freq.len(),
+            2,
+            "and the cache holds the two terms the query asked for, not the vocabulary"
+        );
 
-        assert_eq!(g.num_docs, 1200);
-        assert_eq!(g.avg_doc_len.to_bits(), (1380.0f64 / 1200.0).to_bits());
-        // The invariant the uniformity buys, and the reason it is worth
-        // buying: `doc_freq` is counted over the same physical rows
-        // `num_docs` counts, so it can never exceed it, and IDF's logarithm
-        // therefore never takes an argument below one. Under heavy deletes a
-        // masked `num_docs` over an unmasked `doc_freq` breaks exactly this,
-        // and a negative IDF does not blur the ranking, it reverses it.
+        assert_eq!(g.num_docs, 1118);
+        assert_eq!(g.avg_doc_len.to_bits(), (1281.0f64 / 1118.0).to_bits());
+        // The invariant that survives the change, bought differently: it used
+        // to hold because `doc_freq` and `num_docs` counted the same physical
+        // rows, and it now holds because they are masked at the same instant
+        // by the same `Shard::term_stats` call. Either way `doc_freq` cannot
+        // exceed `num_docs`, so IDF's logarithm never takes an argument below
+        // one — and a negative IDF does not blur a ranking, it reverses it.
         for (t, df) in &g.doc_freq {
             assert!(*df <= g.num_docs, "df({t}) = {df} exceeds num_docs = {}", g.num_docs);
             assert!(g.idf(t) > 0.0, "idf({t}) = {} is not positive", g.idf(t));
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers() {
+        // The strongest single assertion available on this path, and the
+        // cheapest: with no writes between the refresh and the read, staleness
+        // is zero, so the two arms of `gather_stats` are gathering the same
+        // quantity from the same corpus and must agree bit for bit. Anything
+        // that makes the cached arm count something else — a physical row, a
+        // dictionary entry, a sum taken at a different instant — shows up
+        // here without needing a second shard count to compare against.
+        let dir = tmp("stats-fresh-equals-exact");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['n0100'])")
+            .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let note = |id: String, body: String| {
+            Value::obj(vec![("id".into(), Value::Str(id)), ("body".into(), Value::Str(body))])
+        };
+        for i in 0..200usize {
+            let body = if i % 3 == 0 { "alpha zeta zeta" } else { "alpha" };
+            db.insert("notes", note(format!("n{i:04}"), body.into())).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        for i in (0..200usize).step_by(9) {
+            db.delete_key("notes", &format!("n{i:04}")).unwrap();
+        }
+
+        let want =
+            BTreeMap::from([("body".to_string(), vec!["alpha".to_string(), "zeta".to_string()])]);
+        let ts = db.clock.peek();
+        let cached = db.gather_stats("notes", &want, ts, false).unwrap();
+        let exact = db.gather_stats("notes", &want, ts, true).unwrap();
+        let (c, e) = (&cached["body"], &exact["body"]);
+        assert_eq!(c.num_docs, e.num_docs);
+        assert_eq!(c.avg_doc_len.to_bits(), e.avg_doc_len.to_bits(), "by bits: it is an average");
+        assert_eq!(c.doc_freq, e.doc_freq);
+        assert!(c.num_docs > 0 && c.doc_freq["alpha"] > 0, "not agreeing by both being empty");
+
+        // A term nothing holds is the one place the two arms are spelled
+        // differently, and the difference is deliberate rather than a
+        // divergence: the exact arm leaves it out, the cached arm stores an
+        // explicit zero, because without it every query for a term outside the
+        // corpus would re-walk every unit looking for it. `GlobalStats::idf`
+        // reads a missing entry as zero, so the weight both arms produce is
+        // the same.
+        let want = BTreeMap::from([("body".to_string(), vec!["quokka".to_string()])]);
+        let cached = db.gather_stats("notes", &want, ts, false).unwrap();
+        let exact = db.gather_stats("notes", &want, ts, true).unwrap();
+        assert_eq!(cached["body"].doc_freq["quokka"], 0);
+        assert!(exact["body"].doc_freq.is_empty());
+        assert_eq!(cached["body"].idf("quokka"), exact["body"].idf("quokka"));
+        assert_eq!(
+            db.stats.get(&cache_key("notes", "body")).unwrap().doc_freq["quokka"],
+            0,
+            "and the zero is in the cache, so the next query does not walk for it again"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_term_filled_mid_epoch_is_measured_against_the_document_count_it_will_be_divided_by() {
+        // The coherence pin, and the reason `fill_term_stats` overwrites the
+        // cached globals from the same `Shard::term_stats` call that produced
+        // its frequencies. Drop that one step and this test fails: the burst
+        // below stays inside a single refresh window, so `num_docs` would be
+        // left at the 20 documents the epoch was anchored on while
+        // `doc_freq["beta"]` was measured over all 420. `df > n` is then
+        // reachable, IDF's clamp fires, and the two terms — one in 20
+        // documents, one in 400 — collapse onto the same weight. That
+        // flattening is the failure mode, not a rounding error.
+        //
+        // The direction here is inserts, which is the direction the re-anchor
+        // alone repairs. The sibling
+        // `a_frequency_and_the_count_it_is_divided_by_are_never_from_different_instants`
+        // covers deletes, where re-anchoring the globals and keeping the old
+        // frequencies is worse than doing neither.
+        let dir = tmp("stats-coherent-fill");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let note = |id: String, body: &str| {
+            Value::obj(vec![
+                ("id".into(), Value::Str(id)),
+                ("body".into(), Value::Str(body.into())),
+            ])
+        };
+        for i in 0..20usize {
+            db.insert("notes", note(format!("n{i:04}"), "alpha")).unwrap();
+        }
+        let want = |terms: Vec<&str>| {
+            BTreeMap::from([(
+                "body".to_string(),
+                terms.into_iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(vec!["alpha"]), ts, false).unwrap();
+
+        // 400 documents carrying a term the cache has never seen. 420 writes
+        // in total is short of `STATS_REFRESH_WRITES`, so no refresh point
+        // passes and the globals are whatever the fill leaves behind.
+        for i in 0..400usize {
+            db.insert("notes", note(format!("m{i:04}"), "beta")).unwrap();
+        }
+        assert!(db.writes < STATS_REFRESH_WRITES, "the burst has to fit inside one epoch");
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want(vec!["alpha", "beta"]), ts, false).unwrap();
+        let g = &g["body"];
+
+        assert_eq!(g.num_docs, 420, "the fill re-anchored the count on the corpus it measured");
+        assert_eq!(g.doc_freq["beta"], 400);
+        assert_eq!(
+            g.doc_freq["alpha"], 20,
+            "and `alpha` was re-measured in the same call rather than carried across the \
+             re-anchor, so the whole triple is one instant. 400 inserts and no deletes, so the \
+             value is the one the first fill saw — what would differ is which `num_docs` it is \
+             coherent with"
+        );
+        assert!(
+            g.idf("alpha") > g.idf("beta"),
+            "a term in 20 of 420 documents has to outweigh one in 400 of them: idf(alpha) = {}, \
+             idf(beta) = {}",
+            g.idf("alpha"),
+            g.idf("beta")
+        );
+        assert!(g.idf("beta") > 0.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_frequency_and_the_count_it_is_divided_by_are_never_from_different_instants() {
+        // The guarantee the default path offers, stated as the thing that can
+        // break it: every triple this path returns is a set of live sums at
+        // ONE instant. Stale by up to [`STATS_REFRESH_WRITES`] writes, never
+        // mixed. A `df` measured over one corpus divided by an `n` measured
+        // over another is not a stale answer, it is an answer to no question,
+        // and it is arbitrarily wrong rather than boundedly wrong: the error
+        // is a function of `df/n`, so a drift bounded at 511 DOCUMENTS is
+        // negligible at a million documents and total at five hundred.
+        //
+        // The shape below is the one that cannot be repaired by re-gathering
+        // when a term is missing, because nothing is missing: the query that
+        // mixes the instants (`newterm`) does not ask about `alpha` at all,
+        // and the query that reads `alpha` back runs no gather under a cache
+        // that keeps frequencies across a re-anchor. Measured against that
+        // cache: `df(alpha) = 300` against `num_docs = 250` — `df > n`, which
+        // is what `idf_for_df`'s clamp exists to survive — and `idf(alpha) =
+        // 0.00199` against an exact 1.6035, an 804x under-weight, where doing
+        // nothing at all would have been 3.1x. `fill_term_stats` drops every
+        // frequency it did not measure under the globals it is about to write,
+        // which costs the drop's re-gather and buys the sentence above.
+        let dir = tmp("stats-one-instant");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let note = |id: String, body: &str| {
+            Value::obj(vec![
+                ("id".into(), Value::Str(id)),
+                ("body".into(), Value::Str(body.into())),
+            ])
+        };
+        for i in 0..300usize {
+            db.insert("notes", note(format!("a{i:04}"), "alpha zeta")).unwrap();
+        }
+        for i in 0..200usize {
+            db.insert("notes", note(format!("z{i:04}"), "zeta")).unwrap();
+        }
+        let want = |terms: Vec<&str>| {
+            BTreeMap::from([(
+                "body".to_string(),
+                terms.into_iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+
+        // `alpha` measured over 500 documents: 300 of them hold it.
+        let ts = db.clock.peek();
+        let first = db.gather_stats("notes", &want(vec!["alpha"]), ts, false).unwrap();
+        assert_eq!((first["body"].num_docs, first["body"].doc_freq["alpha"]), (500, 300));
+
+        // Then 250 of the alpha-bearing documents go away. Deletes only, so
+        // this is the direction staleness alone is harmless in and a mixed
+        // instant is not.
+        for i in 0..250usize {
+            db.delete_key("notes", &format!("a{i:04}")).unwrap();
+        }
+        let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+        assert!(
+            db.writes - at < STATS_REFRESH_WRITES,
+            "no refresh point may pass: the whole point is that this is INSIDE one epoch, where \
+             the cache is entitled to be stale"
+        );
+
+        // An unrelated query re-anchors the globals on the corpus as it is
+        // now. It never mentions `alpha`, which is what makes this case
+        // unreachable for any repair keyed on the current query's terms.
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(vec!["newterm"]), ts, false).unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(c.num_docs, 250, "the globals moved with the deletes");
+        assert!(
+            !c.doc_freq.contains_key("alpha"),
+            "and the frequency measured under the old globals went with them, rather than \
+             staying to be divided by a count it was never measured against"
+        );
+        assert_eq!(
+            c.doc_freq.len(),
+            c.fill_order.len(),
+            "the map and the eviction queue are dropped together, or the cap stops holding"
+        );
+
+        // The read that follows. Whether it re-gathers is an implementation
+        // detail; that it is coherent is not.
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want(vec!["alpha"]), ts, false).unwrap();
+        let e = db.gather_stats("notes", &want(vec!["alpha"]), ts, true).unwrap();
+        let (g, e) = (&g["body"], &e["body"]);
+        assert!(
+            g.doc_freq["alpha"] <= g.num_docs,
+            "df(alpha) = {} exceeds num_docs = {}",
+            g.doc_freq["alpha"],
+            g.num_docs
+        );
+        assert_eq!((g.num_docs, g.doc_freq["alpha"]), (250, 50));
+        assert_eq!(g.num_docs, e.num_docs);
+        assert_eq!(g.avg_doc_len.to_bits(), e.avg_doc_len.to_bits(), "by bits: it is an average");
+        assert_eq!(g.doc_freq, e.doc_freq);
+        assert_eq!(g.idf("alpha").to_bits(), e.idf("alpha").to_bits());
+
+        // And again with nothing missing and nothing to gather, which is the
+        // arm that reads the cache directly.
+        let g2 = db.gather_stats("notes", &want(vec!["alpha"]), ts, false).unwrap();
+        assert_eq!(g2["body"].num_docs, g.num_docs);
+        assert_eq!(g2["body"].doc_freq, g.doc_freq);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_statistics_refresh_at_the_same_write_counts_whatever_the_shard_count() {
+        // Why a stale statistic is not a shard-dependent one, as an assertion
+        // rather than as a paragraph of the `CachedStats` comment. The gate is
+        // a write counter — engine-wide, as it happens, but what matters is
+        // that no shard's seal or compaction schedule touches it — so one
+        // shard and six cross it after the same writes and reset against the
+        // same corpus; a stale read is
+        // then the same live quantity taken at the same earlier instant, not a
+        // different quantity. Compare with the counts this path used to make,
+        // which were rebuilt at these same moments and still disagreed,
+        // because what they measured depended on when each shard had sealed.
+        let run = |splits: &str, tag: &str| {
+            let dir = tmp(tag);
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            db.execute(&format!("CREATE COLLECTION notes (id TEXT PRIMARY KEY){splits}")).unwrap();
+            db.execute(
+                "CREATE INDEX notes_body ON notes USING fulltext (body) \
+                 WITH (analyzer = 'english')",
+            )
+            .unwrap();
+            let want = BTreeMap::from([("body".to_string(), vec!["alpha".to_string()])]);
+            let mut points = Vec::new();
+            for i in 0..2000usize {
+                let body = if i % 4 == 0 { "alpha zeta" } else { "alpha" };
+                db.insert(
+                    "notes",
+                    Value::obj(vec![
+                        ("id".into(), Value::Str(format!("n{i:04}"))),
+                        ("body".into(), Value::Str(body.into())),
+                    ]),
+                )
+                .unwrap();
+                if i % 13 == 0 {
+                    db.delete_key("notes", &format!("n{:04}", i / 2)).unwrap();
+                }
+                if i % 500 == 0 {
+                    db.execute("FLUSH notes").unwrap();
+                }
+                let ts = db.clock.peek();
+                db.gather_stats("notes", &want, ts, false).unwrap();
+                let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+                if points.last() != Some(&at) {
+                    points.push(at);
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+            points
+        };
+
+        let one = run("", "refresh-points-1");
+        let three = run(" WITH (splits = ['n0700', 'n1400'])", "refresh-points-3");
+        let six = run(
+            " WITH (splits = ['n0350', 'n0700', 'n1050', 'n1400', 'n1750'])",
+            "refresh-points-6",
+        );
+        assert!(points_are_sane(&one), "the workload has to cross several refresh points: {one:?}");
+        assert_eq!(one, three, "1 shard vs 3 shards");
+        assert_eq!(one, six, "1 shard vs 6 shards");
+    }
+
+    #[test]
+    fn the_epoch_clock_keeps_running_when_every_query_fills_a_new_term() {
+        // `fill_term_stats` deliberately does not touch `refreshed_at_writes`,
+        // and the test above cannot see it: that one asks for the same term
+        // every iteration, so the only fill per epoch happens at the instant
+        // the reset has just written the same value, and bumping it there is a
+        // no-op. A query stream with a long tail of distinct terms fills on
+        // EVERY query, and a fill that reset the clock would push the refresh
+        // point forward every time — pinning the globals, and every frequency
+        // measured under them, to an epoch that never ends.
+        let dir = tmp("stats-epoch-clock");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let mut points = Vec::new();
+        for i in 0..2000usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha".into())),
+                ]),
+            )
+            .unwrap();
+            // A term no earlier query asked for, so every one of these fills.
+            let want = BTreeMap::from([("body".to_string(), vec![format!("q{i:06}")])]);
+            let ts = db.clock.peek();
+            db.gather_stats("notes", &want, ts, false).unwrap();
+            let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+            if points.last() != Some(&at) {
+                points.push(at);
+            }
+        }
+        assert!(
+            points_are_sane(&points),
+            "the epoch clock has to keep running under a fill on every query: {points:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_entry_cap_survives_an_epoch_rollover() {
+        // The cap and the epoch boundary, which are only ever tested apart.
+        // A reset starts the epoch by dropping `doc_freq` AND `fill_order`,
+        // and dropping one without the other is silent in every other test:
+        // the queue is drained only by over-cap eviction, so it would grow
+        // across epochs without bound — an unbounded `String` leak — and once
+        // it is longer than the map the eviction loop pops names the map no
+        // longer holds, removing nothing while draining the queue, so the map
+        // stops being bounded by [`STATS_TERM_CAP`] at all.
+        let dir = tmp("stats-cap-rollover");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let note = |i: usize| {
+            Value::obj(vec![
+                ("id".into(), Value::Str(format!("n{i:06}"))),
+                ("body".into(), Value::Str("alpha".into())),
+            ])
+        };
+        for i in 0..40usize {
+            db.insert("notes", note(i)).unwrap();
+        }
+        let want = |terms: Vec<String>| BTreeMap::from([("body".to_string(), terms)]);
+
+        // Epoch one: a few terms.
+        let old: Vec<String> = (0..3).map(|i| format!("old{i:04}")).collect();
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(old.clone()), ts, false).unwrap();
+        assert_eq!(db.stats.get(&cache_key("notes", "body")).unwrap().fill_order.len(), 3);
+
+        // Over a refresh point, into epoch two.
+        for i in 0..STATS_REFRESH_WRITES as usize {
+            db.insert("notes", note(1000 + i)).unwrap();
+        }
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(vec!["new0000".to_string()]), ts, false).unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            c.doc_freq.keys().cloned().collect::<Vec<_>>(),
+            vec!["new0000".to_string()],
+            "a refresh point starts the epoch empty: a frequency measured in the last epoch must \
+             not be read against globals measured in this one"
+        );
+        assert_eq!(
+            c.fill_order.iter().cloned().collect::<Vec<_>>(),
+            vec!["new0000".to_string()],
+            "and the eviction queue went with it, or it never shrinks again"
+        );
+
+        // And the cap still bounds the map on the far side of the rollover.
+        let n = STATS_TERM_CAP + 7;
+        let terms: Vec<String> = (0..n).map(|i| format!("r{i:06}")).collect();
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(terms), ts, false).unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cap is a cap in the second epoch too");
+        assert_eq!(c.fill_order.len(), c.doc_freq.len(), "and the queue is still in step with it");
+        assert!(
+            old.iter().all(|t| !c.doc_freq.contains_key(t)),
+            "nothing from the first epoch survived into the second"
+        );
+
+        // The other way the two desync, and the cheapest: a term list is not a
+        // set — `gather_stats` takes whatever the caller hands it — and a
+        // repeat must not push a second copy of the name into the queue, or
+        // the eviction loop drains a slot further than it evicts.
+        //
+        // The term repeated is `alpha`, which every document in this fixture
+        // holds, and the VALUE is asserted. It used to be `dup`, which nothing
+        // holds: `df` was zero, and zero counted twice is still zero, so the
+        // leg read as coverage of the repeated-term case while saying nothing
+        // about the number it produces. The number was wrong — twice the real
+        // frequency, on both arms. See [`term_set`].
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want(vec!["alpha".to_string(); 2]), ts, false).unwrap();
+        let g = &g["body"];
+        let live = 40 + STATS_REFRESH_WRITES;
+        assert_eq!(g.num_docs, live);
+        assert_eq!(
+            g.doc_freq["alpha"], live,
+            "every document holds it once; naming the term twice does not put it in them twice"
+        );
+        assert!(
+            g.doc_freq["alpha"] <= g.num_docs,
+            "the double count made this `df > num_docs`, which is a negative logarithm"
+        );
+        assert!(g.idf("alpha") > 0.0, "and the IDF clamp fired on a term the corpus is full of");
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cap still holds");
+        assert_eq!(
+            c.fill_order.len(),
+            c.doc_freq.len(),
+            "a repeated term is one map entry and one queue slot"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_query_at_the_same_instant_still_gets_the_first_query_s_frequency() {
+        // The merge, which is the whole reason `fill_term_stats` returns a
+        // triple instead of letting the caller read the cache back — and which
+        // nothing in the tree pinned, because every other multi-term fixture
+        // writes between its two gathers and so takes the
+        // re-gather-everything branch, where the answer happens to be exactly
+        // what this call measured.
+        //
+        // Two gathers at the SAME instant, with overlapping but not identical
+        // term lists and NO write between them. That is the shape that takes
+        // the fast path: the second call gathers only `beta`, because `alpha`
+        // is already cached under globals measured at this same instant. So
+        // `alpha`'s frequency has to come out of the cache and be merged into
+        // the answer. Build the answer from the freshly gathered map alone and
+        // `alpha` comes back `df = 0` — the highest weight IDF has — for a
+        // term every document in the corpus holds.
+        let dir = tmp("stats-same-instant-merge");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['n0030'])")
+            .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..90usize {
+            let body = if i % 3 == 0 { "alpha beta" } else { "alpha" };
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str(body.into())),
+                ]),
+            )
+            .unwrap();
+        }
+        let want = |terms: Vec<String>| BTreeMap::from([("body".to_string(), terms)]);
+
+        let ts = db.clock.peek();
+        let first = db.gather_stats("notes", &want(vec!["alpha".to_string()]), ts, false).unwrap();
+        assert_eq!(first["body"].doc_freq["alpha"], 90, "every document holds it");
+
+        // No write, so `measured_at_writes == self.writes` and the fast path
+        // holds. Assert that it does, or the test could go green by taking the
+        // slow branch and prove nothing about the merge.
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(c.measured_at_writes, db.writes, "the fast path is what this test is about");
+        assert!(c.anchored && c.doc_freq.contains_key("alpha"));
+
+        let ts = db.clock.peek();
+        let g = db
+            .gather_stats("notes", &want(vec!["alpha".to_string(), "beta".to_string()]), ts, false)
+            .unwrap();
+        let g = &g["body"];
+        assert_eq!(g.num_docs, 90);
+        assert_eq!(
+            g.doc_freq["alpha"], 90,
+            "`alpha` was filled by the first query and this one did not re-gather it, so it comes \
+             from the cache — dropping the merge answers 0 here, the maximum IDF, for the most \
+             common term in the corpus"
+        );
+        assert_eq!(g.doc_freq["beta"], 30, "and `beta` is what this call did gather");
+        assert!(
+            g.idf("alpha") < g.idf("beta"),
+            "a term in every document weighs less than one in \
+             a third of them; the unmerged answer reverses that"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_average_document_length_falls_back_only_when_there_is_nothing_to_average() {
+        // The one arithmetic guard on the default path, from both sides. It is
+        // a division, and the fallback exists because the denominator can be
+        // zero — so the test has to hold the boundary at zero AND at one, or
+        // it holds nothing: `num_docs > 0` widened to `>= 0` divides 0 by 0,
+        // and `avgdl` is a denominator inside every BM25 term, so one NaN
+        // makes every score on the query NaN and every comparison between two
+        // of them false. Narrowed to `> 1` it is quieter and no more correct:
+        // a one-document collection gets the literal 1.0 instead of its own
+        // average, so a document of forty terms is scored as if it were one.
+        let dir = tmp("stats-avgdl-boundary");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        for c in ["empty", "single"] {
+            db.execute(&format!("CREATE COLLECTION {c} (id TEXT PRIMARY KEY)")).unwrap();
+            db.execute(&format!(
+                "CREATE INDEX {c}_body ON {c} USING fulltext (body) WITH (analyzer = 'english')"
+            ))
+            .unwrap();
+        }
+        let want = BTreeMap::from([("body".to_string(), vec!["alpha".to_string()])]);
+
+        // Zero documents: nothing to average, so the fallback is the answer.
+        let ts = db.clock.peek();
+        let g = db.gather_stats("empty", &want, ts, false).unwrap();
+        let g = &g["body"];
+        assert_eq!(g.num_docs, 0, "the fixture is an indexed collection with no documents in it");
+        assert!(
+            g.avg_doc_len.is_finite(),
+            "0/0 is NaN and NaN propagates: every BM25 score on the query becomes NaN, every \
+             comparison between two of them is false, and the ranking is whatever order the \
+             sort happened to start in"
+        );
+        assert_eq!(g.avg_doc_len.to_bits(), 1.0f64.to_bits(), "by bits: it is an average");
+
+        // One document: there IS something to average, and the average is its
+        // own length, not the fallback.
+        db.insert(
+            "single",
+            Value::obj(vec![
+                ("id".into(), Value::Str("n0".into())),
+                ("body".into(), Value::Str("alpha beta gamma delta".into())),
+            ]),
+        )
+        .unwrap();
+        let ts = db.clock.peek();
+        let g = db.gather_stats("single", &want, ts, false).unwrap();
+        let e = db.gather_stats("single", &want, ts, true).unwrap();
+        let (g, e) = (&g["body"], &e["body"]);
+        assert_eq!(g.num_docs, 1);
+        assert!(
+            g.avg_doc_len > 1.0,
+            "one document still has an average, and it is that document's own length — the \
+             fallback is for having nothing to average, not for having little"
+        );
+        assert_eq!(g.avg_doc_len.to_bits(), 4.0f64.to_bits(), "one document of four terms");
+        assert_eq!(
+            g.avg_doc_len.to_bits(),
+            e.avg_doc_len.to_bits(),
+            "and the two arms agree at the boundary, as they do everywhere else"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a historical `as_of` must be read with `exact: true`")]
+    fn a_historical_timestamp_on_the_default_arm_is_a_caller_error_and_not_an_approximation() {
+        // `gather_stats` is public on a published crate, so a `debug_assert`
+        // in it is a downstream-visible change and has to earn its place. It
+        // does, and the line between the two arms is what earns it: the exact
+        // call below is a legitimate read of the past and returns; the default
+        // call is not an inaccurate answer to this caller but a write into
+        // epoch-lived state that every LATER query in the epoch reads, which
+        // is a contract rather than a quality note. `run_select` pins
+        // `clock.peek().max(last_commit)` and the crate has no `AS OF` syntax,
+        // so no SQL path can reach this — only a direct caller, who is exactly
+        // who the panic is for.
+        let dir = tmp("stats-historical-ts");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..20usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        let want = BTreeMap::from([("body".to_string(), vec!["alpha".to_string()])]);
+        let historical = db.last_commit - 1;
+        assert!(historical > 0, "the fixture has to have committed something to have a past");
+
+        // Supported, and it must not panic: it writes nothing, so there is
+        // nothing to poison.
+        db.gather_stats("notes", &want, historical, true).unwrap();
+
+        // Not supported.
+        let _ = db.gather_stats("notes", &want, historical, false);
+        unreachable!("a historical timestamp on the default arm has to be refused");
+    }
+
+    #[test]
+    fn a_term_named_twice_is_counted_once_on_both_arms() {
+        // A term list is a `Vec<String>` on a public method, so `["dup",
+        // "dup"]` is expressible, and the shard gather walks one posting
+        // cursor per element: the term came back at twice its real frequency.
+        // Not stale — `df > num_docs`, a negative logarithm, and the IDF clamp
+        // on a term every document holds. No SQL query can reach it, because
+        // `required_terms` sorts and dedups, which is precisely why nothing
+        // caught it.
+        let dir = tmp("stats-duplicate-terms");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['n0040'])")
+            .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..80usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("dup zeta".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        let want = BTreeMap::from([("body".to_string(), vec!["dup".to_string(); 2])]);
+
+        // Both arms, because both summed the same double-counted gather.
+        let ts = db.clock.peek();
+        for exact in [true, false] {
+            let g = db.gather_stats("notes", &want, ts, exact).unwrap();
+            let g = &g["body"];
+            assert_eq!(g.num_docs, 80);
+            assert_eq!(
+                g.doc_freq["dup"], 80,
+                "exact = {exact}: 80 documents hold `dup` once each, so naming it twice in the \
+                 term list cannot make it 160"
+            );
+            assert!(
+                g.doc_freq["dup"] <= g.num_docs,
+                "exact = {exact}: `df > num_docs` is a negative logarithm, not a stale number"
+            );
+            assert!(g.idf("dup") > 0.0, "exact = {exact}: and it drove IDF onto its clamp");
+        }
+
+        // The other shape a direct caller can hand over, and the one that
+        // costs an allocation: not sorted, and repeating. First-occurrence
+        // order is kept rather than sorted, because the order of the fill is
+        // the order the entry cap evicts in and that is the caller's choice.
+        let want = BTreeMap::from([(
+            "body".to_string(),
+            vec!["zeta".to_string(), "dup".to_string(), "zeta".to_string()],
+        )]);
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want, ts, false).unwrap();
+        assert_eq!(g["body"].doc_freq["zeta"], 80);
+        assert_eq!(g["body"].doc_freq["dup"], 80, "already cached, and still counted once");
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            c.fill_order.iter().cloned().collect::<Vec<_>>(),
+            vec!["dup".to_string(), "zeta".to_string()],
+            "`dup` was filled by the first query and `zeta` by the second; one slot each"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_only_query_still_gets_real_globals() {
+        // The one query shape that asks for no terms at all: `leaf_terms`
+        // skips `Prefix` — an expanded term's frequency comes from the
+        // segment's own dictionary on both paths — while `required_terms`
+        // still creates the path entry, so `terms` arrives empty. It used to
+        // be the only caller the reset's own gather was live for. Now the
+        // fill's empty-slice gather is the authoritative one, which is one
+        // pass instead of two and previously untested ground: nothing in the
+        // tree asserted on a prefix query's `num_docs` or `avgdl`, and the
+        // scorer divides every length norm by the second of them.
+        let dir = tmp("stats-prefix-globals");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..200usize {
+            let body = if i % 4 == 0 { "alphabet zeta zeta" } else { "alphabet" };
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str(body.into())),
+                ]),
+            )
+            .unwrap();
+        }
+
+        let want = BTreeMap::from([("body".to_string(), Vec::<String>::new())]);
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want, ts, false).unwrap();
+        let e = db.gather_stats("notes", &want, ts, true).unwrap();
+        let (g, e) = (&g["body"], &e["body"]);
+        assert!(!g.exact, "this leg has to be measuring the cached path");
+        assert_eq!(g.num_docs, 200);
+        assert_eq!(g.num_docs, e.num_docs);
+        assert_eq!(g.avg_doc_len.to_bits(), e.avg_doc_len.to_bits(), "by bits: it is an average");
+        assert!(g.avg_doc_len > 1.0, "a real average, not the `num_docs == 0` fallback of 1.0");
+        assert!(g.doc_freq.is_empty(), "no term was asked about, so none is answered");
+
+        // The same, through the query that actually produces this shape.
+        db.query("SELECT id FROM notes WHERE text_match(body, 'alph*') LIMIT 5").unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert!(c.anchored, "the globals were measured, and `num_docs == 0` cannot say so");
+        assert_eq!(c.num_docs, 200);
+        assert!(c.doc_freq.is_empty(), "a prefix query asks the gather for no terms");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_text_paths_in_one_collection_do_not_share_one_statistics_entry() {
+        // `cache_key` is `collection/path`, and the path half is load-bearing.
+        // Collapse it and two fields share one [`STATS_TERM_CAP`]-entry map
+        // and one `avgdl`: they evict each other, every length norm is divided
+        // by the average of both fields, and a term that appears in both is
+        // answered for whichever field asked first. Nothing else in the suite
+        // can notice — every fulltext index in the tree is on `body`, so no
+        // collection anywhere else has a second text path.
+        let dir = tmp("stats-two-paths");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_title ON notes USING fulltext (title) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        // `alpha` is in every body and in one title in ten, and the two fields
+        // are of very different lengths.
+        for i in 0..100usize {
+            let title = if i % 10 == 0 { "alpha" } else { "zeta" };
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha beta gamma delta".into())),
+                    ("title".into(), Value::Str(title.into())),
+                ]),
+            )
+            .unwrap();
+        }
+
+        let one = |path: &str| BTreeMap::from([(path.to_string(), vec!["alpha".to_string()])]);
+        let ts = db.clock.peek();
+        // Body first, so a shared entry would already hold `alpha` when the
+        // title asks — and would answer the title's query with the body's
+        // frequency without gathering anything.
+        let b = db.gather_stats("notes", &one("body"), ts, false).unwrap();
+        let t = db.gather_stats("notes", &one("title"), ts, false).unwrap();
+        let e = db.gather_stats("notes", &one("title"), ts, true).unwrap();
+        assert_eq!(b["body"].doc_freq["alpha"], 100);
+        assert_eq!(t["title"].doc_freq["alpha"], 10, "the title's own frequency, not the body's");
+        assert_eq!(t["title"].doc_freq, e["title"].doc_freq);
+        assert_eq!(t["title"].avg_doc_len.to_bits(), e["title"].avg_doc_len.to_bits());
+        assert_eq!(b["body"].avg_doc_len, 4.0, "four words of body");
+        assert_eq!(t["title"].avg_doc_len, 1.0, "one of title — and not the average of both");
+
+        assert_eq!(db.stats.get(&cache_key("notes", "body")).unwrap().doc_freq["alpha"], 100);
+        assert_eq!(db.stats.get(&cache_key("notes", "title")).unwrap().doc_freq["alpha"], 10);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fill_later_in_the_epoch_gathers_at_the_query_timestamp_and_not_a_stored_one() {
+        // The detector for the rule written on `fill_term_stats`. The test
+        // below it demonstrates WHY the rule exists, at the shard level; this
+        // one fails if the rule is broken, which is the other half and the one
+        // a future author needs. Storing the timestamp the epoch was anchored
+        // at and re-gathering at it looks free and is not: below a shard's
+        // retain floor `Shard::term_stats` is best-effort, and a seal or a
+        // compaction walks that floor up past any timestamp held from earlier,
+        // so what survives to be counted becomes a per-shard compaction
+        // decision — the exact dependence this cache was rebuilt to remove.
+        //
+        // So: anchor the epoch, then write, delete and compact under it, then
+        // fill a new term in the SAME epoch and demand the live answer. Both
+        // halves of the hazard are in that sequence. A stored timestamp cannot
+        // see the writes above it — 100 documents here — and below the retain
+        // floor the compaction walked past it, what it still sees of the 200
+        // deleted ones is that shard's own collection decision.
+        let dir = tmp("stats-fill-ts");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..600usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        let want = |terms: Vec<&str>| {
+            BTreeMap::from([(
+                "body".to_string(),
+                terms.into_iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want(vec!["alpha"]), ts, false).unwrap();
+        assert_eq!((g["body"].num_docs, g["body"].doc_freq["alpha"]), (600, 600));
+
+        for i in (0..600usize).step_by(3) {
+            db.delete_key("notes", &format!("n{i:04}")).unwrap();
+        }
+        for i in 0..100usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("m{i:04}"))),
+                    ("body".into(), Value::Str("gamma".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db.execute("COMPACT notes").unwrap();
+        let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+        assert!(
+            db.writes - at < STATS_REFRESH_WRITES,
+            "the second gather has to be a FILL inside the epoch the first one anchored, not a \
+             fresh epoch that would take a new timestamp anyway"
+        );
+
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want(vec!["alpha", "beta"]), ts, false).unwrap();
+        let e = db.gather_stats("notes", &want(vec!["alpha", "beta"]), ts, true).unwrap();
+        let (g, e) = (&g["body"], &e["body"]);
+        assert_eq!(g.num_docs, 500, "600 written, one in three deleted, 100 added");
+        assert_eq!(g.doc_freq["alpha"], 400, "and the 100 added carry `gamma`, not `alpha`");
+        assert_eq!(g.num_docs, e.num_docs, "the fill measured the corpus this query sees");
+        assert_eq!(g.avg_doc_len.to_bits(), e.avg_doc_len.to_bits(), "by bits: it is an average");
+        for (t, df) in &g.doc_freq {
+            assert_eq!(*df, e.doc_freq.get(t).copied().unwrap_or(0), "df({t})");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn points_are_sane(points: &[u64]) -> bool {
+        points.len() >= 4 && points.windows(2).all(|w| w[1] - w[0] >= STATS_REFRESH_WRITES)
+    }
+
+    #[test]
+    fn a_statistic_gathered_at_a_pinned_timestamp_does_not_stay_true_at_that_timestamp() {
+        // The demonstration behind the rule written on `fill_term_stats`, and
+        // the reason it is a rule rather than a preference. It shows the
+        // hazard; it does not detect it, because nothing here goes through
+        // `Db`'s statistics path at all — a stored `as_of` can be added to
+        // `fill_term_stats` and every assertion below still passes. The
+        // detector is
+        // `a_fill_later_in_the_epoch_gathers_at_the_query_timestamp_and_not_a_stored_one`
+        // above, and the two are worth having separately: one says what goes
+        // wrong, the other says that it has not. Caching the
+        // timestamp a refresh used and re-gathering at it later looks free —
+        // it would spare the fill nothing but a clock read — and it silently
+        // undoes the whole change: below a shard's retain floor
+        // `Shard::term_stats` is best-effort, `Shard::retain_from` returns
+        // `now` when no `gc_horizon` is pinned, and a seal or a compaction
+        // walks the floor up past any timestamp held from earlier. What
+        // survives to be counted is then a per-shard compaction decision,
+        // which is exactly the dependence the live sums removed.
+        //
+        // So: pin a timestamp, read the triple at it, compact, read it at the
+        // SAME timestamp again, and watch it change.
+        let dir = tmp("stats-stale-ts");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..600usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+
+        // The timestamp a refresh point might have stored, taken while all 600
+        // documents are live.
+        let terms = vec!["alpha".to_string()];
+        let pinned = db.clock.peek();
+        let before = db.shards("notes").unwrap()[0].term_stats("body", &terms, pinned).unwrap();
+        assert_eq!(before, (600, 600, BTreeMap::from([("alpha".to_string(), 600)])));
+
+        // Writes the pinned timestamp is below, and then the collection that
+        // drops what they superseded.
+        for i in (0..600usize).step_by(3) {
+            db.delete_key("notes", &format!("n{i:04}")).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db.execute("COMPACT notes").unwrap();
+
+        let after = db.shards("notes").unwrap()[0].term_stats("body", &terms, pinned).unwrap();
+        assert_ne!(
+            before, after,
+            "the same timestamp answered {before:?} twice running — a stored `as_of` is not a \
+             stable thing to gather at"
+        );
+        assert!(after.0 < before.0, "and what it lost is rows: {before:?} then {after:?}");
+        // The live read is the honest one, and it is the reason the fill takes
+        // the query's timestamp: 400 documents survive, and that is a fact
+        // about the corpus rather than about when this shard compacted.
+        let live =
+            db.shards("notes").unwrap()[0].term_stats("body", &terms, db.clock.peek()).unwrap();
+        assert_eq!(live.0, 400, "600 written, one in three deleted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_per_term_statistics_stay_bounded_at_the_entry_cap() {
+        // Two properties, and the second one is the one that is easy to lose.
+        //
+        // `doc_freq` is filled by whatever queries ask for, so without the cap
+        // a workload with a long tail of distinct terms grows it back into the
+        // corpus-wide vocabulary this path stopped holding. Evicting oldest
+        // first is what the cap costs: a term dropped here is re-gathered by
+        // the next query that wants it, at one masked walk. That is a bound on
+        // what the cache RETAINS.
+        //
+        // It must never become a bound on what a query is ANSWERED, and the
+        // two are one keystroke apart: build the answer by re-reading the
+        // cache after the eviction loop has run and a term the query itself
+        // asked for can be evicted by its own query and read back as `df = 0`
+        // — the highest weight BM25 gives — for a term the whole corpus holds.
+        // `alpha` is that term here. Every document has it, `required_terms`
+        // sorts, so `alpha` sorts ahead of `t000000`, is filled first, sits at
+        // the front of `fill_order` and is the first entry this very query
+        // evicts. `fill_term_stats` returns the triple it gathered instead of
+        // leaving `gather_stats` to re-read residency, so the two are
+        // independent: the assertions below hold `alpha` correct in the answer
+        // and absent from the cache at the same time.
+        let dir = tmp("stats-term-cap");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..40usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str("alpha".into())),
+                ]),
+            )
+            .unwrap();
+        }
+
+        // Well past the cap, and inside one epoch, so nothing here is a
+        // refresh discarding the map rather than the cap bounding it. Nothing
+        // bounds how many terms one query may ask for: `TextQuery::parse`
+        // builds `Any`/`All` from flat loops with no width limit and
+        // `required_terms` unions every `text_match` in the statement, so
+        // `STATS_TERM_CAP + 500` sorted terms in a single request is a shape
+        // SQL can really produce.
+        let n = STATS_TERM_CAP + 500;
+        let mut terms: Vec<String> = (0..n).map(|i| format!("t{i:06}")).collect();
+        terms.insert(0, "alpha".to_string());
+        let want = BTreeMap::from([("body".to_string(), terms.clone())]);
+        let ts = db.clock.peek();
+        let g = db.gather_stats("notes", &want, ts, false).unwrap();
+        let e = db.gather_stats("notes", &want, ts, true).unwrap();
+        assert!(db.writes < STATS_REFRESH_WRITES, "no refresh point may pass during this");
+        let (g, e) = (&g["body"], &e["body"]);
+        assert_eq!(g.doc_freq.len(), terms.len(), "the answer covers every term asked for");
+
+        // The answer, against the exact gather of the same terms at the same
+        // instant. The exact arm omits a term no unit holds where the cached
+        // arm stores an explicit zero (see
+        // `a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers`),
+        // so absence on the exact side reads as the zero it means.
+        assert_eq!(g.doc_freq["alpha"], 40, "a term every document holds, answered over the cap");
+        assert_eq!(g.num_docs, e.num_docs);
+        assert_eq!(g.avg_doc_len.to_bits(), e.avg_doc_len.to_bits(), "by bits: it is an average");
+        for (t, df) in &g.doc_freq {
+            assert_eq!(
+                *df,
+                e.doc_freq.get(t).copied().unwrap_or(0),
+                "the cap bounds what is retained, never what is answered: df({t})"
+            );
+        }
+        assert_eq!(g.idf("alpha").to_bits(), e.idf("alpha").to_bits(), "and so the weight agrees");
+
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cache is capped");
+        assert_eq!(c.fill_order.len(), STATS_TERM_CAP, "and the eviction order with it");
+        assert_eq!(c.num_docs, 40, "the globals are untouched by the eviction");
+        assert_eq!(c.total_doc_len, 40);
+        assert!(
+            !c.doc_freq.contains_key("alpha"),
+            "`alpha` was evicted by its own query, and the assertions above still hold: that \
+             sentence is the whole design, so it is an assertion and not a comment"
+        );
+        assert!(
+            !c.doc_freq.contains_key(&terms[1]) && c.doc_freq.contains_key(&terms[n]),
+            "oldest first, as a retention policy: the first term filled is gone and the last \
+             one is still there"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

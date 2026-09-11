@@ -1154,16 +1154,16 @@ impl Shard {
         // delete is untouched by a seal and survives to be collected by a
         // compaction; what a seal would drop, were it to collect, is a
         // version some later write had already superseded, and that is what
-        // `layers.truncate(1)` below does. Scoring enters into it only on the
-        // exact path now: `term_stats` masks by visibility on both halves of
-        // the quotient, so a seal moves no *exact* score whatever it drops.
-        // The default path still moves. Its statistics come from
-        // `TextSource::all_terms`, which reads the memtable's physical
-        // `ords.len()` before a seal and the built dictionary's deduplicated
-        // count after it, so the very truncation described above drops a
-        // superseded version out of `doc_freq` and shifts IDF — the residual
-        // `CachedStats` documents, and the reason `WITH (exact_scoring)`
-        // exists.
+        // `layers.truncate(1)` below does. Scoring no longer enters into it
+        // on either path: both take their statistics from `term_stats`, which
+        // masks by visibility on both halves of the quotient, so a seal moves
+        // no Term or Phrase score whatever it drops. It used to move the
+        // default path, whose statistics came from `TextSource::all_terms` —
+        // a physical count, so the very truncation described above dropped a
+        // superseded version out of `doc_freq` and shifted IDF. What a seal
+        // still moves is prefix expansion, which reaches the coordinator's
+        // gather on neither path and scores against the segment's own
+        // dictionary instead; see `TextScorer::compile`.
         let retain_from = self.retain_from(self.clock.peek());
         let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
         let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
@@ -1510,6 +1510,15 @@ impl Shard {
     /// compaction has physically dropped versions dead before the horizon and
     /// their lengths went with them — and a pinned `gc_horizon` holds the
     /// floor back and keeps those reads exact too.
+    ///
+    /// `terms` is walked element by element into one `df` map, so a repeated
+    /// element is counted once per occurrence: this takes a set, and the
+    /// caller owes it one. `Db::gather_stats`, which is the entry point for
+    /// every query, deduplicates before it gets here — the repeat is not a
+    /// supported spelling, it is a double count, and `df > num_docs` follows
+    /// from it. Deduplicating is the caller's job rather than this function's
+    /// because this one is per shard and runs once per shard per query, while
+    /// the caller does it once.
     pub fn term_stats(
         &self,
         path: &str,

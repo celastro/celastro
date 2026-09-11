@@ -247,6 +247,18 @@ impl<'a> TextSource<'a> {
         }
     }
 
+    /// Every term this source holds, with its PHYSICAL document frequency —
+    /// the memtable's `ords.len()` before a seal, the built dictionary's
+    /// deduplicated count after it.
+    ///
+    /// Deliberately not a source of scoring statistics, and it used to be one.
+    /// Neither number is masked by visibility, so both count versions a write
+    /// superseded and rows a delete tombstoned, and which of those still exist
+    /// is a per-shard seal and compaction decision: an IDF built from this
+    /// moves with the shard count. [`crate::shard::Shard::term_stats`] answers
+    /// the same question masked at a snapshot, and that is what both scoring
+    /// paths ask. What is left here is fixtures and assertions that want the
+    /// physical picture, which is a real thing to want — just not to rank by.
     pub fn all_terms(&self) -> Vec<(String, u32)> {
         match self {
             TextSource::Sealed { dict, .. } => {

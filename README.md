@@ -9,7 +9,8 @@ libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
 graph, SQL parser, JSON parser and binary codecs are all in the tree.
 
 ```
-cargo test --release                     # 364 tests
+cargo test --release                     # 380 tests (381 in a debug build:
+                                         # one pins a debug-only precondition)
 cargo run --release -- --demo            # guided tour over a small corpus
 cargo run --release -- --dir ./data      # persistent REPL
 cargo run --release -- --file script.sql # run a script
@@ -311,13 +312,20 @@ the candidate union differs with the shard count and the fusion differs with it
 — even in exact mode, where ANN and statistics are removed as sources of
 variance. Bit-identical results across shard counts hold only at `k'` above the
 candidate count, which is what `exact_mode_is_bit_identical_across_shard_counts`
-pins. The statistics half of that claim holds only in exact mode: the two-phase
-gather masks all three of `num_docs`, the length sum and `doc_freq` by snapshot
-visibility, so the triple is a function of the live corpus alone. The cached
-statistics the default path reads are counted over physical rows instead —
-uniformly, which is what keeps `doc_freq ≤ num_docs` and IDF non-negative, but
-physical rows move with flush and compaction timing, and so with the shard
-count.
+pins. The statistics half of that claim holds on both paths, but for different
+reasons. The two-phase gather masks all three of `num_docs`, the length sum and
+`doc_freq` by snapshot visibility on this query, so the triple is a function of
+the live corpus alone. The cached statistics the default path reads are the
+same masked sums, gathered at an instant the query pins and refreshed on a
+write counter no shard's seal or compaction schedule touches — so its residual
+is staleness, and staleness is not a shard-count dependence: one shard and six
+cross the same refresh points after the same writes and measure the same corpus
+there. Every triple the default path returns is a set of live sums at ONE
+instant, at most that counter's interval behind the query: stale, never mixed. They used to be
+counted over physical rows instead, and physical rows move with flush and
+compaction timing, so they moved with the shard count. What remains outside the
+gather on *both* paths is prefix expansion, whose document frequencies still
+come from a segment's own dictionary.
 
 **`search_after` over an approximate index is not cheaper than `OFFSET`.** A
 graph search has no resume primitive: an HNSW heap cannot restart from a
@@ -763,7 +771,15 @@ guarantee:
 | recall@10 ≥ 0.95 under sustained deletes | `recall_at_10_holds_under_sustained_deletes` (40% deleted, before / after / post-compaction) |
 | exact mode bit-identical across shard counts | `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards), `exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes` (linear fusion, so a length norm can reach the assertion) |
 | exact global statistics are a function of the live corpus | `exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `shard::tests::the_length_numerator_matches_a_brute_force_fold_at_every_snapshot` |
-| cached statistics sum over every unit and shard, and stay internally coherent | `engine::tests::the_cached_statistics_sum_over_every_unit_of_every_shard` (`doc_freq ≤ num_docs`, so IDF cannot go negative) |
+| a freshly refreshed default gather matches `WITH (exact_scoring)` for Term and Phrase queries, and the default triple is identical at every shard count fresh or stale | `default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`, `engine::tests::a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers` (not prefix queries, which reach the gather on neither path — `engine::tests::a_prefix_only_query_still_gets_real_globals` covers what they do get) |
+| the cached statistics are live sums over every unit and shard, at one instant: stale, never mixed | `engine::tests::the_cached_statistics_are_live_sums_over_every_unit_of_every_shard`, `engine::tests::a_term_filled_mid_epoch_is_measured_against_the_document_count_it_will_be_divided_by` (inserts), `engine::tests::a_frequency_and_the_count_it_is_divided_by_are_never_from_different_instants` (deletes, where `doc_freq ≤ num_docs` is what a mixed instant breaks) |
+| the entry cap bounds what is retained, never what is answered | `engine::tests::the_per_term_statistics_stay_bounded_at_the_entry_cap`, `engine::tests::the_entry_cap_survives_an_epoch_rollover` |
+| a stale statistic is not a shard-dependent one | `engine::tests::the_statistics_refresh_at_the_same_write_counts_whatever_the_shard_count`, `engine::tests::the_epoch_clock_keeps_running_when_every_query_fills_a_new_term` |
+| a cached statistic is gathered at the current query's timestamp, never at a stored one | `engine::tests::a_fill_later_in_the_epoch_gathers_at_the_query_timestamp_and_not_a_stored_one` (the detector), `engine::tests::a_statistic_gathered_at_a_pinned_timestamp_does_not_stay_true_at_that_timestamp` (the demonstration) |
+| a query answers with every term it asked for, cached or freshly gathered | `engine::tests::a_second_query_at_the_same_instant_still_gets_the_first_query_s_frequency` (two gathers at one instant, overlapping term lists: the second re-gathers only what is missing, so the rest has to come out of the cache) |
+| a term named twice in one term list is counted once | `engine::tests::a_term_named_twice_is_counted_once_on_both_arms` (the term list is a `Vec` on a public method; counted twice it is `df > num_docs`, not a stale number) |
+| the average document length falls back only with nothing to average | `engine::tests::the_average_document_length_falls_back_only_when_there_is_nothing_to_average` (zero documents, where the division is 0/0, and one, where there is a real average) |
+| reading the past is `WITH (exact_scoring)`, and the default path says so | `engine::tests::a_historical_timestamp_on_the_default_arm_is_a_caller_error_and_not_an_approximation` |
 | IDF is total: no statistics make it negative | `text::scorer::tests::idf_is_never_negative_however_incoherent_the_statistics` |
 | approximate mode within tolerance | `approximate_mode_across_shard_counts_stays_within_recall_tolerance` |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
