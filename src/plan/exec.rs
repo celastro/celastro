@@ -1277,6 +1277,69 @@ mod tests {
         BTreeMap::from([("body".to_string(), g)])
     }
 
+    /// A collection with one full-text path and one plain one, so a statement
+    /// can name both an indexed and an unindexed path.
+    fn text_coll() -> Collection {
+        let mut c = Collection::new("notes", "id", None);
+        c.indexes.push(crate::catalog::IndexDef::new(
+            "notes_body",
+            "body",
+            crate::catalog::IndexKind::FullText { analyzer: "english".into() },
+            crate::residency::Tier::default(),
+        ));
+        c
+    }
+
+    fn select(sql: &str) -> Select {
+        match crate::sql::parser::parse(sql, &[]).unwrap() {
+            Statement::Select(s) => *s,
+            _ => panic!("not a SELECT: {sql}"),
+        }
+    }
+
+    #[test]
+    fn prefixes_named_here_are_paths_required_terms_already_created() {
+        // `Db::run_select` relies on this and cannot check it: it merges each
+        // resolved expansion into the `want` map `required_terms` built, and
+        // then attaches the expansion to the `GlobalStats` the gather produced
+        // for that path. A path that reaches `required_prefixes` but not
+        // `required_terms` has no entry to attach to, so every unit falls onto
+        // `scorer::build`'s no-coordinator arm and expands the prefix locally
+        // — which is the per-unit expansion the coordinator exists to replace,
+        // and it fails by ranking differently rather than by erroring.
+        //
+        // It holds because both functions walk the same two sites behind the
+        // same `fulltext_index` guard and the same `TextQuery::parse`, and
+        // `required_terms` creates its entry before it has any term to put in
+        // it. `run_select` used to defend itself with a redundant
+        // `want.entry(path).or_default()` instead, which pinned nothing: a
+        // write that is a no-op while the invariant holds is still a no-op
+        // once it breaks. This is the pin in its place.
+        let coll = text_coll();
+        // A pure negation on the only indexed path: nothing is scored, so the
+        // term list is empty and the entry has to exist anyway. `title` is
+        // unindexed, and neither function may name it.
+        for sql in [
+            "SELECT id FROM notes WHERE text_match(body, '-alph*')",
+            "SELECT id FROM notes WHERE NOT text_match(body, 'alph*')",
+            "SELECT id FROM notes WHERE text_match(body, '-alph*') AND text_match(title, 'b*')",
+            "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'alph*'), \
+              emb <=> [1.0, 0.0]) LIMIT 3",
+        ] {
+            let sel = select(sql);
+            let terms = required_terms(&coll, &sel);
+            let prefixes = required_prefixes(&coll, &sel);
+            assert!(!prefixes.is_empty(), "the statement has to expand something: {sql}");
+            for path in prefixes.keys() {
+                assert!(
+                    terms.contains_key(path),
+                    "`{path}` is expanded but has no `want` entry to attach it to: {sql}"
+                );
+            }
+            assert!(!terms.contains_key("title"), "an unindexed path must not be named: {sql}");
+        }
+    }
+
     #[test]
     fn a_cut_leaf_is_reported_in_every_polarity_the_statement_spelled_it_in() {
         // The message is the only thing a caller has to find the clause that

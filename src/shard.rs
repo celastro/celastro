@@ -2728,6 +2728,15 @@ mod tests {
         // answers below must be the ones the unpinned single-segment shard
         // gives, term for term. It is not a regression test for a defect — the
         // skip is a cost fix — so it does not fail on the unskipped code.
+        // `an_invisible_unit_is_not_opened_at_all` is the one that does.
+        //
+        // The multiplier reproduces on an independently built fixture of the
+        // same shape — 202 units under a pin, 200 live documents, a two-term
+        // gather — at 3.4 ms with the skips deleted against 23 us with them,
+        // for identical answers. The absolute numbers move with how much text
+        // each layer holds, because what the skip saves is per unit and
+        // whole: one text handle, one dictionary decode, one cursor per term.
+        // The ratio is the claim.
         let live = |pin: bool| {
             let mut s = shard();
             for i in 0..6 {
@@ -2759,6 +2768,86 @@ mod tests {
         assert_eq!(docs_pinned, docs_plain, "the same live corpus either way");
         assert_eq!(terms_pinned, terms_plain, "the same live vocabulary");
         assert_eq!(stats_pinned, stats_plain, "and the same triple: ndocs, length sum, df");
+    }
+
+    #[test]
+    fn an_invisible_unit_is_not_opened_at_all() {
+        // The pin for both `vis.popcount() == 0` skips, in `term_stats` and in
+        // `prefix_terms`. What they buy is cost, and cost is not a thing a
+        // test can assert on without becoming a timing test; what they also
+        // buy — and this is the same statement — is that a unit holding
+        // nothing visible at `t` is never OPENED, so nothing about its bytes
+        // can reach the answer. That is assertable, because a segment can be
+        // made to fail on being opened.
+        //
+        // So the refusal below is an instrument, not a scenario: no operator
+        // archives the superseded layers of a shard and leaves the live one
+        // local. It is here because an archived segment on a node configured
+        // to refuse is the cheapest way to make opening a CHOSEN unit fail
+        // loudly, and a gather that still answers then means the unit was not
+        // opened. Delete either skip and both calls below return that refusal
+        // instead of an answer.
+        //
+        // A pinned seal is what makes the fixture: six retained versions of one
+        // key emit one layer per version, and all but one of them holds nothing
+        // visible at the timestamp read at.
+        let fixture = || {
+            let mgr = Arc::new(ResidencyManager::new(crate::residency::ResidencyOpts {
+                archived_access: crate::residency::ArchivedAccess::Refuse,
+                ..Default::default()
+            }));
+            let mut opts = ShardOpts::default();
+            opts.residency = Some(mgr);
+            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts);
+            for i in 0..6 {
+                s.insert(doc(i)).unwrap();
+            }
+            s.opts.gc_horizon = s.clock.peek();
+            for v in 0..6 {
+                let mut d = doc(3);
+                d.set_path("body", Value::Str(format!("vector revision {v}")));
+                s.insert(d).unwrap();
+            }
+            s.flush().unwrap();
+            assert!(s.segments.len() > 1, "the pinned seal has to emit the layers");
+            s
+        };
+        let gone = std::env::temp_dir().join("celastro-no-such-archive.seg");
+        let archive = |h: &Arc<SegmentHandle>| {
+            h.segment.set_source(crate::segment::SegmentSource::Archive(gone.clone()));
+        };
+
+        let s = fixture();
+        let t = s.clock.peek();
+        let mut sent = 0;
+        for h in s.segments.iter().filter(|h| h.visibility(t).popcount() == 0) {
+            archive(h);
+            sent += 1;
+        }
+        assert!(sent > 0, "the fixture has to contain a unit with nothing visible at `t`");
+
+        // Both readers of a unit's text index, and each has its own skip: the
+        // gather opens postings, the expansion opens the dictionary.
+        let (ndocs, _, df) = s.term_stats("body", &["vector".to_string()], t).unwrap();
+        assert_eq!(ndocs, 6, "the live corpus, whatever the dead layers hold");
+        assert_eq!(df.get("vector"), Some(&6), "and its document frequencies");
+        let mut terms = BTreeSet::new();
+        s.prefix_terms("body", "vec", t, 512, None, &mut terms).unwrap();
+        assert!(terms.contains("vector"), "the live vocabulary: {terms:?}");
+
+        // The control, on a FRESH fixture because the first one has decoded
+        // what it was allowed to decode and a resident component is answered
+        // without asking the archive again. It is what stops the assertions
+        // above from passing on a gather that skipped every unit: a unit that
+        // does hold something visible is still opened, and still refuses.
+        let s = fixture();
+        let t = s.clock.peek();
+        s.segments.iter().for_each(archive);
+        let e = s.term_stats("body", &["vector".to_string()], t).unwrap_err().to_string();
+        assert!(e.contains("archived"), "a live unit's refusal still reaches the caller: {e}");
+        let mut terms = BTreeSet::new();
+        let e = s.prefix_terms("body", "vec", t, 512, None, &mut terms).unwrap_err().to_string();
+        assert!(e.contains("archived"), "on the dictionary read too: {e}");
     }
 
     #[test]

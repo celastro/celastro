@@ -761,13 +761,33 @@ fn print_rows(r: &QueryResult) {
     if !r.missing.is_empty() {
         println!("PARTIAL RESULTS — missing: {:?}", r.missing);
     }
-    for t in &r.truncated_prefixes {
-        println!("TRUNCATED — {t}");
-    }
+    print!("{}", truncation_report(r));
     println!("{} row(s)", r.rows.len());
     if let Some(c) = &r.next_cursor {
         println!("next cursor: {}", c.replace('\u{1}', "/"));
     }
+}
+
+/// The `TRUNCATED —` lines a cut query prints, as one block of text.
+///
+/// Returned rather than printed, because this shell is one of the surfaces the
+/// README promises reports a cut prefix expansion and a `println!` inside
+/// `print_rows` is reachable from no test at all: `rows_json` below and the
+/// HTTP server's copy of it are pinned, and the line a person reading the
+/// table sees was not. Empty when nothing was cut, so the caller prints it
+/// unconditionally.
+///
+/// The `celastro` binary carries its own copy, for the reason this file's
+/// header gives: a binary cannot import another binary, and one private
+/// rendering detail is not a reason to grow the library's public API.
+fn truncation_report(r: &QueryResult) -> String {
+    let mut out = String::new();
+    for t in &r.truncated_prefixes {
+        out.push_str("TRUNCATED — ");
+        out.push_str(t);
+        out.push('\n');
+    }
+    out
 }
 
 /// A column of the rendered table. `key`, `score` and `distance` belong to the
@@ -1493,5 +1513,29 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         assert_eq!(persist_status(&mut db, false), 1);
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn a_cut_prefix_is_reported_by_this_shell_one_line_per_leaf() {
+        // The shell half of "every query that was cut says so". Both JSON
+        // surfaces are pinned; this text went to stdout inline, so a dropped
+        // loop or a mangled prefix would have been caught only by somebody
+        // running a wide `a*` by hand and noticing the silence.
+        assert_eq!(truncation_report(&QueryResult::default()), "", "a clean query says nothing");
+
+        let mut r = QueryResult::default();
+        r.truncated_prefixes = vec![
+            "text_match(body, 'a*') was cut: documents are missing".to_string(),
+            "text_match(body, '-a*') was cut: documents it excludes are here".to_string(),
+        ];
+        // Byte for byte what the loop wrote: the em dash with a space either
+        // side, the message unaltered, one line per leaf in the order the
+        // result carries them — a statement spelling one prefix in both
+        // polarities gets a line for each.
+        assert_eq!(
+            truncation_report(&r),
+            "TRUNCATED — text_match(body, 'a*') was cut: documents are missing\n\
+             TRUNCATED — text_match(body, '-a*') was cut: documents it excludes are here\n"
+        );
     }
 }

@@ -1938,14 +1938,23 @@ impl Db {
                 // The expanded terms join the statement's own terms, so the
                 // gather is still one pass per path over one deduplicated list.
                 //
-                // The entry is created unconditionally and only the EXTEND is
-                // conditional, so a path whose every prefix is negated stays in
-                // `want` and `gather_stats` still produces a `GlobalStats` for
-                // it. Without an entry there the loop below has nowhere to
-                // attach the resolved `expansions`, every unit falls onto
-                // `scorer::build`'s no-coordinator arm, and the per-unit
-                // expansion this whole path exists to replace comes back.
-                let w = want.entry(path.clone()).or_default();
+                // A path whose every prefix is negated adds nothing here and
+                // still has to reach `gather_stats`: without an entry in
+                // `want` the loop below has nowhere to attach the resolved
+                // `expansions`, every unit falls onto `scorer::build`'s
+                // no-coordinator arm, and the per-unit expansion this whole
+                // path exists to replace comes back. That entry is
+                // `required_terms`' job and it already does it: the two
+                // functions walk the same two sites behind the same
+                // `fulltext_index` guard and the same `TextQuery::parse`, so
+                // every path `required_prefixes` names is a path
+                // `required_terms` named first — with an EMPTY term list when
+                // nothing is scored, which is exactly the entry needed.
+                // `prefixes_named_here_are_paths_required_terms_already_created`
+                // pins that; creating the entry a second time here does not,
+                // because a redundant write cannot fail when the invariant it
+                // stands in for breaks.
+                //
                 // A leaf written `-a*` is compiled under `TextQuery::Not`,
                 // whose scorer arm keeps the document ids and drops the scores,
                 // so a `df` gathered for its terms is never read — the same
@@ -1960,7 +1969,7 @@ impl Db {
                 // so the disjunction's pivot still reaches every posting and
                 // the exclusion bitmap is identical.
                 if used.positive {
-                    w.extend(terms.iter().cloned());
+                    want.entry(path.clone()).or_default().extend(terms.iter().cloned());
                 }
                 expansions
                     .entry(path.clone())

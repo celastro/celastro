@@ -1252,6 +1252,7 @@ fn text_json(kind: &str, text: &str) -> String {
 mod tests {
     use super::*;
     use crate::plan::exec::Row;
+    use crate::text::scorer::PREFIX_EXPANSION_LIMIT;
     use std::io::Cursor;
     use std::net::IpAddr;
 
@@ -2275,5 +2276,90 @@ mod tests {
         assert_eq!(raw.len(), split + 4);
         let text = String::from_utf8(raw).unwrap();
         assert!(text.contains(&format!("Content-Length: {}", body.len())), "{text}");
+    }
+
+    /// A collection whose live `a*` vocabulary is wider than the expansion
+    /// cap, with `zed` on every document so a negated shape has a positive
+    /// clause that admits everything and therefore measures only the
+    /// exclusion. The shape `engine`'s `cap_fixture` builds, in memory: this
+    /// test is about the wire, and a directory on disk would add failure modes
+    /// that have nothing to do with it.
+    fn cut_prefix_db() -> Db {
+        let mut db = Db::in_memory();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..PREFIX_EXPANSION_LIMIT + 200 {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".to_string(), Value::Str(format!("n{i:05}"))),
+                    ("body".to_string(), Value::Str(format!("zed a{i:05}"))),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db
+    }
+
+    /// How many documents the collection still holds. Every document carries
+    /// `zed`, and `zed` is one term, so this count is never itself cut.
+    fn live_documents(db: &mut Db) -> usize {
+        db.query("SELECT id FROM notes WHERE text_match(body, 'zed') LIMIT 100000")
+            .unwrap()
+            .rows
+            .len()
+    }
+
+    /// One statement, posted the way the console posts it.
+    fn post(sql: &str) -> String {
+        let body = format!(r#"{{"sql":{}}}"#, jstr(sql));
+        let mut request = String::from("POST /api/query?t=tok HTTP/1.1\r\nHost: localhost\r\n");
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        request
+    }
+
+    #[test]
+    fn a_delete_whose_predicate_was_cut_is_refused_over_http_and_deletes_nothing() {
+        // That the engine refuses a cut DELETE is `engine`'s claim and
+        // `engine`'s test. What was untested is the SHAPE that refusal takes
+        // on the wire, which is all the console and any script posting to
+        // `/api/query` can see: a 200 carrying `ok:false` and the reason, like
+        // every other statement the database declines — not a protocol
+        // failure, and above all not an ack for work that did not happen. The
+        // generic error-shape test posts nonsense SQL, which the parser
+        // rejects before a collection is even named; this one is refused by
+        // the executor, with a real collection and real rows to lose.
+        let mut db = cut_prefix_db();
+        let before = live_documents(&mut db);
+        assert_eq!(before, PREFIX_EXPANSION_LIMIT + 200, "the fixture, before anything");
+
+        // Both shapes, because they are cut for opposite reasons: `a*` names
+        // fewer documents than it describes, `zed -a*` excludes fewer, and the
+        // refusal quotes the leaf as it was written so a reader can tell which.
+        for (statement, leaf) in [
+            ("DELETE FROM notes WHERE text_match(body, 'a*')", "'a*'"),
+            ("DELETE FROM notes WHERE text_match(body, 'zed -a*')", "'-a*'"),
+        ] {
+            let response = serve_request(&mut db, &post(statement)).0;
+            assert_eq!(status_line(&response), "HTTP/1.1 200 OK", "{response}");
+            let parsed = json::parse(body_of(&response)).expect("a refusal is still JSON");
+            assert_eq!(parsed.get("ok"), Some(&Value::Bool(false)), "{response}");
+            // `kind` is what the console switches on, and `ack` here would
+            // print a cheerful count for a DELETE that did nothing.
+            assert_eq!(parsed.get("kind"), None, "a refusal is not an outcome: {response}");
+            let error = match parsed.get("error").and_then(|v| v.as_str()) {
+                Some(e) => e,
+                None => panic!("a refusal has to say why: {response}"),
+            };
+            assert!(error.contains("refused"), "{error}");
+            assert!(error.contains("NOTHING was deleted"), "{error}");
+            assert!(error.contains(leaf), "the leaf that was cut, as written: {error}");
+            assert_eq!(live_documents(&mut db), before, "refused means nothing was written");
+        }
     }
 }
