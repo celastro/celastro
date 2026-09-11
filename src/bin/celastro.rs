@@ -241,6 +241,9 @@ fn print_rows(r: &QueryResult) {
     if !r.missing.is_empty() {
         println!("PARTIAL RESULTS — missing: {:?}", r.missing);
     }
+    for t in &r.truncated_prefixes {
+        println!("TRUNCATED — {t}");
+    }
     println!("{} row(s)", r.rows.len());
     if let Some(c) = &r.next_cursor {
         println!("next cursor: {}", c.replace('\u{1}', "/"));

@@ -1163,6 +1163,15 @@ fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
         }
         out.push_str(&jstr(m));
     }
+    // Beside `missing`, and unconditional: a client that renders a row count
+    // has no other way to learn the count is short because a `foo*` was cut.
+    out.push_str(r#"],"truncated_prefixes":["#);
+    for (i, t) in r.truncated_prefixes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&jstr(t));
+    }
     out.push_str(r#"],"next_cursor":"#);
     match &r.next_cursor {
         Some(c) => out.push_str(&jstr(c)),
@@ -1706,6 +1715,7 @@ mod tests {
         let mut r = QueryResult::default();
         r.rows = vec![Row { key: key.clone(), doc, score: Some(1.5), distance: None }];
         r.missing = vec!["tablet\"1".to_string()];
+        r.truncated_prefixes = vec![r#"text_match(body, 'a"b*') was cut\"#.to_string()];
         r.next_cursor = Some("cursor\\\"value".to_string());
         let text = rows_json(&r, 7);
 
@@ -1723,6 +1733,15 @@ mod tests {
         assert_eq!(cursor, Some("cursor\\\"value"));
         let missing = parsed.get("missing").and_then(|v| v.as_array()).unwrap();
         assert_eq!(missing[0].as_str(), Some("tablet\"1"));
+        // `truncated_prefixes` is `missing`'s sibling on the wire and the most
+        // user-facing sentence the README makes ("every query that was cut says
+        // so"), so it gets the same escaping proof rather than being left to an
+        // envelope that only ever carried it empty. The prefix here is a legal
+        // one — `text_match` takes a quoted string — so this is the real shape,
+        // not a contrived one.
+        let cut = parsed.get("truncated_prefixes").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].as_str(), Some(r#"text_match(body, 'a"b*') was cut\"#));
         let rows = parsed.get("rows").and_then(|v| v.as_array()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("key").and_then(|v| v.as_str()), Some(key.as_str()));

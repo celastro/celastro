@@ -57,7 +57,49 @@ impl TextQuery {
                     q.leaf_terms(out);
                 }
             }
+            // Not recursed, and [`leaf_prefixes`](Self::leaf_prefixes) does
+            // recurse: a negated term is never scored, so its `df` is never
+            // read, while a negated prefix's term list is the exclusion set.
             TextQuery::Not(_) => {}
+        }
+    }
+
+    /// Every prefix leaf, for the coordinator's expansion. The resolved term
+    /// list is pinned once, at the coordinator, rather than re-derived by every
+    /// searchable unit: the cap is applied to the UNION, so which terms the
+    /// query names stops depending on how the corpus happens to be laid out.
+    ///
+    /// The `Not` arm recurses here and deliberately does NOT in
+    /// [`leaf_terms`](Self::leaf_terms), and the asymmetry is the point rather
+    /// than an oversight to tidy up. A negated TERM contributes no score, so
+    /// its document frequency is never read and gathering one is wasted work.
+    /// A negated PREFIX is different in kind: its expansion is the EXCLUSION
+    /// set, so the list decides which documents the query drops. Leave it to
+    /// each unit and the exclusion set moves with the layout, which is the same
+    /// defect as on the positive side and just as silent.
+    /// The POLARITY travels with each prefix, and it has to. Truncating a
+    /// positive expansion loses rows; truncating a negated one does the
+    /// opposite — the exclusion set is short, so rows the query should have
+    /// dropped are still in the answer. A report that does not know which leaf
+    /// it is describing says the inverse of what happened for `-a*`, which is
+    /// worse than saying nothing.
+    pub fn leaf_prefixes(&self, out: &mut Vec<(String, bool)>) {
+        self.prefixes_under(false, out)
+    }
+
+    fn prefixes_under(&self, negated: bool, out: &mut Vec<(String, bool)>) {
+        match self {
+            TextQuery::Prefix(p) => out.push((p.clone(), negated)),
+            TextQuery::Term(_) | TextQuery::Phrase(_) | TextQuery::Empty => {}
+            TextQuery::All(v) | TextQuery::Any(v) => {
+                for q in v {
+                    q.prefixes_under(negated, out);
+                }
+            }
+            // Flipped rather than set: `--a*` is a double negation and its
+            // expansion is a matching set again, however unlikely a spelling
+            // it is.
+            TextQuery::Not(q) => q.prefixes_under(!negated, out),
         }
     }
 
@@ -314,6 +356,44 @@ mod tests {
         // request — it survives parsing and is refused at compile time.
         let q = TextQuery::parse("quick OR -lazy", Analyzer::English).unwrap();
         assert!(matches!(q, TextQuery::Any(_)), "{q:?}");
+    }
+
+    #[test]
+    fn leaf_prefixes_descends_into_not_and_leaf_terms_does_not() {
+        // The asymmetry is deliberate and documented on both arms, and this is
+        // the test that stops it being "tidied up" in either direction.
+        //
+        // `quick -lazy* -slow` parses to `quick AND NOT lazy* AND NOT slow`.
+        // `slow` is negated, so it is never scored and its document frequency
+        // is never read: gathering one would be a posting-list walk per shard
+        // for a number nothing consumes. `lazy*` is negated too, but its
+        // expansion is not a weight — it is the set of documents the query
+        // throws away. Resolve that per searchable unit and the exclusion set
+        // moves with the flush and compaction schedule, exactly as the
+        // positive side did.
+        let q = TextQuery::parse("quick -lazy* -slow fast*", Analyzer::English).unwrap();
+        let (mut terms, mut prefixes) = (Vec::new(), Vec::new());
+        q.leaf_terms(&mut terms);
+        q.leaf_prefixes(&mut prefixes);
+        assert_eq!(terms, vec!["quick".to_string()], "`slow` is negated: no df is ever read");
+        // The polarity comes back with each prefix, because truncating the two
+        // costs opposite things: a cut positive expansion loses rows, a cut
+        // exclusion set keeps rows it was asked to drop. The report is written
+        // off this flag, so getting it here wrong states the inverse of what
+        // happened to the caller.
+        assert_eq!(
+            prefixes,
+            vec![("fast".to_string(), false), ("lazy".to_string(), true)],
+            "both prefixes, negated or not: each names a term list the answer depends on"
+        );
+
+        // A double negation is a matching set again. Flipping rather than
+        // setting the flag is what makes that true, and nothing else in the
+        // suite writes `--`.
+        let q = TextQuery::parse("quick --lazy*", Analyzer::English).unwrap();
+        let mut prefixes = Vec::new();
+        q.leaf_prefixes(&mut prefixes);
+        assert_eq!(prefixes, vec![("lazy".to_string(), false)], "{q:?}");
     }
 
     #[test]

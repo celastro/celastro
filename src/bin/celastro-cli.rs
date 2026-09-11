@@ -761,6 +761,9 @@ fn print_rows(r: &QueryResult) {
     if !r.missing.is_empty() {
         println!("PARTIAL RESULTS — missing: {:?}", r.missing);
     }
+    for t in &r.truncated_prefixes {
+        println!("TRUNCATED — {t}");
+    }
     println!("{} row(s)", r.rows.len());
     if let Some(c) = &r.next_cursor {
         println!("next cursor: {}", c.replace('\u{1}', "/"));
@@ -924,6 +927,8 @@ fn error_json(msg: &str) -> Value {
 fn rows_json(r: &QueryResult, d: Duration) -> Value {
     let rows: Vec<Value> = r.rows.iter().map(row_json).collect();
     let missing: Vec<Value> = r.missing.iter().map(|m| Value::Str(m.clone())).collect();
+    let truncated: Vec<Value> =
+        r.truncated_prefixes.iter().map(|t| Value::Str(t.clone())).collect();
     let cursor = match &r.next_cursor {
         Some(c) => Value::Str(c.clone()),
         None => Value::Null,
@@ -934,6 +939,7 @@ fn rows_json(r: &QueryResult, d: Duration) -> Value {
         ("count".to_string(), Value::Int(r.rows.len() as i64)),
         ("elapsed_ms".to_string(), Value::Int(elapsed_ms(d))),
         ("missing".to_string(), Value::Array(missing)),
+        ("truncated_prefixes".to_string(), Value::Array(truncated)),
         ("next_cursor".to_string(), cursor),
         ("rows".to_string(), Value::Array(rows)),
     ])
@@ -1407,6 +1413,36 @@ mod tests {
         let rows = parsed.get("rows").and_then(|v| v.as_array()).unwrap();
         assert_eq!(rows[0].get("score"), Some(&Value::Null), "{out}");
         assert_eq!(rows[0].get("distance"), Some(&Value::Null), "{out}");
+    }
+
+    #[test]
+    fn a_cut_prefix_reaches_the_json_the_way_a_missing_tablet_does() {
+        // `truncated_prefixes` is `missing`'s sibling on the wire, and the
+        // `--json` output is the half of that pair a script reads: the
+        // `TRUNCATED —` line the interactive shells print is for a human, and
+        // a program piping `--json` sees nothing of it. This field was added
+        // with no test on this side at all, so a rename or a dropped entry
+        // would have been caught only by the HTTP server's copy.
+        let mut r = QueryResult::default();
+        r.truncated_prefixes =
+            vec![r#"text_match(body, 'a"b*') expanded to 512 terms"#.to_string()];
+        let out = json::to_string(&rows_json(&r, Duration::from_millis(0)));
+        let parsed = json::parse(&out).expect("a cut report must not spoil the document");
+        let cut = parsed.get("truncated_prefixes").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(cut.len(), 1, "{out}");
+        // Escaped rather than spliced: a prefix may hold a quote, and the
+        // report quotes the leaf back.
+        assert_eq!(
+            cut[0].as_str(),
+            Some(r#"text_match(body, 'a"b*') expanded to 512 terms"#),
+            "{out}"
+        );
+
+        // Present and empty when nothing was cut, so a reader can index it
+        // unconditionally rather than testing for the key.
+        let clean = json::to_string(&rows_json(&QueryResult::default(), Duration::from_millis(0)));
+        let parsed = json::parse(&clean).unwrap();
+        assert_eq!(parsed.get("truncated_prefixes"), Some(&Value::Array(Vec::new())), "{clean}");
     }
 
     #[test]

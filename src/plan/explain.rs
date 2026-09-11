@@ -9,13 +9,46 @@
 use crate::plan::fusion::FusionExplain;
 use crate::vector::VectorReport;
 
+/// Which machinery the unit actually ran for one text leaf.
+///
+/// A discriminant rather than a string built at the push site, because the
+/// renderer is the thing that was wrong: it formatted every text line as
+/// "block-max WAND, terms=…, candidates=…", including the filter path, which
+/// runs [`scorer::evaluate_to_bitmap`](crate::text::scorer::evaluate_to_bitmap)
+/// — a bare `advance` loop with no scoring, no max-score pivot and no
+/// threshold. A plan that names an algorithm the query did not enter is worse
+/// than no plan, because it is the document someone debugging a slow query
+/// reasons from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextStrategy {
+    /// Ranked: block-max WAND over the scored terms, keeping the top `k'`.
+    /// `matched` is the candidates it kept.
+    #[default]
+    Wand,
+    /// A `text_match` predicate: a full bitmap evaluation, no pruning and no
+    /// scores. It has no scored terms to list, and `matched` is survivors.
+    Filter,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TextExplain {
     pub source: String,
+    pub strategy: TextStrategy,
     pub terms: Vec<String>,
-    pub candidates: usize,
-    /// A `foo*` that hit the expansion cap. Silently returning fewer results is
-    /// worse than saying so.
+    /// Candidates kept on [`TextStrategy::Wand`], survivors on
+    /// [`TextStrategy::Filter`]. One number, two honest names, and the
+    /// renderer prints whichever one this unit earned.
+    pub matched: usize,
+    /// A `foo*` that hit the expansion cap, as seen by THIS unit. Normally the
+    /// coordinator's verdict on the whole collection, repeated by every unit
+    /// that compiled the query; on the no-coordinator path it is the unit's own
+    /// dictionary being cut, which is the only place that fact is visible.
+    ///
+    /// The query-level statement lives on
+    /// [`QueryResult::truncated_prefixes`](crate::plan::exec::QueryResult),
+    /// which an ordinary query sees without asking for a plan. Silently
+    /// returning fewer results is worse than saying so, and saying so only
+    /// under `EXPLAIN ANALYZE` was most of the way to silence.
     pub prefix_truncated: bool,
     pub stats_exact: bool,
 }
@@ -130,13 +163,17 @@ impl Explain {
                     ));
                 }
                 for t in &u.text {
-                    o.push_str(&format!(
-                        "      text[{}]: block-max WAND, terms={:?}, candidates={}{}\n",
-                        t.source,
-                        t.terms,
-                        t.candidates,
-                        if t.prefix_truncated { ", PREFIX EXPANSION TRUNCATED" } else { "" }
-                    ));
+                    let cut = if t.prefix_truncated { ", PREFIX EXPANSION TRUNCATED" } else { "" };
+                    o.push_str(&match t.strategy {
+                        TextStrategy::Wand => format!(
+                            "      text[{}]: block-max WAND, terms={:?}, candidates={}{}\n",
+                            t.source, t.terms, t.matched, cut
+                        ),
+                        TextStrategy::Filter => format!(
+                            "      text[{}]: bitmap evaluation, survivors={}{}\n",
+                            t.source, t.matched, cut
+                        ),
+                    });
                 }
                 for (name, v) in &u.vector {
                     o.push_str(&format!(

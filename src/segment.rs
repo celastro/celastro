@@ -1317,10 +1317,15 @@ mod tests {
             num_docs: n as u64,
             avg_doc_len: src.total_doc_len() as f64 / n as f64,
             doc_freq: src.all_terms().into_iter().map(|(t, d)| (t, d as u64)).collect(),
+            // No coordinator in this test: the segment is the whole world.
+            expansions: Default::default(),
             exact: true,
         };
         let q = TextQuery::parse("hybrid retrieval", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &stats, Bm25Params::default()).unwrap();
+        // No deletes in this fixture, so every ordinal is visible and a full
+        // bitmap is this source's actual visibility.
+        let live = Bitmap::all(n);
+        let c = compile(&q, &src, &live, &stats, Bm25Params::default()).unwrap();
         let hits = collect_top_k(c.scorer.unwrap(), &filter, c.excluded.as_ref(), 10);
         assert_eq!(hits.len(), 10);
         assert!(hits.iter().all(|h| filter.get(h.ord as usize)));

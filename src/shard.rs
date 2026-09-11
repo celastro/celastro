@@ -13,7 +13,7 @@
 //! write, but the shape is the shape: everything that must commit together goes
 //! into one record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -1160,10 +1160,13 @@ impl Shard {
         // no Term or Phrase score whatever it drops. It used to move the
         // default path, whose statistics came from `TextSource::all_terms` —
         // a physical count, so the very truncation described above dropped a
-        // superseded version out of `doc_freq` and shifted IDF. What a seal
-        // still moves is prefix expansion, which reaches the coordinator's
-        // gather on neither path and scores against the segment's own
-        // dictionary instead; see `TextScorer::compile`.
+        // superseded version out of `doc_freq` and shifted IDF. Prefix
+        // expansion used to be the exception — it reached the coordinator's
+        // gather on neither path and scored against the segment's own
+        // dictionary — and is no longer one: the coordinator resolves it once
+        // for the statement, and `Shard::prefix_terms` enumerates the LIVE
+        // dictionary at the query's own `t`, so neither which terms a prefix
+        // names nor what they weigh depends on what this seal drops or keeps.
         let retain_from = self.retain_from(self.clock.peek());
         let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
         let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
@@ -1494,6 +1497,83 @@ impl Shard {
                 )
             })
             .collect()
+    }
+
+    /// Terms beginning with `prefix` that at least one document LIVE AT `t`
+    /// holds, unioned into `out` across every searchable unit in the snapshot.
+    ///
+    /// This is a dictionary read rather than a statistic — it answers which
+    /// terms the query names, and [`Shard::term_stats`] then measures how many
+    /// live documents hold each of them — but it is a read of the LIVE
+    /// dictionary, and the difference is not cosmetic. A term whose every
+    /// posting is dead does contribute a cursor that matches nothing; what it
+    /// also does, once `limit` binds, is DISPLACE a live term out of the cap.
+    /// Which dead terms a unit is still carrying is a seal and compaction
+    /// decision, so an unmasked enumeration puts the layout back into the
+    /// answer through the one door the cap leaves open — measured at 12 rows
+    /// against 512 for the same collection at two shard counts, and at 0 rows
+    /// against 400 before and after a `COMPACT` at one.
+    ///
+    /// Masking has to happen INSIDE the enumeration, not to its result: the cap
+    /// counts live terms, so a dead run is stepped over rather than paid for.
+    /// See [`TextSource::live_terms_with_prefix`](crate::text::TextSource::live_terms_with_prefix).
+    ///
+    /// Each unit is asked for its own first `limit` LIVE terms, and the union
+    /// of those, cut at `limit`, is EXACTLY the collection's first `limit` live
+    /// matching terms. The argument is monotonicity, not a coincidence, and the
+    /// cap makes it non-obvious enough to write down:
+    ///
+    /// * live in some unit at `t` implies live globally at `t`, because the
+    ///   global `df` is the sum of the per-unit visibility-masked `df`s taken
+    ///   at that same `t`; and a globally live term is live in at least one
+    ///   unit. The predicate never disagrees with itself across the two levels.
+    /// * COMPLETENESS: let `x` be among the `limit` smallest globally live
+    ///   matching terms. `x` is live in some unit `U`; the terms live-in-`U`
+    ///   that precede `x` are a subset of the globally live terms that precede
+    ///   it, of which there are fewer than `limit`. So `x` is inside `U`'s
+    ///   first `limit` and reaches the union.
+    /// * SOUNDNESS: every term in the union is live in the unit that emitted
+    ///   it, hence live globally. The union holds no dead term at all.
+    ///
+    /// A term live in one unit and dead in another is handled by that, and the
+    /// union is what handles it: the unit where it is dead returns nothing and
+    /// spends no budget on it, the unit where it is live returns it, and every
+    /// unit — including the first — then compiles a cursor for it. That
+    /// cursor matches no visible document there, which is correct and costs one
+    /// cursor open.
+    ///
+    /// Both the mask and the gather read the same `t`, which is why `vis` comes
+    /// from `s.visibility(t)` here and from nowhere else. A liveness test taken
+    /// at a different instant, or one that is not the predicate the gather
+    /// uses, breaks the argument above.
+    ///
+    /// `text_handle` is the FALLIBLE spelling for the same reason
+    /// [`Shard::term_stats`] uses it: an archived segment configured to refuse
+    /// reads must surface the refusal, not look like a path carrying no index
+    /// and silently drop its terms out of the expansion.
+    pub fn prefix_terms(
+        &self,
+        path: &str,
+        prefix: &str,
+        t: Timestamp,
+        limit: usize,
+        out: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let snap = self.snapshot_at(t);
+        for s in self.sources(&snap) {
+            let handle = s.text_handle(path)?;
+            if let Some(src) = handle.as_ref().and_then(|h| h.source(path)) {
+                // Once per unit, not once per term. For a segment this is the
+                // cached bitmap [`Shard::term_stats`] reads at the same `t`;
+                // for the memtable it is the same O(n) build the gather
+                // already pays on every query.
+                let vis = s.visibility(t);
+                for term in src.live_terms_with_prefix(prefix, limit, &vis) {
+                    out.insert(term);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Local document frequencies for a set of terms, gathered across every
@@ -2435,6 +2515,22 @@ mod tests {
         // Swallowing this would make the segment look like a path with no text
         // index: its documents still count towards `ndocs`, so the IDF is
         // inflated and the query is silently mis-ranked.
+        assert!(e.contains("archived"), "the refusal has to reach the caller: {e}");
+
+        // And the same on the DICTIONARY read, which is a separate call with
+        // the same obligation and its own failure mode: a swallowed refusal
+        // there drops the segment's terms out of the expansion, so a wide
+        // prefix quietly names fewer terms and the query returns fewer rows.
+        //
+        // Tested here rather than only end to end deliberately. Through a
+        // query the refusal is MASKED — `Db::run_select` hands every path to
+        // `gather_stats` whatever the expansion resolved to, and `term_stats`
+        // above raises on the same handle a moment later, so the statement
+        // still fails and a swallowed refusal here is invisible. It stops
+        // being invisible the day the gather skips a path with nothing to
+        // measure, and by then the expansion is short and nothing says so.
+        let mut out = BTreeSet::new();
+        let e = s.prefix_terms("body", "vec", MAX_TS, 512, &mut out).unwrap_err().to_string();
         assert!(e.contains("archived"), "the refusal has to reach the caller: {e}");
     }
 }

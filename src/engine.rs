@@ -29,7 +29,7 @@ use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
 use crate::segment::BuildOpts;
 use crate::shard::{sort_key, Shard, ShardOpts};
 use crate::sql::{self, ast::*};
-use crate::text::scorer::GlobalStats;
+use crate::text::scorer::{Expansion, GlobalStats, PREFIX_EXPANSION_LIMIT};
 use crate::time::{Hlc, Timestamp};
 use crate::value::Value;
 
@@ -46,6 +46,32 @@ const STATS_REFRESH_WRITES: u64 = 512;
 /// past it the oldest fill is dropped and the next query that wants it pays
 /// one masked walk to get it back.
 const STATS_TERM_CAP: usize = 4096;
+
+/// How many DISTINCT prefixes one statement may name, counted per indexed path.
+///
+/// Distinct is the whole cost model, and the bound and its refusal have to say
+/// the same thing: `Db::run_select` resolves each `(path, prefix)` pair ONCE
+/// and every clause spelling it reads that one expansion, so a statement
+/// writing `a*` twelve times on `body` costs exactly what writing it once
+/// costs, and is admitted. Two paths spelling the same prefix are two
+/// enumerations and count two, because a term list is only valid for the
+/// dictionary it came from.
+///
+/// Each one costs a dictionary enumeration in every unit of every shard plus
+/// up to [`PREFIX_EXPANSION_LIMIT`] gathered document frequencies, and the
+/// `text_match` grammar puts no bound on how many of them a query string holds
+/// — so without this the multiplier is chosen by whoever writes the query.
+/// Measured over 20000 documents in 6 units: one leaf 48 ms, 24 leaves 1.2 s,
+/// and the 24-leaf statement never warms, because its 12288 gathered terms
+/// evict each other out of a [`STATS_TERM_CAP`]-entry map.
+///
+/// The value is exactly the number of full-cap expansions that fit that cache,
+/// so any statement this admits can hold all of its terms at once and a repeat
+/// of it is warm. Over it the statement is REFUSED rather than quietly cut:
+/// this change exists to stop prefix queries from silently answering less than
+/// they were asked, and a silent aggregate cap would be the same failure one
+/// level up.
+const PREFIX_LEAVES_LIMIT: usize = STATS_TERM_CAP / PREFIX_EXPANSION_LIMIT;
 
 /// How coarsely the per-index access clocks are written to disk. The lifecycle
 /// DSL's finest unit is a minute, so persisting to within a minute is exact at
@@ -138,15 +164,20 @@ impl Default for DbOpts {
 /// leaving the globals alone would have been 3.1x. A bound that improves with
 /// corpus size is not a bound for a database with no minimum corpus size.
 ///
-/// Two approximations are *not* addressed here, and both are shared with
-/// `WITH (exact_scoring)` rather than particular to this cache. Prefix
-/// expansion is not covered: `TextQuery::leaf_terms` deliberately skips it, so
-/// an expanded term is never asked for on either path and `TextScorer::compile`
-/// falls back to the segment's own physical dictionary count. And `avgdl` is
+/// Prefix expansion is covered, and used not to be: `run_select` resolves each
+/// prefix against every unit of every shard before the gather and hands the
+/// resolved terms to it like any other, so an expanded term is weighted by the
+/// collection on both paths. What that leaves is the cap — a wide prefix names
+/// the lexicographically first [`PREFIX_EXPANSION_LIMIT`] LIVE terms of the
+/// union and no more, which is a partial answer by construction, though the
+/// same partial answer at every shard count and on either side of a compaction.
+///
+/// One approximation is *not* addressed here, and it is shared with
+/// `WITH (exact_scoring)` rather than particular to this cache: `avgdl` is
 /// diluted by documents that carry no text on the path, which
 /// [`Shard::term_stats`] documents where the dilution happens. So what this
-/// buys is parity with `WITH (exact_scoring)` for Term and Phrase queries, not
-/// blanket invariance.
+/// buys is parity with `WITH (exact_scoring)` for Term, Phrase and Prefix
+/// queries, not blanket invariance.
 ///
 /// A note on the cadence, now that staleness is the only residual and the
 /// cadence is the only knob left: `refreshed_at_writes` is compared against
@@ -678,6 +709,9 @@ impl Db {
                             1.0
                         },
                         doc_freq: df,
+                        // Filled in by `run_select`, which is the only caller
+                        // that knows the statement's prefixes.
+                        expansions: Default::default(),
                         exact: true,
                     },
                 );
@@ -747,6 +781,7 @@ impl Db {
                             1.0
                         },
                         doc_freq: df,
+                        expansions: Default::default(),
                         exact: false,
                     },
                 );
@@ -891,9 +926,14 @@ impl Db {
         for s in self.shards(collection)? {
             // An empty `gather` is not a wasted call: `term_stats` then does
             // one `visibility` and one masked length sum per unit and enters
-            // no posting cursor at all, which is how a prefix-only query —
-            // `TextQuery::leaf_terms` skips `Prefix`, so its term list is
-            // empty — gets real globals for one cheap pass.
+            // no posting cursor at all, so a statement with no terms to
+            // measure still gets real `num_docs` and `avgdl` for one cheap
+            // pass. A prefix-only query used to be the example, because
+            // `TextQuery::leaf_terms` skipped `Prefix` and left the list
+            // empty; `run_select` now merges the resolved expansion into
+            // `want` before this runs, so what reaches here empty is a prefix
+            // that matched no live term, or a path whose leaves are all
+            // negated.
             let (n, tl, d) = s.term_stats(path, &gather, ts)?;
             num_docs += n;
             total_doc_len += tl;
@@ -1043,7 +1083,7 @@ impl Db {
                 Ok(Outcome::Ack(format!("{n} document(s) written at ts {}", self.last_commit)))
             }
             Statement::Delete(d) => {
-                let keys: Vec<String> = match &d.predicate {
+                let (keys, cut): (Vec<String>, Vec<String>) = match &d.predicate {
                     None => {
                         return Err(Error::Plan(
                             "DELETE without WHERE is refused; add a predicate or drop the \
@@ -1063,13 +1103,65 @@ impl Db {
                             collapse: None,
                             with: WithOpts::default(),
                         };
-                        self.run_select(&sel, "", false)?
-                            .rows
-                            .iter()
-                            .map(|r| r.key.clone())
-                            .collect()
+                        // The whole result, not just its rows. A DELETE runs
+                        // the same `Select` every query does, so its predicate
+                        // can be CUT the same way — and this is the one
+                        // statement shape where a short answer does write
+                        // work.
+                        let r = self.run_select(&sel, "", false)?;
+                        (
+                            r.rows.iter().map(|x| x.key.clone()).collect(),
+                            r.truncated_prefixes.clone(),
+                        )
                     }
                 };
+                // REFUSED, and before a single `delete_key`. The choice is
+                // between executing and saying so, and refusing, and it is
+                // decided by what a cut predicate does in the shape that goes
+                // WRONG rather than by the shape that is merely short.
+                //
+                // A cut SELECT is recoverable: the caller widens the prefix and
+                // runs it again, and the rows are still there to be found. A
+                // cut DELETE is not, and in the negated shape it is not even
+                // short — it is LARGER than what was asked for. `DELETE ...
+                // WHERE text_match(body, 'zed -a*')` over 1000 documents each
+                // holding its own `a#####` term excludes every one of them, so
+                // the correct answer is zero rows; the cut exclusion set covers
+                // 512 of the terms, the other 488 documents are no longer
+                // excluded, and executing it destroyed 488 rows THE PREDICATE
+                // EXCLUDED. No acknowledgement fixes that, because by the time
+                // it is read the rows are gone.
+                //
+                // Nor can the two be told apart here and only the dangerous one
+                // refused. The polarity on the leaf is the polarity inside the
+                // `text_match` string, and SQL's own `NOT` wraps the whole call
+                // (`Parser::not_expr`), so a positive leaf under it over-deletes
+                // exactly as a negated one does; one statement may also spell
+                // both. A rule that guesses the direction would be wrong
+                // silently, in the direction that loses data.
+                //
+                // So: refuse, which is what this repository does everywhere the
+                // alternative is doing something irreversible quietly — the
+                // prefix-leaf budget above refuses rather than trimming, the
+                // server binds the loopback rather than guessing an interface.
+                // The cost is a wide-prefix DELETE that has to be spelled as
+                // several narrower ones, and that loop deletes exactly what
+                // each piece names, which is the property a re-run loop over a
+                // cut predicate never had.
+                if !cut.is_empty() {
+                    return Err(Error::Plan(format!(
+                        "DELETE refused and NOTHING was deleted: its predicate was CUT at \
+                         {PREFIX_EXPANSION_LIMIT} expanded terms, so the documents it selects \
+                         are not the documents it describes. A cut `a*` names only part of \
+                         what it matches; a cut `-a*` is a short EXCLUSION set, so the \
+                         statement would delete documents the predicate EXCLUDES — and a \
+                         delete cannot be taken back either way. Narrow the prefix until it \
+                         expands to at most {PREFIX_EXPANSION_LIMIT} terms and delete the \
+                         pieces, or delete by key; the same predicate as a SELECT shows what \
+                         was cut — {}",
+                        cut.join("; ")
+                    )));
+                }
                 let mut n = 0;
                 for k in keys {
                     if self.delete_key(&d.collection, &k)? {
@@ -1674,13 +1766,135 @@ impl Db {
         // observed (§6).
         let ts = self.clock.peek().max(self.last_commit);
         let coll = self.catalog.get(&sel.collection)?.clone();
-        let want = exec::required_terms(&coll, sel);
-        let stats = self.gather_stats(
+        let mut want = exec::required_terms(&coll, sel);
+        // Resolve every prefix in the statement HERE, once, before the gather.
+        //
+        // The cap is applied to the union over every unit of every shard, not
+        // per unit, and that is the whole mechanism: a term is in the answer if
+        // it is among the lexicographically first `PREFIX_EXPANSION_LIMIT` of
+        // the collection's LIVE matching vocabulary, which is a property of the
+        // collection at this instant and not of how it happens to be laid out.
+        // Asking each unit for its own first `limit` live terms is sufficient —
+        // `Shard::prefix_terms` proves it — so the work is bounded by the cap
+        // plus whatever garbage it steps over, never by the vocabulary.
+        //
+        // This is a SECOND coordinator read at the same pinned `ts`, and the
+        // two reads have to agree, which is why both mask at `ts`: this one
+        // says which terms the query names, `term_stats` then measures how many
+        // live documents hold each of them. A term whose last posting died
+        // between them comes back with `df == 0` and matches nothing, which is
+        // the same answer it would get had it never been enumerated.
+        //
+        // Deliberately NOT cached across queries, and the reason changed with
+        // the masking, so it is worth stating precisely rather than leaving the
+        // old one standing. It used to be a correctness argument: the list was
+        // a function of the PHYSICAL dictionary, FLUSH and COMPACT rebuild that
+        // without moving `Db::writes` — the counter `refreshed_at_writes` is
+        // compared against — and a list cached against it survived a compaction
+        // that changed it. Measured: 212 rows, then 212 again after a `COMPACT`
+        // that should have made it 300.
+        //
+        // That is no longer true, because the list is now a function of the
+        // live corpus at `ts` and FLUSH and COMPACT do not change that. What is
+        // left is weaker and still sufficient: a cache key here would have to
+        // be a complete clock for WHICH DOCUMENTS ARE LIVE, and `writes` is
+        // only that by coincidence of counting exactly inserts and deletes
+        // today. The list is cheap — bounded by the cap plus the garbage in
+        // front of it — and it is read once per statement. Buying a
+        // microsecond with a second thing that has to stay in step with
+        // liveness forever is not a trade worth making.
+        let prefixes_by_path = exec::required_prefixes(&coll, sel);
+        // One statement, one budget. Each DISTINCT prefix costs a dictionary
+        // walk in every unit of every shard plus up to `PREFIX_EXPANSION_LIMIT`
+        // gathered frequencies, and nothing in the grammar bounds how many of
+        // them a `text_match` string may name — measured at 24 in one
+        // statement for 1.0 s a query, with the aggregate expansion (12288
+        // terms) so far over `STATS_TERM_CAP` that the statement evicts its own
+        // entries and never warms.
+        //
+        // A refusal, not a silent cut: the cut is the thing this whole change
+        // exists to stop doing quietly, and a statement that names more than
+        // the statistics cache can hold is a statement the operator wants to
+        // see. The bound is exactly the number of full-cap expansions that fit
+        // in `STATS_TERM_CAP`, so a statement inside it can always warm.
+        //
+        // What is counted is DISTINCT prefixes per path, because that is what
+        // is paid for: the loop below resolves each `(path, prefix)` pair once
+        // and every clause that spells it reads the same expansion. The
+        // message says so. It used to say "this statement has N prefix
+        // leaves", which is a different quantity from the one the bound is
+        // taken over — a statement spelling `a*` twelve times has twelve
+        // leaves, costs one expansion, and is admitted — so an operator
+        // counting the leaves in their own statement could not predict, or
+        // meet, this refusal.
+        let distinct: usize = prefixes_by_path.values().map(|v| v.len()).sum();
+        if distinct > PREFIX_LEAVES_LIMIT {
+            return Err(Error::Plan(format!(
+                "this statement names {distinct} distinct prefixes across its indexed paths \
+                 and the limit is {PREFIX_LEAVES_LIMIT}; each DISTINCT one expands against \
+                 every unit of every shard and gathers up to {PREFIX_EXPANSION_LIMIT} document \
+                 frequencies, so {} terms would not fit the {STATS_TERM_CAP}-term statistics \
+                 cache. Repeats of one prefix on one path are expanded once and cost nothing \
+                 more. Split the statement, or narrow the prefixes.",
+                distinct * PREFIX_EXPANSION_LIMIT
+            )));
+        }
+        let mut expansions: BTreeMap<String, BTreeMap<String, Expansion>> = BTreeMap::new();
+        for (path, prefixes) in prefixes_by_path {
+            for (p, used) in prefixes {
+                // One MORE than the cap, from every unit, for the one thing
+                // that cannot be recovered afterwards: whether the cap cut
+                // anything. A union of exactly `cap` terms is what both "the
+                // collection holds exactly this many" and "there were more"
+                // look like, and the caller must not have to guess. Asking for
+                // `cap + 1` per unit is enough to decide it globally by the
+                // same sorted-order argument `Shard::prefix_terms` makes — if
+                // the collection matches more than `cap` terms, each of the
+                // `cap + 1` smallest is among the `cap + 1` smallest of
+                // whichever unit holds it, so all of them reach the union.
+                //
+                // What it does NOT buy is how many were dropped: the
+                // enumeration is bounded, so the honest report is "there are
+                // more", not a count. Counting them means enumerating the whole
+                // matching vocabulary, whose cost is exactly what the cap
+                // exists to refuse.
+                let mut union: BTreeSet<String> = BTreeSet::new();
+                for s in self.shards(&sel.collection)? {
+                    s.prefix_terms(&path, &p, ts, PREFIX_EXPANSION_LIMIT + 1, &mut union)?;
+                }
+                // Over LIVE terms, so it says the honest thing: the
+                // collection really does hold more than `cap` matching terms a
+                // visible document carries, and the answer really is short.
+                // Decided over the physical dictionary it fired on complete
+                // answers, which is a warning nobody could act on.
+                let truncated = union.len() > PREFIX_EXPANSION_LIMIT;
+                let terms: Vec<String> = union.into_iter().take(PREFIX_EXPANSION_LIMIT).collect();
+                // The expanded terms join the statement's own terms, so the
+                // gather is still one pass per path over one deduplicated list.
+                want.entry(path.clone()).or_default().extend(terms.iter().cloned());
+                expansions
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(p, Expansion { terms, truncated, used });
+            }
+            if let Some(v) = want.get_mut(&path) {
+                v.sort();
+                v.dedup();
+            }
+        }
+        let mut stats = self.gather_stats(
             &sel.collection,
             &want,
             ts,
             sel.with.exact_scoring || sel.with.exact,
         )?;
+        // Every path named here is a path `want` carries, so `gather_stats`
+        // produced an entry for it.
+        for (path, e) in expansions {
+            if let Some(g) = stats.get_mut(&path) {
+                g.expansions = e;
+            }
+        }
         self.log_vector_queries(sel);
         let shards = self.shards(&sel.collection)?;
         exec::run_select(ExecInput {
@@ -2789,15 +3003,21 @@ mod tests {
 
     #[test]
     fn a_prefix_only_query_still_gets_real_globals() {
-        // The one query shape that asks for no terms at all: `leaf_terms`
-        // skips `Prefix` — an expanded term's frequency comes from the
-        // segment's own dictionary on both paths — while `required_terms`
-        // still creates the path entry, so `terms` arrives empty. It used to
-        // be the only caller the reset's own gather was live for. Now the
-        // fill's empty-slice gather is the authoritative one, which is one
-        // pass instead of two and previously untested ground: nothing in the
-        // tree asserted on a prefix query's `num_docs` or `avgdl`, and the
-        // scorer divides every length norm by the second of them.
+        // Two things, and they used to be one. `required_terms` creates a
+        // path entry for a text query whether or not it names a term, so
+        // `terms` can arrive EMPTY — and the empty slice still has to yield a
+        // real `num_docs` and `avgdl`, which the fill's own gather provides in
+        // one pass. Nothing else in the tree asserts on that, and the scorer
+        // divides every length norm by the second of them.
+        //
+        // The second half is what changed: `run_select` now resolves a
+        // prefix against every unit of every shard before the gather and hands
+        // the resolved terms to it, so a prefix query does NOT ask for nothing
+        // any more. The final assertion used to read `doc_freq.is_empty()`,
+        // "a prefix query asks the gather for no terms", and that sentence was
+        // the defect written down as a guarantee: it is exactly why an
+        // expanded term was weighted by whichever segment happened to score
+        // it. It is inverted below.
         let dir = tmp("stats-prefix-globals");
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
         db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
@@ -2829,13 +3049,650 @@ mod tests {
         assert!(g.avg_doc_len > 1.0, "a real average, not the `num_docs == 0` fallback of 1.0");
         assert!(g.doc_freq.is_empty(), "no term was asked about, so none is answered");
 
-        // The same, through the query that actually produces this shape.
+        // Now through a real query. `alph*` resolves to `alphabet` — every
+        // document has it — so the gather is asked for it and answers its
+        // real collection-wide count, which is what makes the weight the same
+        // in every unit that scores it.
         db.query("SELECT id FROM notes WHERE text_match(body, 'alph*') LIMIT 5").unwrap();
         let c = db.stats.get(&cache_key("notes", "body")).unwrap();
         assert!(c.anchored, "the globals were measured, and `num_docs == 0` cannot say so");
         assert_eq!(c.num_docs, 200);
-        assert!(c.doc_freq.is_empty(), "a prefix query asks the gather for no terms");
+        assert_eq!(
+            c.doc_freq.get("alphabet").copied(),
+            Some(200),
+            "the coordinator resolved `alph*` and gathered a global df for what it resolved to"
+        );
+        assert_eq!(c.doc_freq.get("zeta"), None, "and only for what it resolved to");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_resolves_to_the_same_terms_at_every_shard_count() {
+        // The statistic-level pin under the two end-to-end tests in
+        // `tests/integration.rs`, and the one place the CAP itself is
+        // asserted. Two claims, and they are different claims:
+        //
+        //   * the resolved list is the lexicographically first
+        //     `PREFIX_EXPANSION_LIMIT` of the UNION over every unit of every
+        //     shard. Taking the cap per unit — which is what `scorer::build`
+        //     did, and still does when it is called without a coordinator —
+        //     gives a union of per-unit cuts, and how many terms that is
+        //     depends on how many units there are;
+        //   * the triple gathered for that list is identical at every shard
+        //     count, bit for bit. Bits are safe HERE and nowhere near a score:
+        //     this is a sum of counts and an average of lengths, not an f32
+        //     accumulation whose order depends on cursor positions.
+        //
+        // 600 distinct terms against a cap of 512, deliberately: the cap has
+        // to bind or neither claim is being tested. The mid-way FLUSH is
+        // load-bearing too — with one unit per shard the per-unit cut and the
+        // union cut coincide, and the old code passes.
+        let run = |splits: &str, tag: &str| {
+            let dir = tmp(tag);
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            db.execute(&format!("CREATE COLLECTION notes (id TEXT PRIMARY KEY){splits}")).unwrap();
+            db.execute(
+                "CREATE INDEX notes_body ON notes USING fulltext (body)                  WITH (analyzer = 'english')",
+            )
+            .unwrap();
+            for i in 0..600usize {
+                if i == 300 {
+                    db.execute("FLUSH notes").unwrap();
+                }
+                db.insert(
+                    "notes",
+                    Value::obj(vec![
+                        ("id".into(), Value::Str(format!("n{i:04}"))),
+                        // Length variance so `avgdl` is a real average that a
+                        // bit comparison can catch moving.
+                        ("body".into(), Value::Str(format!("a{i:05}{}", " pad".repeat(i % 5)))),
+                    ]),
+                )
+                .unwrap();
+            }
+            db.execute("FLUSH notes").unwrap();
+            // The ANSWER as well as the cache. Asserting only on `db.stats`
+            // couples this test to `STATS_TERM_CAP`, a tuning constant it does
+            // not mention: dropping that to 256 fails the assertions below
+            // while every query still answers correctly, and — the direction
+            // that matters — a defect in the answer path can be papered over by
+            // the cache happening to hold the right numbers.
+            let mut rows: Vec<String> = db
+                .query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000")
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.key.clone())
+                .collect();
+            rows.sort();
+            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            let got = (c.num_docs, c.total_doc_len, c.doc_freq.clone(), rows);
+            let _ = fs::remove_dir_all(&dir);
+            got
+        };
+
+        let one = run("", "prefix-pinned-1");
+        let three = run(" WITH (splits = ['n0200', 'n0400'])", "prefix-pinned-3");
+        let six = run(
+            " WITH (splits = ['n0100', 'n0200', 'n0300', 'n0400', 'n0500'])",
+            "prefix-pinned-6",
+        );
+
+        // `pad` is in the dictionary and matches no prefix, so its absence
+        // also says the gather was asked for the expansion and not for the
+        // vocabulary.
+        let want: BTreeMap<String, u64> =
+            (0..PREFIX_EXPANSION_LIMIT).map(|i| (format!("a{i:05}"), 1u64)).collect();
+        assert_eq!(one.2, want, "the lexicographically first 512 of 600, each in one document");
+        assert_eq!(one.0, 600, "and every document counts, including those the cut left out");
+        let want_rows: Vec<String> =
+            (0..PREFIX_EXPANSION_LIMIT).map(|i| format!("n{i:04}")).collect();
+        assert_eq!(one.3, want_rows, "and the rows the query returned, not just the cache");
+        assert_eq!(one, three, "1 shard vs 3 shards");
+        assert_eq!(one, six, "1 shard vs 6 shards");
+    }
+
+    /// A collection of `n` notes `n00000..`, each with its own `a#####` term,
+    /// of which the first `dead` are rewritten to a `b` term after a FLUSH — so
+    /// a run of terms sorting before every survivor is in the dictionary and
+    /// held by no live document.
+    fn dead_run(dir: &std::path::Path, splits: &str, n: usize, dead: usize) -> Db {
+        let mut db = Db::open(dir, DbOpts::default()).unwrap();
+        db.execute(&format!("CREATE COLLECTION notes (id TEXT PRIMARY KEY){splits}")).unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let put = |db: &mut Db, i: usize, t: char| {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:05}"))),
+                    ("body".into(), Value::Str(format!("{t}{i:05}"))),
+                ]),
+            )
+            .unwrap();
+        };
+        for i in 0..n {
+            put(&mut db, i, 'a');
+        }
+        db.execute("FLUSH notes").unwrap();
+        for i in 0..dead {
+            put(&mut db, i, 'b');
+        }
+        db.execute("FLUSH notes").unwrap();
+        db
+    }
+
+    #[test]
+    fn no_term_in_a_resolved_expansion_comes_back_with_a_zero_frequency() {
+        // The statistics-level statement of the same invariant the integration
+        // test asserts on rows, and it is cheap enough to be worth having
+        // twice: in a quiescent fixture a resolved term CANNOT legitimately
+        // have `df == 0`. A term only reaches zero by dying between the
+        // dictionary read and the gather, and nothing writes while this
+        // assertion runs — so a zero here means a PHYSICAL term got into the
+        // expansion, whatever path put it there.
+        //
+        // That generality is the point. This fails the moment a dead term
+        // re-enters the pinned list, including through some future route that
+        // has nothing to do with prefixes, and it does so without needing a
+        // fixture tuned to make the cap bind.
+        let dir = tmp("expansion-zero-df");
+        let mut db = dead_run(&dir, "", 1000, 600);
+        db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5").unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let dead: Vec<&String> =
+            c.doc_freq.iter().filter(|(_, &d)| d == 0).map(|(t, _)| t).collect();
+        assert!(dead.is_empty(), "terms no live document holds, in a pinned expansion: {dead:?}");
+        assert_eq!(c.doc_freq.len(), 400, "the live matching vocabulary, all of it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_expansion_over_an_unflushed_memtable_takes_the_first_terms() {
+        // The memtable arm of the expansion, with nothing sealed. It is the arm
+        // with the least cover in the crate — every other prefix fixture
+        // flushes — and two independent defects live in it: returning the
+        // matching terms in some order other than sorted (the coordinator's
+        // union cap is correct ONLY because each unit answers its own first
+        // `limit`), and applying the visibility filter AFTER `take(limit)`
+        // instead of before it.
+        let dir = tmp("prefix-memtable-order");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..600usize {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:05}"))),
+                    ("body".into(), Value::Str(format!("a{i:05}"))),
+                ]),
+            )
+            .unwrap();
+        }
+        // Deliberately NO flush: this has to be the memtable's own `BTreeMap`
+        // range walk, not a dictionary block walk.
+        let rows = |db: &mut Db| {
+            let mut ks: Vec<String> = db
+                .query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000")
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.key.clone())
+                .collect();
+            ks.sort();
+            ks
+        };
+        let got = rows(&mut db);
+        assert_eq!(got.len(), PREFIX_EXPANSION_LIMIT);
+        assert_eq!(got.first().map(String::as_str), Some("n00000"), "the FIRST 512 of 600");
+        assert_eq!(got.last().map(String::as_str), Some("n00511"), "not the last 512");
+
+        // And with one document deleted, which takes the masked arm rather
+        // than the every-document-is-visible fast path: `a00000` is now held by
+        // nobody, so it must not spend a slot — the answer shifts by exactly
+        // one term at BOTH ends.
+        assert!(db.delete_key("notes", "n00000").unwrap());
+        let got = rows(&mut db);
+        assert_eq!(got.len(), PREFIX_EXPANSION_LIMIT);
+        assert_eq!(got.first().map(String::as_str), Some("n00001"));
+        assert_eq!(got.last().map(String::as_str), Some("n00512"), "the dead term freed a slot");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_carrying_more_prefix_leaves_than_the_budget_is_refused() {
+        // The per-statement bound. One leaf is bounded by the expansion cap;
+        // nothing bounded how many leaves a `text_match` string may hold, and
+        // the multiplier was therefore chosen by whoever wrote the query — 24
+        // leaves measured at 1.2 s, gathering 12288 terms into a 4096-entry
+        // cache that then evicts its own entries, so the identical statement
+        // never warms.
+        //
+        // Refused rather than silently cut, which is the same choice the rest
+        // of this change makes: a query that cannot be answered in full should
+        // say so rather than answer less.
+        let dir = tmp("prefix-leaf-budget");
+        let mut db = cap_fixture(&dir, 64);
+        let q = |n: usize| {
+            let leaves = (0..n).map(|i| format!("a{i:05}*")).collect::<Vec<_>>().join(" ");
+            format!("SELECT id FROM notes WHERE text_match(body, '{leaves}') LIMIT 5")
+        };
+        assert!(db.query(&q(PREFIX_LEAVES_LIMIT)).is_ok(), "the budget itself is admitted");
+        let e = db.query(&q(PREFIX_LEAVES_LIMIT + 1)).unwrap_err().to_string();
+        assert!(e.contains(&PREFIX_LEAVES_LIMIT.to_string()), "the bound, so it can be met: {e}");
+
+        // What the bound COUNTS, and the message saying the same thing. The
+        // budget is taken over distinct `(path, prefix)` pairs, because the
+        // coordinator resolves each pair once; a statement spelling one prefix
+        // a dozen times pays for one expansion and is admitted. That is the
+        // right cost model and this leg pins it — but the refusal used to
+        // announce "this statement has N prefix leaves", a quantity the
+        // statement above has twelve of and is not refused for, so an operator
+        // counting leaves could neither predict the refusal nor meet it.
+        assert!(e.contains("distinct prefixes"), "the message names what it counts: {e}");
+        let repeated = (0..12).map(|_| "a00000*").collect::<Vec<_>>().join(" ");
+        assert!(
+            db.query(&format!("SELECT id FROM notes WHERE text_match(body, '{repeated}') LIMIT 5"))
+                .is_ok(),
+            "one prefix spelled twelve times is one expansion and is admitted"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_query_in_a_fresh_epoch_ranks_like_exact_scoring() {
+        // The parity the `CachedStats` doc comment now claims for Prefix as
+        // well as Term and Phrase, as an assertion. The two arms are different
+        // machinery — `exact_scoring` gathers per query, the default reads an
+        // epoch-scoped cache — and they agree only because the expansion is
+        // resolved before either of them runs and both are then asked for the
+        // same term list. Before that, `exact_scoring` bought a prefix query
+        // nothing at all: no expanded term ever reached either gather.
+        //
+        // Fresh epoch, so staleness is off the table and what is left is the
+        // choice of `df`. The order is asserted, not the score bits: a prefix
+        // compiles to a many-child disjunction and `DisjunctionScorer::score`
+        // sums f32 in cursor order.
+        let dir = tmp("prefix-exact-parity");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['n0300'])")
+            .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..600usize {
+            let term = if i % 7 == 0 { "alphabet" } else { "alpha" };
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:04}"))),
+                    ("body".into(), Value::Str(format!("{term}{}", " pad".repeat(i % 5)))),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+
+        let ranked = |db: &mut Db, with: &str| {
+            db.query(&format!(
+                "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'alph*'),                  method => 'linear', k => 100000) LIMIT 10{with}"
+            ))
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.key.clone())
+            .collect::<Vec<_>>()
+        };
+        let default = ranked(&mut db, "");
+        let exact = ranked(&mut db, " WITH (exact_scoring)");
+        assert_eq!(default.len(), 10);
+        assert_eq!(default, exact, "default vs `WITH (exact_scoring)` in a fresh epoch");
+
+        // And the cached entry is the exact gather's own numbers, for the
+        // expansion's terms rather than for nothing.
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            c.doc_freq,
+            BTreeMap::from([("alpha".to_string(), 514u64), ("alphabet".to_string(), 86)]),
+            "600 documents, one in seven holding the rarer term"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_term_living_in_one_shard_is_weighted_by_the_whole_collection() {
+        // The shape the old code could not get right even without a cap in
+        // play: `alphabet` lives almost entirely in the second shard, so the
+        // first shard's own dictionary says it is a two-document rarity while
+        // the collection says it is in 102 of 600. A segment-local df hands
+        // those two documents the weight of the rarest term there is.
+        //
+        // Three things at once, and each is a separate way to get this wrong:
+        // the union must CONTAIN a term no single shard could enumerate on its
+        // own; the df must be the collection's, so a document scores the same
+        // whichever shard holds it; and the shard that holds no `alpha` at all
+        // must contribute nothing to `df(alpha)` while its documents still
+        // count in `num_docs` — an IDF divided by a corpus that shrank to the
+        // shard is wrong in the other direction.
+        let run = |splits: &str, tag: &str| {
+            let dir = tmp(tag);
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            db.execute(&format!("CREATE COLLECTION notes (id TEXT PRIMARY KEY){splits}")).unwrap();
+            db.execute(
+                "CREATE INDEX notes_body ON notes USING fulltext (body)                  WITH (analyzer = 'english')",
+            )
+            .unwrap();
+            for i in 0..600usize {
+                let term = if (2..500).contains(&i) { "alpha" } else { "alphabet" };
+                db.insert(
+                    "notes",
+                    Value::obj(vec![
+                        ("id".into(), Value::Str(format!("n{i:04}"))),
+                        ("body".into(), Value::Str(format!("{term}{}", " pad".repeat(i % 5)))),
+                    ]),
+                )
+                .unwrap();
+            }
+            db.execute("FLUSH notes").unwrap();
+            let ranked = db
+                .query(
+                    "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'alph*'),                      method => 'linear', k => 100000) LIMIT 10",
+                )
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<_>>();
+            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            let got = (c.num_docs, c.doc_freq.clone(), ranked);
+            let _ = fs::remove_dir_all(&dir);
+            got
+        };
+
+        let one = run("", "prefix-one-shard-1");
+        let two = run(" WITH (splits = ['n0500'])", "prefix-one-shard-2");
+
+        assert_eq!(
+            one.1,
+            BTreeMap::from([("alpha".to_string(), 498u64), ("alphabet".to_string(), 102)]),
+            "both expanded terms, at their collection-wide frequencies"
+        );
+        assert_eq!(one.0, 600, "including the documents of the shard that holds no `alpha`");
+        assert_eq!(one.1, two.1, "df, 1 shard vs 2 shards");
+        assert_eq!(one.0, two.0, "num_docs, 1 shard vs 2 shards");
+        assert_eq!(one.2.len(), 10);
+        assert_eq!(one.2, two.2, "the ranking, 1 shard vs 2 shards");
+    }
+
+    /// A collection holding exactly `terms` distinct `a#####` terms, one per
+    /// document, split across three units so the coordinator's union is a real
+    /// union rather than one unit's dictionary read twice.
+    fn cap_fixture(dir: &std::path::Path, terms: usize) -> Db {
+        cap_fixture_in(dir, terms, 3)
+    }
+
+    /// The same collection laid out in exactly `units` sealed segments.
+    ///
+    /// The unit count is a parameter because the per-unit enumeration limit is
+    /// only observable when ONE unit holds more than the cap: a vocabulary
+    /// spread over three units is asked for `cap + 1` terms per unit and each
+    /// of them answers with everything it has, so asking for `cap` instead
+    /// would return the same union and the boundary would go unpinned. See
+    /// `an_expansion_of_exactly_the_cap_dropped_nothing_and_must_not_say_it_did`.
+    ///
+    /// Every document also holds `zed`, so a negated shape — `zed -a*`, where
+    /// the expansion is the EXCLUSION set — has a positive clause that admits
+    /// everything and therefore measures nothing but the exclusion. It is in
+    /// the fixture rather than in the one test that needs it because a term
+    /// every document holds shifts no relative frequency and no ranking.
+    fn cap_fixture_in(dir: &std::path::Path, terms: usize, units: usize) -> Db {
+        let mut db = Db::open(dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..terms {
+            if units > 1 && i > 0 && i % (terms / units).max(1) == 0 {
+                db.execute("FLUSH notes").unwrap();
+            }
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i:05}"))),
+                    ("body".into(), Value::Str(format!("zed a{i:05}"))),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db
+    }
+
+    #[test]
+    fn an_expansion_of_exactly_the_cap_dropped_nothing_and_must_not_say_it_did() {
+        // The off-by-one, in the shape that reproduced it. The test used to be
+        // `terms.len() >= PREFIX_EXPANSION_LIMIT` applied to a list that had
+        // just been `take(cap)`-ed, so it could never mean anything else: a
+        // dictionary the cap had cut and a dictionary holding exactly `cap`
+        // matching terms produce lists of identical length, and the shorter
+        // one is unreachable. Every prefix that reached the cap was reported
+        // truncated, including the ones that lost nothing — a design pass
+        // measured a 512-term vocabulary reporting 3 of 9 units "truncating"
+        // with zero terms dropped.
+        //
+        // The fix is not a comparison operator, it is asking for one more term
+        // than the cap and seeing whether it comes back. That extra term is the
+        // only evidence that exists, at the coordinator or in `scorer::build`;
+        // the length of the answer carries none.
+        //
+        // A warning nobody can act on is worse than silence, because the next
+        // wide prefix — the one that really did drop 3000 terms — says exactly
+        // the same thing.
+        let dir = tmp("prefix-cap-exact");
+        let mut db = cap_fixture(&dir, PREFIX_EXPANSION_LIMIT);
+        let r = db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000").unwrap();
+        assert_eq!(r.rows.len(), PREFIX_EXPANSION_LIMIT, "every document matches and none is cut");
+        assert!(
+            r.truncated_prefixes.is_empty(),
+            "exactly the cap, nothing dropped: {:?}",
+            r.truncated_prefixes
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // One more term, and one document is now unreachable by this query.
+        // Same assertion machinery, opposite verdict: if the boundary moved
+        // the wrong way, this leg is what catches it.
+        let dir = tmp("prefix-cap-over");
+        let mut db = cap_fixture(&dir, PREFIX_EXPANSION_LIMIT + 1);
+        let r = db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000").unwrap();
+        assert_eq!(r.rows.len(), PREFIX_EXPANSION_LIMIT, "the last document is behind the cut");
+        assert_eq!(r.truncated_prefixes.len(), 1, "{:?}", r.truncated_prefixes);
+        let msg = &r.truncated_prefixes[0];
+        assert!(msg.contains("body") && msg.contains("'a*'"), "{msg}");
+        assert!(msg.contains("512"), "the number of terms kept, which is the dial: {msg}");
+        let _ = fs::remove_dir_all(&dir);
+
+        // And the same `cap + 1` terms in ONE unit, which is the only layout
+        // that can see the `cap + 1` the coordinator asks each unit for. The
+        // two legs above hold their vocabulary in three units of ~171 terms,
+        // so a unit asked for `cap` and a unit asked for `cap + 1` hand back
+        // the identical dictionary and the union is the same either way: they
+        // pin the VERDICT, and this leg pins the ENUMERATION it is read off.
+        //
+        // Drop the `+ 1` in `Db::run_select` and this query sees a union of
+        // exactly 512 terms, cannot tell "the collection holds 512" from "the
+        // collection holds more", reports no truncation, and drops `n00512`
+        // in silence — the original defect, one level down from where the
+        // legs above look. It was an integration test's job before this leg
+        // existed, so the boundary went unpinned where it is implemented.
+        let dir = tmp("prefix-cap-over-one-unit");
+        let mut db = cap_fixture_in(&dir, PREFIX_EXPANSION_LIMIT + 1, 1);
+        let r = db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 100000").unwrap();
+        assert_eq!(r.rows.len(), PREFIX_EXPANSION_LIMIT, "one unit, one cut");
+        assert_eq!(
+            r.truncated_prefixes.len(),
+            1,
+            "a single unit holding `cap + 1` terms is truncated, and the only evidence of \
+             that is the term the coordinator asks for beyond the cap: {:?}",
+            r.truncated_prefixes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_prefix_says_so_on_a_plain_query_of_either_shape() {
+        // Where the signal has to arrive. It used to reach `EXPLAIN ANALYZE`
+        // and nowhere else — `QueryResult::explain` is `None` unless `analyze`
+        // — so an ordinary ranked query truncated in silence, and the filter
+        // path dropped the flag on the floor before it could reach even that.
+        //
+        // `WHERE text_match(body, 'a*')` is the commonest shape a wide prefix
+        // takes and the one that returned a fraction of the matching documents
+        // with no signal on any path at all.
+        let dir = tmp("prefix-cut-reported");
+        let mut db = cap_fixture(&dir, PREFIX_EXPANSION_LIMIT + 200);
+
+        let filtered =
+            db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5").unwrap();
+        assert!(filtered.explain.is_none(), "no ANALYZE: the point is that it still says so");
+        assert_eq!(filtered.truncated_prefixes.len(), 1, "{:?}", filtered.truncated_prefixes);
+
+        let ranked = db
+            .query(
+                "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'a*'), \
+                 method => 'linear', k => 100000) LIMIT 5",
+            )
+            .unwrap();
+        assert!(ranked.explain.is_none());
+        assert_eq!(ranked.truncated_prefixes, filtered.truncated_prefixes, "same query, same cut");
+
+        // A prefix that fits says nothing, on the same database: the report is
+        // a property of the query, not a banner the collection wears.
+        let narrow =
+            db.query("SELECT id FROM notes WHERE text_match(body, 'a0000*') LIMIT 100").unwrap();
+        assert_eq!(narrow.rows.len(), 10, "`a00000`..`a00009`");
+        assert!(narrow.truncated_prefixes.is_empty(), "{:?}", narrow.truncated_prefixes);
+
+        // And the per-unit line, which is the only thing that can report the
+        // no-coordinator fallback arm of `scorer::build`. The filter path
+        // pushed no text line at all before this, so neither the flag nor the
+        // survivor count reached the plan.
+        let text = match db
+            .execute("EXPLAIN ANALYZE SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5")
+            .unwrap()
+        {
+            Outcome::Explain(t) => t,
+            _ => panic!("expected a plan"),
+        };
+        assert!(text.contains("[filter]"), "the filter path reports a text line:\n{text}");
+        assert!(text.contains("PREFIX EXPANSION TRUNCATED"), "{text}");
+        // And it describes the machinery it actually ran. This line used to go
+        // through the ranked path's formatter, so it announced "block-max WAND"
+        // for a call to `scorer::evaluate_to_bitmap` — a bare `advance` loop
+        // with no scoring, no pivot and no threshold — and labelled its
+        // survivor count "candidates", with `terms=[]` beside it. A plan is the
+        // document someone debugging a slow query reasons from; one that names
+        // an algorithm the query never entered is worse than no plan.
+        assert!(
+            text.contains("[filter]]: bitmap evaluation, survivors="),
+            "the filter line describes the filter path:\n{text}"
+        );
+        assert!(!text.contains("[filter]]: block-max WAND"), "{text}");
+        // The coordinator's line too, once, rather than once per unit.
+        assert_eq!(
+            text.matches("documents are missing from this answer").count(),
+            1,
+            "the query-level statement belongs in the plan once:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delete_whose_predicate_was_cut_is_refused_rather_than_deleting_what_it_did_not_name() {
+        // The one statement shape where a short answer does WRITE work, and
+        // the only one where the write cannot be taken back.
+        //
+        // The arm used to take `.rows` and throw the rest of the result away:
+        // the caller saw `512 document(s) deleted` and 200 matching documents
+        // still sitting there with nothing to say why. Reporting it instead of
+        // dropping it was the first fix and it was not enough, because the
+        // report was written for the positive shape and the negated one does
+        // the opposite thing. MEASURED on 1000 documents each holding `zed
+        // a#####`, every one of which `zed -a*` EXCLUDES, so the correct
+        // answer is zero deletions: it deleted 488 and left 512, then said
+        // that documents it matches remain and re-running would delete more.
+        // Re-running deleted nothing. The message was false in the direction
+        // that matters, and the sentence the operator needed — that 488 rows
+        // their predicate excluded are gone — was not in it.
+        //
+        // So the statement is REFUSED, before any `delete_key`, in both shapes
+        // and for the reasons `Db::execute` states: a cut SELECT is
+        // recoverable and a cut DELETE is not, and which of the two kinds of
+        // damage a given statement would do cannot be read off the leaf,
+        // because SQL's own `NOT` inverts it and one statement may spell both.
+        let dir = tmp("delete-cut");
+        let mut db = cap_fixture(&dir, PREFIX_EXPANSION_LIMIT + 200);
+        let all = |db: &mut Db| {
+            db.query("SELECT id FROM notes WHERE text_match(body, 'zed') LIMIT 100000")
+                .unwrap()
+                .rows
+                .len()
+        };
+        assert_eq!(all(&mut db), PREFIX_EXPANSION_LIMIT + 200, "the fixture, before anything");
+
+        // The POSITIVE shape: the predicate names 512 of the 712 documents it
+        // describes, so executing it would delete a subset and leave the rest
+        // with no way to see which.
+        let e = db.execute("DELETE FROM notes WHERE text_match(body, 'a*')").unwrap_err();
+        let e = e.to_string();
+        assert!(e.contains("refused") && e.contains("NOTHING was deleted"), "{e}");
+        assert!(e.contains("'a*'"), "and which leaf was cut: {e}");
+        assert_eq!(all(&mut db), PREFIX_EXPANSION_LIMIT + 200, "refused means nothing was written");
+
+        // The NEGATED shape, which the old test did not cover and the old
+        // message described backwards. Every document holds `zed` and its own
+        // `a#####`, so `zed -a*` excludes all 712 and the honest answer is
+        // zero rows; the cut exclusion set covers 512 of them, which used to
+        // make the other 200 — documents the predicate EXCLUDES — deletable.
+        let e = db.execute("DELETE FROM notes WHERE text_match(body, 'zed -a*')").unwrap_err();
+        let e = e.to_string();
+        assert!(e.contains("refused") && e.contains("NOTHING was deleted"), "{e}");
+        // The leaf as WRITTEN, sign and all: `-a*` and `a*` are cut for
+        // different reasons and a reader has to find the clause.
+        assert!(e.contains("'-a*'"), "the negated leaf, as it was written: {e}");
+        // And the sentence that is true of this shape and was missing: a cut
+        // exclusion deletes rows the predicate excluded.
+        assert!(
+            e.contains("delete documents the predicate EXCLUDES"),
+            "the consequence of a cut exclusion set: {e}"
+        );
+        assert!(
+            !e.contains("re-running"),
+            "the old message's claim, which was false here — re-running deleted 0: {e}"
+        );
+        assert_eq!(all(&mut db), PREFIX_EXPANSION_LIMIT + 200, "and 200 excluded rows survive");
+
+        // The refusal is not a ban on deleting by prefix. A prefix whose
+        // expansion fits is not cut, so it deletes and reports a plain count —
+        // which is also the loop the refusal points the operator at: `a0000*`,
+        // `a0001*`, and so on, each one deleting exactly what it names.
+        let msg = match db.execute("DELETE FROM notes WHERE text_match(body, 'a0000*')").unwrap() {
+            Outcome::Ack(m) => m,
+            other => panic!("expected an ack, got {other:?}"),
+        };
+        assert_eq!(msg, "10 document(s) deleted", "{msg}");
+        assert_eq!(all(&mut db), PREFIX_EXPANSION_LIMIT + 190, "`a00000`..`a00009`, and no more");
         let _ = fs::remove_dir_all(&dir);
     }
 

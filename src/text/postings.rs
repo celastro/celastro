@@ -317,6 +317,31 @@ impl<'a> TermDict<'a> {
     /// Terms in `[prefix, prefix+\u{221e})`, capped. Backs prefix queries in the
     /// `text_match` grammar (§2.4).
     pub fn terms_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, TermMeta)> {
+        self.terms_with_prefix_where(prefix, limit, &mut |_, _| true)
+    }
+
+    /// [`terms_with_prefix`](Self::terms_with_prefix) with `keep` deciding
+    /// which of the matching terms count.
+    ///
+    /// The cap counts KEPT terms, and that — not the filtering — is why this
+    /// exists rather than the caller filtering the returned window. A rejected
+    /// term must not spend the budget: filter a fixed-size unmasked window
+    /// instead and a run of terms the caller rejects eats the whole cap and
+    /// displaces every accepted term behind it. The live-masked caller in
+    /// [`crate::text::TextSource::live_terms_with_prefix`] is where that bites
+    /// — a design pass measured the filter-afterwards shape recovering 213 of
+    /// 300 matching documents on a fixture where counting the cap in KEPT terms
+    /// recovers all of them, and still moving with the compaction schedule.
+    ///
+    /// Enumeration therefore runs PAST a rejected run, so its cost is the cap
+    /// plus the rejected terms it steps over — bounded by what the dictionary
+    /// holds, never by the accepted vocabulary.
+    pub fn terms_with_prefix_where(
+        &self,
+        prefix: &str,
+        limit: usize,
+        keep: &mut dyn FnMut(&str, &TermMeta) -> bool,
+    ) -> Vec<(String, TermMeta)> {
         let mut out = Vec::new();
         let start = self.block_for(prefix).unwrap_or(0);
         let index = self.index();
@@ -329,6 +354,9 @@ impl<'a> TermDict<'a> {
             }
             for (t, m) in self.iter_block(bi) {
                 if t.starts_with(prefix) {
+                    if !keep(&t, &m) {
+                        continue;
+                    }
                     out.push((t, m));
                     if out.len() >= limit {
                         break;
@@ -574,6 +602,50 @@ mod tests {
         let p = d.terms_with_prefix("sc", 10);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "scarce");
+    }
+
+    #[test]
+    fn a_capped_prefix_walk_returns_the_first_terms_and_counts_only_the_kept_ones() {
+        // Two properties of one walk, and both are load-bearing well outside
+        // this file.
+        //
+        // FIRST, not any: `Db::run_select` unions each unit's answer and takes
+        // the first `PREFIX_EXPANSION_LIMIT` of the union, which is the
+        // collection's true first-`limit` only because each unit answered with
+        // its own first-`limit`. Return some other `limit` of them and a prefix
+        // query means something different in every unit, silently.
+        //
+        // And the cap counts KEPT terms, so the walk runs PAST a rejected run
+        // instead of spending the budget on it. That is what makes a rejected
+        // term — in the live-masked caller, a term no visible document holds —
+        // cost a step rather than a slot.
+        let mut b = InvertedBuilder::new();
+        for i in 0..300u32 {
+            b.add_doc(i, &[(format!("a{i:05}"), 0)]);
+        }
+        let (dict, _, _) = b.finish();
+        let parts = DictParts::parse(&dict).unwrap();
+        let d = TermDict::new(&parts);
+
+        let got: Vec<String> = d.terms_with_prefix("a", 10).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(got.first().map(String::as_str), Some("a00000"), "the FIRST ten, in order");
+        assert_eq!(got.last().map(String::as_str), Some("a00009"));
+
+        // The first 100 terms rejected. A window-then-filter implementation
+        // returns nothing here, because all ten of its slots went to rejects;
+        // counting the cap in kept terms returns `a00100`..`a00109`.
+        let got: Vec<String> = d
+            .terms_with_prefix_where("a", 10, &mut |t, _| t >= "a00100")
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(got.len(), 10, "ten KEPT terms, not ten terms looked at");
+        assert_eq!(got.first().map(String::as_str), Some("a00100"));
+        assert_eq!(got.last().map(String::as_str), Some("a00109"));
+
+        // A rejected run longer than the whole dictionary is exhausted rather
+        // than looped on, and the prefix bound still holds.
+        assert!(d.terms_with_prefix_where("a", 10, &mut |_, _| false).is_empty());
     }
 
     #[test]

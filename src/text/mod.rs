@@ -233,6 +233,21 @@ impl<'a> TextSource<'a> {
         self.try_cursor(term).ok().flatten()
     }
 
+    /// The first `limit` terms beginning with `prefix`, IN SORTED ORDER, from
+    /// the PHYSICAL dictionary.
+    ///
+    /// The ordering is load-bearing outside this file and not an accident of
+    /// the two implementations: `Db::run_select` unions this answer over every
+    /// unit of every shard and takes the first `PREFIX_EXPANSION_LIMIT` of the
+    /// union, which is the collection's true first-`limit` only because a term
+    /// among the `limit` smallest globally is among the `limit` smallest of
+    /// whichever unit holds it. Return these unordered and a prefix query
+    /// silently starts meaning something different in every unit.
+    ///
+    /// Every query path wants [`live_terms_with_prefix`](Self::live_terms_with_prefix)
+    /// instead, because a term no live document holds still occupies a slot
+    /// here. What is left for this spelling is the physical picture: fixtures,
+    /// assertions and tooling that want to see what a dictionary is carrying.
     pub fn terms_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
         match self {
             TextSource::Sealed { dict, .. } => {
@@ -241,6 +256,78 @@ impl<'a> TextSource<'a> {
             TextSource::Memory { terms, .. } => terms
                 .range(prefix.to_string()..)
                 .take_while(|(t, _)| t.starts_with(prefix))
+                .take(limit)
+                .map(|(t, _)| t.clone())
+                .collect(),
+        }
+    }
+
+    /// The first `limit` terms beginning with `prefix` that at least one
+    /// document `vis` marks visible still holds, IN SORTED ORDER.
+    ///
+    /// The cap counts LIVE terms, and that is the whole difference from
+    /// [`terms_with_prefix`](Self::terms_with_prefix). Enumerating the first
+    /// `limit` physical terms and filtering the answer afterwards lets a run of
+    /// dead terms spend the budget, so the terms behind it never get asked
+    /// about: which garbage a unit has not yet compacted away then decides what
+    /// the query means. Here the enumeration runs PAST a dead run, so the
+    /// answer is a function of the live corpus at `t` alone — see
+    /// [`crate::shard::Shard::prefix_terms`] for why unioning per-unit answers
+    /// is still exactly the collection's first `limit` live terms.
+    ///
+    /// Cost is one probe per term enumerated, and the probe stops at a term's
+    /// first live posting — for a live term that is one cursor open and one
+    /// block decode, work the query repeats in `scorer::build` a moment later.
+    /// Stepping over a dead term was measured at ~1 us, against 237-468 us to
+    /// gather one term's frequency at the coordinator.
+    pub fn live_terms_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+        vis: &crate::bitmap::Bitmap,
+    ) -> Vec<String> {
+        let live = vis.popcount();
+        // Nothing is dead in this unit at `t`, so every term is live and the
+        // probe can only say so. The walk is then byte-for-byte the physical
+        // one, for the cost of a popcount the caller has already paid — and
+        // that is most units most of the time.
+        //
+        // Against `vis.len()` — the unit's document count — because that is
+        // the condition actually meant: no ordinal in this unit is dead.
+        // `doc_lens().len()` is the tempting spelling and is only equal to it
+        // by a second invariant, that `InvertedBuilder::add_doc` is called for
+        // EVERY ordinal, including the ones carrying no text on this path, so
+        // `doc_lens` is padded out to the unit's length. Were that ever to
+        // change, `doc_lens` would stop short of the trailing text-less
+        // documents, and a unit with exactly that many dead ordinals would take
+        // the fast path — skipping the mask on precisely the units that need
+        // it. This spelling does not depend on the other invariant at all.
+        if live == vis.len() {
+            return self.terms_with_prefix(prefix, limit);
+        }
+        // The opposite extreme, and it is not rare: a segment every one of
+        // whose documents has been superseded or tombstoned holds no live term
+        // at all. Without this the probe still opens a cursor per term and
+        // `next_set` still scans the whole bitmap to find nothing, which was
+        // measured at 12 us a term over a 50000-term dead run — the walk over a
+        // unit that is pure garbage should be the CHEAPEST case, not the
+        // dearest.
+        if live == 0 {
+            return Vec::new();
+        }
+        match self {
+            TextSource::Sealed { dict, postings, .. } => dict
+                .terms_with_prefix_where(prefix, limit, &mut |_, m| {
+                    sealed_has_live_posting(postings, m, vis)
+                })
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect(),
+            TextSource::Memory { terms, .. } => terms
+                .range(prefix.to_string()..)
+                .take_while(|(t, _)| t.starts_with(prefix))
+                // Before `take`, not after: the cap counts live terms.
+                .filter(|(_, tp)| tp.ords.iter().any(|o| vis.get(*o as usize)))
                 .take(limit)
                 .map(|(t, _)| t.clone())
                 .collect(),
@@ -269,6 +356,49 @@ impl<'a> TextSource<'a> {
             }
         }
     }
+}
+
+/// Does the sealed term `m` describes hold at least one posting `vis` marks
+/// visible?
+///
+/// A galloping intersection of the posting list with the bitmap, not a scan.
+/// Each turn either finds a live posting and stops, or consumes one live
+/// ordinal this term does not hold, so it runs at most
+/// `min(df, popcount(vis))` times and skips whole posting blocks between turns.
+/// On a live term it stops at the first posting: one cursor open and one block
+/// decode, work the query repeats in `scorer::build` a moment later.
+///
+/// Takes the [`TermMeta`] the enumeration already decoded rather than the term
+/// string, and that is a measured decision, not a style one.
+/// [`TextSource::try_cursor`] would look the term up again, and a dictionary
+/// lookup decodes and allocates the term's whole block — so probing every term
+/// of a block re-decoded that block once per term. Over a 50000-term dead run
+/// that was 580 ms against 20 ms.
+///
+/// An UNREADABLE extent answers "live", not "dead". Dropping a term because its
+/// postings are corrupt turns corruption into a quietly smaller expansion,
+/// which is the one failure mode [`TextSource::try_cursor`]'s doc comment
+/// exists to refuse; letting it through costs one term in the expansion, and
+/// the gather that follows opens the same extent and raises the error there.
+fn sealed_has_live_posting(postings: &[u8], m: &TermMeta, vis: &crate::bitmap::Bitmap) -> bool {
+    let start = m.postings_off as usize;
+    // Widened before adding, for the same reason `try_cursor` widens: the sum
+    // computed in u32 wraps on a corrupt extent and yields a range that looks
+    // perfectly in bounds.
+    let Some(end) = start.checked_add(m.postings_len as usize) else { return true };
+    let Some(slice) = postings.get(start..end) else { return true };
+    let Ok(mut c) = PostingCursor::open(slice) else { return true };
+    let mut d = c.advance(0);
+    while d != EXHAUSTED {
+        if vis.get(d as usize) {
+            return true;
+        }
+        match vis.next_set(d as usize + 1) {
+            Some(n) => d = c.advance(n as u32),
+            None => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -5,7 +5,11 @@
 //! | hybrid queries provably correct; harness trusted | [`hybrid_retrieval_is_a_union_of_all_three_modes`], [`the_recall_harness_catches_a_deliberate_regression`] |
 //! | recall@10 ≥ 0.95 under sustained deletes | [`recall_at_10_holds_under_sustained_deletes`] |
 //! | in exact mode, results bit-identical regardless of shard count | [`exact_mode_is_bit_identical_across_shard_counts`], [`exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`], [`exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`] |
-//! | in default mode, a freshly refreshed gather matches `WITH (exact_scoring)` for Term and Phrase queries, and the triple is identical at every shard count fresh or stale (not prefix queries, which reach the gather on neither path) | [`default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`], [`default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`] |
+//! | in default mode, a freshly refreshed gather matches `WITH (exact_scoring)` for Term, Phrase and Prefix queries, and the triple is identical at every shard count fresh or stale | [`default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`], [`default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`] |
+//! | a prefix query names the same terms and ranks them the same way at every shard count | [`a_prefix_query_ranks_the_same_at_every_shard_count`], [`a_prefix_query_finds_the_same_documents_at_every_shard_count`] |
+//! | a prefix names the LIVE vocabulary, so a dead term cannot displace a live one out of the cap | [`a_prefix_query_names_the_live_vocabulary_not_the_physical_one`] |
+//! | a cut EXCLUSION set is reported as keeping rows, not as losing them | [`a_truncated_exclusion_says_rows_were_kept_not_that_rows_are_missing`] |
+//! | a prefix expansion the cap cut says so, on every query shape | `engine::tests::a_truncated_prefix_says_so_on_a_plain_query_of_either_shape`, `engine::tests::an_expansion_of_exactly_the_cap_dropped_nothing_and_must_not_say_it_did` |
 //! | state survives a reopen | [`a_database_survives_reopen`] |
 
 use std::collections::BTreeMap;
@@ -709,6 +713,394 @@ fn default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes()
     assert_eq!(one.len(), 20);
     assert_eq!(one, three, "1 shard vs 3 shards");
     assert_eq!(one, six, "1 shard vs 6 shards");
+}
+
+// --------------------------------------------------------------------------
+// Prefix expansion: the same query at every shard count
+// --------------------------------------------------------------------------
+
+/// The vocabulary both prefix tests draw from, as a body string for document
+/// `i`: deterministic in `i` alone, so the same document carries the same
+/// terms in every leg however the legs are split.
+fn zipf_body(i: usize, vocab: usize, seed: u64) -> String {
+    let mut rng = Rng::new(seed ^ i as u64);
+    let count = 3 + rng.next_usize(6);
+    let mut terms = Vec::with_capacity(count);
+    for _ in 0..count {
+        // Cubic zipf. A FLAT draw is the trap: it gives every term in the
+        // expansion nearly the same document frequency, so a segment-local df
+        // and the collection-wide df agree by construction and the defect this
+        // test exists to catch cannot reach an assertion. Cubing the uniform
+        // draw crowds it onto the low indices and spreads the frequencies
+        // inside one expansion over orders of magnitude.
+        let u = rng.next_f64();
+        terms.push(format!("pterm{:03}", ((vocab as f64 * u * u * u) as usize).min(vocab - 1)));
+    }
+    let filler = "padding ".repeat(1 + i % 9);
+    format!("{} {filler}", terms.join(" "))
+}
+
+#[test]
+fn a_prefix_query_ranks_the_same_at_every_shard_count() {
+    // The prefix sibling of `default_mode_is_bit_identical_...`, and the
+    // reason it needed one: `TextQuery::leaf_terms` skipped `Prefix`, so the
+    // coordinator gathered no global df for an expanded term and every
+    // searchable unit fell back to its own segment-local dictionary count.
+    // `scorer::compile` runs once per UNIT, so the weight a term carries was a
+    // function of which units exist — that is, of the shard count and of the
+    // flush and compaction schedule.
+    //
+    // Measured on the code this test was written against: all 25 queries below
+    // returned a different top-10 key ORDER *and* a different top-10 key SET at
+    // three shards and at six than at one — 25/25 on each of the four
+    // comparisons. Adding `WITH (exact_scoring)` changed nothing, 25/25 again,
+    // which is what rules the statistics cache out and points at the prefix
+    // hole. None of these queries truncates — a 40-term vocabulary against a
+    // cap of 512 — so this leg isolates the document-frequency half of the
+    // defect; its sibling below isolates the expansion-set half.
+    //
+    // Load-bearing, and the test proves nothing without all of them: the
+    // cubic-zipf vocabulary (see `zipf_body`), `method => 'linear'` (RRF ranks,
+    // so a weight shift is invisible unless it flips one), per-document length
+    // variance, updates, deletes and a small `max_bytes` so the units really do
+    // hold different rows, a split that cuts through the middle of a tenant,
+    // and `k => 100000` so per-shard `k'` truncation is off the table.
+    //
+    // The assertion is the KEY SEQUENCE, not score bits, and deliberately:
+    // `DisjunctionScorer::score` sums f32 in cursor order, so a query with
+    // three or more disjuncts — which every prefix expansion is — is not
+    // bit-identical across shard counts for reasons that have nothing to do
+    // with prefixes. Bit equality is asserted on the gathered triple instead.
+    let dims = 16;
+    let n = 4000;
+    const VOCAB: usize = 40;
+
+    let queries = || {
+        // Four ten-term expansions, twenty one-term expansions and the
+        // whole forty-term vocabulary. The one-term ones matter as much as
+        // the wide ones: a single expanded term still took its weight from
+        // the unit that scored it, and units disagree, so documents that
+        // live in different units were compared on different scales.
+        let mut q: Vec<String> = (0..4).map(|d| format!("pterm0{d}*")).collect();
+        q.extend((0..10).map(|d| format!("pterm00{d}*")));
+        q.extend((0..10).map(|d| format!("pterm01{d}*")));
+        q.push("pterm*".to_string());
+        q
+    };
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        let varied = |c: &mut Corpus, i: usize, seed: u64| {
+            let mut d = c.doc(i);
+            d.set_path("body", Value::Str(zipf_body(i, VOCAB, seed)));
+            d
+        };
+        for i in 0..n {
+            let d = varied(&mut c, i, 0x9157);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(7) {
+            let d = varied(&mut c, i, 0x2b41);
+            db.insert("items", d).unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete_key("items", &format!("t{}\u{1}doc-{i:05}", i % 3)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        db.execute("COMPACT items").unwrap();
+        queries()
+            .into_iter()
+            .map(|p| {
+                let sql = format!(
+                    "SELECT id FROM items \
+                     ORDER BY hybrid(text_match(body, '{p}'), method => 'linear', k => 100000) \
+                     LIMIT 10"
+                );
+                keys(&db.query(&sql).unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let one = run(&[]);
+    let three = run(&["t1", "t2\u{1}doc-00450"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+
+    // The anchor: every query really found something, so the equalities below
+    // cannot pass on three empty answers.
+    for (p, r) in queries().iter().zip(&one) {
+        assert_eq!(r.len(), 10, "`{p}` returned {} of 10 documents at one shard", r.len());
+    }
+    for ((p, a), b) in queries().iter().zip(&one).zip(&three) {
+        assert_eq!(a, b, "`{p}`: 1 shard vs 3 shards");
+    }
+    for ((p, a), b) in queries().iter().zip(&one).zip(&six) {
+        assert_eq!(a, b, "`{p}`: 1 shard vs 6 shards");
+    }
+}
+
+#[test]
+fn a_prefix_query_finds_the_same_documents_at_every_shard_count() {
+    // The second, larger half of the same defect, with no scoring in it at
+    // all. `PREFIX_EXPANSION_LIMIT` used to be applied per searchable UNIT
+    // inside `scorer::build`, so each unit expanded its own dictionary and
+    // truncated at its own lexicographic cut. More units means each one's
+    // dictionary is smaller, so its first 512 covers a larger fraction of it
+    // and the union grows: the SET OF TERMS the query means was a function of
+    // the flush and compaction schedule, and the match set moved with it.
+    //
+    // Measured on the code this test was written against, on this fixture:
+    // `a*` returned 2473 rows at one shard, 2523 at three and 2611 at six, of
+    // 6000 that match, and `zed -a*` the complements — 3527 / 3477 / 3389 —
+    // silently, on the two most ordinary prefix shapes there are. Pinning the
+    // lexicographically first 512 terms of the UNION over every unit at the
+    // coordinator answers 1511 and 4489 at all three.
+    //
+    // Note what the trade is, because it is not a free win: the invariant
+    // answer is SMALLER than the largest of the three it replaces. A wide
+    // prefix is a partial answer by construction either way; what changes is
+    // that the partiality stops depending on the flush and compaction
+    // schedule, and starts being a property of the collection — the terms
+    // nearest the start of the alphabet, which is arbitrary but stable.
+    //
+    // This also covers the WHERE call site, which the ranking test above does
+    // not reach: a `text_match` predicate compiles a scorer and throws the
+    // scores away.
+    let dims = 16;
+    let n = 6000;
+    const VOCAB: usize = 4000;
+    // Measured, and re-measure it if the fixture moves rather than adjusting
+    // it until it passes.
+    const PINNED: usize = 1511;
+
+    let run = |splits: &[&str]| {
+        let mut o = opts(64);
+        o.thresholds.max_bytes = 96 << 10;
+        let mut db = Db::with_opts(o);
+        setup(&mut db, dims, splits);
+        let mut c = Corpus::new(dims, 42);
+        for i in 0..n {
+            let mut d = c.doc(i);
+            let mut rng = Rng::new(0x51ed ^ i as u64);
+            let (x, y) = (rng.next_usize(VOCAB), rng.next_usize(VOCAB));
+            // `zed` is in every document, so the negated leg below has a
+            // positive clause that admits everything and measures nothing but
+            // the exclusion set.
+            d.set_path("body", Value::Str(format!("zed a{x:05} a{y:05}")));
+            db.insert("items", d).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        db.execute("COMPACT items").unwrap();
+        let rows = |db: &mut Db, q: &str| {
+            let sql = format!("SELECT id FROM items WHERE text_match(body, '{q}') LIMIT 1000000");
+            let mut ks = keys(&db.query(&sql).unwrap());
+            ks.sort();
+            ks
+        };
+        // The negated leg is here and not in a test of its own because it is
+        // the same fixture and the same cap: `leaf_prefixes` descends into
+        // `Not` where `leaf_terms` does not, precisely because a negated
+        // prefix's expansion is the EXCLUSION set. Copy `leaf_terms`' `Not`
+        // arm and every unit re-derives its own exclusion list, so which
+        // documents the query drops moves with the layout — the same defect,
+        // wearing the opposite sign.
+        (rows(&mut db, "a*"), rows(&mut db, "zed -a*"))
+    };
+
+    let (one, none) = run(&[]);
+    let (three, nthree) = run(&["t1", "t2\u{1}doc-00450"]);
+    let (six, nsix) =
+        run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+
+    // The expansion really does truncate here — 4000 distinct terms against a
+    // cap of 512 — so this is a PARTIAL answer by construction at every shard
+    // count. That is the point: partial and invariant, not partial and moving.
+    // The anchor is the count itself: a change that made `a*` stop matching
+    // would agree at every shard count and pass green without it.
+    assert_eq!(one.len(), PINNED, "the pinned first 512 terms cover this many of the {n}");
+    assert_eq!(none.len(), n - PINNED, "and `-a*` excludes exactly the complement");
+    // Row counts first: the sets differ by hundreds of rows when this
+    // regresses, and a diff of two 1500-element key vectors says much less
+    // than the two counts do.
+    assert_eq!(one.len(), three.len(), "row count, 1 shard vs 3 shards");
+    assert_eq!(one.len(), six.len(), "row count, 1 shard vs 6 shards");
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+    assert_eq!(none.len(), nthree.len(), "`-a*` row count, 1 shard vs 3 shards");
+    assert_eq!(none.len(), nsix.len(), "`-a*` row count, 1 shard vs 6 shards");
+    assert_eq!(none, nthree, "`-a*`, 1 shard vs 3 shards");
+    assert_eq!(none, nsix, "`-a*`, 1 shard vs 6 shards");
+}
+
+/// A collection of `n` documents `k00000..`, each holding `zed a#####` with its
+/// own distinct `a` term, of which the first `dead` are then rewritten to hold
+/// a `b` term instead — so `a00000..a0{dead}` are terms no live document holds
+/// and they sort BEFORE every surviving one.
+///
+/// The FLUSH between the two loops is load-bearing and not tidiness: it puts
+/// the dead terms in a SEALED segment, where they stay in the dictionary until
+/// a compaction rewrites it. With `dead/n` under `CompactionOpts::dead_ratio`
+/// (0.30) a `COMPACT` leaves that segment alone and the dead terms survive,
+/// which is the whole state this fixture exists to reach. Change the ratio and
+/// the fixture disarms itself silently.
+fn dead_run_fixture(splits: &[&str], n: usize, dead: usize) -> Db {
+    let splits_sql = if splits.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " WITH (splits = [{}])",
+            splits.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
+        )
+    };
+    let mut db = Db::with_opts(DbOpts::default());
+    db.execute(&format!("CREATE COLLECTION items (id TEXT PRIMARY KEY){splits_sql}")).unwrap();
+    db.execute(
+        "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english')",
+    )
+    .unwrap();
+    let put = |db: &mut Db, i: usize, t: char| {
+        db.insert(
+            "items",
+            Value::obj(vec![
+                ("id".into(), Value::Str(format!("k{i:05}"))),
+                // `zed` is in every document so the negated shape has a
+                // positive clause that admits everything.
+                ("body".into(), Value::Str(format!("zed {t}{i:05}"))),
+            ]),
+        )
+        .unwrap();
+    };
+    for i in 0..n {
+        put(&mut db, i, 'a');
+    }
+    db.execute("FLUSH items").unwrap();
+    for i in 0..dead {
+        put(&mut db, i, 'b');
+    }
+    db.execute("FLUSH items").unwrap();
+    db
+}
+
+fn prefix_rows(db: &mut Db, q: &str) -> Vec<String> {
+    let sql = format!("SELECT id FROM items WHERE text_match(body, '{q}') LIMIT 1000000");
+    let mut ks = keys(&db.query(&sql).unwrap());
+    ks.sort();
+    ks
+}
+
+#[test]
+fn a_prefix_query_names_the_live_vocabulary_not_the_physical_one() {
+    // The leg the two tests above are STRUCTURALLY unable to reach, and the
+    // combination matters: `a_prefix_query_finds_the_same_documents_...` makes
+    // the cap bind but never updates or deletes, so its live and physical
+    // dictionaries are identical; `a_prefix_query_ranks_the_same_...` updates
+    // and deletes but has a 40-term vocabulary against a cap of 512, so the cap
+    // cannot bind. A dead term only does damage when the cap binds, because
+    // what it does is DISPLACE a live term out of it.
+    //
+    // Measured on the code this test was written against — 2000 documents,
+    // the first 500 rewritten, FLUSH, COMPACT, 1500 still matching `a*`:
+    //
+    //     1 shard                                   12 rows, k00500..k00511
+    //     4 shards (k00500, k01000, k01500)        512 rows, k00500..k01011
+    //
+    // Twelve rows out of 1500, from a query whose answer is supposed to be a
+    // property of the collection. The mechanism: at one shard the first
+    // segment's dead ratio is 0.25, under `CompactionOpts::dead_ratio` 0.30, so
+    // it is not rewritten and the 500 dead `a` terms — which sort first — eat
+    // 500 of the 512 slots. Split by key, the k00000..k00499 shard is 100% dead
+    // and IS rewritten, so its terms leave the union and the cap goes to live
+    // ones.
+    //
+    // Note what is NOT asserted, and why. Cross-shard equality alone would pass
+    // on the bug: the second fixture below measured 0 rows at one shard and 0
+    // rows at six on the defective code. Equal, and both wrong. So both legs
+    // assert the ABSOLUTE answer — the first `PREFIX_EXPANSION_LIMIT` LIVE
+    // matching terms — and anyone simplifying these back to `assert_eq!(one,
+    // six)` is removing the only assertion that has teeth.
+    const CAP: usize = 512;
+    let expect: Vec<String> = (500..500 + CAP).map(|i| format!("k{i:05}")).collect();
+
+    let run = |splits: &[&str]| {
+        let mut db = dead_run_fixture(splits, 2000, 500);
+        db.execute("COMPACT items").unwrap();
+        prefix_rows(&mut db, "a*")
+    };
+    let one = run(&[]);
+    let four = run(&["k00500", "k01000", "k01500"]);
+    assert_eq!(one.len(), CAP, "the first {CAP} LIVE terms, one document each");
+    assert_eq!(one, expect, "`a00500`..`a01011`, not whatever the compactor left behind");
+    assert_eq!(one, four, "1 shard vs 4 shards");
+
+    // The second axis, and the one that keeps its teeth at a FIXED shard
+    // count: the same database, queried before and after a `COMPACT`. The
+    // split points in the first leg happen to correlate with the dead run, so
+    // that leg alone would stop meaning anything if they ever drifted apart.
+    //
+    // 1000 documents with the first 600 rewritten leaves 400 matching `a*` and
+    // a live vocabulary of 400 terms — comfortably UNDER the cap, so nothing is
+    // truncated and the honest answer is all 400 documents, before and after
+    // any compaction. Measured on the code this test was written against:
+    //
+    //                                 before COMPACT     after COMPACT
+    //       1 shard                         0 rows           400 rows
+    //       6 shards                        0 rows           400 rows
+    //
+    // Zero. All 512 pinned terms were dead ones, the query matched nothing, and
+    // it reported truncation while it did so — on a collection whose entire
+    // matching vocabulary fits in the cap eight times over.
+    let expect: Vec<String> = (600..1000).map(|i| format!("k{i:05}")).collect();
+    let splits: Vec<&[&str]> = vec![&[], &["k00200", "k00400", "k00600", "k00800", "k00900"][..]];
+    for sp in splits {
+        let mut db = dead_run_fixture(sp, 1000, 600);
+        let before = prefix_rows(&mut db, "a*");
+        db.execute("COMPACT items").unwrap();
+        let after = prefix_rows(&mut db, "a*");
+        assert_eq!(before, expect, "400 live terms, {} shard(s), before COMPACT", sp.len() + 1);
+        assert_eq!(after, expect, "and the same after it");
+    }
+
+    // And nothing says the answer is short, because it is not: the truncation
+    // verdict is taken over live terms too, so a complete answer no longer
+    // claims to be missing documents.
+    let mut db = dead_run_fixture(&[], 1000, 600);
+    let r = db.query("SELECT id FROM items WHERE text_match(body, 'a*') LIMIT 1000000").unwrap();
+    assert!(r.truncated_prefixes.is_empty(), "{:?}", r.truncated_prefixes);
+}
+
+#[test]
+fn a_truncated_exclusion_says_rows_were_kept_not_that_rows_are_missing() {
+    // Truncating an EXCLUSION set does not lose rows. It fails to remove them,
+    // so the answer has extra ones — the exact opposite of what the report used
+    // to say, on a shape `leaf_prefixes` supports on purpose and the test above
+    // exercises. Reporting the inverse fact is worse than reporting nothing:
+    // it sends the reader looking for documents that are all present.
+    //
+    // 1000 distinct `a` terms against a cap of 512, no deletes, so the cut is
+    // the cap doing its job rather than any of the liveness machinery.
+    let mut db = dead_run_fixture(&[], 1000, 0);
+    let r =
+        db.query("SELECT id FROM items WHERE text_match(body, 'zed -a*') LIMIT 1000000").unwrap();
+    assert_eq!(r.rows.len(), 1000 - 512, "the 512 excluded terms are the cap's worth");
+    assert_eq!(r.truncated_prefixes.len(), 1, "{:?}", r.truncated_prefixes);
+    let m = &r.truncated_prefixes[0];
+    // Rendered as it was written, sign included, or a reader cannot tell which
+    // of `a*` and `-a*` was cut when a statement holds both.
+    assert!(m.contains("'-a*'"), "the leaf as written: {m}");
+    assert!(
+        m.contains("should have excluded are still in this answer"),
+        "the consequence of cutting an exclusion set: {m}"
+    );
+    assert!(!m.contains("documents are missing"), "which is NOT what happened: {m}");
+
+    // The positive leaf on the same collection, for contrast: same cap, same
+    // cut, opposite consequence.
+    let r = db.query("SELECT id FROM items WHERE text_match(body, 'a*') LIMIT 1000000").unwrap();
+    let m = &r.truncated_prefixes[0];
+    assert!(m.contains("'a*'") && m.contains("documents are missing from this answer"), "{m}");
 }
 
 #[test]

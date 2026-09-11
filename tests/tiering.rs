@@ -1131,6 +1131,48 @@ fn a_refused_archived_read_fails_the_query_instead_of_shortening_it() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The same refusal, on the path a PREFIX expansion takes.
+///
+/// The test above uses a non-text predicate, so it never enters
+/// `Shard::prefix_terms` — and that function opens its text handle with the
+/// fallible spelling precisely so that an archived segment configured to refuse
+/// reads surfaces the refusal instead of looking like a path with no index and
+/// silently dropping its terms out of the expansion. A silently shorter
+/// expansion is a silently shorter ANSWER, which is the failure mode the whole
+/// truncation report exists to make impossible.
+#[test]
+fn a_refused_archived_read_fails_a_prefix_expansion_instead_of_shortening_it() {
+    let d = dir("silent-prefix");
+    let mut o = DbOpts::default();
+    o.residency.archived_access = ArchivedAccess::Refuse;
+    let mut db = Db::open(&d, o).unwrap();
+    db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+    db.execute("CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer='english')")
+        .unwrap();
+    for i in 0..60 {
+        db.insert(
+            "items",
+            Value::obj(vec![
+                ("id".to_string(), Value::Str(format!("d-{i:03}"))),
+                ("body".to_string(), Value::Str(format!("alpha{i:03}"))),
+            ]),
+        )
+        .unwrap();
+    }
+    db.execute("FLUSH items").unwrap();
+
+    let sql = "SELECT id FROM items WHERE text_match(body, 'alpha*') LIMIT 1000";
+    assert_eq!(db.query(sql).unwrap().rows.len(), 60, "60 distinct terms, all readable");
+
+    db.execute("ALTER INDEX items_body ON items SET TIER 'archived'").unwrap();
+    // Strictly `Err`, unlike its sibling above: the dictionary this expansion
+    // has to read IS the archived index, so there is no arrangement in which
+    // the query legitimately succeeds. An `Ok` here is the silent shortening.
+    let e = db.query(sql).expect_err("a refused dictionary read must fail the query").to_string();
+    assert!(e.contains("archived"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The ledger must not keep charging for segments compaction has retired.
 #[test]
 fn compaction_releases_the_ledger_entries_of_the_segments_it_retires() {

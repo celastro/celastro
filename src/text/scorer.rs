@@ -32,13 +32,77 @@ impl Default for Bm25Params {
     }
 }
 
+/// What one `foo*` leaf resolved to at the coordinator: the terms, and whether
+/// the collection had more of them than [`PREFIX_EXPANSION_LIMIT`] allows.
+///
+/// The two travel together because they are one fact. The terms alone cannot
+/// say whether anything was dropped — a list exactly `PREFIX_EXPANSION_LIMIT`
+/// long is what both "the cap cut this" and "the collection happens to hold
+/// exactly that many" look like, and reading the cut off the length is the
+/// off-by-one this type exists to make unrepresentable. Only the coordinator
+/// can tell them apart, because only the coordinator saw the union.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Expansion {
+    /// The terms the query names: the lexicographically first, capped, LIVE
+    /// matching terms of the collection at the query's snapshot. A term no
+    /// visible document holds is not here, and — the part that took a
+    /// measurement to get right — it did not occupy a slot either.
+    pub terms: Vec<String>,
+    /// The collection matched more LIVE terms than `terms` carries, so the
+    /// answer really is short. Reported on
+    /// [`QueryResult`](crate::plan::exec::QueryResult).
+    ///
+    /// Live, not physical, and that is what makes the report actionable: a
+    /// verdict taken over the physical dictionary fires when a collection with
+    /// a few hundred live terms happens to be carrying dead ones, and tells a
+    /// caller holding a COMPLETE answer that it is incomplete. A warning
+    /// nobody can act on is worse than silence.
+    pub truncated: bool,
+    /// How the statement used this prefix, which decides what a cut COST.
+    pub used: PrefixUse,
+}
+
+/// The polarity (or polarities) one prefix leaf was written in.
+///
+/// Both flags can be set: one statement may spell `a*` in one clause and `-a*`
+/// in another, they resolve to the same term list, and truncating it then does
+/// both kinds of damage at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixUse {
+    /// Used as a matching leaf. Cutting its expansion LOSES rows.
+    pub positive: bool,
+    /// Used under a `Not`, where the expansion is the EXCLUSION set. Cutting it
+    /// KEEPS rows the query asked to drop — the opposite consequence, which is
+    /// why the two cannot share one message.
+    pub negated: bool,
+}
+
 /// Collection-wide term statistics, gathered by the coordinator and attached
 /// to the query for its own terms only (§8.1).
+///
+/// `#[non_exhaustive]` because this grew a field in a breaking release and the
+/// next statistic should not need another one.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct GlobalStats {
     pub num_docs: u64,
     pub avg_doc_len: f64,
     pub doc_freq: BTreeMap<String, u64>,
+    /// Prefix leaf -> what the coordinator resolved it to, pinned once for the
+    /// whole query (§8.1). Present for every prefix in the statement when the
+    /// query came through `Db::run_select`; empty when `compile` was called
+    /// directly, which is the fallback `build` documents.
+    ///
+    /// This is what makes a prefix query mean the same thing at every shard
+    /// count. Expanding per searchable unit applies the expansion cap per unit,
+    /// so each one truncates at its own lexicographic cut and the union — the
+    /// set of terms the query actually names — grows and shrinks with the
+    /// flush and compaction schedule. Resolving it here is necessary but not
+    /// sufficient: the enumeration must also be masked by the query's own
+    /// snapshot, or the cut is over the PHYSICAL dictionary and the schedule
+    /// gets back in through the dead terms it leaves in front of the live ones.
+    pub expansions: BTreeMap<String, Expansion>,
     /// True when gathered exactly for this query (`WITH exact_scoring`), false
     /// when read from the periodically refreshed cache. Reported by
     /// `EXPLAIN ANALYZE` so a scoring anomaly can be attributed.
@@ -541,9 +605,37 @@ impl Scorer for BitmapScorer {
 }
 
 /// Maximum number of dictionary terms a single `foo*` expands to. An unbounded
-/// prefix on a large dictionary is a denial of service, and silently returning
-/// fewer results is worse than saying so — the cap is reported in
-/// `EXPLAIN ANALYZE`.
+/// prefix on a large dictionary is a denial of service.
+///
+/// Applied by the coordinator to the UNION over every unit of every shard
+/// (`Db::run_select`), so the terms a prefix names are the lexicographically
+/// first `PREFIX_EXPANSION_LIMIT` of the collection's LIVE matching vocabulary
+/// at the query's snapshot — a property of the collection, not of its layout.
+/// Applied per unit, which is what the fallback arm of `build` still does, the
+/// union of the per-unit cuts grows with the number of units and the query
+/// means something different after a flush.
+///
+/// "Live" is the second half of the same property and it is not decoration.
+/// Each unit enumerates only terms a visible document still holds, and it
+/// enumerates PAST the dead ones rather than counting them against the cap: a
+/// dead term contributes no rows either way, but under a cap it would otherwise
+/// displace a live term, which puts the compaction schedule back in the answer.
+/// See [`crate::shard::Shard::prefix_terms`].
+///
+/// A wide prefix is therefore a PARTIAL answer, and the honest bound is
+/// recall, not correctness: `a*` keeps the terms nearest the start of the
+/// alphabet, which is arbitrary but stable. Silently returning fewer results
+/// is worse than saying so, so the cut is reported on
+/// [`QueryResult::truncated_prefixes`](crate::plan::exec::QueryResult) for
+/// every query — ranked or filtered, `EXPLAIN ANALYZE` or not — and repeated
+/// per unit in `EXPLAIN ANALYZE`.
+///
+/// Raising it is a recall dial with a real price. The rows a wide prefix
+/// returns go roughly as `n · (1 − (1 − cap/V)^t)` for a collection of `n`
+/// documents over a matching vocabulary of `V` terms with `t` of them per
+/// document, so recall improves sub-linearly in the cap while the work — one
+/// cursor per resolved term, in every unit — grows with it directly. README's
+/// "A wide `foo*` is a partial answer" note carries the measured numbers.
 pub const PREFIX_EXPANSION_LIMIT: usize = 512;
 
 pub struct Compiled<'a> {
@@ -612,15 +704,21 @@ struct Built<'a> {
     negation_only: bool,
 }
 
+/// `vis` is the unit's visibility bitmap at the query's pinned `t`, and it is
+/// required rather than optional because the one place it is read — the
+/// no-coordinator prefix arm of [`build`] — must use the SAME liveness
+/// predicate, at the same instant, as `Shard::prefix_terms` and
+/// `Shard::term_stats`. One liveness rule in the crate, not two.
 pub fn compile<'a>(
     q: &TextQuery,
     src: &'a TextSource<'a>,
+    vis: &Bitmap,
     stats: &GlobalStats,
     params: Bm25Params,
 ) -> Result<Compiled<'a>> {
     let avgdl = if stats.avg_doc_len > 0.0 { stats.avg_doc_len as f32 } else { 1.0 };
     let mut truncated = false;
-    let b = build(q, src, stats, params, avgdl, &mut truncated)?;
+    let b = build(q, src, vis, stats, params, avgdl, &mut truncated)?;
     Ok(Compiled {
         scorer: b.scorer,
         excluded: if b.excluded.is_empty() { None } else { Some(b.excluded) },
@@ -632,6 +730,7 @@ pub fn compile<'a>(
 fn build<'a>(
     q: &TextQuery,
     src: &'a TextSource<'a>,
+    vis: &Bitmap,
     stats: &GlobalStats,
     params: Bm25Params,
     avgdl: f32,
@@ -656,24 +755,77 @@ fn build<'a>(
             },
         },
         TextQuery::Prefix(p) => {
-            let terms = src.terms_with_prefix(p, PREFIX_EXPANSION_LIMIT);
-            if terms.len() >= PREFIX_EXPANSION_LIMIT {
-                *truncated = true;
-            }
+            // The coordinator resolved this prefix against every unit of every
+            // shard and pinned the first `PREFIX_EXPANSION_LIMIT` of the union,
+            // so the term list — and therefore what the query MEANS — is the
+            // same in every unit that compiles it. Expanding here instead
+            // applies the cap per unit, and the union of per-unit cuts is a
+            // function of the flush and compaction schedule.
+            let resolved = stats.expansions.get(p);
+            let owned;
+            let terms: &[String] = match resolved {
+                Some(e) => {
+                    // The coordinator already decided whether anything was
+                    // dropped, because it is the only place that saw the union,
+                    // and every unit repeats its verdict — so for the first
+                    // time this flag says something about the QUERY rather
+                    // than about one segment. Note that it is NOT read off
+                    // `e.terms.len()`: a full list and a cut list are the same
+                    // length.
+                    *truncated |= e.truncated;
+                    &e.terms
+                }
+                None => {
+                    // `compile` called without a coordinator: the unit is the
+                    // whole world, so expanding here is the best available
+                    // answer rather than a second-choice one.
+                    //
+                    // Masked by `vis`, exactly as `Shard::prefix_terms` masks
+                    // the coordinator's read, and for the same reason: a term
+                    // no live document holds must not spend a slot under the
+                    // cap and displace one that a document does hold. A
+                    // unit-local expansion is a smaller world than the
+                    // collection, but it should still not depend on that
+                    // unit's garbage.
+                    //
+                    // One MORE than the cap, then cut back. Asking for exactly
+                    // the cap and testing `len() == cap` cannot tell a
+                    // dictionary the cap truncated from a dictionary that holds
+                    // exactly `cap` matching terms and lost nothing, and it
+                    // called both of them truncation. The extra term is the
+                    // whole difference: if it comes back, something was left
+                    // behind.
+                    owned = src.live_terms_with_prefix(p, PREFIX_EXPANSION_LIMIT + 1, vis);
+                    if owned.len() > PREFIX_EXPANSION_LIMIT {
+                        *truncated = true;
+                        &owned[..PREFIX_EXPANSION_LIMIT]
+                    } else {
+                        &owned
+                    }
+                }
+            };
             let mut kids: Vec<Box<dyn Scorer + 'a>> = Vec::with_capacity(terms.len());
-            for t in &terms {
+            for t in terms {
                 let Some(cur) = src.try_cursor(t)? else { continue };
-                let idf = if stats.doc_freq.contains_key(t) {
+                let idf = if resolved.is_some() {
+                    // UNCONDITIONALLY global once the expansion was resolved,
+                    // with no per-term fallback. Every term in the pinned list
+                    // was handed to the same gather that produced `doc_freq`,
+                    // so a miss means no live document holds it and `df == 0`
+                    // — the highest weight there is — is the right answer, the
+                    // same one a Term leaf gets in the same situation. Falling
+                    // back to `src.doc_freq(t)` for the misses would reinstate
+                    // the segment-local weight for exactly the terms the
+                    // coordinator disagrees with the segment about, which is
+                    // the defect, restricted to its worst case.
                     stats.idf(t)
                 } else {
-                    // A prefix term the coordinator never saw has no global df,
-                    // because `TextQuery::leaf_terms` deliberately skips
-                    // `Prefix`, so this mixes the segment's own df with the
-                    // global document count. It is internally consistent within
-                    // one segment, but scores from a prefix expansion are still
-                    // NOT comparable across shards (§8.2) — making them so needs
-                    // the coordinator to gather df for the expanded terms, which
-                    // cannot be decided here.
+                    // No coordinator, so the only df available is the
+                    // segment's own PHYSICAL dictionary count, which counts
+                    // superseded versions and tombstoned rows. Internally
+                    // consistent within one unit and not comparable between
+                    // units — which is why the resolved path above exists and
+                    // why this arm is reached only by direct `compile` calls.
                     //
                     // The clamp inside `idf` is load-bearing here, not
                     // cosmetic. A `num_docs` smaller than the local df — a
@@ -738,7 +890,7 @@ fn build<'a>(
             }
         }
         TextQuery::Not(inner) => {
-            let b = build(inner, src, stats, params, avgdl, truncated)?;
+            let b = build(inner, src, vis, stats, params, avgdl, truncated)?;
             let mut ex = Bitmap::new(n);
             if let Some(s) = b.scorer {
                 let mut s = if b.excluded.is_empty() {
@@ -766,7 +918,7 @@ fn build<'a>(
             // branch alone — the exact mis-answer the refusal exists to avoid.
             let mut saw_negation = false;
             for p in parts {
-                let b = build(p, src, stats, params, avgdl, truncated)?;
+                let b = build(p, src, vis, stats, params, avgdl, truncated)?;
                 match b.scorer {
                     Some(s) => {
                         // Scoped here, to this disjunct only.
@@ -827,7 +979,7 @@ fn build<'a>(
                 if p.is_empty() {
                     continue;
                 }
-                let b = build(p, src, stats, params, avgdl, truncated)?;
+                let b = build(p, src, vis, stats, params, avgdl, truncated)?;
                 excluded.or_inplace(&b.excluded);
                 match b.scorer {
                     Some(s) => kids.push(s),
@@ -986,11 +1138,19 @@ mod tests {
         (crate::text::postings::DictParts::parse(&dict).unwrap(), post, b.doc_lens.clone())
     }
 
+    /// Every document visible. These fixtures build a source directly, with no
+    /// delete log and no superseded versions, so a full bitmap is not a
+    /// convenience stand-in for visibility — it IS this source's visibility.
+    fn all_live(src: &TextSource<'_>) -> Bitmap {
+        Bitmap::all(src.num_docs() as usize)
+    }
+
     fn stats(src: &TextSource<'_>) -> GlobalStats {
         let mut s = GlobalStats {
             num_docs: src.num_docs() as u64,
             avg_doc_len: src.total_doc_len() as f64 / src.num_docs().max(1) as f64,
             doc_freq: Default::default(),
+            expansions: Default::default(),
             exact: true,
         };
         for (t, df) in src.all_terms() {
@@ -1009,7 +1169,7 @@ mod tests {
         filter: &Bitmap,
         k: usize,
     ) -> Vec<Hit> {
-        let c = compile(q, src, st, Bm25Params::default()).unwrap();
+        let c = compile(q, src, &all_live(src), st, Bm25Params::default()).unwrap();
         let excluded = c.excluded.clone();
         let mut out = Vec::new();
         if let Some(mut s) = c.scorer {
@@ -1048,7 +1208,7 @@ mod tests {
             let q = TextQuery::parse(qs, Analyzer::English).unwrap();
             for k in [1usize, 3, 10] {
                 let want = brute_force(&src, &st, &q, &all, k);
-                let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+                let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
                 let got = match c.scorer {
                     Some(s) => collect_top_k(s, &all, c.excluded.as_ref(), k),
                     None => Vec::new(),
@@ -1073,7 +1233,7 @@ mod tests {
             f.set(i);
         }
         let q = TextQuery::parse("quick brown fox vector graph", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let got = collect_top_k(c.scorer.unwrap(), &f, c.excluded.as_ref(), 10);
         assert!(!got.is_empty());
         assert!(got.iter().all(|h| h.ord % 2 == 1), "{got:?}");
@@ -1103,7 +1263,7 @@ mod tests {
         let src = TextSource::sealed(&dict, &post, &lens);
         let st = stats(&src);
         let q = TextQuery::parse("\"small world\"", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(2), c.excluded.as_ref(), 10);
         assert_eq!(got.iter().map(|h| h.ord).collect::<Vec<_>>(), vec![1]);
     }
@@ -1126,19 +1286,19 @@ mod tests {
         let st = stats(&src);
 
         let q = TextQuery::parse("(alpha -beta) OR gamma", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         // doc 2 is `gamma beta`: it matches the gamma branch, and the `-beta`
         // in the *other* branch has no business removing it.
         assert_eq!(evaluate_to_bitmap(c, 4).to_vec(), vec![1, 2, 3]);
 
         // A negation that genuinely applies to the whole query still does.
         let q = TextQuery::parse("(alpha OR gamma) AND -beta", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         assert_eq!(evaluate_to_bitmap(c, 4).to_vec(), vec![1, 3]);
 
         // And a negation as an OR branch is refused rather than mis-answered.
         let q = TextQuery::parse("alpha OR -beta", Analyzer::English).unwrap();
-        let e = match compile(&q, &src, &st, Bm25Params::default()) {
+        let e = match compile(&q, &src, &all_live(&src), &st, Bm25Params::default()) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a refusal"),
         };
@@ -1153,7 +1313,7 @@ mod tests {
         let src = TextSource::sealed(&dict, &post, &lens);
         let st = stats(&src);
         let q = TextQuery::parse("-quick", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         assert!(c.pure_negation);
         let bm = evaluate_to_bitmap(c, DOCS.len());
         assert!(!bm.get(0) && !bm.get(3) && !bm.get(7));
@@ -1171,12 +1331,12 @@ mod tests {
         let st = stats(&src);
         let q = TextQuery::parse("the AND fox", Analyzer::English).unwrap();
         assert_eq!(q, TextQuery::All(vec![TextQuery::Empty, TextQuery::Term("fox".into())]));
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let got = evaluate_to_bitmap(c, DOCS.len());
         assert_eq!(got.to_vec(), vec![0, 5]);
 
         let bare = TextQuery::parse("fox", Analyzer::English).unwrap();
-        let c = compile(&bare, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&bare, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         assert_eq!(got.to_vec(), evaluate_to_bitmap(c, DOCS.len()).to_vec());
     }
 
@@ -1190,17 +1350,64 @@ mod tests {
         let src = TextSource::sealed(&dict, &post, &lens);
         let st = stats(&src);
         let q = TextQuery::parse("quick OR -nonexistentterm", Analyzer::English).unwrap();
-        let e = match compile(&q, &src, &st, Bm25Params::default()) {
+        let e = match compile(&q, &src, &all_live(&src), &st, Bm25Params::default()) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a refusal"),
         };
         assert!(e.contains("negation cannot be one side of an OR"), "{e}");
     }
 
-    /// A prefix expansion has no global df, so it scores against the local one.
-    /// When `num_docs` is smaller than that df — a stale statistics cache — the
-    /// idf goes negative, and a non-positive `max_score` gives WAND's pivot loop
+    /// The expansion cap's boundary, on the arm that has to find it for
+    /// itself. `compile` here is called without a coordinator, so `build`
+    /// expands the prefix against this source's own dictionary — and that arm
+    /// used to ask for exactly `PREFIX_EXPANSION_LIMIT` terms and then report
+    /// truncation when it got them. After a `take(limit)` the answer can never
+    /// be longer than the limit, so the report was not a measurement: a
+    /// dictionary with exactly `cap` matching terms, which dropped nothing, is
+    /// indistinguishable by length from one the cap cut in half.
+    ///
+    /// Both legs are here because either alone passes under a plausible wrong
+    /// fix: reporting nothing ever passes the first, and the old code passes
+    /// the second.
+    #[test]
+    fn an_expansion_reports_truncation_only_when_a_term_was_actually_dropped() {
+        let expand = |vocab: usize| {
+            let mut b = InvertedBuilder::new();
+            for i in 0..vocab {
+                let mut toks = Vec::new();
+                Analyzer::English.analyze(&format!("a{i:05}"), 0, &mut toks);
+                b.add_doc(i as u32, &toks);
+            }
+            let (dict, post, _) = b.finish();
+            let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
+            let lens = b.doc_lens.clone();
+            let src = TextSource::sealed(&dict, &post, &lens);
+            let st = GlobalStats { num_docs: vocab as u64, avg_doc_len: 1.0, ..Default::default() };
+            let q = TextQuery::parse("a*", Analyzer::English).unwrap();
+            let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+            let truncated = c.prefix_truncated;
+            (truncated, evaluate_to_bitmap(c, vocab).popcount())
+        };
+
+        assert_eq!(
+            expand(PREFIX_EXPANSION_LIMIT),
+            (false, PREFIX_EXPANSION_LIMIT),
+            "exactly the cap: every term is in the answer, so there is nothing to warn about"
+        );
+        assert_eq!(
+            expand(PREFIX_EXPANSION_LIMIT + 1),
+            (true, PREFIX_EXPANSION_LIMIT),
+            "one term over: one document is unreachable, and the answer has to say so"
+        );
+    }
+
+    /// With no coordinator to ask, a prefix expansion has no global df, so it
+    /// scores against the unit's own. When `num_docs` is smaller than that df —
+    /// a stale statistics cache, or a segment newer than the gather — the idf
+    /// goes negative, and a non-positive `max_score` gives WAND's pivot loop
     /// nothing to pivot on: the query returns no rows rather than its matches.
+    /// The clamp inside `idf` is what stops that, and this is the test that
+    /// says so.
     #[test]
     fn a_stale_global_doc_count_does_not_make_a_prefix_query_return_nothing() {
         let (dict, post, lens) = build();
@@ -1211,16 +1418,17 @@ mod tests {
             num_docs: 1,
             avg_doc_len: src.total_doc_len() as f64 / src.num_docs().max(1) as f64,
             doc_freq: Default::default(),
+            expansions: Default::default(),
             exact: false,
         };
         let q = TextQuery::parse("graph*", Analyzer::English).unwrap();
         assert_eq!(q, TextQuery::Prefix("graph".into()));
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         assert_eq!(evaluate_to_bitmap(c, DOCS.len()).to_vec(), vec![1, 2, 6, 8]);
 
         // And the same query through the pruning collector, which is where the
         // threshold the pivot is compared against actually comes from.
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 4);
         assert_eq!(got.len(), 4);
         assert!(got.iter().all(|h| h.score > 0.0), "{got:?}");
@@ -1285,22 +1493,28 @@ mod tests {
         );
     }
 
-    /// A prefix expansion scores each expanded term against the *segment's*
-    /// df, because `TextQuery::leaf_terms` skips `Prefix` and the coordinator
-    /// therefore gathers no global df for any of them (§8.2). Reaching for the
-    /// global map anyway is not a smaller mistake than it sounds: every
+    /// With no coordinator to ask, a prefix expansion scores each expanded term
+    /// against the *segment's* own df — and reaching for the global map anyway
+    /// is not a smaller mistake than it sounds: with nothing gathered, every
     /// expanded term misses, every miss is `df == 0`, and `df == 0` is the
-    /// maximum idf — so the whole expansion is weighted identically and the
-    /// ranking within it collapses to term frequency.
+    /// maximum idf, so the whole expansion is weighted identically and the
+    /// ranking within it collapses to term frequency. (Through `Db::run_select`
+    /// the map is populated, every term is in it, and the global branch is the
+    /// right one — see `build`.)
     ///
     /// Here `alphabet` holds 1 document of 10 and `alpha` holds 8, so the one
     /// document with the rare term must beat the document that repeats the
     /// common one three times. Against a global df it loses to it instead.
     ///
-    /// This pins the *choice of df*, not the cross-shard consequence: prefix
-    /// scores still are not comparable between shards, and making them so
-    /// needs the coordinator to gather df for expanded terms — a separate
-    /// backlog item, not something this file can decide.
+    /// This pins the NO-COORDINATOR fallback path specifically. `compile` is
+    /// called here with an empty `GlobalStats`, which is what a direct caller
+    /// gets and what `build` documents as the fallback arm; a query through
+    /// `Db::run_select` arrives with `stats.expansions` already resolved and a
+    /// global `df` for each of its terms. Either way the *choice* is the same
+    /// and is what this test defends: each expanded term is weighted by its own
+    /// frequency, not collapsed into one synthetic term. Any design that scored
+    /// a whole expansion as a single term contradicts this test, and should be
+    /// rejected on its authority rather than by editing it.
     #[test]
     fn a_prefix_expansion_ranks_by_each_terms_own_document_frequency() {
         const DOCS: &[&str] = &[
@@ -1333,10 +1547,13 @@ mod tests {
             num_docs: DOCS.len() as u64,
             avg_doc_len: src.total_doc_len() as f64 / DOCS.len() as f64,
             doc_freq: Default::default(),
+            // No `expansions` either, which is what puts this test on the
+            // fallback arm — see the doc comment.
+            expansions: Default::default(),
             exact: false,
         };
         let q = TextQuery::parse("alpha*", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 2);
         assert_eq!(got[0].ord, 8, "expected the rare expanded term to win: {got:?}");
         assert_eq!(got[1].ord, 0, "{got:?}");
@@ -1348,7 +1565,7 @@ mod tests {
         let src = TextSource::sealed(&dict, &post, &lens);
         let st = stats(&src);
         let q = TextQuery::parse("quick AND -lazy", Analyzer::English).unwrap();
-        let c = compile(&q, &src, &st, Bm25Params::default()).unwrap();
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         let bm = evaluate_to_bitmap(c, DOCS.len());
         // docs 0 and 3 have both quick and lazy; 7 has quick alone.
         assert_eq!(bm.to_vec(), vec![7]);

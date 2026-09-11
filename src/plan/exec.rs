@@ -35,13 +35,13 @@ use crate::bitmap::Bitmap;
 use crate::catalog::{Collection, Metric};
 use crate::column::CmpOp;
 use crate::error::{Error, Result};
-use crate::plan::explain::{Explain, ShardExplain, TextExplain, UnitExplain};
+use crate::plan::explain::{Explain, ShardExplain, TextExplain, TextStrategy, UnitExplain};
 use crate::plan::fusion::{fuse, Candidate, Direction, Fused, SourceList};
 use crate::shard::{partition_prefix, Searchable, Shard};
 use crate::sql::ast::*;
 use crate::text::analyzer::Analyzer;
 use crate::text::query::TextQuery;
-use crate::text::scorer::{self, Bm25Params, GlobalStats};
+use crate::text::scorer::{self, Bm25Params, GlobalStats, PrefixUse};
 use crate::time::Timestamp;
 use crate::value::{compare_total, Value};
 use crate::vector::{distance, SearchOpts, Strategy};
@@ -96,14 +96,98 @@ pub struct Row {
     pub distance: Option<f32>,
 }
 
+/// `#[non_exhaustive]` because this grew `truncated_prefixes` in a breaking
+/// release, and the next thing a query needs to tell its caller should not
+/// need another one.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct QueryResult {
     pub rows: Vec<Row>,
     pub explain: Option<Explain>,
     /// Tablets that did not answer. Non-empty only under `WITH partial_results`
     /// (§8.4).
     pub missing: Vec<String>,
+    /// Prefix leaves whose expansion hit
+    /// [`PREFIX_EXPANSION_LIMIT`](crate::text::scorer::PREFIX_EXPANSION_LIMIT),
+    /// one line each, naming the path and the prefix.
+    ///
+    /// The sibling of `missing`, and here for the same reason: both say the
+    /// answer is short, and an answer that is short without saying so is the
+    /// failure worth engineering against. `missing` is opt-in — a query only
+    /// gets a partial answer from a tablet if it asked for one — while this is
+    /// not, because nothing about `foo*` asks for a cap; it simply arrives.
+    ///
+    /// It is deliberately NOT confined to `EXPLAIN ANALYZE`, which is where
+    /// truncation used to be reported and only on the ranking path. A
+    /// `WHERE text_match(body, 'a*')` predicate is the commonest shape a wide
+    /// prefix takes, it returns whatever fraction of the matching documents the
+    /// cap left, and before this it said nothing on any path.
+    pub truncated_prefixes: Vec<String>,
     pub next_cursor: Option<String>,
+}
+
+/// The prefixes this query's statistics say were cut, rendered for a human.
+///
+/// Read back off `GlobalStats` rather than threaded down from the coordinator
+/// as a separate argument: the expansion and the verdict on it are one fact
+/// (see [`Expansion`](crate::text::scorer::Expansion)), the stats map already
+/// carries exactly this statement's paths and prefixes, and a second channel
+/// would be a second thing to keep in step with the first.
+///
+/// The count is the terms KEPT, not the terms dropped. How many were dropped is
+/// not known and deliberately not measured — see `Db::run_select`, where the
+/// enumeration is bounded on purpose.
+fn truncated_prefixes(stats: &BTreeMap<String, GlobalStats>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, g) in stats {
+        for (p, e) in &g.expansions {
+            if !e.truncated {
+                continue;
+            }
+            // Rendered as it was WRITTEN, sign and all. A report that prints
+            // `a*` for a leaf the caller spelled `-a*` cannot be acted on:
+            // both spellings can appear in one statement, and they are cut for
+            // different reasons and at different costs.
+            //
+            // EVERY spelling, which is why this is a match and not a boolean.
+            // One term list serves both polarities, so a statement that writes
+            // `a*` in one clause and `-a*` in another gets ONE line here, and
+            // that line has to name both — printing only `'a*'` beside the
+            // combined consequence below left the reader with a message that
+            // says rows were wrongly KEPT by a leaf whose spelling cannot keep
+            // any, and no way to find the clause that did.
+            let leaf = match (e.used.positive, e.used.negated) {
+                (true, true) => format!("'{p}*' and '-{p}*'"),
+                (false, true) => format!("'-{p}*'"),
+                // `(false, false)` is unreachable — `required_prefixes` sets
+                // one flag per occurrence and drops empty entries — and it
+                // renders as the positive spelling, which is what a leaf with
+                // no recorded polarity was written as.
+                _ => format!("'{p}*'"),
+            };
+            // And the CONSEQUENCE, which is the half that was inverted.
+            // Truncating an exclusion set does not lose rows — it fails to
+            // remove them, so the answer has extra ones. Saying "documents are
+            // missing" there is not a vague warning, it is the opposite of
+            // what happened.
+            let consequence = match (e.used.positive, e.used.negated) {
+                (_, false) => "so documents are missing from this answer",
+                (false, true) => {
+                    "so documents this query should have excluded are still in this answer"
+                }
+                (true, true) => {
+                    "so documents are missing from this answer AND documents it should have \
+                     excluded are still in it"
+                }
+            };
+            out.push(format!(
+                "text_match({path}, {leaf}) expanded to {} terms and was cut there: the \
+                 collection matches more, {consequence}",
+                e.terms.len()
+            ));
+        }
+    }
+    out
 }
 
 /// A candidate-generating source, resolved against the catalog.
@@ -163,6 +247,56 @@ pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<S
         v.sort();
         v.dedup();
     }
+    out
+}
+
+/// Prefixes this statement needs the coordinator to expand, per path.
+///
+/// The sibling of [`required_terms`], walking the same two sites, and it exists
+/// for the same reason: a prefix resolved per searchable unit is resolved
+/// differently in each of them. `TextQuery::leaf_prefixes` explains why its
+/// `Not` arm recurses where `leaf_terms`' does not.
+///
+/// Empty entries are dropped so that a statement with no prefix in it does no
+/// expansion work at all — the coordinator's loop over this map is then simply
+/// not entered.
+///
+/// Each prefix is carried once per path with a [`PrefixUse`] recording every
+/// polarity the statement used it in. One term list serves both — `a*` and
+/// `-a*` name the same terms — but they differ in what a CUT costs, so the
+/// polarity has to survive the deduplication that merges them.
+pub fn required_prefixes(
+    coll: &Collection,
+    sel: &Select,
+) -> BTreeMap<String, BTreeMap<String, PrefixUse>> {
+    let mut out: BTreeMap<String, BTreeMap<String, PrefixUse>> = BTreeMap::new();
+    let mut add = |path: &str, q: &str| {
+        let an = Analyzer::parse(coll.analyzer_for(path));
+        if let Ok(tq) = TextQuery::parse(q, an) {
+            let mut ps = Vec::new();
+            tq.leaf_prefixes(&mut ps);
+            let e = out.entry(path.to_string()).or_default();
+            for (p, negated) in ps {
+                let u = e.entry(p).or_default();
+                if negated {
+                    u.negated = true;
+                } else {
+                    u.positive = true;
+                }
+            }
+        }
+    };
+    if let Some(e) = &sel.predicate {
+        walk_text_match(e, &mut |p, q| add(p, q));
+    }
+    if let Some(OrderBy::Hybrid(h)) = &sel.order {
+        for s in &h.sources {
+            if let HybridSource::Text { path, query } = s {
+                add(path, query);
+            }
+        }
+    }
+    out.retain(|_, v| !v.is_empty());
     out
 }
 
@@ -263,10 +397,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     if sources.is_empty() {
         let out = scan(&input, &prefix, k, &mut ex, deadline)?;
         ex.total_micros = t0.elapsed().as_micros();
+        let cut = truncated_prefixes(input.stats);
+        ex.notes.extend(cut.iter().cloned());
         return Ok(QueryResult {
             rows: out.0,
             explain: if input.analyze { Some(ex) } else { None },
             missing: out.1,
+            truncated_prefixes: cut,
             next_cursor: None,
         });
     }
@@ -331,7 +468,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             };
             filter.and_inplace(&vis);
             if let Some(e) = &sel.predicate {
-                let bm = eval_expr(unit, e, &vis, &filter, input.stats, &mut ux)?;
+                let bm = eval_expr(unit, e, &vis, &filter, input.stats, input.analyze, &mut ux)?;
                 filter.and_inplace(&bm);
             }
             ux.survivors = filter.popcount();
@@ -339,7 +476,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
 
             if ux.survivors > 0 {
                 for (i, sp) in sources.iter().enumerate() {
-                    let got = run_source(unit, sp, &filter, k_prime, sel, input.stats, &mut ux)?;
+                    let got = run_source(unit, sp, &vis, &filter, k_prime, &input, &mut ux)?;
                     for (ord, raw) in got {
                         if let Some(key) = unit.key(ord) {
                             shard_heaps[i].push(Candidate { key: key.to_string(), raw_score: raw });
@@ -470,10 +607,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         .map(|r| encode_cursor(last_sort.unwrap_or(0.0), cursor_depth + rows.len(), &r.key));
     ex.missing = missing.clone();
     ex.total_micros = t0.elapsed().as_micros();
+    let cut = truncated_prefixes(input.stats);
+    ex.notes.extend(cut.iter().cloned());
     Ok(QueryResult {
         rows,
         explain: if input.analyze { Some(ex) } else { None },
         missing,
+        truncated_prefixes: cut,
         next_cursor,
     })
 }
@@ -609,6 +749,7 @@ fn eval_expr(
     vis: &Bitmap,
     candidates: &Bitmap,
     stats: &BTreeMap<String, GlobalStats>,
+    analyze: bool,
     ux: &mut UnitExplain,
 ) -> Result<Bitmap> {
     let n = unit.num_docs();
@@ -625,7 +766,7 @@ fn eval_expr(
                 if acc.is_empty() {
                     break;
                 }
-                let bm = eval_expr(unit, p, vis, &acc, stats, ux)?;
+                let bm = eval_expr(unit, p, vis, &acc, stats, analyze, ux)?;
                 acc.and_inplace(&bm);
             }
             acc
@@ -633,7 +774,7 @@ fn eval_expr(
         Expr::Or(parts) => {
             let mut acc = Bitmap::new(n);
             for p in parts {
-                acc.or_inplace(&eval_expr(unit, p, vis, candidates, stats, ux)?);
+                acc.or_inplace(&eval_expr(unit, p, vis, candidates, stats, analyze, ux)?);
             }
             acc
         }
@@ -644,8 +785,8 @@ fn eval_expr(
             // Complementing over visibility instead would select exactly those
             // rows, and would make `NOT (a = b)` disagree with `a <> b`.
             let all = Bitmap::all(n);
-            let t = eval_expr(unit, inner, vis, &all, stats, ux)?;
-            let mut acc = eval_defined(unit, inner, vis, &all, stats, ux)?;
+            let t = eval_expr(unit, inner, vis, &all, stats, analyze, ux)?;
+            let mut acc = eval_defined(unit, inner, vis, &all, stats, analyze, ux)?;
             acc.andnot_inplace(&t);
             acc
         }
@@ -672,9 +813,37 @@ fn eval_expr(
             let tq = TextQuery::parse(query, an)?;
             let empty = GlobalStats::default();
             let st = stats.get(path).unwrap_or(&empty);
-            let c = scorer::compile(&tq, &src, st, Bm25Params::default())?;
-            ux.access_paths.push(format!("text_match({path}, …) [filter]"));
-            scorer::evaluate_to_bitmap(c, n)
+            let c = scorer::compile(&tq, &src, vis, st, Bm25Params::default())?;
+            let label = format!("text_match({path}, …) [filter]");
+            ux.access_paths.push(label.clone());
+            // The flag used to stop here, which made this — the commonest
+            // shape a wide prefix takes — the one path that truncated with no
+            // signal anywhere. The coordinator's verdict now reaches
+            // `QueryResult` whatever the query shape, so what this adds is the
+            // per-UNIT line: it is the only thing that can report the fallback
+            // arm of `scorer::build`, where each unit expands the prefix
+            // against its own dictionary and cuts it at its own place.
+            let prefix_truncated = c.prefix_truncated;
+            let bm = scorer::evaluate_to_bitmap(c, n);
+            // Gated: the whole `UnitExplain` is dropped unless `analyze`, and
+            // this line costs a `popcount` over the unit bitmap. Paying that
+            // on every unit of every query for a plan nobody asked for is the
+            // kind of cost that only ever shows up in someone else's p99.
+            if analyze {
+                ux.text.push(TextExplain {
+                    source: label,
+                    // A filter contributes no rank, so it has no scored terms
+                    // to list; what it has is survivors — which is why it also
+                    // carries its own strategy, so the renderer does not
+                    // credit it with machinery it never entered.
+                    strategy: TextStrategy::Filter,
+                    terms: Vec::new(),
+                    matched: bm.popcount(),
+                    prefix_truncated,
+                    stats_exact: st.exact,
+                });
+            }
+            bm
         }
     })
 }
@@ -685,7 +854,8 @@ fn eval_expr(
 /// conjunct is defined and false, or both are defined — so the safe, and
 /// standard, rule is that a compound is defined where all of its parts are.
 ///
-/// `vis`, `stats` and `ux` are threaded through unchanged today because the
+/// `vis`, `stats`, `analyze` and `ux` are threaded through unchanged today
+/// because the
 /// leaf cases that will use them — a text leaf that needs global statistics, a
 /// per-leaf explain line — are the natural next thing to add here, and a
 /// signature that differs from `eval_expr` invites the two walkers to drift.
@@ -696,6 +866,7 @@ fn eval_defined(
     vis: &Bitmap,
     candidates: &Bitmap,
     stats: &BTreeMap<String, GlobalStats>,
+    analyze: bool,
     ux: &mut UnitExplain,
 ) -> Result<Bitmap> {
     let n = unit.num_docs();
@@ -704,11 +875,11 @@ fn eval_defined(
         Expr::And(parts) | Expr::Or(parts) => {
             let mut acc = Bitmap::all(n);
             for p in parts {
-                acc.and_inplace(&eval_defined(unit, p, vis, candidates, stats, ux)?);
+                acc.and_inplace(&eval_defined(unit, p, vis, candidates, stats, analyze, ux)?);
             }
             acc
         }
-        Expr::Not(inner) => eval_defined(unit, inner, vis, candidates, stats, ux)?,
+        Expr::Not(inner) => eval_defined(unit, inner, vis, candidates, stats, analyze, ux)?,
         Expr::Compare { path, op, lit } => unit.comparable(path, *op, lit, candidates)?,
         // A text match is two-valued: a document either matches or it does not.
         Expr::TextMatch { .. } => Bitmap::all(n),
@@ -742,30 +913,37 @@ fn short(v: &Value) -> String {
     }
 }
 
+/// `input` rather than the two fields it is read for: this gained `vis` — the
+/// unit's visibility, which the text arm needs so a prefix it has to expand for
+/// itself is masked by the same predicate the coordinator uses — and taking
+/// `select` and `stats` from the struct that already carries both keeps the
+/// signature at a size a reader can hold.
 fn run_source(
     unit: &Searchable<'_>,
     sp: &SourcePlan,
+    vis: &Bitmap,
     filter: &Bitmap,
     k_prime: usize,
-    sel: &Select,
-    stats: &BTreeMap<String, GlobalStats>,
+    input: &ExecInput<'_>,
     ux: &mut UnitExplain,
 ) -> Result<Vec<(u32, f32)>> {
+    let (sel, stats) = (input.select, input.stats);
     match sp {
         SourcePlan::Text { path, query, terms, name, .. } => {
             let Some(handle) = unit.text_handle(path)? else { return Ok(Vec::new()) };
             let Some(src) = handle.source(path) else { return Ok(Vec::new()) };
             let empty = GlobalStats::default();
             let st = stats.get(path).unwrap_or(&empty);
-            let c = scorer::compile(query, &src, st, Bm25Params::default())?;
+            let c = scorer::compile(query, &src, vis, st, Bm25Params::default())?;
             let hits = match c.scorer {
                 Some(s) => scorer::collect_top_k(s, filter, c.excluded.as_ref(), k_prime),
                 None => Vec::new(),
             };
             ux.text.push(TextExplain {
                 source: name.clone(),
+                strategy: TextStrategy::Wand,
                 terms: terms.clone(),
-                candidates: hits.len(),
+                matched: hits.len(),
                 prefix_truncated: c.prefix_truncated,
                 stats_exact: st.exact,
             });
@@ -845,7 +1023,7 @@ fn scan(
             };
             filter.and_inplace(&vis);
             if let Some(e) = &sel.predicate {
-                let bm = eval_expr(unit, e, &vis, &filter, input.stats, &mut ux)?;
+                let bm = eval_expr(unit, e, &vis, &filter, input.stats, input.analyze, &mut ux)?;
                 filter.and_inplace(&bm);
             }
             ux.survivors = filter.popcount();
@@ -998,6 +1176,58 @@ mod tests {
 
     fn doc(key: &str, json: &str) -> (String, Value) {
         (key.to_string(), crate::json::parse(json).unwrap())
+    }
+
+    /// One cut leaf on `body`, used in the polarities the flags describe.
+    fn cut(positive: bool, negated: bool) -> BTreeMap<String, GlobalStats> {
+        let e = crate::text::scorer::Expansion {
+            terms: vec!["a1".to_string(), "a2".to_string()],
+            truncated: true,
+            used: PrefixUse { positive, negated },
+        };
+        let g = GlobalStats {
+            expansions: BTreeMap::from([("a".to_string(), e)]),
+            ..Default::default()
+        };
+        BTreeMap::from([("body".to_string(), g)])
+    }
+
+    #[test]
+    fn a_cut_leaf_is_reported_in_every_polarity_the_statement_spelled_it_in() {
+        // The message is the only thing a caller has to find the clause that
+        // was cut, so the spelling in it has to be a spelling they wrote.
+        let one = |st| {
+            let mut v = truncated_prefixes(&st);
+            assert_eq!(v.len(), 1, "{v:?}");
+            v.pop().unwrap()
+        };
+
+        let m = one(cut(true, false));
+        assert!(m.contains("text_match(body, 'a*')"), "{m}");
+        assert!(m.contains("documents are missing from this answer"), "{m}");
+
+        // A cut EXCLUSION set keeps rows rather than losing them, so both
+        // halves of this line differ from the one above.
+        let m = one(cut(false, true));
+        assert!(m.contains("text_match(body, '-a*')"), "{m}");
+        assert!(!m.contains("'a*'"), "the sign is not optional: {m}");
+        assert!(m.contains("should have excluded are still in this answer"), "{m}");
+
+        // And the mixed statement — `a*` in one clause, `-a*` in another —
+        // which is ONE expansion and therefore one line. It used to be printed
+        // with the positive spelling alone beside the combined consequence, so
+        // it told the reader that `'a*'` had kept rows it should have
+        // excluded: a claim about a clause that does not exist, while the
+        // clause that really did keep them went unnamed.
+        let m = one(cut(true, true));
+        assert!(m.contains("text_match(body, 'a*' and '-a*')"), "both spellings: {m}");
+        assert!(
+            m.contains(
+                "documents are missing from this answer AND documents it should have \
+                        excluded are still in it"
+            ),
+            "{m}"
+        );
     }
 
     /// `k'` used to come from LIMIT alone, so every stage below the gather

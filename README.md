@@ -9,7 +9,7 @@ libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
 graph, SQL parser, JSON parser and binary codecs are all in the tree.
 
 ```
-cargo test --release                     # 380 tests (381 in a debug build:
+cargo test --release                     # 399 tests (400 in a debug build:
                                          # one pins a debug-only precondition)
 cargo run --release -- --demo            # guided tour over a small corpus
 cargo run --release -- --dir ./data      # persistent REPL
@@ -333,9 +333,114 @@ cross the same refresh points after the same writes and measure the same corpus
 there. Every triple the default path returns is a set of live sums at ONE
 instant, at most that counter's interval behind the query: stale, never mixed. They used to be
 counted over physical rows instead, and physical rows move with flush and
-compaction timing, so they moved with the shard count. What remains outside the
-gather on *both* paths is prefix expansion, whose document frequencies still
-come from a segment's own dictionary.
+compaction timing, so they moved with the shard count. Prefix expansion is
+inside the gather too: the coordinator resolves each `foo*` against every unit
+of every shard, takes the lexicographically first `PREFIX_EXPANSION_LIMIT` terms
+of that union, and gathers a global `df` for each of them, so an expanded term is
+weighted by the collection rather than by whichever segment happened to score it.
+The enumeration is masked by the same snapshot the gather uses, so the terms a
+prefix names are the first `PREFIX_EXPANSION_LIMIT` of the collection's LIVE
+matching vocabulary. That last word is load-bearing and it cost a measurement
+to learn: a term whose every posting is dead contributes no rows, but under a
+cap it DISPLACES a term that would have. Enumerating the physical dictionary
+instead, a collection of 2000 documents with 500 of them rewritten answered the
+same `a*` with 12 rows at one shard and 512 at four, and a smaller one answered
+0 rows before a `COMPACT` and 400 after — which is the flush and compaction
+schedule back in the answer through the one door the cap leaves open. The mask
+has to be applied *inside* the walk, so that the cap counts live terms and a run
+of dead ones is stepped over rather than paid for; filtering a fixed-size
+physical window afterwards was measured to recover 213 of 300 matching documents
+on a smaller fixture, and to still move with the compaction schedule. A wide
+prefix is still a partial answer — the cap binds — but the partiality is now a
+property of the collection instead of the flush and compaction schedule.
+
+The mask is not a tax. Stepping over a dead term costs about a microsecond,
+measured as the slope between a 10000-term and a 50000-term dead run in front of
+the same 20000 live terms (15.6 ms and 53.1 ms, best of five), against 237–468 µs
+to gather one term's frequency — so skipping a dead term during enumeration is
+some 250x cheaper than over-enumerating one at the coordinator. A unit with no
+garbage takes a `popcount` and then the identical physical walk, and a unit that
+is *entirely* garbage answers in constant time. Where the corpus is
+update-heavy the mask *deletes* work rather than adding it: 200 dead terms of
+500 dead postings each went from 745 ms returning 312 rows to 19 ms returning
+all 512, because the dead terms never reach the frequency gather at all.
+
+**A wide `foo*` is a partial answer, and pinning it made the answer smaller.**
+A prefix expands to at most `PREFIX_EXPANSION_LIMIT` (512) dictionary terms.
+That cap used to be applied by each searchable unit to its own dictionary, so
+the terms a query named were the union of every unit's own lexicographic cut —
+more units meant a larger union. Measured on 6000 documents each holding two
+terms drawn from a 4000-term vocabulary, so that all 6000 match — the fixture
+`tests/integration.rs::a_prefix_query_finds_the_same_documents_at_every_shard_count`
+builds, so these numbers are re-runnable rather than quoted from a harness that
+is not in the crate: `SELECT id FROM items WHERE text_match(body, 'a*')`
+returned **2473 rows at one shard, 2523 at three and 2611 at six**, silently.
+The coordinator now resolves the prefix once and caps the union, and the same
+query returns **1511 rows at all three** (and its negation the exact
+complement, 4489). That is deterministic, and it is *lower recall than the
+largest of the answers it replaces*. The trade is deliberate: an answer that depends on
+when the last compaction ran cannot be reasoned about at all, while a smaller
+answer that is the same every time — and that says it is smaller — can.
+
+The shape to plan against is `rows ≈ n · (1 − (1 − cap/V)^t)`, for `n`
+documents over a matching vocabulary of `V` terms with `t` of them per
+document. The cap only bites when `V` is large relative to it: on a design-pass fixture
+of the same shape at 700 distinct terms, the corpus goes from 5637/5782/5783
+rows to 5582 everywhere, a 1% change. At 4000 it is the difference above. (That
+sweep and the cap dial below were measured on a separate harness with different
+unit counts, so their absolute row counts do not line up with the in-tree
+test's; what transfers is the shape.) The cut is lexicographic, so `a*`
+keeps the terms nearest the start of the alphabet — arbitrary, but stable, and
+stable is the property that was missing. (Choosing the cap's members by global
+document frequency would cover more documents and is equally shard-count
+independent, but it needs a `df` for the whole union first, whose cost is
+unbounded in the vocabulary. Rejected, not deferred.)
+
+Raising the cap is a real dial with a real price, not a free recall win. At a
+pinned cap of 2048 on a 20000-document fixture, coverage of that 4000-term
+vocabulary rises from 1499 to 4705 of 6000 (78%) while `a*` goes from 171 ms to
+around 1200 ms ranked and 1000 ms filtered — roughly 7x, because the work is one
+cursor per resolved term in every unit and that grows with the cap directly
+while recall improves sub-linearly.
+
+**Every query that was cut says so, whether or not it asked.** Truncation is
+reported on `QueryResult::truncated_prefixes` — as `truncated_prefixes` in the
+HTTP and `--json` responses, and as a `TRUNCATED —` line in the shells — for
+ranked queries and `WHERE text_match(...)` predicates alike. It used to be reachable only through
+`EXPLAIN ANALYZE`, and only on the ranking path: the filter path, which is the
+commonest shape a wide prefix takes, discarded the flag entirely. What is
+reported is the number of terms *kept*, never the number dropped: counting those
+means enumerating the whole matching vocabulary, which is the cost the cap
+exists to refuse.
+
+The message carries the leaf's polarity, because cutting the two costs opposite
+things. A cut `a*` loses rows. A cut `-a*` is a short *exclusion* set, so it
+fails to remove rows and the answer has extra ones — and the leaf is printed as
+it was written, sign and all, so a statement holding both can be told apart. A
+statement spelling one prefix in both polarities gets one line naming both, and
+both consequences, because it is one expansion doing both kinds of damage.
+
+**A `DELETE` whose predicate was cut is refused, and nothing is deleted.** A
+cut `SELECT` is recoverable — widen the prefix, run it again, the rows are
+still there. A cut `DELETE` is not, and in the negated shape it is not even
+short: measured on 1000 documents each holding `zed a#####`, every one of which
+`zed -a*` excludes, so the correct answer is zero deletions, a cut exclusion
+set covering 512 of the terms made the other 488 deletable and they went. The
+direction of the damage cannot be read off the leaf either — SQL's `NOT` wraps
+the whole `text_match` call and inverts it, and one statement may spell both
+polarities — so the refusal covers both shapes and names the leaf that was cut.
+Delete by key, or narrow the prefix until it expands to at most 512 terms and
+delete the pieces; that loop deletes exactly what each piece names.
+
+One statement may name at most eight *distinct* prefixes, counted per indexed
+path. Each distinct one costs a dictionary walk in every unit of every shard
+plus up to 512 gathered frequencies, and nothing in the `text_match` grammar
+bounds how many a query string holds: 24 of them measured at 1.2 s and gathered
+12288 terms into a 4096-entry statistics cache, which then evicted its own
+entries so the identical statement never warmed. Repeats of one prefix on one
+path are expanded once and cost nothing more. Over the bound the statement is
+refused rather than quietly trimmed — a silent aggregate cap would be the same
+failure one level up.
 
 **`search_after` over an approximate index is not cheaper than `OFFSET`.** A
 graph search has no resume primitive: an HNSW heap cannot restart from a
@@ -781,7 +886,10 @@ guarantee:
 | recall@10 ≥ 0.95 under sustained deletes | `recall_at_10_holds_under_sustained_deletes` (40% deleted, before / after / post-compaction) |
 | exact mode bit-identical across shard counts | `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards), `exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes` (linear fusion, so a length norm can reach the assertion) |
 | exact global statistics are a function of the live corpus | `exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `shard::tests::the_length_numerator_matches_a_brute_force_fold_at_every_snapshot` |
-| a freshly refreshed default gather matches `WITH (exact_scoring)` for Term and Phrase queries, and the default triple is identical at every shard count fresh or stale | `default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`, `engine::tests::a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers` (not prefix queries, which reach the gather on neither path — `engine::tests::a_prefix_only_query_still_gets_real_globals` covers what they do get) |
+| a freshly refreshed default gather matches `WITH (exact_scoring)` for Term, Phrase and Prefix queries, and the default triple is identical at every shard count fresh or stale | `default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`, `engine::tests::a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers`, `engine::tests::a_prefix_query_in_a_fresh_epoch_ranks_like_exact_scoring` (the Prefix leg: the only test that runs both arms and compares them), `engine::tests::a_prefix_only_query_still_gets_real_globals` (a prefix query's globals, which is a different claim) |
+| a prefix query means the same thing at every shard count | `a_prefix_query_ranks_the_same_at_every_shard_count` (the document frequencies), `a_prefix_query_finds_the_same_documents_at_every_shard_count` (the expansion set itself, positive and negated, with no scoring in it), `engine::tests::a_prefix_resolves_to_the_same_terms_at_every_shard_count` (the cap applies to the union), `engine::tests::a_prefix_term_living_in_one_shard_is_weighted_by_the_whole_collection` |
+| a prefix names the LIVE vocabulary, so neither a dead term nor the compaction schedule can displace a live one out of the cap | `a_prefix_query_names_the_live_vocabulary_not_the_physical_one` (absolute answers, before and after `COMPACT`, at 1/4 and 1/6 shards), `engine::tests::no_term_in_a_resolved_expansion_comes_back_with_a_zero_frequency`, `engine::tests::a_prefix_expansion_over_an_unflushed_memtable_takes_the_first_terms` |
+| a truncated prefix expansion is reported, on every query shape and without `EXPLAIN ANALYZE` | `engine::tests::a_truncated_prefix_says_so_on_a_plain_query_of_either_shape`, `engine::tests::an_expansion_of_exactly_the_cap_dropped_nothing_and_must_not_say_it_did` (the boundary), `text::scorer::tests::an_expansion_reports_truncation_only_when_a_term_was_actually_dropped` (the no-coordinator arm), `a_truncated_exclusion_says_rows_were_kept_not_that_rows_are_missing` (the negated leaf, whose consequence is the opposite one), `plan::exec::tests::a_cut_leaf_is_reported_in_every_polarity_the_statement_spelled_it_in` (one statement spelling both, which is one expansion and one line naming both), `celastro-cli::tests::a_cut_prefix_reaches_the_json_the_way_a_missing_tablet_does` and `serve::tests::a_document_containing_a_quote_cannot_break_out_of_the_json_response` (the wire, both shells), `engine::tests::a_statement_carrying_more_prefix_leaves_than_the_budget_is_refused` (and that the bound counts DISTINCT prefixes, which is what its refusal now says), `engine::tests::a_delete_whose_predicate_was_cut_is_refused_rather_than_deleting_what_it_did_not_name` (both shapes: a cut DELETE writes nothing) |
 | the cached statistics are live sums over every unit and shard, at one instant: stale, never mixed | `engine::tests::the_cached_statistics_are_live_sums_over_every_unit_of_every_shard`, `engine::tests::a_term_filled_mid_epoch_is_measured_against_the_document_count_it_will_be_divided_by` (inserts), `engine::tests::a_frequency_and_the_count_it_is_divided_by_are_never_from_different_instants` (deletes, where `doc_freq ≤ num_docs` is what a mixed instant breaks) |
 | the entry cap bounds what is retained, never what is answered | `engine::tests::the_per_term_statistics_stay_bounded_at_the_entry_cap`, `engine::tests::the_entry_cap_survives_an_epoch_rollover` |
 | a stale statistic is not a shard-dependent one | `engine::tests::the_statistics_refresh_at_the_same_write_counts_whatever_the_shard_count`, `engine::tests::the_epoch_clock_keeps_running_when_every_query_fills_a_new_term` |
