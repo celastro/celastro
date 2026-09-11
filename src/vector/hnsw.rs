@@ -62,6 +62,24 @@ impl PartialOrd for Cand {
     }
 }
 
+/// A distance as `Cand::cmp` orders it.
+///
+/// Every threshold read out of a result heap has to be read through this. The
+/// heap's order is total because `Cand::cmp` maps NaN to `+INFINITY`, but the
+/// thresholds used to be the raw `w.d`: once a NaN-distance candidate reached
+/// the top of the heap, `d < worst` was false for every later candidate, so
+/// admission stopped, and `c.d > worst` was false too, so the early stop never
+/// fired and the traversal ran to exhaustion. A NaN is the worst possible
+/// distance in the heap and has to be the worst possible threshold as well.
+#[inline]
+fn ord_d(d: f32) -> f32 {
+    if d.is_nan() {
+        f32::INFINITY
+    } else {
+        d
+    }
+}
+
 /// Min-heap ordering by distance.
 #[derive(Clone, Copy, PartialEq)]
 struct RevCand(Cand);
@@ -331,7 +349,7 @@ impl Hnsw {
         }
         while let Some(RevCand(c)) = cands.pop() {
             if let Some(worst) = results.peek() {
-                if c.d > worst.d && results.len() >= ef {
+                if ord_d(c.d) > ord_d(worst.d) && results.len() >= ef {
                     break;
                 }
             }
@@ -340,8 +358,8 @@ impl Hnsw {
                     continue;
                 }
                 let d = d_to(n);
-                let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
-                if results.len() < ef || d < worst {
+                let worst = results.peek().map(|w| ord_d(w.d)).unwrap_or(f32::INFINITY);
+                if results.len() < ef || ord_d(d) < worst {
                     let nc = Cand { d, id: n };
                     cands.push(RevCand(nc));
                     results.push(nc);
@@ -417,10 +435,16 @@ impl Hnsw {
     ///
     /// Filter-aware traversal cannot stop until the result heap holds `ef`
     /// *admitted* nodes, so at selectivity `s` it visits about `ef / s` nodes,
-    /// and as `s` approaches zero that is a full scan of the segment. The
-    /// budget is what keeps a pathological filter from turning one query into
-    /// that scan; when it binds, the answer degrades to the best the budget
-    /// found, which is the trade `SearchOpts::max_amplification` describes.
+    /// and as `s` approaches zero that is a full scan of the segment. This
+    /// budget caps that, and when it binds the answer degrades to the best the
+    /// budget found.
+    ///
+    /// Nothing on the query path passes one: `VectorStore::graph_search` calls
+    /// [`Hnsw::search`], and `SearchOpts::max_amplification` bounds `ef` on the
+    /// post-filter arm rather than bounding visits here. Wiring this in would
+    /// change which documents a filtered search returns, so it is a decision
+    /// for a caller that would rather have a short answer than an unbounded
+    /// scan, not a silent default.
     pub fn search_budgeted(
         &self,
         ef: usize,
@@ -457,8 +481,8 @@ impl Hnsw {
         // heap held, and that is the honest answer.
         let ef = ef.max(1);
         'traverse: while let Some(RevCand(c)) = cands.pop() {
-            let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
-            if results.len() >= ef && c.d > worst {
+            let worst = results.peek().map(|w| ord_d(w.d)).unwrap_or(f32::INFINITY);
+            if results.len() >= ef && ord_d(c.d) > worst {
                 break;
             }
             for &n in self.neighbors(0, c.id) {
@@ -470,13 +494,13 @@ impl Hnsw {
                 }
                 visits += 1;
                 let d = d_to(n);
-                let worst = results.peek().map(|w| w.d).unwrap_or(f32::INFINITY);
+                let worst = results.peek().map(|w| ord_d(w.d)).unwrap_or(f32::INFINITY);
                 // Expansion is unconditional; admission is not. This is the
                 // whole of the ACORN idea.
-                if results.len() < ef || d < worst {
+                if results.len() < ef || ord_d(d) < worst {
                     cands.push(RevCand(Cand { d, id: n }));
                 }
-                if admitted(n) && (results.len() < ef || d < worst) {
+                if admitted(n) && (results.len() < ef || ord_d(d) < worst) {
                     results.push(Cand { d, id: n });
                     if results.len() > ef {
                         results.pop();
@@ -901,6 +925,82 @@ mod tests {
         assert!(unbudgeted > n / 2, "unbudgeted traversal should scan the segment: {unbudgeted}");
         assert!(budgeted < n / 4, "the budget should have cut the traversal short: {budgeted}");
         assert!(capped.len() <= full.len());
+    }
+
+    /// A NaN distance used to freeze the result heap: `Cand::cmp` sorts it to
+    /// the top as the worst candidate, and the raw `worst` read off that top
+    /// made both `d < worst` and `c.d > worst` false, so nothing was admitted
+    /// after it and the early stop never fired.
+    #[test]
+    fn a_nan_distance_neither_freezes_admission_nor_disables_the_early_stop() {
+        let (n, dims) = (500usize, 16usize);
+        let data = corpus(n, dims);
+        let dist = |a: u32, b: u32| {
+            distance::distance(
+                Metric::Cosine,
+                &data[a as usize * dims..(a as usize + 1) * dims],
+                &data[b as usize * dims..(b as usize + 1) * dims],
+            )
+        };
+        let g = Hnsw::build(n, HnswParams::default(), &dist);
+        let q = &data[0..dims];
+        let seen = std::cell::Cell::new(0usize);
+        let clean = |i: u32| {
+            seen.set(seen.get() + 1);
+            distance::distance(Metric::Cosine, q, &data[i as usize * dims..(i as usize + 1) * dims])
+        };
+        // The entry point is the one node guaranteed to be admitted before the
+        // heap is full, so poisoning it puts the NaN at the top of the heap
+        // from the first iteration.
+        let bad = g.entry;
+        let poisoned = |i: u32| if i == bad { f32::NAN } else { clean(i) };
+
+        let got = g.search(10, 10, None, &poisoned);
+        let poisoned_visits = seen.get();
+        seen.set(0);
+        let _ = g.search(10, 10, None, &clean);
+        let clean_visits = seen.get();
+
+        assert!(
+            got.iter().all(|(_, d)| !d.is_nan()),
+            "a NaN candidate was never displaced: {got:?}"
+        );
+        assert!(
+            poisoned_visits < clean_visits * 4,
+            "the early stop never fired: {poisoned_visits} visits against {clean_visits}"
+        );
+    }
+
+    /// The same defect on the build path, where a frozen layer search silently
+    /// degrades the graph instead of the answer.
+    #[test]
+    fn a_nan_distance_does_not_freeze_the_build_time_layer_search() {
+        let (n, dims) = (200usize, 8usize);
+        let data = corpus(n, dims);
+        let dist = |a: u32, b: u32| {
+            distance::distance(
+                Metric::Cosine,
+                &data[a as usize * dims..(a as usize + 1) * dims],
+                &data[b as usize * dims..(b as usize + 1) * dims],
+            )
+        };
+        let g = Hnsw::build(n, HnswParams::default(), &dist);
+        let q = &data[0..dims];
+        let bad = g.entry;
+        let d_to = |i: u32| {
+            if i == bad {
+                f32::NAN
+            } else {
+                distance::distance(
+                    Metric::Cosine,
+                    q,
+                    &data[i as usize * dims..(i as usize + 1) * dims],
+                )
+            }
+        };
+        let out = g.search_layer_build(&[bad], 8, 0, &d_to);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|c| !c.d.is_nan()), "a NaN candidate held a slot in the layer");
     }
 
     #[test]

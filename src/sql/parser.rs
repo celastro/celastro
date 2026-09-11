@@ -115,12 +115,33 @@ impl<'a> Parser<'a> {
     /// and is stripped, so `doc.author.name` and `author.name` are the same
     /// path.
     fn path(&mut self) -> Result<String> {
-        let mut p = self.ident()?;
+        let mut p = self.path_segment()?;
         while self.eat_punct(".") {
             p.push('.');
-            p.push_str(&self.ident()?);
+            p.push_str(&self.path_segment()?);
         }
         Ok(p.strip_prefix("doc.").unwrap_or(&p).to_string())
+    }
+
+    /// One segment of a dotted path.
+    ///
+    /// A double-quoted identifier is the only way a `.` can reach here inside a
+    /// single token, and every consumer of a path splits the string back apart
+    /// on `.` (`Value::path`, `Value::set_path`, the catalog's path walk). So
+    /// `"a.b"` was answered against the nested path `a` → `b` rather than
+    /// against the field actually named `a.b`, with nothing to say which was
+    /// meant. Refusing it rejects an input that was being silently resolved
+    /// against the wrong field; the unquoted `a.b` means that nested path and
+    /// is untouched, as is a quoted name with no dot in it, which is what
+    /// quoting is for.
+    fn path_segment(&mut self) -> Result<String> {
+        let s = self.ident()?;
+        if s.contains('.') {
+            return Err(Error::Sql(format!(
+                "a quoted identifier cannot contain `.`: `{s}` would be read as a nested path"
+            )));
+        }
+        Ok(s)
     }
 
     // ---------------------------------------------------------------- stmts
@@ -128,8 +149,15 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) -> Result<Statement> {
         if self.eat_kw("EXPLAIN") {
             let analyze = self.eat_kw("ANALYZE");
-            let inner = self.statement()?;
-            return Ok(Statement::Explain { analyze, inner: Box::new(inner) });
+            // A prefix that recurses into `statement` is recursive descent like
+            // any other and takes the same counter. Without it a repeated
+            // keyword overflows the stack, and a stack overflow aborts the
+            // process rather than returning the error the caller would get from
+            // every other malformed statement.
+            self.enter()?;
+            let inner = self.statement();
+            self.leave();
+            return Ok(Statement::Explain { analyze, inner: Box::new(inner?) });
         }
         if self.eat_kw("CREATE") {
             if self.eat_kw("COLLECTION") {
@@ -370,7 +398,7 @@ impl<'a> Parser<'a> {
                             .ok_or_else(|| Error::Sql("analyzer must be a string".into()))?
                             .to_string()
                     }
-                    "dims" | "dimensions" => dims = v.as_i64().map(|x| x as usize),
+                    "dims" | "dimensions" => dims = Some(dims_option(&key, &v)?),
                     "metric" => {
                         metric = Metric::parse(
                             v.as_str()
@@ -607,8 +635,13 @@ impl<'a> Parser<'a> {
                 "exact" => w.exact = bool_option(&key, val)?,
                 "exact_scoring" => w.exact_scoring = bool_option(&key, val)?,
                 "partial_results" => w.partial_results = bool_option(&key, val)?,
-                "ef_search" => w.ef_search = val.and_then(|v| v.as_i64()).map(|x| x as usize),
-                "deadline_ms" => w.deadline_ms = val.and_then(|v| v.as_i64()).map(|x| x as u64),
+                "ef_search" => {
+                    let n = count_option(&key, val)?;
+                    let n = usize::try_from(n)
+                        .map_err(|_| Error::Sql("`ef_search` is too large".into()))?;
+                    w.ef_search = Some(n);
+                }
+                "deadline_ms" => w.deadline_ms = Some(count_option(&key, val)?),
                 other => return Err(Error::Sql(format!("unknown WITH option `{other}`"))),
             }
             if !self.eat_punct(",") {
@@ -975,7 +1008,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_punct("-") {
             return Ok(match self.literal()? {
-                Value::Int(i) => Value::Int(-i),
+                // `-i64::MIN` has no answer: it panics where overflow checks
+                // are on and wraps back to `i64::MIN` where they are not, so
+                // the predicate compares against the value that was negated.
+                Value::Int(i) => Value::Int(
+                    i.checked_neg()
+                        .ok_or_else(|| Error::Sql(format!("negating {i} is out of range")))?,
+                ),
                 Value::Float(f) => Value::Float(-f),
                 other => return Err(Error::Sql(format!("cannot negate {}", other.ty().name()))),
             });
@@ -1048,10 +1087,54 @@ fn bool_option(key: &str, val: Option<Value>) -> Result<bool> {
 /// A negative count would wrap to `usize::MAX` in the `as usize` cast, and the
 /// recall harness then grows its query Vec until the process is killed; zero
 /// asks for a measurement of nothing.
+///
+/// The upper bound is the other half of the same guard. The lexer turns an
+/// integer too large for i64 into an `f64`, and `Value::as_i64` converts a
+/// float with no fractional part back with a saturating cast, so `1e30` and
+/// `i64::MAX` both arrive here as a positive count and are just as
+/// unallocatable as the wrapped negative was.
+const MAX_COUNT: i64 = 1 << 20;
+
 fn positive_usize(key: &str, v: &Value) -> Result<usize> {
     match v.as_i64() {
-        Some(n) if n > 0 => Ok(n as usize),
-        _ => Err(Error::Sql(format!("`{key}` must be a positive integer"))),
+        Some(n) if n > 0 && n <= MAX_COUNT => Ok(n as usize),
+        _ => Err(Error::Sql(format!(
+            "`{key}` must be a positive integer no larger than {MAX_COUNT}"
+        ))),
+    }
+}
+
+/// The largest `dims` a vector index will accept.
+///
+/// A dimension count is a per-vector allocation in the store, and the bare
+/// `as usize` cast this replaces turned `-1` into `usize::MAX` and `1e30` into
+/// `i64::MAX`; both reach `vec![0.0f32; n * dims]` and abort the process on
+/// capacity overflow. Neither ever produced an index, so refusing them costs
+/// nothing that worked. Real embeddings are orders of magnitude below the
+/// bound.
+const MAX_DIMS: i64 = 1 << 16;
+
+fn dims_option(key: &str, v: &Value) -> Result<usize> {
+    match v.as_i64() {
+        Some(n) if n > 0 && n <= MAX_DIMS => Ok(n as usize),
+        _ => {
+            Err(Error::Sql(format!("`{key}` must be a positive integer no larger than {MAX_DIMS}")))
+        }
+    }
+}
+
+/// An integer `WITH` option.
+///
+/// Unlike `bool_option` there is no bare-flag spelling: `WITH (ef_search)` asks
+/// for a value and supplies none, and dropping the bound on the floor is how a
+/// tuning knob comes to be silently ignored. A negative value used to wrap
+/// through `as usize` / `as u64` into the largest bound expressible, which is
+/// the opposite of what was written.
+fn count_option(key: &str, val: Option<Value>) -> Result<u64> {
+    let v = val.ok_or_else(|| Error::Sql(format!("`{key}` requires a value")))?;
+    match v.as_i64() {
+        Some(n) if n >= 0 => Ok(n as u64),
+        _ => Err(Error::Sql(format!("`{key}` must be a non-negative integer"))),
     }
 }
 
@@ -1064,6 +1147,62 @@ mod tests {
             Statement::Select(s) => *s,
             other => panic!("expected SELECT, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_repeated_explain_prefix_is_bounded_rather_than_overflowing_the_stack() {
+        let sql = "EXPLAIN ".repeat(100_000) + "SELECT * FROM t";
+        let e = parse(&sql, &[]).unwrap_err().to_string();
+        assert!(e.contains("nests deeper"), "{e}");
+        assert!(matches!(
+            parse("EXPLAIN SELECT * FROM t", &[]).unwrap(),
+            Statement::Explain { .. }
+        ));
+        assert!(matches!(
+            parse("EXPLAIN ANALYZE SELECT * FROM t", &[]).unwrap(),
+            Statement::Explain { analyze: true, .. }
+        ));
+    }
+
+    #[test]
+    fn out_of_range_counts_are_refused_rather_than_wrapping() {
+        for bad in ["-1", "0", "1e30", "9223372036854775807"] {
+            let sql = format!("CREATE INDEX i ON c USING vector (v) WITH (dims = {bad})");
+            assert!(parse(&sql, &[]).is_err(), "accepted dims = {bad}");
+            let sql = format!("MEASURE RECALL ON c WITH (k = {bad})");
+            assert!(parse(&sql, &[]).is_err(), "accepted k = {bad}");
+        }
+        assert!(parse("CREATE INDEX i ON c USING vector (v) WITH (dims = 8)", &[]).is_ok());
+        assert!(parse("MEASURE RECALL ON c WITH (k = 10, samples = 8)", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_with_option_that_takes_a_count_refuses_a_negative_or_missing_value() {
+        for bad in ["ef_search = -1", "deadline_ms = -1", "ef_search", "deadline_ms = 'oops'"] {
+            let sql = format!("SELECT * FROM c WITH ({bad})");
+            assert!(parse(&sql, &[]).is_err(), "accepted {bad}");
+        }
+        // Zero is a meaningful `ef_search`: the search floors it at one.
+        let s = sel("SELECT * FROM c WITH (ef_search = 0, deadline_ms = 50)", &[]);
+        assert_eq!(s.with.ef_search, Some(0));
+        assert_eq!(s.with.deadline_ms, Some(50));
+    }
+
+    #[test]
+    fn negating_the_smallest_integer_is_refused_rather_than_wrapping() {
+        let e = parse("SELECT * FROM c WHERE n = -$1", &[Value::Int(i64::MIN)]).unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+        let s = sel("SELECT * FROM c WHERE n = -$1", &[Value::Int(7)]);
+        assert!(format!("{:?}", s.predicate).contains("Int(-7)"));
+    }
+
+    #[test]
+    fn a_quoted_identifier_holding_a_dot_is_refused_rather_than_split() {
+        let e = parse("SELECT * FROM c WHERE \"a.b\" = 1", &[]).unwrap_err();
+        assert!(e.to_string().contains("quoted"), "{e}");
+        // The unquoted dotted path and the quoted odd name both still parse.
+        assert!(parse("SELECT * FROM c WHERE a.b = 1", &[]).is_ok());
+        assert!(parse("SELECT * FROM c WHERE \"a b\" = 1", &[]).is_ok());
     }
 
     #[test]

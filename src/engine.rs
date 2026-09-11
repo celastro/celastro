@@ -398,6 +398,17 @@ impl Db {
                 let ranges = fs::read_to_string(sdir.join("RANGE")).unwrap_or_default();
                 let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
                 let parts: Vec<&str> = ranges.split('\n').collect();
+                // Two lines, a low bound and a high one. `create_collection`
+                // refuses a split key that could write a third, so a third is
+                // a damaged tablet map -- and a tablet map read wrong is a
+                // shard that silently owns the wrong keys, which no later
+                // check catches because every shard agrees with itself.
+                if parts.len() > 2 {
+                    return Err(Error::Storage(format!(
+                        "shard-{i:04} of `{name}`: RANGE holds {} lines, expected 2",
+                        parts.len()
+                    )));
+                }
                 let lo = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
                 let hi = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
                 sh.key_range = Some((lo, hi));
@@ -472,6 +483,20 @@ impl Db {
     /// shards. Separate from [`Db::create_collection`] so that a failure part
     /// way through has one place to unwind from.
     fn build_shards(&self, coll: &Collection, splits: &[String]) -> Result<Vec<Shard>> {
+        // The tablet map is the only on-disk record of the split points, and
+        // it is a two-line file. A split key holding a line break writes a
+        // third line and is read back as a different key -- the shard then
+        // owns a range nobody asked for, and routing sends writes to it that
+        // reads look for elsewhere. An empty split key is the same ambiguity
+        // by another route: it is how the file spells "unbounded".
+        for k in splits {
+            if k.is_empty() || k.contains('\n') {
+                return Err(Error::Schema(format!(
+                    "split key {k:?} cannot be stored in the tablet map: \
+                     a split key must be non-empty and must not contain a line break"
+                )));
+            }
+        }
         let mut shards = Vec::with_capacity(splits.len() + 1);
         for i in 0..=splits.len() {
             let lo = if i == 0 { None } else { Some(splits[i - 1].clone()) };
@@ -509,6 +534,15 @@ impl Db {
                 s.adopt_catalog(coll.clone())?;
             }
         }
+        // A new index changes where this collection's segments belong: the
+        // resolved tier of a segment is the coldest tier over the indexes it
+        // holds, so adding a cached or active index to a collection whose
+        // files were relocated into `archive/` means they have to come back.
+        // `sync_archive` is the only thing that moves them, and `apply_tiers`
+        // is the only caller of it -- without this the catalog says the new
+        // index is active and the bytes are still in the archive, and nothing
+        // else on any path reconciles the two.
+        self.apply_tiers(collection)?;
         self.persist_catalog()?;
         Ok(())
     }
@@ -1503,8 +1537,23 @@ impl Db {
     }
 
     pub fn drop_policy(&mut self, name: &str) -> Result<()> {
-        if self.catalog.policies.remove(name).is_none() {
+        let Some(gone) = self.catalog.policies.remove(name) else {
             return Err(Error::Plan(format!("no lifecycle policy `{name}`")));
+        };
+        // A `demoted_by` pin exists only so that a retention rule and
+        // access-promotion do not fight: it says "a rule put this here, and a
+        // query is not evidence against it". With the rule gone, and no other
+        // policy left covering the index, there is nothing to fight and the
+        // pin is simply permanent -- the index can never be promoted back by
+        // an access, and nothing else in the system clears it.
+        let policies = &self.catalog.policies;
+        for ((c, i), act) in self.catalog.activity.iter_mut() {
+            if act.demoted_by.is_none() || *c != gone.collection || !gone.covers(i) {
+                continue;
+            }
+            if !policies.values().any(|p| p.collection == *c && p.covers(i)) {
+                act.demoted_by = None;
+            }
         }
         self.catalog.version += 1;
         self.persist_catalog()
@@ -1566,7 +1615,13 @@ impl Db {
     /// Release idle components, then evict down to the node budget. Returns
     /// `(idle bytes, over-budget bytes)`.
     pub fn unload_idle(&mut self, collection: Option<&str>) -> Result<(usize, usize)> {
-        let now = lifecycle::now_micros(&self.clock);
+        // The wall clock, not the HLC's physical component, because the stamps
+        // this is about to be subtracted from are wall-clock stamps written by
+        // `Segment::acquire`. The HLC is monotone and absorbs remote
+        // timestamps, so it can only ever run *ahead* of wall time: mixing the
+        // two makes every component look idle by however far ahead it is, and
+        // the sweeper unloads components that were touched a moment ago.
+        let now = crate::time::now_micros() as u64;
         let names: Vec<String> = match collection {
             Some(c) => {
                 self.catalog.get(c)?;
@@ -1702,7 +1757,9 @@ impl Db {
             }
             None => self.shards.keys().cloned().collect(),
         };
-        let now = lifecycle::now_micros(&self.clock);
+        // Wall time, for the same reason as `unload_idle`: `last` below is a
+        // wall-clock stamp, and the idle column is their difference.
+        let now = crate::time::now_micros() as u64;
         let mut out = String::from(
             "collection            shard  segment  component        tier      bytes      idle\n",
         );
@@ -2197,6 +2254,203 @@ mod tests {
         assert!(db.catalog.get("notes").is_err());
         assert!(db.shards("notes").is_err());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Files in `collections/<c>/shard-NNNN/<sub>`.
+    fn count(dir: &Path, collection: &str, sub: &str) -> usize {
+        let p = dir.join("collections").join(collection).join("shard-0000").join(sub);
+        fs::read_dir(p).map(|d| d.filter_map(|e| e.ok()).count()).unwrap_or(0)
+    }
+
+    fn note(id: &str) -> Value {
+        Value::obj(vec![
+            ("id".into(), Value::Str(id.into())),
+            ("body".into(), Value::Str("segments and postings".into())),
+            ("title".into(), Value::Str("a title".into())),
+        ])
+    }
+
+    /// A collection is archived when *every* index says so, so creating one
+    /// that does not is a placement decision, not just a catalog edit. Without
+    /// re-running placement the new index is `active` in the catalog while its
+    /// segments are still in `archive/`, and nothing afterwards reconciles the
+    /// two: `sync_archive` is the only thing that moves a file back, and no
+    /// other path calls it.
+    #[test]
+    fn creating_an_index_brings_the_segments_back_out_of_the_archive() {
+        let dir = tmp("add-index-placement");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert("notes", note("a")).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.execute("ALTER INDEX notes_body ON notes SET TIER 'archived'").unwrap();
+        assert_eq!(count(&dir, "notes", "segments"), 0, "everything archived, so the file moved");
+        assert!(count(&dir, "notes", "archive") > 0);
+
+        db.execute(
+            "CREATE INDEX notes_title ON notes USING fulltext (title) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        assert_eq!(
+            count(&dir, "notes", "archive"),
+            0,
+            "an index that is not archived means the collection is not archived either"
+        );
+        assert!(count(&dir, "notes", "segments") > 0, "the segment file has to come back");
+
+        // And reading it is no longer an archive round trip, because it is no
+        // longer in the archive.
+        let faults = db.residency().faults();
+        let r = db.query("SELECT * FROM notes WHERE text_match(body, 'postings')").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(db.residency().faults(), faults, "nothing left to fault in");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The pin is a truce between a retention rule and access-promotion. Drop
+    /// the rule and there is nothing left to keep the truce with, but the pin
+    /// is persisted and permanent: the index can never be promoted back by a
+    /// query, and no other path clears it.
+    #[test]
+    fn dropping_the_last_policy_covering_an_index_releases_its_retention_pin() {
+        let dir = tmp("drop-policy-pin");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert("notes", note("a")).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.execute(
+            "CREATE LIFECYCLE POLICY old ON notes MOVE TO cached AFTER 1 day SINCE CREATION",
+        )
+        .unwrap();
+
+        let key = ("notes".to_string(), "notes_body".to_string());
+        let now = lifecycle::now_micros(&db.clock);
+        db.catalog.activity.get_mut(&key).unwrap().created_micros = now - 2 * 86_400_000_000;
+        assert_eq!(db.run_lifecycle(Some("notes")).unwrap().moves.len(), 1);
+        assert_eq!(
+            db.catalog.activity[&key].demoted_by,
+            Some(lifecycle::Trigger::SinceCreation),
+            "an age demotion pins the index against promotion"
+        );
+
+        db.drop_policy("old").unwrap();
+        assert_eq!(
+            db.catalog.activity[&key].demoted_by, None,
+            "with the rule gone the pin has nothing left to protect"
+        );
+        assert!(db.catalog.activity[&key].promotable());
+        // And it survives the write, rather than being a live-only repair.
+        let re = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(re.catalog.activity[&key].demoted_by, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A policy that still covers the index keeps its pin: the truce is with
+    /// whatever rule can still fire, not with the one that happened to fire.
+    #[test]
+    fn a_pin_survives_dropping_a_policy_that_is_not_the_last_one() {
+        let dir = tmp("drop-policy-pin-kept");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert("notes", note("a")).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.execute(
+            "CREATE LIFECYCLE POLICY old ON notes MOVE TO cached AFTER 1 day SINCE CREATION",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE LIFECYCLE POLICY older ON notes MOVE TO archived AFTER 9 days SINCE CREATION",
+        )
+        .unwrap();
+
+        let key = ("notes".to_string(), "notes_body".to_string());
+        let now = lifecycle::now_micros(&db.clock);
+        db.catalog.activity.get_mut(&key).unwrap().created_micros = now - 2 * 86_400_000_000;
+        assert_eq!(db.run_lifecycle(Some("notes")).unwrap().moves.len(), 1);
+
+        db.drop_policy("old").unwrap();
+        assert_eq!(
+            db.catalog.activity[&key].demoted_by,
+            Some(lifecycle::Trigger::SinceCreation),
+            "`older` still covers this index, and its rule would demote it again"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `last_access` is stamped from the wall clock by `Segment::acquire`, so
+    /// the sweeper has to subtract it from the wall clock. The HLC absorbs
+    /// timestamps from elsewhere and is monotone, so it runs ahead of wall
+    /// time by however far ahead the furthest coordinator was -- and every
+    /// component then looks that much idler than it is.
+    #[test]
+    fn idleness_is_measured_against_the_clock_that_stamped_it() {
+        let dir = tmp("idle-clock");
+        let mut o = DbOpts::default();
+        o.residency.active_idle_unload = Some(std::time::Duration::from_secs(600));
+        let mut db = Db::open(&dir, o).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.insert("notes", note("a")).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.query("SELECT * FROM notes WHERE text_match(body, 'postings')").unwrap();
+        let resident = db.residency().resident_bytes();
+        assert!(resident > 0, "the query has to leave something decoded to unload");
+
+        // A read-your-writes token from a coordinator an hour ahead. Absorbing
+        // it is what the clock is for (§6); it says nothing about how long ago
+        // this node touched its own segments.
+        db.clock.observe(crate::time::from_micros(crate::time::now_micros() + 3_600_000_000));
+
+        let (idle, _) = db.unload_idle(None).unwrap();
+        assert_eq!(idle, 0, "nothing here has been idle for ten minutes");
+        assert_eq!(db.residency().resident_bytes(), resident);
+        assert_eq!(db.residency().unloads(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tablet map is two lines in a file, so a split key that holds a line
+    /// break is a shard boundary the reopen cannot read back -- and a boundary
+    /// read back wrong is a shard that owns keys nobody routed to it.
+    #[test]
+    fn a_split_key_the_tablet_map_cannot_hold_is_refused() {
+        let dir = tmp("range-guard");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let coll = Collection::new("notes", "id", None);
+        let e = db.create_collection(coll.clone(), &["m\nz".to_string()]).unwrap_err();
+        assert!(matches!(e, Error::Schema(_)), "{e}");
+        assert!(db.create_collection(coll.clone(), &[String::new()]).is_err());
+        assert!(
+            db.catalog.collections.is_empty(),
+            "a refused split list must not leave the collection behind"
+        );
+        db.create_collection(coll, &["m".to_string()]).unwrap();
+        assert_eq!(db.shards("notes").unwrap().len(), 2);
+
+        // And a tablet map that already holds one -- written by a build
+        // without the guard -- is reported at open rather than silently
+        // reinterpreted as a different range.
+        let range = dir.join("collections").join("notes").join("shard-0000").join("RANGE");
+        fs::write(&range, b"\nm\nz").unwrap();
+        assert!(
+            matches!(Db::open(&dir, DbOpts::default()), Err(Error::Storage(_))),
+            "a three-line RANGE has to be reported, not reinterpreted"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

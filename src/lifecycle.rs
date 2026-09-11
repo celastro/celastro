@@ -83,6 +83,11 @@ impl Unit {
             _ => Unit::Days,
         }
     }
+
+    /// The decoder's version: an unrecognised byte is damage, not `days`.
+    fn try_from_u8(b: u8) -> Option<Unit> {
+        (b <= 2).then(|| Unit::from_u8(b))
+    }
 }
 
 /// A duration as the user wrote it. The original unit is kept so that
@@ -384,10 +389,22 @@ pub fn decode_policies(b: &[u8], i: &mut usize) -> Result<BTreeMap<String, Lifec
         }
         let mut rules = Vec::with_capacity(nr);
         for _ in 0..nr {
-            let to = Tier::from_u8(*b.get(*i).ok_or_else(bad)?);
+            // Bounded rather than saturating, in all three. Every saturating
+            // mapping here resolves an unrecognised byte to the most
+            // destructive reading available -- unknown tier to `archived`, the
+            // one tier that relocates files; unknown unit to `days`, the
+            // longest window; unknown trigger to `SINCE CREATION`, the
+            // demotion no access can undo -- so a damaged catalog decodes into
+            // a policy that looks deliberate and then moves files. A byte this
+            // build does not know is a record it should not be interpreting.
+            let tb = *b.get(*i).ok_or_else(bad)?;
+            let to = Tier::try_from_u8(tb)
+                .ok_or_else(|| Error::Storage(format!("lifecycle: unknown tier byte {tb}")))?;
             *i += 1;
             let cnt = get_uvarint(b, i).ok_or_else(bad)?;
-            let unit = Unit::from_u8(*b.get(*i).ok_or_else(bad)?);
+            let ub = *b.get(*i).ok_or_else(bad)?;
+            let unit = Unit::try_from_u8(ub)
+                .ok_or_else(|| Error::Storage(format!("lifecycle: unknown duration unit {ub}")))?;
             *i += 1;
             let trig = *b.get(*i).ok_or_else(bad)?;
             *i += 1;
@@ -399,7 +416,15 @@ pub fn decode_policies(b: &[u8], i: &mut usize) -> Result<BTreeMap<String, Lifec
             rules.push(Rule {
                 to,
                 after: Every::new(cnt, unit)?,
-                trigger: if trig == 0 { Trigger::Inactivity } else { Trigger::SinceCreation },
+                trigger: match trig {
+                    0 => Trigger::Inactivity,
+                    1 => Trigger::SinceCreation,
+                    _ => {
+                        return Err(Error::Storage(format!(
+                            "lifecycle: unknown trigger byte {trig}"
+                        )))
+                    }
+                },
             });
         }
         out.insert(name.clone(), LifecyclePolicy { name, collection, indexes, rules });
@@ -649,5 +674,39 @@ mod tests {
         put_uvarint(&mut b, 1u64 << 60);
         let mut i = 0;
         assert!(decode_policies(&b, &mut i).is_err());
+    }
+
+    /// One rule, with each of its three enumerated bytes in turn set to a
+    /// value this build does not define. Saturating them is not leniency: the
+    /// three unknown bytes resolve to `archived`, `days` and `SINCE CREATION`,
+    /// which together is the most destructive policy expressible -- it
+    /// relocates files and pins them where no access can promote them back.
+    #[test]
+    fn an_unknown_enumerated_byte_in_a_rule_is_damage_not_a_default() {
+        let policy = LifecyclePolicy {
+            name: "p".into(),
+            collection: "c".into(),
+            indexes: vec![],
+            rules: vec![Rule {
+                to: Tier::Cached,
+                after: Every::new(7, Unit::Days).unwrap(),
+                trigger: Trigger::Inactivity,
+            }],
+        };
+        let mut good = Vec::new();
+        encode_policies(&BTreeMap::from([("p".to_string(), policy.clone())]), &mut good);
+        let mut i = 0;
+        assert_eq!(decode_policies(&good, &mut i).unwrap()["p"], policy);
+
+        // The rule is the last thing encoded: tier, count, unit, trigger.
+        let (tier, unit, trig) = (good.len() - 4, good.len() - 2, good.len() - 1);
+        assert_eq!((good[tier], good[unit], good[trig]), (Tier::Cached.as_u8(), 2, 0));
+        for (at, byte) in [(tier, 4u8), (tier, 200), (unit, 3), (unit, 255), (trig, 2), (trig, 9)] {
+            let mut b = good.clone();
+            b[at] = byte;
+            let mut i = 0;
+            let e = decode_policies(&b, &mut i).unwrap_err();
+            assert!(matches!(e, Error::Storage(_)), "byte {byte} at {at}: {e}");
+        }
     }
 }

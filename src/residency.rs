@@ -178,6 +178,17 @@ impl Tier {
         }
     }
 
+    /// The same mapping for bytes that came off disk, where an unknown byte is
+    /// damage rather than a tier.
+    ///
+    /// `from_u8` saturates, which is the wrong shape for a decoder: it turns
+    /// every unrecognised byte into `archived`, the one tier that relocates
+    /// files. A byte this build does not know is a record it should not be
+    /// interpreting at all.
+    pub(crate) fn try_from_u8(b: u8) -> Option<Tier> {
+        (b <= 3).then(|| Tier::from_u8(b))
+    }
+
     /// Is this a demotion — further down the ladder?
     pub fn is_colder_than(self, other: Tier) -> bool {
         self > other

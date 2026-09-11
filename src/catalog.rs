@@ -464,6 +464,23 @@ impl Catalog {
         if self.collections.contains_key(&c.name) {
             return Err(Error::Schema(format!("collection `{}` already exists", c.name)));
         }
+        // One path, one declaration. Two `ColumnDef`s for the same path are two
+        // answers to "what type is this": if they disagree, `validate_doc`
+        // checks both and the collection can never accept another write; if
+        // they agree, `shred_candidates` names the path twice and the segment
+        // writer emits two columns under one region name, of which the reader
+        // sees whichever the directory kept. This is the one door every
+        // `CREATE COLLECTION` goes through, and it is before anything is
+        // written, which is the only place the answer can still be "no".
+        let mut seen = std::collections::BTreeSet::new();
+        for d in &c.declared {
+            if !seen.insert(d.path.as_str()) {
+                return Err(Error::Schema(format!(
+                    "column `{}` is declared twice in collection `{}`",
+                    d.path, c.name
+                )));
+            }
+        }
         self.collections.insert(c.name.clone(), c);
         self.version += 1;
         Ok(())
@@ -638,8 +655,9 @@ impl Catalog {
                 // it should not be interpreting.
                 let tier_byte = |b: Option<&u8>| -> Result<crate::residency::Tier> {
                     match b {
-                        Some(v) if *v <= 3 => Ok(crate::residency::Tier::from_u8(*v)),
-                        Some(v) => Err(Error::Storage(format!("catalog: unknown tier byte {v}"))),
+                        Some(v) => crate::residency::Tier::try_from_u8(*v).ok_or_else(|| {
+                            Error::Storage(format!("catalog: unknown tier byte {v}"))
+                        }),
                         None => Err(bad()),
                     }
                 };
@@ -763,5 +781,30 @@ mod tests {
         assert_eq!(a.indexes[0].tier, crate::residency::Tier::Cached, "tier survives a reopen");
         assert_eq!(a.vector_dims("embedding"), Some(8));
         assert_eq!(a.doc_count, 1);
+    }
+
+    /// A path declared twice is not a harmless repetition. With disagreeing
+    /// types it is a collection that accepts no further writes at all, because
+    /// `validate_doc` walks both declarations and one of them always fails;
+    /// with agreeing types the writer shreds the path twice into one region
+    /// name. Neither survives a reopen any better than it started, so the
+    /// refusal belongs at creation.
+    #[test]
+    fn a_path_cannot_be_declared_twice() {
+        let mut cat = Catalog::default();
+        let mut c = Collection::new("notes", "id", None);
+        c.declared.push(ColumnDef { path: "n".into(), ty: ValueType::Number, not_null: false });
+        c.declared.push(ColumnDef { path: "n".into(), ty: ValueType::Str, not_null: false });
+        let e = cat.create(c).unwrap_err();
+        assert!(matches!(e, Error::Schema(_)), "{e}");
+        assert!(e.to_string().contains("declared twice"), "{e}");
+        assert!(cat.collections.is_empty(), "the rejected collection must not be in the catalog");
+
+        // The same two types on two different paths are ordinary DDL.
+        let mut c = Collection::new("notes", "id", None);
+        c.declared.push(ColumnDef { path: "n".into(), ty: ValueType::Number, not_null: false });
+        c.declared.push(ColumnDef { path: "s".into(), ty: ValueType::Str, not_null: false });
+        cat.create(c).unwrap();
+        assert_eq!(cat.get("notes").unwrap().declared.len(), 2);
     }
 }

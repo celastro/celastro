@@ -44,8 +44,16 @@ pub struct SearchOpts {
     pub rerank_multiplier: usize,
     /// `WITH exact`: brute force over every vector, no approximation (§14).
     pub exact: bool,
-    /// Upper bound on `1/s` amplification, so a pathological filter cannot turn
-    /// one query into a full scan through the back door.
+    /// Upper bound on the `1/s` amplification of `k`, so a very selective
+    /// filter cannot widen one query's traversal without limit.
+    ///
+    /// It bounds `ef`, not visits, and only on the [`Strategy::PostFilter`]
+    /// arm — the two places that read it both clamp `1/s` before computing
+    /// `ef`. [`Strategy::FilterAware`] traversal is bounded by `ef_search` and
+    /// by the graph: at a selectivity low enough that the result heap never
+    /// fills, it does walk the whole segment. `Hnsw::search_budgeted` can cap
+    /// that, but a bound budget changes which documents come back, so nothing
+    /// here passes one.
     pub max_amplification: usize,
 }
 

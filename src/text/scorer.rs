@@ -1089,8 +1089,18 @@ pub fn collect_top_k(
     }
     // Descending by score, then ascending by ordinal. The ordinal tie-break is
     // a local stand-in for the primary-key tie-break the coordinator applies
-    // (§7.2); within a segment the two agree, because segments are primary-key
-    // sorted.
+    // (§7.2). The two agree inside a sealed segment, which is primary-key
+    // sorted. They do NOT agree inside the memtable, whose ordinals are push
+    // order, so a memtable score tie is broken by insertion order and the
+    // wrong one of two tied documents can take the last slot.
+    //
+    // That is known and not fixed here, because it is not a local change. The
+    // k-th score is also the WAND threshold, and `DisjunctionScorer::advance`
+    // prunes on `sum > threshold`, so a document that can only *tie* the k-th
+    // score is skipped before it is ever scored — a key-aware tie-break here
+    // would never see it. Admitting it means pushing a threshold below the
+    // k-th score, which un-prunes every tie in the collection and is paid on
+    // every multi-term query. The tie-break is not worth that price.
     heap.sort_by(|a, b| {
         b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.ord.cmp(&b.ord))
     });

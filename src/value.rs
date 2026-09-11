@@ -58,7 +58,20 @@ impl Value {
     pub fn obj(fields: Vec<(String, Value)>) -> Value {
         let mut f = fields;
         f.sort_by(|a, b| a.0.cmp(&b.0));
-        f.dedup_by(|a, b| a.0 == b.0);
+        // A repeated key takes its last value, the way serde_json, `JSON.parse`
+        // and Python's `json` all resolve one; first-wins silently discarded
+        // the value the writer meant. The sort is stable, so the duplicates
+        // arrive in source order, and `dedup_by` keeps the *earlier* of each
+        // pair — hence the swap, which moves the later value into the slot
+        // that survives.
+        f.dedup_by(|a, b| {
+            if a.0 == b.0 {
+                std::mem::swap(a, b);
+                true
+            } else {
+                false
+            }
+        });
         Value::Object(f)
     }
 
@@ -327,6 +340,24 @@ mod tests {
 
     fn obj(fields: &[(&str, Value)]) -> Value {
         Value::obj(fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    #[test]
+    fn a_repeated_key_takes_its_last_value() {
+        let v = Value::obj(vec![("a".into(), Value::Int(1)), ("a".into(), Value::Int(2))]);
+        assert_eq!(v.get("a"), Some(&Value::Int(2)));
+        let v = Value::obj(vec![
+            ("b".into(), Value::Int(9)),
+            ("a".into(), Value::Int(1)),
+            ("a".into(), Value::Int(2)),
+            ("a".into(), Value::Int(3)),
+        ]);
+        assert_eq!(v.get("a"), Some(&Value::Int(3)));
+        assert_eq!(v.get("b"), Some(&Value::Int(9)));
+        // Every parsed object is built through `obj`, so this is what makes a
+        // repeated key agree with serde_json, `JSON.parse` and Python.
+        let p = crate::json::parse(r#"{"a":1,"b":0,"a":2}"#).unwrap();
+        assert_eq!(p.get("a"), Some(&Value::Int(2)));
     }
 
     #[test]

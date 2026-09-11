@@ -801,6 +801,20 @@ fn check_vector(coll: &Collection, path: &str, op: DistOp, query: &[f32]) -> Res
             query.len()
         )));
     }
+    if let Some((i, bad)) = query.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+        // The store side refuses a non-finite *stored* component because one
+        // infinity gives a dimension an infinite range and dequantizes the
+        // whole segment to NaN. A query carrying one is the same value arriving
+        // from the other side: every distance it computes is NaN, and a NaN
+        // sorts by whatever the comparator happens to do with it rather than
+        // erroring. A literal that overflows f32 (`1e40`) and a bound
+        // `Value::Float` parameter both get here, so the guard belongs on the
+        // vector rather than on the parser.
+        return Err(Error::Plan(format!(
+            "query vector component {i} is not finite ({bad}); \
+             `{path}` cannot be searched with it"
+        )));
+    }
     let declared = coll.vector_metric(path).unwrap();
     if declared != op.metric() {
         return Err(Error::Plan(format!(
@@ -1288,6 +1302,38 @@ mod tests {
             crate::residency::Tier::default(),
         ));
         c
+    }
+
+    /// A collection with one two-dimensional cosine vector index, and the
+    /// full-text index a hybrid ORDER BY needs alongside it.
+    fn vector_coll() -> Collection {
+        let mut c = text_coll();
+        c.indexes.push(crate::catalog::IndexDef::new(
+            "notes_emb",
+            "emb",
+            crate::catalog::IndexKind::Vector { dims: 2, metric: Metric::Cosine },
+            crate::residency::Tier::default(),
+        ));
+        c
+    }
+
+    /// `VectorStore::push` refuses a non-finite stored component; the query
+    /// side used to accept one and answer every distance as NaN.
+    #[test]
+    fn a_non_finite_query_component_is_refused_the_way_a_stored_one_is() {
+        let coll = vector_coll();
+        // `1e40` is finite as a JSON number and infinite as an f32, so the
+        // literal arrives already overflowed.
+        for sql in [
+            "SELECT id FROM notes ORDER BY emb <=> [1e40, 0.0] LIMIT 3",
+            "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'a'), \
+              emb <=> [0.0, 1e40]) LIMIT 3",
+        ] {
+            let Err(e) = plan_sources(&coll, &select(sql), 3) else {
+                panic!("planned a query with an infinite component: {sql}");
+            };
+            assert!(e.to_string().contains("is not finite"), "{sql}: {e}");
+        }
     }
 
     fn select(sql: &str) -> Select {

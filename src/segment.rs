@@ -695,16 +695,29 @@ impl Segment {
                  (supports {MIN_READABLE_VERSION}..={FORMAT_VERSION})"
             )));
         }
-        // Read past the whole-body checksum without verifying it: that is what
-        // `verify()` is for. Checking it here would mean reading every byte of
-        // every segment at every open, which is exactly the cost this file is
-        // organised to avoid. Each region carries its own checksum instead.
+        // Read past the whole-body checksum without verifying it. Checking it
+        // here would mean reading every byte of every segment at every open,
+        // which is exactly the cost this file is organised to avoid -- and it
+        // would detect nothing new, because the region directory tiles the
+        // body and `read_region` checks every region against its own checksum.
+        // Nothing else verifies it either; see `assemble`.
         let _body_crc = get_u32(&footer, &mut i).ok_or_else(bad)?;
         let id = get_u64(&footer, &mut i).ok_or_else(bad)?;
         let level = get_u32(&footer, &mut i).ok_or_else(bad)?;
         let _num_docs = get_uvarint(&footer, &mut i).ok_or_else(bad)?;
         let _num_vectors = get_uvarint(&footer, &mut i).ok_or_else(bad)?;
-        let ns = get_uvarint(&footer, &mut i).ok_or_else(bad)? as usize;
+        // Every count below is read out of the footer and handed straight to
+        // an allocator, so a damaged one is an allocation request of arbitrary
+        // size -- an abort, instead of the `Error::Storage` a damaged segment
+        // is supposed to produce. Bound each by the bytes actually left, at
+        // the smallest number of bytes one element can occupy: a shredded path
+        // is a length-prefixed string, so at least one byte.
+        let ns = bounded_len(
+            get_uvarint(&footer, &mut i).ok_or_else(bad)?,
+            1,
+            footer.len().saturating_sub(i),
+        )
+        .ok_or_else(bad)?;
         let mut shredded = Vec::with_capacity(ns);
         for _ in 0..ns {
             shredded.push(get_str(&footer, &mut i).ok_or_else(bad)?);
@@ -738,7 +751,10 @@ impl Segment {
         let idx_bytes = read_one("docs.index")?;
         let idx = &idx_bytes[..];
         let mut j = 0usize;
-        let n = get_uvarint(idx, &mut j).ok_or_else(bad)? as usize;
+        // One document is one varint delta here, so at least one byte.
+        let n =
+            bounded_len(get_uvarint(idx, &mut j).ok_or_else(bad)?, 1, idx.len().saturating_sub(j))
+                .ok_or_else(bad)?;
         let mut blob_offsets = Vec::with_capacity(n);
         let mut prev = 0u32;
         for _ in 0..n {
@@ -824,6 +840,21 @@ impl SegmentSource {
     }
 }
 
+/// Reject an element count the remaining bytes could not possibly hold, before
+/// anything reserves for it.
+///
+/// A count read off disk is a claim, not a fact: reserved from directly it is
+/// an allocation abort on a damaged file, which is the one outcome a decoder
+/// whose job is to report damage must not produce. `min_bytes_each` is the
+/// smallest encoded size of one element.
+fn bounded_len(n: u64, min_bytes_each: usize, remaining: usize) -> Option<usize> {
+    let n = usize::try_from(n).ok()?;
+    if n > remaining / min_bytes_each.max(1) {
+        return None;
+    }
+    Some(n)
+}
+
 /// Lay regions out and append the footer.
 fn assemble(
     id: u64,
@@ -843,11 +874,12 @@ fn assemble(
     }
     let mut footer = Vec::new();
     put_u32(&mut footer, FORMAT_VERSION);
-    // A whole-body checksum as well as the per-region ones below. It is not
-    // read at open — that would mean reading the entire file to answer "what
-    // is in it", which is the opposite of lazy loading — but `verify()` uses
-    // it to check a segment end to end, including the bytes no query has
-    // touched yet.
+    // A whole-body checksum as well as the per-region ones below. Nothing
+    // reads it: the directory tiles the body, so every byte of it is already
+    // covered by a region checksum that `read_region` checks when the region
+    // is decoded, and `verify()` walks the directory for exactly that reason.
+    // It stays in the footer because it is part of the format other builds
+    // read, and because a future whole-file scrub would want it.
     put_u32(&mut footer, crc32(&body));
     put_u64(&mut footer, id);
     put_u32(&mut footer, level);
@@ -1398,5 +1430,70 @@ mod tests {
         assert_eq!(s.num_docs(), 1);
         assert_eq!(s.ordinals.commit_ts, vec![20]);
         assert_eq!(s.document(0).unwrap().path("body").unwrap().as_str(), Some("second"));
+    }
+
+    /// A well-framed segment whose footer counts are lies: checksums all
+    /// correct, so the decoder reaches the counts and believes them. Built by
+    /// hand because `assemble` only ever writes honest ones.
+    fn forged_segment(shredded: u64, docs_index: Option<Vec<u8>>) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut dir: Vec<(String, u64, u64, u32)> = Vec::new();
+        let regions: Vec<(&str, Vec<u8>)> = match docs_index {
+            Some(idx) => vec![("ordinals.map", Ordinals::default().encode()), ("docs.index", idx)],
+            None => Vec::new(),
+        };
+        for (name, bytes) in &regions {
+            let off = body.len() as u64;
+            dir.push(((*name).to_string(), off, bytes.len() as u64, crc32(bytes)));
+            body.extend_from_slice(bytes);
+        }
+        let mut footer = Vec::new();
+        put_u32(&mut footer, FORMAT_VERSION);
+        put_u32(&mut footer, crc32(&body));
+        put_u64(&mut footer, 1); // id
+        put_u32(&mut footer, 0); // level
+        put_uvarint(&mut footer, 0); // documents
+        put_uvarint(&mut footer, 0); // vectors
+        put_uvarint(&mut footer, shredded);
+        put_uvarint(&mut footer, dir.len() as u64);
+        for (name, off, len, crc) in &dir {
+            put_str(&mut footer, name);
+            put_u64(&mut footer, *off);
+            put_u64(&mut footer, *len);
+            put_u32(&mut footer, *crc);
+        }
+        let crc = crc32(&footer);
+        let flen = footer.len() as u32;
+        let mut out = body;
+        out.extend_from_slice(&footer);
+        put_u32(&mut out, flen);
+        put_u32(&mut out, crc);
+        out.extend_from_slice(MAGIC);
+        out
+    }
+
+    /// Both counts are reserved from before anything reads an element, so an
+    /// impossible one has to be refused rather than allocated: the whole point
+    /// of these decoders is to turn a damaged file into an error, and an
+    /// allocation the process cannot serve is not an error, it is the end of
+    /// the process.
+    #[test]
+    fn footer_counts_are_bounded_by_the_bytes_behind_them() {
+        assert!(matches!(Segment::decode(&forged_segment(u64::MAX, None)), Err(Error::Storage(_))));
+        // One shredded path claimed and no bytes to hold it is the same lie in
+        // small; an honestly empty footer still decodes.
+        assert!(Segment::decode(&forged_segment(1, None)).is_err());
+        assert!(Segment::decode(&forged_segment(0, Some(Vec::new()))).is_err());
+
+        let mut idx = Vec::new();
+        put_uvarint(&mut idx, u64::MAX);
+        assert!(matches!(Segment::decode(&forged_segment(0, Some(idx))), Err(Error::Storage(_))));
+
+        // And the honest version of the same region decodes to one offset.
+        let mut idx = Vec::new();
+        put_uvarint(&mut idx, 1);
+        put_uvarint(&mut idx, 4);
+        let s = Segment::decode(&forged_segment(0, Some(idx))).unwrap();
+        assert_eq!(s.blob_offsets, vec![4]);
     }
 }

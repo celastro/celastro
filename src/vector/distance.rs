@@ -62,13 +62,45 @@ pub fn norm(a: &[f32]) -> f32 {
     dot(a, a).sqrt()
 }
 
+/// Scale `v` to unit length, or leave it alone if it has no direction.
+///
+/// The norm is taken *after* dividing through by the largest component. On the
+/// raw vector `dot(v, v)` overflows to `+inf` once the norm passes
+/// `sqrt(f32::MAX)`, and `1.0 / inf` is zero, so a perfectly ordinary
+/// large-magnitude vector was overwritten with zeros — a document pointing
+/// exactly along the query then ranked last rather than first. At the other
+/// end a small vector's squares flush to denormals and the old absolute
+/// `n > 1e-12` floor declined to normalise it at all, leaving a non-unit
+/// vector in a store whose cosine distance assumes unit length.
+///
+/// Both divisions are real divisions. Multiplying by a precomputed `1.0 / m`
+/// reintroduces a quieter version of the same bug: for `m` near `f32::MAX` the
+/// reciprocal is itself denormal and carries only a few bits of precision.
 pub fn normalize(v: &mut [f32]) {
-    let n = norm(v);
-    if n > 1e-12 {
-        let inv = 1.0 / n;
-        for x in v.iter_mut() {
-            *x *= inv;
+    let mut m = 0.0f32;
+    for x in v.iter() {
+        // A non-finite component has no direction to preserve. The store side
+        // refuses one outright; this leaves it untouched rather than turning
+        // the whole vector into zeros.
+        if !x.is_finite() {
+            return;
         }
+        let a = x.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    if m == 0.0 {
+        return;
+    }
+    for x in v.iter_mut() {
+        *x /= m;
+    }
+    // The largest component is now exactly 1, so `n` is at least 1 and at most
+    // `sqrt(len)` — inside the float range whatever the input magnitude was.
+    let n = norm(v);
+    for x in v.iter_mut() {
+        *x /= n;
     }
 }
 
@@ -114,6 +146,37 @@ mod tests {
         assert!((dot(&a, &b) - nd).abs() < 1e-3);
         let nl: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
         assert!((l2_squared(&a, &b) - nl).abs() < 1e-3);
+    }
+
+    /// `dot(v, v)` is `+inf` here, so the old `1.0 / n` was zero and wrote the
+    /// zero vector — every distance from it identical, and a document that
+    /// points exactly along the query indistinguishable from one that points
+    /// away.
+    #[test]
+    fn a_large_vector_normalises_rather_than_collapsing_to_zero() {
+        let mut v = vec![3.0e19f32, 4.0e19, 0.0];
+        prepare(Metric::Cosine, &mut v);
+        assert!((v[0] - 0.6).abs() < 1e-5 && (v[1] - 0.8).abs() < 1e-5, "{v:?}");
+        let q = vec![0.6f32, 0.8, 0.0];
+        assert!(distance(Metric::Cosine, &v, &q).abs() < 1e-5, "{v:?}");
+    }
+
+    /// The mirror image: the norm underflows below the old absolute `1e-12`
+    /// floor, so the vector was left un-normalised in a store whose cosine
+    /// distance assumes unit length.
+    #[test]
+    fn a_tiny_vector_normalises_rather_than_being_left_alone() {
+        let mut v = vec![3.0e-20f32, 4.0e-20, 0.0];
+        prepare(Metric::Cosine, &mut v);
+        assert!((norm(&v) - 1.0).abs() < 1e-5, "{v:?}");
+        assert!((v[0] - 0.6).abs() < 1e-5 && (v[1] - 0.8).abs() < 1e-5, "{v:?}");
+    }
+
+    #[test]
+    fn a_zero_vector_is_left_alone() {
+        let mut v = vec![0.0f32; 4];
+        prepare(Metric::Cosine, &mut v);
+        assert_eq!(v, vec![0.0f32; 4]);
     }
 
     #[test]

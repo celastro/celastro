@@ -98,18 +98,32 @@ impl Ordinals {
     pub fn decode(b: &[u8]) -> Result<Ordinals> {
         let bad = || Error::Storage("ordinals: truncated".into());
         let mut i = 0usize;
-        let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        // The count comes off the file, and both vectors below are reserved
+        // from it before a single entry is read: a corrupt count is then an
+        // allocation request of arbitrary size, which the process answers by
+        // aborting rather than by returning the `Error::Storage` this
+        // signature promises. One entry costs at least ten bytes -- a shared
+        // varint, a suffix length varint and eight bytes of commit timestamp
+        // -- so a count past what the buffer could hold is corruption.
+        let n = usize::try_from(get_uvarint(b, &mut i).ok_or_else(bad)?).map_err(|_| bad())?;
+        if n > b.len().saturating_sub(i) / 10 {
+            return Err(bad());
+        }
         let mut o = Ordinals { keys: Vec::with_capacity(n), commit_ts: Vec::with_capacity(n) };
         let mut prev = String::new();
         for _ in 0..n {
             let shared = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
             let suffix = get_str(b, &mut i).ok_or_else(bad)?;
             let ts = get_u64(b, &mut i).ok_or_else(bad)?;
-            let mut k = String::with_capacity(shared + suffix.len());
-            // From a file: `shared` is untrusted. An unchecked slice here is a
-            // panic on a corrupt or truncated segment, on a path that runs at
-            // every reopen.
-            k.push_str(prev.get(..shared).ok_or_else(bad)?);
+            // From a file: `shared` is untrusted. Validate it before it sizes
+            // anything -- an unchecked slice is a panic on a corrupt or
+            // truncated segment, and reserving `shared + suffix.len()` first
+            // is an allocation abort (and, with overflow checks on, the
+            // addition itself overflows), both on a path that runs at every
+            // reopen.
+            let prefix = prev.get(..shared).ok_or_else(bad)?;
+            let mut k = String::with_capacity(prefix.len() + suffix.len());
+            k.push_str(prefix);
             k.push_str(&suffix);
             o.keys.push(k.clone());
             o.commit_ts.push(ts);
@@ -329,5 +343,52 @@ mod tests {
         assert_eq!(back.delete_ts(3), 900);
         assert_eq!(back.delete_ts(7), 800);
         assert_eq!(back.delete_ts(9), MAX_TS);
+    }
+
+    /// The entry count is the first thing in the region and the last thing
+    /// anyone checks, so a damaged one has to be rejected before it sizes the
+    /// two vectors. Unbounded, this is `Vec::with_capacity(usize::MAX)`: an
+    /// allocation the process answers by dying, on a file it was asked to
+    /// report on.
+    #[test]
+    fn an_ordinals_count_the_region_cannot_hold_is_rejected_not_reserved() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, u64::MAX);
+        let e = Ordinals::decode(&b).unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "{e}");
+
+        // One byte short of the ten an entry costs is still a lie about the
+        // region, and the real encoding of one entry still decodes.
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 1);
+        b.extend_from_slice(&[0u8; 9]);
+        assert!(Ordinals::decode(&b).is_err());
+        let mut o = Ordinals::default();
+        o.push("k".into(), 7);
+        assert_eq!(Ordinals::decode(&o.encode()).unwrap().keys, vec!["k".to_string()]);
+    }
+
+    /// Front coding makes every key an offset into the one before it, and the
+    /// offset is a file-supplied number. Sizing the new key from it before it
+    /// is validated overflows the addition and reserves from a length no
+    /// previous key ever had.
+    #[test]
+    fn an_ordinals_prefix_longer_than_the_previous_key_is_rejected_before_it_sizes_anything() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 1); // one entry
+        put_uvarint(&mut b, u64::MAX); // shared prefix, from a damaged file
+        put_str(&mut b, "x");
+        put_u64(&mut b, 42);
+        let e = Ordinals::decode(&b).unwrap_err();
+        assert!(matches!(e, Error::Storage(_)), "{e}");
+
+        // A shared length that is merely longer than the previous key, rather
+        // than absurd, is the same corruption and the same answer.
+        let mut b = Vec::new();
+        put_uvarint(&mut b, 1);
+        put_uvarint(&mut b, 5);
+        put_str(&mut b, "x");
+        put_u64(&mut b, 42);
+        assert!(Ordinals::decode(&b).is_err());
     }
 }

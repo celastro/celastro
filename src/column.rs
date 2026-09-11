@@ -11,6 +11,7 @@
 //! is what lets a structured predicate meet a posting list and a vector result
 //! without a join (§4.2).
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::bitmap::Bitmap;
@@ -257,6 +258,17 @@ impl Column {
         let mut keep = vec![true; nblocks];
         match (&self.zones, op) {
             (Zones::Num(z), CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) => {
+                // A zone bound is an `f64`, so a literal `f64` cannot hold
+                // exactly is placed against the bounds by its rounded
+                // neighbour, which can land on the far side of a bound and
+                // declare a block dead that holds matches. The scan below
+                // answers that literal exactly; zone skipping sits it out
+                // rather than answer it approximately. Every literal that
+                // round-trips — every literal any query has used — still
+                // skips exactly as before.
+                if round_tie(lit) != Ordering::Equal {
+                    return None;
+                }
                 let v = lit.as_f64()?;
                 for (b, (lo, hi)) in z.iter().enumerate() {
                     keep[b] = match op {
@@ -473,11 +485,12 @@ impl Column {
                 if !matches!(lit, Value::Int(_) | Value::Float(_)) {
                     return out;
                 }
+                let tie = round_tie(lit);
                 for i in present.iter() {
                     if !block_live(i as usize) {
                         continue;
                     }
-                    if cmp_ok(op, vals[i as usize].partial_cmp(&want)) {
+                    if cmp_ok(op, cmp_rounded(vals[i as usize], want, tie)) {
                         out.set(i as usize);
                     }
                 }
@@ -536,9 +549,10 @@ impl Column {
             }
             ColumnData::MultiNum { present, starts, vals } => {
                 let Some(want) = lit.as_f64() else { return out };
+                let tie = round_tie(lit);
                 for i in present.iter() {
                     let (s, e) = (starts[i as usize] as usize, starts[i as usize + 1] as usize);
-                    if (s..e).any(|j| cmp_ok(op, vals[j].partial_cmp(&want))) {
+                    if (s..e).any(|j| cmp_ok(op, cmp_rounded(vals[j], want, tie))) {
                         out.set(i as usize);
                     }
                 }
@@ -546,6 +560,49 @@ impl Column {
         }
         out
     }
+}
+
+/// Which side of an integer literal the `f64` the column compares against
+/// fell on, and `Equal` for every literal `f64` holds exactly.
+///
+/// A shredded numeric column stores `f64`, so an integer literal is matched
+/// against stored values as `i as f64` — the neighbouring double, once the
+/// magnitude passes 2^53. Where a stored value lands exactly on that double the
+/// rounded comparison answers `Equal`, which is the one answer that cannot be
+/// right, because the literal is not that double. It is a bounded error: any
+/// other stored value is on the same side of the literal as of its neighbour,
+/// so this one tie is the whole of the correction.
+fn round_tie(lit: &Value) -> Ordering {
+    match lit {
+        // i128 because `i64::MAX as f64` is 2^63, which an `as i64` cast back
+        // would saturate to `i64::MAX` and call a round trip.
+        Value::Int(i) => ((*i as f64) as i128).cmp(&(*i as i128)),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Compare a stored `f64` with a literal that reached here as `want`, where
+/// `tie` is [`round_tie`] of that literal. `Ordering::Equal` for `tie` — the
+/// ordinary case — leaves the comparison exactly as it was.
+fn cmp_rounded(v: f64, want: f64, tie: Ordering) -> Option<Ordering> {
+    match v.partial_cmp(&want) {
+        Some(Ordering::Equal) => Some(tie),
+        o => o,
+    }
+}
+
+/// Can a numeric column hold this value without changing it?
+///
+/// The column stores `f64`, and an integer past 2^53 does not survive that.
+/// A rounded integer is not the value the document holds: `= 9007199254740993`
+/// answered no and `= 9007199254740992` yes, while the memtable and the variant
+/// fallback answered the other way round, so the same query changed its answer
+/// when a segment was sealed. The column declines the value instead — which is
+/// what `Column::mismatch` is for — and the reader answers it from the
+/// document blob, exactly. Nothing changes for a value that round-trips, which
+/// is every integer written so far.
+fn stores_exactly(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_)) && round_tie(v) == Ordering::Equal
 }
 
 fn cmp_ok(op: CmpOp, o: Option<std::cmp::Ordering>) -> bool {
@@ -602,7 +659,7 @@ pub struct ColumnBuilder {
 fn fits(ty: ValueType, elem_str: bool, v: &Value) -> bool {
     match ty {
         ValueType::Bool => matches!(v, Value::Bool(_)),
-        ValueType::Number => matches!(v, Value::Int(_) | Value::Float(_)),
+        ValueType::Number => stores_exactly(v),
         ValueType::Timestamp => matches!(v, Value::Timestamp(_)),
         ValueType::Str => matches!(v, Value::Str(_)),
         ValueType::Array => {
@@ -610,7 +667,7 @@ fn fits(ty: ValueType, elem_str: bool, v: &Value) -> bool {
                 if elem_str {
                     matches!(e, Value::Str(_))
                 } else {
-                    matches!(e, Value::Int(_) | Value::Float(_))
+                    stores_exactly(e)
                 }
             };
             match v {
@@ -1258,10 +1315,12 @@ pub fn comparable(v: &Value, op: CmpOp, lit: &Value) -> bool {
 /// Does one value satisfy `op lit`?
 ///
 /// The single definition of predicate semantics. Column evaluation is an
-/// optimisation of this function, never a redefinition of it — which is what
-/// makes the "shredded or not, same answer" claim in §2.1 checkable rather
-/// than aspirational, and what
-/// `column::tests::column_and_variant_paths_agree` checks exhaustively.
+/// optimisation of this function, never a redefinition of it: where a column
+/// cannot represent a value exactly it declines it (`Column::mismatch`) and the
+/// reader falls back here rather than answering from the approximation. That is
+/// what the "shredded or not, same answer" claim in §2.1 rests on. No test
+/// establishes it exhaustively — the divergences that have been found were
+/// each closed with a case of their own.
 ///
 /// A scalar and a one-element array are treated as the same thing throughout.
 /// A path is scalar in some documents and an array in others far too often for
@@ -1359,6 +1418,66 @@ mod tests {
             b.push(i as u32, if i % 10 == 3 { None } else { Some(Value::Int(i as i64)) });
         }
         b.finish(n)
+    }
+
+    #[test]
+    fn an_integer_f64_cannot_hold_is_declined_rather_than_rounded() {
+        // 2^53 + 1 is the smallest integer f64 cannot hold; it rounds to 2^53.
+        // Stored as f64 the column answers `= 2^53` yes and `= 2^53 + 1` no,
+        // both the opposite of what the document says and of what the memtable
+        // and the variant fallback answer.
+        let big = (1i64 << 53) + 1;
+        let mut b = ColumnBuilder::new("n", ValueType::Number);
+        b.push(0, Some(Value::Int(1)));
+        b.push(1, Some(Value::Int(big)));
+        let c = b.finish(2);
+        assert!(c.mismatch.get(1), "a lossy integer belongs in the variant fallback");
+        assert!(!c.present().get(1));
+        assert!(!c.filter(CmpOp::Eq, &Value::Int(big - 1)).get(1), "rounded down into 2^53");
+        assert!(!c.filter(CmpOp::Eq, &Value::Int(big)).get(1));
+        // The fallback answers it, and answers it exactly.
+        assert!(matches(&Value::Int(big), CmpOp::Eq, &Value::Int(big)));
+        assert!(!matches(&Value::Int(big), CmpOp::Eq, &Value::Int(big - 1)));
+        // Same for an element of a scalar array column.
+        let mut b = ColumnBuilder::new("ns", ValueType::Array);
+        b.push(0, Some(Value::Array(vec![Value::Int(1), Value::Int(big)])));
+        b.push(1, Some(Value::Array(vec![Value::Int(2)])));
+        let c = b.finish(2);
+        assert!(c.mismatch.get(0), "an array holding a lossy integer is a mismatch");
+        assert!(c.present().get(1));
+    }
+
+    #[test]
+    fn an_integer_literal_f64_cannot_hold_does_not_match_its_rounded_neighbour() {
+        let exact = 1i64 << 53; // representable, so it is stored in the column
+        let lossy = exact + 1; // rounds to `exact`
+        let mut b = ColumnBuilder::new("n", ValueType::Number);
+        b.push(0, Some(Value::Int(exact)));
+        let c = b.finish(1);
+        assert!(c.present().get(0) && c.mismatch.is_empty());
+        // 2^53 is not 2^53 + 1, it is below it, and the column must say so.
+        assert!(!matches(&Value::Int(exact), CmpOp::Eq, &Value::Int(lossy)));
+        assert!(c.filter(CmpOp::Eq, &Value::Int(lossy)).is_empty());
+        assert!(matches(&Value::Int(exact), CmpOp::Lt, &Value::Int(lossy)));
+        assert!(c.filter(CmpOp::Lt, &Value::Int(lossy)).get(0), "zone or scan dropped it");
+        assert!(c.filter(CmpOp::Le, &Value::Int(lossy)).get(0));
+        assert!(!c.filter(CmpOp::Gt, &Value::Int(lossy)).get(0));
+        assert!(!c.filter(CmpOp::Ge, &Value::Int(lossy)).get(0));
+        assert!(c.filter(CmpOp::Ne, &Value::Int(lossy)).get(0));
+        // The other rounding direction: 2^53 + 3 rounds up to 2^53 + 4.
+        let up = exact + 3;
+        let mut b = ColumnBuilder::new("n", ValueType::Number);
+        b.push(0, Some(Value::Int(exact + 4)));
+        let c = b.finish(1);
+        assert!(matches(&Value::Int(exact + 4), CmpOp::Gt, &Value::Int(up)));
+        assert!(c.filter(CmpOp::Gt, &Value::Int(up)).get(0));
+        assert!(c.filter(CmpOp::Eq, &Value::Int(up)).is_empty());
+        // A multi-value column reads the literal the same way.
+        let mut b = ColumnBuilder::new("ns", ValueType::Array);
+        b.push(0, Some(Value::Array(vec![Value::Int(exact)])));
+        let c = b.finish(1);
+        assert!(c.filter(CmpOp::Eq, &Value::Int(lossy)).is_empty());
+        assert!(c.filter(CmpOp::Lt, &Value::Int(lossy)).get(0));
     }
 
     #[test]

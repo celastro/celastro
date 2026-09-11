@@ -214,12 +214,16 @@ impl<'a> Parser<'a> {
     }
 
     fn hex4(&mut self) -> Result<u32> {
-        if self.i + 4 > self.b.len() {
-            return Err(Error::Schema("short \\u escape".into()));
+        let raw = self
+            .b
+            .get(self.i..self.i + 4)
+            .ok_or_else(|| Error::Schema("short \\u escape".into()))?;
+        // `u32::from_str_radix` also accepts a leading sign, so `\u+abc`
+        // decoded as U+0ABC. RFC 8259 asks for exactly four hex digits.
+        if !raw.iter().all(u8::is_ascii_hexdigit) {
+            return Err(Error::Schema("bad \\u escape".into()));
         }
-        let s = std::str::from_utf8(&self.b[self.i..self.i + 4])
-            .map_err(|_| Error::Schema("bad \\u escape".into()))?;
-        let v = u32::from_str_radix(s, 16).map_err(|_| Error::Schema("bad \\u escape".into()))?;
+        let v = raw.iter().fold(0u32, |a, c| a * 16 + char::from(*c).to_digit(16).unwrap_or(0));
         self.i += 4;
         Ok(v)
     }
@@ -244,6 +248,14 @@ impl<'a> Parser<'a> {
         if s.is_empty() {
             return Err(Error::Schema(format!("bad number at byte {start}")));
         }
+        // The scan above is deliberately loose so that the whole run is
+        // reported as one bad number rather than as trailing input. What it
+        // scanned is then held to the grammar, because the parse below is not:
+        // `f64::from_str` takes `+1`, `1.` and `.5`, and the i64 arm takes
+        // `01`, none of which are JSON. The module header promises RFC 8259.
+        if !is_json_number(s.as_bytes()) {
+            return Err(Error::Schema(format!("bad number `{s}` at byte {start}")));
+        }
         if !is_float {
             if let Ok(i) = s.parse::<i64>() {
                 return Ok(Value::Int(i));
@@ -258,6 +270,45 @@ impl<'a> Parser<'a> {
         }
         Ok(Value::Float(f))
     }
+}
+
+/// RFC 8259 §6: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_json_number(s: &[u8]) -> bool {
+    fn digits(s: &[u8], i: &mut usize) -> bool {
+        let start = *i;
+        while s.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        *i > start
+    }
+    let mut i = 0usize;
+    if s.first() == Some(&b'-') {
+        i += 1;
+    }
+    match s.get(i) {
+        // A leading zero is not the start of a longer integer: `01` is not 1.
+        Some(b'0') => i += 1,
+        Some(c) if c.is_ascii_digit() => {
+            digits(s, &mut i);
+        }
+        _ => return false,
+    }
+    if s.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(s, &mut i) {
+            return false;
+        }
+    }
+    if matches!(s.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(s.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !digits(s, &mut i) {
+            return false;
+        }
+    }
+    i == s.len()
 }
 
 fn utf8_len(b: u8) -> usize {
@@ -406,6 +457,28 @@ fn write_json_string(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_numbers_are_refused_rather_than_read_loosely() {
+        // `f64::from_str` is far looser than RFC 8259, and the module header
+        // claims strictness.
+        for bad in ["+1", "01", "-01", "1.", ".5", "1.e5", "1e", "-", "1e+"] {
+            assert!(parse(&format!("{{\"a\":{bad}}}")).is_err(), "accepted `{bad}`");
+        }
+        for good in ["0", "-0", "1", "12", "1.5", "-1.5e-3", "1E+2", "0.0", "1e5"] {
+            assert!(parse(&format!("{{\"a\":{good}}}")).is_ok(), "refused `{good}`");
+        }
+        assert_eq!(parse("[1,-0.25,3e2]").unwrap().to_string(), "[1,-0.25,300.0]");
+    }
+
+    #[test]
+    fn a_unicode_escape_requires_four_hex_digits() {
+        // `u32::from_str_radix` accepts a leading `+`, so `\u+abc` used to
+        // decode as U+0ABC.
+        assert!(parse(r#"["\u+abc"]"#).is_err());
+        assert!(parse(r#"["\u 041"]"#).is_err());
+        assert_eq!(parse(r#""\u0041""#).unwrap(), Value::Str("A".into()));
+    }
 
     #[test]
     fn an_invalid_low_surrogate_is_rejected_rather_than_fabricating_a_char() {
