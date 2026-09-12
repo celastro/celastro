@@ -925,6 +925,105 @@ fn sync_dir_of(path: &Path) -> Result<()> {
     sync_dir(dir)
 }
 
+/// The lowest segment id no file in `dir` already claims.
+///
+/// Every file this shard writes for a segment is named `{id:016x}` with an
+/// extension: the segment, its delete log, and the temp file either is renamed
+/// from. So the id of a file that was written under an id is recoverable from
+/// its name whatever stopped before the manifest learned of it, and anything
+/// whose name does not parse — a `MANIFEST`, a file somebody else left here —
+/// claims nothing.
+///
+/// All three directories, because a segment's file is in `segments/` only
+/// until it is tiered and in `archive/` afterwards, and a delete log is in
+/// neither. `deletes/` is the one that carries the loss: an id whose `.seg`
+/// has been removed but whose `.dlog` has not is still an id that must never
+/// be handed out.
+///
+/// The `.tmp` leg is defence in depth rather than a live property, and is
+/// recorded here rather than tested because a test for it would assert
+/// nothing. A `.tmp` in `segments/` means the rename never happened, so that
+/// id has no `.seg` — and no `.dlog` either, since a delete log is only ever
+/// written for a segment whose own file was renamed first. Reusing the id
+/// therefore overwrites a temp file and loses nothing. There is no path to a
+/// loss without changing that write order, which is the change that would make
+/// this line load-bearing; it is cheaper to keep it than to notice then.
+fn first_unused_segment_id(dir: &Path) -> u64 {
+    let mut next = 1u64;
+    for sub in ["segments", "archive", "deletes"] {
+        let Ok(entries) = fs::read_dir(dir.join(sub)) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.split('.').next()) else { continue };
+            if let Ok(id) = u64::from_str_radix(stem, 16) {
+                next = next.max(id.saturating_add(1));
+            }
+        }
+    }
+    next
+}
+
+/// Unlink the files of segment ids the manifest does not name.
+///
+/// A publication that fails leaves the segments it was about to install on the
+/// disk: their `.seg`, and their `.dlog` when the failure was at or after
+/// MANIFEST's own write. Nothing else ever reclaims them. `Shard::sweep_retired`
+/// unlinks what the shard is still holding, and a handle that was never
+/// installed was never on that list; `first_unused_segment_id` then guarantees
+/// the ids are not handed out again, so they are not even overwritten. Left
+/// alone that is one dead segment per failed seal or compaction for the life of
+/// the database, and the case that produces them in bulk is a volume that is
+/// failing because it is full, where every retry writes another output set
+/// roughly the size of its inputs.
+///
+/// A reopen is the moment this is safe and the failure path is not. The
+/// manifest has just been installed and names every segment that can be
+/// reached, no reader exists yet to hold one, and — unlike the failure path —
+/// a crash comes back through here too, which is the only way the orphans a
+/// crash leaves are ever seen again.
+///
+/// The price of waiting for that moment is stated rather than hidden: a
+/// process that runs for a month and fails a publication a day carries those
+/// files for the month. This bounds the leak by the lifetime of a process
+/// instead of the lifetime of the database, which is the most a reclamation
+/// that needs a quiet moment can offer; unlinking them where they were
+/// abandoned would need a promise that no reader is mid-open on the id, and
+/// would still do nothing for the crash.
+///
+/// It runs only where a manifest was read, which is why the call sits inside
+/// that branch rather than after it. A directory with no MANIFEST is either
+/// brand new or has lost the one file that says what is live, and reading the
+/// second as "nothing is live" would turn a directory a human could still
+/// recover into an empty one.
+///
+/// It must run AFTER the id guard, and that is why the guard is in
+/// [`Shard::attach_dir`]: the evidence this unlinks is the same evidence
+/// `first_unused_segment_id` reads, so a reclamation that went first would
+/// hand the ids it just freed straight back out. `attach_dir` runs before any
+/// manifest is read, so the counter is already past every id the directory
+/// held by the time anything here is unlinked.
+///
+/// Within a pass the order does not matter, and neither does finishing. An
+/// interrupted pass leaves whichever file it had not reached yet in one of the
+/// three directories that guard reads, so the next open refuses that id again
+/// — and once BOTH files of an id are gone the id is genuinely free, which is
+/// the only reason handing it out afterwards is safe. An unlink that fails is
+/// dropped: the orphan survives to be reclaimed by the next reopen, and a
+/// reopen must not fail because tidying did.
+fn reclaim_orphans(dir: &Path, live: &[u64]) {
+    for sub in ["segments", "archive", "deletes"] {
+        let Ok(entries) = fs::read_dir(dir.join(sub)) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.split('.').next()) else { continue };
+            let Ok(id) = u64::from_str_radix(stem, 16) else { continue };
+            if !live.contains(&id) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 pub const WAL_INSERT: u8 = 1;
 pub const WAL_DELETE: u8 = 2;
 pub const WAL_SEALED: u8 = 3;
@@ -1085,8 +1184,10 @@ impl Wal {
     /// Forget every record in the log.
     ///
     /// Only a caller that has already made the records' effect durable some
-    /// other way may do this -- in practice [`Shard::flush`], after
-    /// `persist_manifest` has published the segments they were sealed into.
+    /// other way may do this -- in practice [`Shard::flush`], after its call to
+    /// `publish_segments` has returned `Ok` for a set that names the segments
+    /// they were sealed into. Not `persist_manifest`, which publishes the set
+    /// the shard is already in and so has no ordering property to offer.
     /// Recorded for the probe because "the manifest is durable before the WAL
     /// is emptied" is an ordering claim, and the wrong order loses every
     /// document in the sealed memtable.
@@ -1255,6 +1356,35 @@ impl Shard {
         // see `Db::build_shards`.
         sync_dir(dir)?;
         self.dir = Some(dir.to_path_buf());
+        // The lowest id this shard may use is what the DIRECTORY holds, and it
+        // is decided here rather than in `Shard::open` because `open` is not
+        // the only way in: `Db::build_shards` attaches without opening, and
+        // this method is public API. A shard that attached to a populated
+        // directory and resumed at id 1 would inherit the delete log already
+        // sitting under that id, which is the silent loss below.
+        //
+        // The manifest is not the whole record of which ids have been spoken
+        // for. A publication that failed — or a crash, which is the same story
+        // with no error to catch — leaves a `.seg` and possibly a `.dlog` on
+        // the disk under an id the manifest it never reached would have been
+        // the first to name. Resuming at the manifest's counter hands that id
+        // out again, and the `.dlog` is the reason that matters: delete logs
+        // are found by id and nothing else, and an empty one is not written, so
+        // the segment that reuses the id is reopened carrying the deletions of
+        // the segment that was never published. Documents nobody deleted
+        // disappear, and no error is returned anywhere.
+        //
+        // So the directory is asked instead. One listing per attach, against a
+        // seal path that would otherwise have to make an id durable before it
+        // could be used — a second manifest publication, two fsyncs and a
+        // rename, on every flush, to insure against a failure that is rare.
+        // Cleaning the orphans up on the failure path instead would leave the
+        // crash unhandled, because nothing runs on that path at all; the
+        // reclamation that does happen, in [`reclaim_orphans`], cannot stand in
+        // for this either, because it runs only where a MANIFEST says what is
+        // live and the directory that lost its manifest is exactly the one
+        // where reusing an id costs documents.
+        self.next_segment_id = self.next_segment_id.max(first_unused_segment_id(dir));
         // Another directory holds another MANIFEST, and what was published to
         // the last one says nothing about what is in this one. This keeps the
         // field's contract true rather than being the thing that prevents a
@@ -1794,37 +1924,67 @@ impl Shard {
             handles.push(handle);
         }
 
-        // Nothing below here may fail before the memtable is swapped out: this
-        // is the one point at which the seal becomes reader-visible.
-        self.next_segment_id = next_id;
+        // The set this seal is proposing, in a local. Id order is what
+        // `locate`'s newest-first scan reads as version order, so it is stated
+        // here rather than left to the loop direction — `install_compaction`
+        // sorts for the same reason.
         let sealed = Sealed { segment_ids: handles.iter().map(|h| h.id()).collect() };
-        self.segments.extend(handles);
-        // Id order is what `locate`'s newest-first scan reads as version order,
-        // so state it here rather than leaving it to the loop direction —
-        // `install_compaction` sorts for the same reason.
-        self.segments.sort_by_key(|h| h.id());
-        self.manifest_version += 1;
-        self.flushes += 1;
+        let mut next = self.segments.clone();
+        next.extend(handles);
+        next.sort_by_key(|h| h.id());
+        let version = self.manifest_version + 1;
 
+        // The ids are committed here rather than below, and deliberately not
+        // as part of the commit: the files under them are already on the disk,
+        // so they have been spoken for whatever happens next. Handing one out
+        // again after a failed publication overwrites an orphaned `.seg` --
+        // harmless -- and inherits an orphaned `.dlog`, which is not: delete
+        // logs are found by id alone, and an empty log is not written, so the
+        // segment that reuses the id would be reopened carrying deletions that
+        // belong to a segment nothing ever published. Erring high costs an id
+        // out of 2^64. `Shard::open` refuses the same reuse across a reopen,
+        // where the counter itself is what was lost.
+        self.next_segment_id = next_id;
+
+        // The publication, and the last thing here that can fail. Until it
+        // returns `Ok` the shard is still the shard it was: the memtable holds
+        // every row, the old segment set is the one readers see, and it is the
+        // one the manifest on the disk names. A seal that installed first would
+        // answer queries out of a set no manifest records -- with the rows
+        // reachable a second time through the memtable that still holds them --
+        // and a reopen would produce neither state.
+        //
+        // It also comes before the log is emptied, and that `?` is load-bearing
+        // too. The WAL holds the only other copy of the rows this seal just
+        // wrote: truncating it first -- or despite a publication that failed --
+        // leaves the old MANIFEST, which does not name the new segments, beside
+        // a log that no longer holds the documents. Every document in the
+        // sealed memtable is gone, and nothing anywhere returns an error to say
+        // so.
+        self.publish_segments(&next, version)?;
+
+        // The commit. Nothing in it can fail: this is the one point at which
+        // the seal becomes reader-visible, and it is now a point at which the
+        // seal is already recorded.
+        self.segments = next;
+        self.manifest_version = version;
+        self.flushes += 1;
         let old = std::mem::replace(
             &mut self.memtable,
             Memtable::new(&self.coll, self.opts.budget.clone()),
         );
         old.release_budget();
         // Only now has anything been forgotten: until the swap the memtable
-        // still held every row, and `persist_manifest` failing below does not
-        // put them back. Claiming the floor earlier would claim a collection
-        // that had not happened yet, and the field's contract is that at or
-        // above it nothing has been collected.
+        // still held every row. Claiming the floor earlier would claim a
+        // collection that had not happened yet — and before the publication
+        // above, one that might never happen at all — and the field's contract
+        // is that at or above it nothing has been collected.
         self.retain_floor = self.retain_floor.max(retain_from);
-        // The manifest is published before the log is emptied, and the `?` is
-        // load-bearing. The WAL holds the only other copy of the rows this seal
-        // just wrote: truncating it before `persist_manifest` -- or despite a
-        // `persist_manifest` that failed -- leaves the old MANIFEST, which does
-        // not name the new segments, beside a log that no longer holds the
-        // documents. Every document in the sealed memtable is gone, and nothing
-        // anywhere returns an error to say so.
-        self.persist_manifest()?;
+        // The log can go now, and only now. This one is still fallible and the
+        // error is still reported: what it leaves behind is a log holding
+        // records the manifest already names, which is the ordinary
+        // crash-between-the-two state and the one `Shard::open`'s replay
+        // converges on rather than re-applying.
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
         }
@@ -1844,11 +2004,24 @@ impl Shard {
     }
 
     pub fn manifest(&self) -> Manifest {
+        Shard::manifest_of(&self.segments, self.manifest_version, self.next_segment_id)
+    }
+
+    /// The manifest a given segment set would publish.
+    ///
+    /// Taken as arguments rather than read off `self` because a publication
+    /// happens BEFORE the shard is moved to the state it publishes: see
+    /// [`Shard::publish_segments`]. The shard's own fields are one caller of
+    /// this, not its definition.
+    fn manifest_of(
+        segments: &[Arc<SegmentHandle>],
+        version: u64,
+        next_segment_id: u64,
+    ) -> Manifest {
         Manifest {
-            version: self.manifest_version,
-            next_segment_id: self.next_segment_id,
-            segments: self
-                .segments
+            version,
+            next_segment_id,
+            segments: segments
                 .iter()
                 .map(|h| SegmentMeta {
                     id: h.id(),
@@ -1862,8 +2035,18 @@ impl Shard {
         }
     }
 
-    /// Write the manifest durably: temp file, fsync, rename, fsync the
-    /// directory.
+    /// Publish the segment set this shard is in right now.
+    ///
+    /// The shells call this after an acknowledged statement. It is the
+    /// degenerate case of the publication a seal or a compaction performs: the
+    /// set being published and the set the shard is already describing are the
+    /// same one, so there is no order for it to get wrong.
+    pub fn persist_manifest(&self) -> Result<()> {
+        self.publish_segments(&self.segments, self.manifest_version)
+    }
+
+    /// Write a segment set's manifest durably: temp file, fsync, rename, fsync
+    /// the directory.
     ///
     /// A bare `fs::write` truncates in place, so a crash halfway through leaves
     /// a manifest that will not decode — every segment file intact and the
@@ -1875,18 +2058,49 @@ impl Shard {
     /// belong to: a manifest that arrives without them describes segments whose
     /// deletes have been forgotten, and every deleted document comes back.
     ///
+    /// The set is a PARAMETER, and that is the whole of the ordering property.
+    /// [`Shard::flush`] and [`Shard::install_compaction`] call this with the
+    /// set they are about to install and install it only if this returns `Ok`,
+    /// so a publication that fails leaves the shard describing exactly what is
+    /// on the disk. A publication that read `self.segments` could not be used
+    /// that way: it would force its caller to move the shard first, and a
+    /// caller that has moved first cannot move back — the reader it has
+    /// already let in has seen a segment set no manifest records, and a failure
+    /// is the moment that set stops being one a reopen can reproduce.
+    ///
+    /// The id counter is NOT a parameter, and the asymmetry is the point: the
+    /// segment set and its version are the proposal, and the counter is already
+    /// committed by the time any caller gets here — `Shard::flush` assigns it
+    /// one line above the call, because the files under those ids are on the
+    /// disk whatever happens next. A parameter would offer a degree of freedom
+    /// that does not exist; all three call sites passed the field.
+    ///
+    /// What this ordering does NOT buy is worth stating beside it. Publishing
+    /// is [`atomic_write`]'s rename followed by the fsync that makes the new
+    /// name durable, so a publication that reports failure may still be the
+    /// MANIFEST on the disk — the rename landed and only the fsync did not.
+    /// The shard then rolls back and a later publication writes version v again
+    /// for a different segment set. That is accepted rather than overlooked:
+    /// `Manifest::version` is monotonic in memory, where it advances only on a
+    /// publication that returned `Ok`, but the PERSISTED field is not, so it is
+    /// a version and not a change token. Nothing may compare two of them across
+    /// a restart to decide whether the segment set moved — the set itself is
+    /// the record — and the cost of making it a token would be publishing the
+    /// version before the set it names, which is the ordering this whole
+    /// function exists to avoid.
+    ///
     /// A file whose bytes have not changed since this shard published them is
     /// not rewritten. This is not an optimisation of a rare case — inserts land
     /// in the memtable and nothing touches the segment set until a seal, so in
     /// steady state *every* call would otherwise rewrite the same manifest, at
     /// a temp file, two fsyncs and a rename each, to say what the disk already
-    /// says. Making the publication durable, above, roughly doubles what that
-    /// waste costs; not doing it is what pays for it.
-    pub fn persist_manifest(&self) -> Result<()> {
+    /// says. Making the publication durable roughly doubles what that waste
+    /// costs; not doing it is what pays for it.
+    fn publish_segments(&self, segments: &[Arc<SegmentHandle>], version: u64) -> Result<()> {
         let Some(dir) = self.dir.as_ref() else { return Ok(()) };
         let ddir = dir.join("deletes");
         let mut published: Vec<(u64, Vec<u8>)> = Vec::new();
-        for h in &self.segments {
+        for h in segments {
             let d = h.encode_deletes();
             if d.is_empty() {
                 continue;
@@ -1917,12 +2131,17 @@ impl Shard {
             }
         }
         // Segment ids ascend and are never reused, so a segment that has left
-        // the manifest is never coming back and its entry is dead weight.
+        // the manifest is never coming back and its entry is dead weight. A
+        // publication that fails can drop an entry for a segment that is still
+        // installed -- the set published was the one the caller then abandoned
+        // -- and that costs one rewrite of a delete log whose bytes the disk
+        // already has. Erring towards rewriting is the only direction this
+        // cache may err in.
         self.published_deletes
             .write()
             .unwrap()
-            .retain(|id, _| self.segments.iter().any(|h| h.id() == *id));
-        let mut body = self.manifest().encode();
+            .retain(|id, _| segments.iter().any(|h| h.id() == *id));
+        let mut body = Shard::manifest_of(segments, version, self.next_segment_id).encode();
         let crc = crc32(&body);
         put_u32(&mut body, crc);
         let p = dir.join("MANIFEST");
@@ -1952,7 +2171,10 @@ impl Shard {
             }
             let m = Manifest::decode(body)?;
             s.manifest_version = m.version;
-            s.next_segment_id = m.next_segment_id.max(1);
+            // Never below what `attach_dir` read off the disk: the manifest's
+            // counter is the lowest id it would be safe to resume at if the
+            // manifest were the whole record, and it is not.
+            s.next_segment_id = s.next_segment_id.max(m.next_segment_id.max(1));
             for meta in &m.segments {
                 // Reopen reads the footer, not the file. A shard with a hundred
                 // archived segments must not pull a hundred segments' worth of
@@ -1978,6 +2200,10 @@ impl Shard {
                 };
                 s.segments.push(SegmentHandle::new(seg, dl, Some(p)));
             }
+            // Inside the branch on purpose: the live set is only known where a
+            // manifest was read. See [`reclaim_orphans`].
+            let live: Vec<u64> = m.segments.iter().map(|meta| meta.id).collect();
+            reclaim_orphans(dir, &live);
         }
         let records = Wal::replay(&dir.join("wal.log"))?;
         for r in records {
@@ -2063,21 +2289,37 @@ impl Shard {
             }
             handles.push(h);
         }
-        let removed: Vec<Arc<SegmentHandle>> =
-            self.segments.iter().filter(|h| input_ids.contains(&h.id())).cloned().collect();
-        self.segments.retain(|h| !input_ids.contains(&h.id()));
-        self.segments.extend(handles);
-        self.segments.sort_by_key(|h| h.id());
+        // The set this compaction is proposing, in a local: the survivors of
+        // the input list, plus the outputs, in id order.
+        let mut next: Vec<Arc<SegmentHandle>> =
+            self.segments.iter().filter(|h| !input_ids.contains(&h.id())).cloned().collect();
+        next.extend(handles);
+        next.sort_by_key(|h| h.id());
+        let version = self.manifest_version + 1;
+
+        // The publication, and the last thing here that can fail. A compaction
+        // that swapped the set first and published afterwards lost its inputs
+        // twice over when the publication failed: readers were on a merged set
+        // no manifest recorded, and the input handles — dropped on the way out
+        // of `retain`, with `retiring` only reached below the `?` — were gone
+        // from the one list that unlinks files, while the manifest on the disk
+        // still named them. Nothing afterwards could retire what the shard no
+        // longer had, so both files stayed for the life of the database.
+        self.publish_segments(&next, version)?;
+
         // The commit point: the merged, collected set is reader-visible from
-        // here, so the floor has to be up before `persist_manifest` below can
-        // fail. Raising it in `run`, next to `collect_for_compaction`, would
-        // claim a collection that a later `build` error could still abandon.
+        // here, and recorded before here. The floor moves with it — raising it
+        // in `run`, next to `collect_for_compaction`, would claim a collection
+        // that a later `build` error could still abandon, and raising it above
+        // the publication would claim one that a failed publication abandons.
         // Both of `run`'s call sites come through here, including the one that
         // installs no outputs at all — which still collected.
+        let removed: Vec<Arc<SegmentHandle>> =
+            self.segments.iter().filter(|h| input_ids.contains(&h.id())).cloned().collect();
+        self.segments = next;
         self.retain_floor = self.retain_floor.max(retain_from);
-        self.manifest_version += 1;
+        self.manifest_version = version;
         self.compactions += 1;
-        self.persist_manifest()?;
         self.retiring.extend(removed);
         self.sweep_retired();
         Ok(())
@@ -2409,6 +2651,28 @@ mod tests {
 
     fn shard() -> Shard {
         Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default())
+    }
+
+    /// A directory of this test's own, under a name no other test can build.
+    ///
+    /// The process id is not enough on its own, and the way that failed is
+    /// worth keeping: libtest runs these as threads of ONE process, so two
+    /// tests that picked the same label shared a directory, and each one's
+    /// opening `remove_dir_all` deleted the other's live shard. It reported
+    /// itself as a durability failure in a test that was working perfectly,
+    /// which is the most expensive shape a flaky test can take.
+    ///
+    /// So the name is unique per CALL rather than per label: a duplicated
+    /// label -- which is what the next person to copy a test will write --
+    /// cannot collide any more, and the label is left as a hint for whoever is
+    /// looking at the leftovers in `/tmp`. The removal is here too, because a
+    /// previous run of this binary can have had the same pid.
+    fn test_dir(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, AtomicOrdering::Relaxed);
+        let d = std::env::temp_dir().join(format!("celastro-{label}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
     }
 
     #[test]
@@ -2754,8 +3018,7 @@ mod tests {
         // still holds every one of them — the same key visible twice, and a
         // retry that makes the duplicate permanent by putting it in the
         // manifest.
-        let dir = std::env::temp_dir().join(format!("celastro-halfflush-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("halfflush");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -2796,8 +3059,7 @@ mod tests {
 
     #[test]
     fn reopen_replays_the_wal() {
-        let dir = std::env::temp_dir().join(format!("celastro-wal-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("wal");
         fs::create_dir_all(&dir).unwrap();
         let clock = Arc::new(Hlc::new());
         {
@@ -3026,12 +3288,7 @@ mod tests {
     /// and v1 is re-inserted and never superseded. Without this leg that
     /// version of the fix looks correct.
     fn replay_reproduces_the_seal(pin: bool) {
-        let dir = std::env::temp_dir().join(format!(
-            "celastro-replay-{}-{}",
-            if pin { "pinned" } else { "unpinned" },
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir(if pin { "replay-pinned" } else { "replay-unpinned" });
         fs::create_dir_all(&dir).unwrap();
         let clock = Arc::new(Hlc::new());
         let wal_bytes;
@@ -3270,8 +3527,7 @@ mod tests {
 
     #[test]
     fn a_zero_filled_wal_tail_ends_replay_instead_of_panicking() {
-        let dir = std::env::temp_dir().join(format!("celastro-tail-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("tail");
         fs::create_dir_all(&dir).unwrap();
         {
             let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
@@ -3472,8 +3728,7 @@ mod tests {
         // It also pins the promise `sealed_has_live_posting` makes when it lets
         // an unreadable extent through the prefix walk as "live": that the
         // gather which follows opens the same extent and raises there.
-        let dir = std::env::temp_dir().join(format!("celastro-corrupt-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("corrupt");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         for i in 0..8 {
@@ -3636,8 +3891,7 @@ mod tests {
     /// takes back -- and the last one does.
     #[test]
     fn a_publication_syncs_the_bytes_then_renames_then_syncs_the_name() {
-        let dir = std::env::temp_dir().join(format!("celastro-pub-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("pub");
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("FILE");
 
@@ -3668,8 +3922,7 @@ mod tests {
     /// durable. Only an ordered probe can tell the two apart.
     #[test]
     fn an_insert_appends_its_wal_record_and_then_makes_it_durable() {
-        let dir = std::env::temp_dir().join(format!("celastro-walsync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("walsync");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("wal.log");
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
@@ -3729,8 +3982,7 @@ mod tests {
     /// stopped answering for the version the log still describes as live.
     #[test]
     fn an_insert_that_supersedes_a_document_syncs_the_record_that_supersedes_it() {
-        let dir = std::env::temp_dir().join(format!("celastro-resync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("resync");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("wal.log");
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
@@ -3756,8 +4008,7 @@ mod tests {
     /// visible in memory and the document comes back on reopen.
     #[test]
     fn a_delete_makes_its_wal_record_durable_before_it_returns() {
-        let dir = std::env::temp_dir().join(format!("celastro-delsync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("delsync");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("wal.log");
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
@@ -3787,8 +4038,7 @@ mod tests {
     /// `mark_superseded`/`memtable.insert` pair it deliberately sits above.
     #[test]
     fn a_wal_sync_that_fails_is_reported_and_leaves_the_shard_as_it_was() {
-        let dir = std::env::temp_dir().join(format!("celastro-syncfail-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("syncfail");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("wal.log");
         let key = format!("t1{KEY_SEP}d0001");
@@ -3856,8 +4106,7 @@ mod tests {
     /// durable too.
     #[test]
     fn a_seal_publishes_the_delete_logs_durably_and_before_the_manifest() {
-        let dir = std::env::temp_dir().join(format!("celastro-puborder-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("puborder");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -3913,8 +4162,7 @@ mod tests {
     /// memtable is gone with no error anywhere.
     #[test]
     fn a_seal_publishes_the_manifest_before_it_empties_the_wal() {
-        let dir = std::env::temp_dir().join(format!("celastro-sealorder-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("sealorder");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -3960,8 +4208,7 @@ mod tests {
     /// the first step of `atomic_write`.
     #[test]
     fn a_seal_whose_manifest_cannot_be_published_keeps_the_wal() {
-        let dir = std::env::temp_dir().join(format!("celastro-sealfail-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("sealfail");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -4001,8 +4248,7 @@ mod tests {
     /// window.
     #[test]
     fn a_publication_that_failed_after_the_rename_is_retried_rather_than_believed() {
-        let dir = std::env::temp_dir().join(format!("celastro-retry-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("retry");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -4010,19 +4256,26 @@ mod tests {
             s.insert(doc(i)).unwrap();
         }
 
-        // The MANIFEST leg. The seal publishes a manifest, so the rename
-        // happens and the fsync of the directory it landed in is what fails.
-        durability_probe::fail_next(Op::DirSync, &dir);
-        let e = s.flush().unwrap_err();
+        // The MANIFEST leg. A publication that writes the state the shard is
+        // already in, so that the failure has nothing to roll back and the
+        // bytes left on the disk are the ones the cache would have recorded.
+        //
+        // A seal cannot be used for this any more. Its publication happens
+        // before it installs anything (R6), so a seal that fails leaves the
+        // shard describing the state BEFORE it — and a cache written too early
+        // would then hold bytes the shard never publishes again, and be missed
+        // rather than believed. Attaching to a second directory republishes the
+        // state in hand, which is the same rename with nothing behind it.
+        s.flush().unwrap();
+        let two = dir.join("elsewhere");
+        fs::create_dir_all(&two).unwrap();
+        s.attach_dir(&two).unwrap();
+        durability_probe::fail_next(Op::DirSync, &two);
+        let e = s.persist_manifest().unwrap_err();
         assert!(matches!(e, Error::Io(_)), "a directory fsync that failed was swallowed: {e}");
         assert_eq!(
-            fs::read(dir.join("MANIFEST")).unwrap(),
-            {
-                let mut body = s.manifest().encode();
-                let crc = crc32(&body);
-                put_u32(&mut body, crc);
-                body
-            },
+            fs::read(two.join("MANIFEST")).unwrap(),
+            manifest_bytes(&s),
             "the rename happened: the bytes on disk are the ones a cache written too early \
              would be believed against"
         );
@@ -4030,15 +4283,15 @@ mod tests {
         s.persist_manifest().unwrap();
         let ev = durability_probe::take();
         assert!(
-            ev.at(Op::Rename, &dir.join("MANIFEST")).is_some(),
+            ev.at(Op::Rename, &two.join("MANIFEST")).is_some(),
             "the manifest was believed published by a call that returned `Err`, so its name \
              will never be made durable: {ev:?}"
         );
-        assert!(ev.at(Op::DirSync, &dir).is_some(), "{ev:?}");
+        assert!(ev.at(Op::DirSync, &two).is_some(), "{ev:?}");
 
         // The delete-log leg, which caches the same way.
         s.delete(&format!("t0{KEY_SEP}d0006")).unwrap().expect("nothing was deleted");
-        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        durability_probe::fail_next(Op::DirSync, &two.join("deletes"));
         let e = s.persist_manifest().unwrap_err();
         assert!(matches!(e, Error::Io(_)), "{e}");
         durability_probe::start();
@@ -4057,8 +4310,7 @@ mod tests {
     /// them republished the same bytes at two fsyncs and a rename apiece.
     #[test]
     fn a_persist_that_would_rewrite_the_same_manifest_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("celastro-nowrite-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("nowrite");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -4100,8 +4352,7 @@ mod tests {
     /// reopen reads in place of the state the shard is actually in.
     #[test]
     fn a_manifest_that_was_replaced_underneath_the_shard_is_republished() {
-        let dir = std::env::temp_dir().join(format!("celastro-regone-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("regone");
         fs::create_dir_all(&dir).unwrap();
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
         s.attach_dir(&dir).unwrap();
@@ -4147,8 +4398,7 @@ mod tests {
     /// there says nothing about what is here.
     #[test]
     fn a_reattached_shard_publishes_into_its_new_directory() {
-        let base = std::env::temp_dir().join(format!("celastro-reattach-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
+        let base = test_dir("reattach");
         let (one, two) = (base.join("one"), base.join("two"));
         fs::create_dir_all(&one).unwrap();
         fs::create_dir_all(&two).unwrap();
@@ -4192,8 +4442,7 @@ mod tests {
     /// the `break` is replays two records here instead of one.
     #[test]
     fn replay_stops_at_a_record_whose_crc_does_not_match() {
-        let dir = std::env::temp_dir().join(format!("celastro-walcrc-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = test_dir("walcrc");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("wal.log");
         {
@@ -4238,6 +4487,565 @@ mod tests {
             re.get(&format!("t0{KEY_SEP}d0003"), MAX_TS).unwrap().is_none(),
             "the record after the damaged one was applied, so the replay skipped a torn record \
              instead of stopping at it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------------------
+    // Publication is ordered: nothing the shard says is true until the
+    // manifest that says it is on the disk (R6).
+    //
+    // R21 made these publications durable. These three are the other half:
+    // durable is worth nothing if the shard has already moved on by the time
+    // the publication fails, because then the in-memory state describes a
+    // manifest nobody ever wrote, and a reader is reading a segment set that
+    // no reopen will ever produce.
+    //
+    // `DirSync` on `deletes/` is the injected failure in all three. It is the
+    // one that lands where a publication fails BEFORE MANIFEST's rename -- the
+    // delete logs are published and fsynced first, precisely because MANIFEST
+    // is what names the segments they belong to -- so the disk still holds the
+    // pre-operation manifest and "what the shard says" and "what was written"
+    // can be compared byte for byte.
+    // ----------------------------------------------------------------------
+
+    /// Everything a seal or a compaction may claim only once its manifest is
+    /// on the disk.
+    ///
+    /// One value rather than a handful of assertions in each of two tests. The
+    /// fields are claims of one kind -- the segment set readers are served
+    /// from, the version they are served under, the floor that says versions
+    /// below it may have been collected, and the counters that say the
+    /// operation happened -- and they were pinned in complementary halves: the
+    /// seal's test had the set and the version, the compaction's had the set
+    /// and the floor, and neither had a counter, so a seal that counted itself
+    /// without happening was invisible at both call sites. Comparing the whole
+    /// record before and after an armed failure also covers the field somebody
+    /// adds next, at both call sites, without their having to remember either
+    /// test.
+    #[derive(Debug, PartialEq)]
+    struct Committed {
+        segments: Vec<u64>,
+        manifest_version: u64,
+        retain_floor: Timestamp,
+        flushes: u64,
+        compactions: u64,
+    }
+
+    fn committed(s: &Shard) -> Committed {
+        Committed {
+            segments: s.segments.iter().map(|h| h.id()).collect(),
+            manifest_version: s.manifest_version,
+            retain_floor: s.retain_floor,
+            flushes: s.flushes,
+            compactions: s.compactions,
+        }
+    }
+
+    /// The MANIFEST a shard's in-memory state claims is on the disk.
+    fn manifest_bytes(s: &Shard) -> Vec<u8> {
+        manifest_bytes_with(s, s.next_segment_id)
+    }
+
+    /// The same, with the id counter replaced.
+    ///
+    /// The counter is the one field of the manifest that may legitimately run
+    /// ahead of the disk, because it may never run behind it: a failed
+    /// publication leaves files under the ids it spoke for, and the shard has
+    /// to keep refusing them. So the comparisons below substitute the disk's
+    /// counter and assert on it separately, rather than dropping to comparing
+    /// segment ids and letting the rest of the manifest go unchecked.
+    fn manifest_bytes_with(s: &Shard, next_segment_id: u64) -> Vec<u8> {
+        let mut m = s.manifest();
+        m.next_segment_id = next_segment_id;
+        let mut body = m.encode();
+        let crc = crc32(&body);
+        put_u32(&mut body, crc);
+        body
+    }
+
+    /// The manifest on the disk, with its checksum checked the way a reopen
+    /// checks it.
+    fn manifest_on_disk(dir: &Path) -> Manifest {
+        let b = fs::read(dir.join("MANIFEST")).unwrap();
+        let (body, tail) = b.split_at(b.len() - 4);
+        assert_eq!(crc32(body), u32::from_le_bytes(tail.try_into().unwrap()), "torn MANIFEST");
+        Manifest::decode(body).unwrap()
+    }
+
+    /// A seal that cannot publish its manifest has not sealed anything.
+    ///
+    /// The segments were durable before the manifest was attempted, so the
+    /// tempting reading is that installing them early is harmless. It is not:
+    /// the rows are still in the memtable and in the WAL, so a shard that
+    /// installs them anyway has the same key reachable twice, and it answers
+    /// queries out of a segment set that the next reopen cannot reproduce --
+    /// the manifest on the disk names the old one. The flush's counter, the
+    /// memtable swap and the retain floor all say the same thing, and all of
+    /// them are claims about a seal that did not happen.
+    #[test]
+    fn a_seal_whose_manifest_publication_fails_installs_nothing() {
+        let dir = test_dir("sealpubfail");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        let published = fs::read(dir.join("MANIFEST")).unwrap();
+        assert_eq!(published, manifest_bytes(&s), "the control: the two agree to begin with");
+
+        // A second seal, with a delete of a row the memtable still holds: the
+        // sealed segment carries it, so publishing the seal publishes a delete
+        // log and fsyncs `deletes/` before it touches MANIFEST at all.
+        for i in 20..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        let key = format!("t1{KEY_SEP}d0022");
+        s.delete(&key).unwrap().expect("nothing was deleted");
+        let before = s.num_docs(s.clock.peek());
+        let committed_before = committed(&s);
+
+        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        let e = s.flush().unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "the failed publication was swallowed: {e}");
+
+        assert_eq!(
+            fs::read(dir.join("MANIFEST")).unwrap(),
+            published,
+            "the failure is before MANIFEST's rename, so the disk still holds the old one"
+        );
+        let on_disk = manifest_on_disk(&dir);
+        assert_eq!(
+            manifest_bytes_with(&s, on_disk.next_segment_id),
+            published,
+            "the shard is describing a manifest that was never written"
+        );
+        assert!(
+            s.next_segment_id > on_disk.next_segment_id,
+            "the failed seal wrote a segment under id {} and the counter came back below it",
+            on_disk.next_segment_id
+        );
+        assert_eq!(
+            committed(&s),
+            committed_before,
+            "a seal whose publication failed committed part of it anyway: the segment set \
+             readers see, the version they see it under, the floor below which versions may \
+             have been collected, and the count of seals that happened"
+        );
+        assert!(!s.memtable.is_empty(), "the rows the retry needs were swapped out anyway");
+        assert_eq!(s.num_docs(s.clock.peek()), before, "a reader lost rows to a seal that failed");
+
+        // A reopen is the same state, which is the point: the WAL still holds
+        // every row the seal was going to take out of it.
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.num_docs(MAX_TS), before, "the reopened shard is not the shard in memory");
+        assert!(re.get(&key, MAX_TS).unwrap().is_none(), "the delete was lost");
+
+        // And the retry, with nothing armed, lands the whole seal.
+        assert!(s.flush().unwrap().is_some());
+        assert!(s.memtable.is_empty());
+        assert_eq!(s.num_docs(s.clock.peek()), before);
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), manifest_bytes(&s));
+        assert!(s.get(&key, MAX_TS).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compaction half of the same claim, and the leak that rides on it.
+    ///
+    /// A compaction that removes its inputs from the segment list before the
+    /// publication that records the removal loses them twice over. The first
+    /// is the segment set, as above. The second is the files: the inputs are
+    /// handed to `retiring` only BELOW the publication, so a failure drops the
+    /// last reference to them -- the manifest still names them, nothing in the
+    /// shard holds them, and no later compaction can retire what it no longer
+    /// has. The `.seg` stays on the disk for the life of the database.
+    #[test]
+    fn a_compaction_whose_publication_fails_keeps_its_inputs_and_retires_them_on_the_retry() {
+        let dir = test_dir("compfail");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        for i in 20..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        // A delete inside an input, so the merge carries one into its output
+        // and the publication goes through `deletes/` first.
+        // Pinned below the delete, so the merge carries the tombstone into its
+        // output rather than collecting it. That is what gives the output a
+        // delete log of its own, and the publication a `deletes/` fsync to
+        // fail on -- the step that happens before MANIFEST is touched.
+        s.opts.gc_horizon = s.clock.peek();
+        let key = format!("t0{KEY_SEP}d0003");
+        s.delete(&key).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+        let published = fs::read(dir.join("MANIFEST")).unwrap();
+        let before = s.num_docs(s.clock.peek());
+        let committed_before = committed(&s);
+        let inputs: Vec<PathBuf> = s.segments.iter().filter_map(|h| h.path()).collect();
+        assert_eq!(inputs.len(), 2, "two inputs, both with files of their own");
+
+        let opts = crate::compaction::CompactionOpts { tier_fanout: 2, ..Default::default() };
+        let job = crate::compaction::plan(&s, s.clock.peek(), &opts)
+            .expect("two segments at a fanout of two");
+        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        let e = crate::compaction::run(&mut s, &job, &opts).unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "the failed publication was swallowed: {e}");
+
+        assert_eq!(
+            committed(&s),
+            committed_before,
+            "a compaction whose publication failed committed part of it anyway: the segment \
+             set, the version, the retain floor and the count of compactions that happened"
+        );
+        let on_disk = manifest_on_disk(&dir);
+        assert_eq!(
+            manifest_bytes_with(&s, on_disk.next_segment_id),
+            published,
+            "the shard is describing a manifest that was never written"
+        );
+        assert!(
+            s.next_segment_id > on_disk.next_segment_id,
+            "the failed compaction wrote its output under id {} and the counter came back \
+             below it",
+            on_disk.next_segment_id
+        );
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), published, "MANIFEST moved");
+        assert_eq!(s.num_docs(s.clock.peek()), before);
+        assert!(s.get(&key, MAX_TS).unwrap().is_none(), "the delete came back");
+        for p in &inputs {
+            assert!(p.exists(), "an input was unlinked by a compaction that did not happen");
+        }
+
+        // The inputs are still this shard's, so the retry can retire them.
+        // Nothing else ever can: they are named by no later manifest and held
+        // by no list, so a shard that dropped them here leaks both files for
+        // as long as the database exists.
+        crate::compaction::run(&mut s, &job, &opts).unwrap();
+        s.sweep_retired();
+        for p in &inputs {
+            assert!(
+                !p.exists(),
+                "{} is named by no manifest and owned by nothing: a leak no later compaction \
+                 can clean up",
+                p.display()
+            );
+        }
+        assert_eq!(s.num_docs(s.clock.peek()), before);
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), manifest_bytes(&s));
+        assert!(s.get(&key, MAX_TS).unwrap().is_none());
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.num_docs(MAX_TS), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A publication that failed leaves files behind under ids the manifest
+    /// never learned about, so the manifest is not the whole record of which
+    /// ids have been spoken for -- the directory is.
+    ///
+    /// This is not about tidiness. The orphaned `.seg` a reused id overwrites
+    /// is worthless and nobody would miss it. The `.dlog` beside it is not:
+    /// delete logs are found by id and nothing else, so the segment that
+    /// reuses the id inherits the deletions of the segment that failed to be
+    /// published. Its own log is empty -- an empty log is not written -- so
+    /// nothing overwrites the stale one, and the next reopen silently deletes
+    /// documents that were never deleted.
+    ///
+    /// A crash is the same story with no error to catch, which is why the fix
+    /// cannot be cleanup on the failure path: the id must be refused on the
+    /// way back in, by the reopen, whatever it was that stopped.
+    #[test]
+    fn a_reopen_does_not_hand_out_a_segment_id_the_disk_already_holds() {
+        let dir = test_dir("idreuse");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        for i in 20..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        // Pinned below the delete, so the merge carries the tombstone into its
+        // output rather than collecting it. That is what gives the output a
+        // delete log of its own, and the publication a `deletes/` fsync to
+        // fail on -- the step that happens before MANIFEST is touched.
+        s.opts.gc_horizon = s.clock.peek();
+        let key = format!("t0{KEY_SEP}d0003");
+        s.delete(&key).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+        let published = fs::read(dir.join("MANIFEST")).unwrap();
+
+        // The merge's outputs are ids 3 and 4 -- the cap splits forty documents
+        // into twenty-five and fifteen -- and the carried delete is in the
+        // first, so both of id 3's files reach the disk before the publication
+        // fails. TWO ids, deliberately: an id counter nudged past the one file
+        // anybody thought to look for is not the property. The property is that
+        // no id the disk already holds is handed out, however many of them a
+        // single failure left behind.
+        let opts = crate::compaction::CompactionOpts {
+            tier_fanout: 2,
+            segment_cap: 25,
+            ..Default::default()
+        };
+        let job = crate::compaction::plan(&s, s.clock.peek(), &opts)
+            .expect("two segments at a fanout of two");
+        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        assert!(crate::compaction::run(&mut s, &job, &opts).is_err());
+        for id in [3u64, 4] {
+            assert!(
+                dir.join("segments").join(format!("{id:016x}.seg")).exists(),
+                "the output segments are written before the manifest, as they have to be"
+            );
+        }
+        assert!(
+            dir.join("deletes").join(format!("{:016x}.dlog", 3)).exists(),
+            "the carried delete reached the disk, which is what makes the id dangerous"
+        );
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), published, "MANIFEST moved");
+        drop(s);
+
+        let mut re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            re.next_segment_id > 4,
+            "the reopen resumed at {}, and the disk already holds segments 3 and 4 and the \
+             delete log of 3",
+            re.next_segment_id
+        );
+
+        // A seal with no deletions in it at all, so whatever id it takes, it
+        // writes no delete log -- and an empty log is not written, so a stale
+        // one under the same id is not overwritten either.
+        for i in 100..140 {
+            re.insert(doc(i)).unwrap();
+        }
+        re.flush().unwrap();
+        let expect = re.num_docs(MAX_TS);
+        assert_eq!(expect, 20 + 20 - 1 + 40);
+        drop(re);
+
+        let again = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(
+            again.num_docs(MAX_TS),
+            expect,
+            "the delete log of an unpublished segment was applied to the segment that reused \
+             its id: documents nobody deleted are gone"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The delete-log half of the "already published" skip.
+    ///
+    /// `publish_segments` skips a delete log whose bytes it published last
+    /// time, and the cache alone cannot decide that: a file that went away
+    /// underneath the shard is not published however well the shard remembers
+    /// writing it. The MANIFEST half of exactly this skip has a test of its
+    /// own; this half had none, and it is the half that loses data quietly --
+    /// a skipped rewrite leaves the segment to be reopened with an empty
+    /// delete log, and every document deleted since it was sealed comes back
+    /// while the shard reports success.
+    #[test]
+    fn a_delete_log_that_was_removed_underneath_the_shard_is_republished() {
+        let dir = test_dir("dlogreplace");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        let key = format!("t0{KEY_SEP}d0003");
+        s.delete(&key).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+
+        let p = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        let published = fs::read(&p).unwrap();
+        fs::remove_file(&p).unwrap();
+        s.persist_manifest().unwrap();
+
+        assert!(p.exists(), "the shard believed its cache over the disk and skipped the rewrite");
+        assert_eq!(fs::read(&p).unwrap(), published, "the delete log came back with other bytes");
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(re.get(&key, MAX_TS).unwrap().is_none(), "the delete came back from the dead");
+        assert_eq!(re.num_docs(MAX_TS), 19);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An id can be hiding in any of the three directories, not just
+    /// `segments/`.
+    ///
+    /// A tiered segment's file lives only in `archive/`, and a delete log
+    /// lives in neither of the other two -- and the delete log is the one that
+    /// costs documents when its id is handed out again. A reopen that asked
+    /// `segments/` alone would resume at 1 here.
+    ///
+    /// The manifest is absent, which is both what makes the directory the only
+    /// record and what keeps [`reclaim_orphans`] out of it: a lost MANIFEST
+    /// must never be read as "none of these files are live", because that
+    /// turns a directory somebody could still recover into an empty one.
+    #[test]
+    fn a_reopen_reads_every_directory_a_segment_id_can_be_hiding_in() {
+        let dir = test_dir("archiveids");
+        fs::create_dir_all(dir.join("archive")).unwrap();
+        fs::create_dir_all(dir.join("deletes")).unwrap();
+        let seg = dir.join("archive").join(format!("{:016x}.seg", 1));
+        let dlog = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        // Contents are never read: nothing names these, which is the point.
+        fs::write(&seg, b"an archived segment no manifest names").unwrap();
+        fs::write(&dlog, b"its delete log").unwrap();
+
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(
+            s.next_segment_id, 2,
+            "the reopen resumed at {} with id 1 sitting in archive/ and deletes/",
+            s.next_segment_id
+        );
+        assert!(seg.exists() && dlog.exists(), "a directory with no MANIFEST was emptied");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The files a publication that never landed left behind are reclaimed by
+    /// the next reopen.
+    ///
+    /// Publishing before installing keeps the INPUTS of a failed compaction --
+    /// the shard still holds them, so the retry retires them. The outputs are
+    /// the other side of that: they are on the disk, no manifest names them,
+    /// no list owns them, and the id guard means no later segment overwrites
+    /// them either. One per failed attempt, for the life of the database, on a
+    /// volume that is most likely failing because it is already full.
+    ///
+    /// So the reopen unlinks them, and the two halves of that are both pinned
+    /// here: what the manifest does not name goes, and what it names stays --
+    /// including the delete log of a live segment, whose removal would bring
+    /// every deleted document back.
+    #[test]
+    fn a_reopen_reclaims_the_files_of_a_publication_that_never_landed() {
+        let dir = test_dir("orphans");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        for i in 20..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        // Pinned below the delete so the merge carries the tombstone into its
+        // output, which gives the output a delete log of its own and the
+        // publication a `deletes/` fsync to fail on.
+        s.opts.gc_horizon = s.clock.peek();
+        let key = format!("t0{KEY_SEP}d0003");
+        s.delete(&key).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+        let before = s.num_docs(s.clock.peek());
+
+        let opts = crate::compaction::CompactionOpts { tier_fanout: 2, ..Default::default() };
+        let job = crate::compaction::plan(&s, s.clock.peek(), &opts)
+            .expect("two segments at a fanout of two");
+        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        assert!(crate::compaction::run(&mut s, &job, &opts).is_err());
+
+        let orphans = [
+            dir.join("segments").join(format!("{:016x}.seg", 3)),
+            dir.join("deletes").join(format!("{:016x}.dlog", 3)),
+        ];
+        for o in &orphans {
+            assert!(o.exists(), "the output was durable before the manifest, as it has to be");
+        }
+        let live = [
+            dir.join("segments").join(format!("{:016x}.seg", 1)),
+            dir.join("segments").join(format!("{:016x}.seg", 2)),
+            dir.join("deletes").join(format!("{:016x}.dlog", 1)),
+        ];
+        for l in &live {
+            assert!(l.exists(), "the control: the manifest names these");
+        }
+        drop(s);
+
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        for o in &orphans {
+            assert!(
+                !o.exists(),
+                "{} is named by no manifest and owned by no list, and it survived the one \
+                 moment at which anything can reclaim it",
+                o.display()
+            );
+        }
+        for l in &live {
+            assert!(l.exists(), "{} is named by the manifest and was unlinked", l.display());
+        }
+        assert_eq!(re.num_docs(MAX_TS), before, "the reclamation took a live file with it");
+        assert!(re.get(&key, MAX_TS).unwrap().is_none(), "a live delete log was reclaimed");
+        assert!(
+            re.next_segment_id > 3,
+            "the reopen read the directory after emptying it and resumed at {}",
+            re.next_segment_id
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The id guard is on the directory, not on `Shard::open`.
+    ///
+    /// `attach_dir` is public API and `Db::build_shards` reaches a shard
+    /// through it without opening at all, so a guard that lived in `open`
+    /// alone left the one entry point that resumes at id 1 over a directory
+    /// that is not empty -- which is what a collection created over a
+    /// surviving shard directory the catalog no longer lists does.
+    #[test]
+    fn an_attach_to_a_populated_directory_refuses_the_ids_it_already_holds() {
+        let dir = test_dir("attachids");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        for i in [3, 6, 9] {
+            s.delete(&format!("t0{KEY_SEP}d{i:04}")).unwrap().expect("nothing was deleted");
+        }
+        s.persist_manifest().unwrap();
+        assert!(
+            dir.join("deletes").join(format!("{:016x}.dlog", 1)).exists(),
+            "the delete log under id 1 is what makes the id dangerous"
+        );
+        drop(s);
+
+        let mut fresh = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        fresh.attach_dir(&dir).unwrap();
+        assert!(
+            fresh.next_segment_id > 1,
+            "the attach resumed at {} and the disk already holds segment 1 and its delete log",
+            fresh.next_segment_id
+        );
+
+        // A seal with no deletions in it, so it writes no delete log of its
+        // own -- an empty one is not written -- and nothing overwrites a stale
+        // one sitting under the id it takes.
+        for i in 100..120 {
+            fresh.insert(doc(i)).unwrap();
+        }
+        fresh.flush().unwrap();
+        let expect = fresh.num_docs(MAX_TS);
+        assert_eq!(expect, 20, "the fresh shard's own rows, none of them deleted");
+        drop(fresh);
+
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(
+            re.num_docs(MAX_TS),
+            expect,
+            "the delete log of the segment that was here first was applied to the segment that \
+             reused its id: three documents nobody deleted are gone"
         );
         let _ = fs::remove_dir_all(&dir);
     }
