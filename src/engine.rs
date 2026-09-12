@@ -320,6 +320,12 @@ pub struct Db {
     /// number down to be trebled again. The shards' copies are cleared at open
     /// and this holds what they no longer carry.
     stats_baseline: BTreeMap<String, (u64, BTreeMap<String, crate::catalog::PathStats>)>,
+    /// The catalog exactly as this process last published it, so that a persist
+    /// which would rewrite CATALOG byte for byte can decline to. See
+    /// [`Shard::persist_manifest`], which does the same for the manifests, and
+    /// for the same reason: the shells persist after every acknowledged
+    /// statement, and almost no statement changes the catalog.
+    published_catalog: Option<Vec<u8>>,
     writes: u64,
     lifecycle_checked_at_writes: u64,
     activity_persisted_micros: u64,
@@ -360,6 +366,7 @@ impl Db {
             residency,
             stats: BTreeMap::new(),
             stats_baseline: BTreeMap::new(),
+            published_catalog: None,
             writes: 0,
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
@@ -395,20 +402,30 @@ impl Db {
                 if !sdir.exists() {
                     break;
                 }
-                let ranges = fs::read_to_string(sdir.join("RANGE")).unwrap_or_default();
-                let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
-                let parts: Vec<&str> = ranges.split('\n').collect();
-                // Two lines, a low bound and a high one. `create_collection`
-                // refuses a split key that could write a third, so a third is
-                // a damaged tablet map -- and a tablet map read wrong is a
-                // shard that silently owns the wrong keys, which no later
+                // Two lines, a low bound and a high one, and neither the
+                // file nor either line is optional. `create_collection`
+                // refuses a split key that could write a third line, so a
+                // third is a damaged tablet map -- and a tablet map read wrong
+                // is a shard that silently owns the wrong keys, which no later
                 // check catches because every shard agrees with itself.
-                if parts.len() > 2 {
+                //
+                // A missing or empty RANGE is the same defect wearing the
+                // opposite disguise, and it used to be read as success: an
+                // `unwrap_or_default()` turned it into `""`, which splits into
+                // ONE empty part, and a shard with no bounds owns every key.
+                // Every shard in the collection then answers `true` to `owns`,
+                // writes land wherever the router looked first and reads find
+                // the same key in two places. It has to fail here instead.
+                let ranges = fs::read_to_string(sdir.join("RANGE"))
+                    .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?;
+                let parts: Vec<&str> = ranges.split('\n').collect();
+                if parts.len() != 2 {
                     return Err(Error::Storage(format!(
                         "shard-{i:04} of `{name}`: RANGE holds {} lines, expected 2",
                         parts.len()
                     )));
                 }
+                let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
                 let lo = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
                 let hi = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
                 sh.key_range = Some((lo, hi));
@@ -506,13 +523,43 @@ impl Db {
             if let Some(dir) = &self.dir {
                 let sdir = dir.join("collections").join(&coll.name).join(format!("shard-{i:04}"));
                 fs::create_dir_all(&sdir)?;
-                fs::write(
-                    sdir.join("RANGE"),
-                    format!("{}\n{}", lo.unwrap_or_default(), hi.unwrap_or_default()),
+                // Through `atomic_write`, like every other file this database
+                // cannot afford to find half-written. RANGE decides which keys
+                // the shard owns, and the CREATE COLLECTION that writes it is
+                // acknowledged on the strength of a CATALOG that IS published
+                // durably -- so a bare `fs::write`, which syncs nothing and
+                // truncates in place, is the one file on the acknowledged path
+                // that a crash could disagree with the catalog about. What it
+                // leaves is a zero-length or half-written tablet map, which the
+                // reopen above now refuses rather than reinterprets.
+                crate::shard::atomic_write(
+                    &sdir.join("RANGE"),
+                    format!("{}\n{}", lo.unwrap_or_default(), hi.unwrap_or_default()).as_bytes(),
                 )?;
                 sh.attach_dir(&sdir)?;
             }
             shards.push(sh);
+        }
+        // The shard directories now hold durable files under durable names.
+        // The names of the DIRECTORIES are a separate question: `create_dir_all`
+        // above wrote `collections/`, `collections/<name>/` and each
+        // `shard-NNNN` as dirty metadata in their parents, and fsyncing a file
+        // cannot create the directory entry that reaches it. Without this walk
+        // a crash after an acknowledged CREATE COLLECTION and an acknowledged
+        // INSERT leaves a durable CATALOG naming a collection whose directory
+        // is not there -- and `Db::open`'s scan stops at the missing shard
+        // directory, leaving a collection that answers `already exists` to
+        // CREATE and `no such collection` to everything else.
+        //
+        // Once per collection, not once per shard: every `shard-NNNN` entry
+        // lives in `collections/<name>`, so one fsync of it covers all of them,
+        // and this is creation-time work that no write path pays for. Top down,
+        // because a prefix of the chain being durable is a state the reopen
+        // handles and a directory whose parent does not name it is not.
+        if let Some(dir) = &self.dir {
+            crate::shard::sync_dir(dir)?;
+            crate::shard::sync_dir(&dir.join("collections"))?;
+            crate::shard::sync_dir(&dir.join("collections").join(&coll.name))?;
         }
         Ok(shards)
     }
@@ -547,12 +594,31 @@ impl Db {
         Ok(())
     }
 
-    fn persist_catalog(&self) -> Result<()> {
+    fn persist_catalog(&mut self) -> Result<()> {
         if let Some(dir) = &self.dir {
+            let bytes = self.catalog.encode();
+            let p = dir.join("CATALOG");
+            // The same bytes as last time mean the same file on the disk, and
+            // rewriting it durably costs two fsyncs and a rename to say
+            // nothing. The cache is a record of what THIS `Db` published --
+            // that is the invariant, not "this process": there is no lock file
+            // anywhere in the tree, so two `Db` handles on one directory each
+            // keep their own cache and neither sees the other's writes. Two
+            // handles on one directory were already unsupported and are no more
+            // supported now. What is defended is the file being taken away or
+            // replaced underneath a single handle: `still_published` compares
+            // the bytes on disk, and a save that can no longer be written has
+            // to say so rather than skipping its way to success.
+            if self.published_catalog.as_deref() == Some(bytes.as_slice())
+                && crate::shard::still_published(&p, &bytes)
+            {
+                return Ok(());
+            }
             // Not `fs::write`: that truncates in place, so a crash partway
             // through leaves a catalog that will not decode and a database
             // that will not open, with every segment file intact.
-            crate::shard::atomic_write(&dir.join("CATALOG"), &self.catalog.encode())?;
+            crate::shard::atomic_write(&p, &bytes)?;
+            self.published_catalog = Some(bytes);
         }
         Ok(())
     }
@@ -2231,6 +2297,8 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::shard::durability_probe::{self, Op};
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("celastro-engine-{tag}-{}", std::process::id()));
@@ -4641,6 +4709,380 @@ mod tests {
              one is still there"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// CATALOG and MANIFEST are published by a rename, and a rename is a change
+    /// to a directory: until that directory is fsynced the bytes can be durable
+    /// while the name that reaches them is not. Asserted at the callers rather
+    /// than on `atomic_write` itself, so that deleting the sync turns this red
+    /// from the path the database actually takes -- and asserted as an ORDER,
+    /// because a directory synced before the rename is a directory synced for
+    /// nothing.
+    #[test]
+    fn the_catalog_and_manifest_renames_are_made_durable_at_their_callers() {
+        let dir = tmp("dirsync");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+
+        durability_probe::start();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let ev = durability_probe::take();
+        let catalog =
+            ev.at(Op::Rename, &dir.join("CATALOG")).expect("CATALOG was not published by a rename");
+        assert!(
+            ev.at_after(Op::DirSync, &dir, catalog).is_some(),
+            "CATALOG was renamed into {dir:?} and that directory was not synced after it: {ev:?}"
+        );
+
+        let sdir = dir.join("collections").join("notes").join("shard-0000");
+        db.insert("notes", note("a")).unwrap();
+        durability_probe::start();
+        db.flush("notes").unwrap();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+        let manifest = ev
+            .at(Op::Rename, &sdir.join("MANIFEST"))
+            .expect("MANIFEST was not published by a rename");
+        assert!(
+            ev.at_after(Op::DirSync, &sdir, manifest).is_some(),
+            "MANIFEST was renamed into {sdir:?} and that directory was not synced after it: {ev:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `CREATE COLLECTION` is acknowledged, and an `INSERT` after it is
+    /// acknowledged on the strength of an fdatasync'd WAL record. fdatasync
+    /// flushes the file's data and cannot create the directory entry that names
+    /// the file, so unless the directories created along the way are fsynced
+    /// too, the acknowledged insert lives in a file a crash can take away
+    /// wholesale -- and `Db::open`'s shard scan stops at the missing directory,
+    /// leaving a collection that is in the catalog with no shards, answering
+    /// `already exists` to CREATE and `no such collection` to everything else.
+    ///
+    /// The chain is the assertion: every directory from the root down to each
+    /// shard, and all of it before the first record is synced into any of them.
+    ///
+    /// Two shards, and the collection directory's own fsync stated against the
+    /// LAST of them. A collection with one shard cannot tell a chain walk that
+    /// runs once for the collection from one that runs for the first shard and
+    /// stops: both fsync `collections/notes` exactly once, at a moment that
+    /// looks the same. They are not the same. The second leaves `shard-0001`'s
+    /// entry in `collections/notes` as dirty metadata a crash takes, and
+    /// `Db::open`'s scan stops at the first shard directory that is not there
+    /// -- so the collection comes back with half its key space missing and
+    /// nothing anywhere returns an error.
+    #[test]
+    fn creating_a_collection_makes_the_directories_that_hold_it_durable() {
+        let dir = tmp("dircreate");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let cdir = dir.join("collections").join("notes");
+        let sdirs: Vec<PathBuf> = (0..2).map(|i| cdir.join(format!("shard-{i:04}"))).collect();
+
+        durability_probe::start();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        // One document on each side of the split, so every WAL in the
+        // collection is one a crash could be asked about.
+        db.insert("notes", note("a")).unwrap();
+        db.insert("notes", note("z")).unwrap();
+        let ev = durability_probe::take();
+
+        for d in [&dir, &dir.join("collections"), &cdir].into_iter().chain(sdirs.iter()) {
+            assert!(
+                ev.at(Op::DirSync, d).is_some(),
+                "{d:?} names something this database needs and was never made durable: {ev:?}"
+            );
+        }
+
+        for sdir in &sdirs {
+            let log = sdir.join("wal.log");
+            // The shard's own directory, in the order the claim needs: `sdir`
+            // does not name `wal.log` until `Wal::open` has created it, so an
+            // fsync of `sdir` above that call syncs a directory the log is not
+            // in yet and its name is never made durable at all.
+            let created = ev
+                .at(Op::WalCreate, &log)
+                .unwrap_or_else(|| panic!("{log:?} was never created: {ev:?}"));
+            assert!(
+                ev.at_after(Op::DirSync, sdir, created).is_some(),
+                "{sdir:?} was fsynced before it named {log:?}, so the log every later insert is \
+                 acknowledged against is a file a crash can still take: {ev:?}"
+            );
+            assert!(
+                ev.ordered((Op::DirSync, sdir), (Op::WalSync, &log)),
+                "the insert's record was fsynced into a WAL whose own directory entry was still \
+                 only in the page cache: {ev:?}"
+            );
+            assert!(
+                ev.ordered((Op::DirSync, &cdir), (Op::WalSync, &log)),
+                "the shard directory's own name was not durable when the insert was \
+                 acknowledged, so the whole shard can be gone: {ev:?}"
+            );
+        }
+
+        let last = ev.at(Op::WalCreate, &sdirs[1].join("wal.log")).unwrap();
+        assert!(
+            ev.at_after(Op::DirSync, &cdir, last).is_some(),
+            "{cdir:?} was made durable before the last shard directory in it existed, so the \
+             shards after the first are names a crash takes back: {ev:?}"
+        );
+
+        // Nothing about this is per-write: the second insert syncs no directory
+        // at all.
+        durability_probe::start();
+        db.insert("notes", note("b")).unwrap();
+        let ev = durability_probe::take();
+        assert!(ev.paths(Op::DirSync).is_empty(), "a write paid for a directory fsync: {ev:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RANGE decides which keys a shard owns and the statement that writes it
+    /// is acknowledged as durable, so it is published like every other file
+    /// this database cannot afford to find half-written.
+    ///
+    /// The second half is what a bare `fs::write` used to leave behind: a
+    /// zero-length RANGE, whose dirent committed while its data was still in
+    /// the page cache. That used to be read as a shard with no bounds -- which
+    /// owns every key, so every shard in the collection owns every key, writes
+    /// land wherever the router looked first and the same key is readable from
+    /// two shards. There is no later check for it, because every shard agrees
+    /// with itself.
+    #[test]
+    fn the_tablet_map_is_published_durably_and_a_damaged_one_is_refused() {
+        let dir = tmp("range-durable");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+
+        durability_probe::start();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        let ev = durability_probe::take();
+
+        let cdir = dir.join("collections").join("notes");
+        for i in 0..2 {
+            let sdir = cdir.join(format!("shard-{i:04}"));
+            let range = sdir.join("RANGE");
+            let renamed = ev.at(Op::Rename, &range).unwrap_or_else(|| {
+                panic!("{range:?} was not published by a rename, so a crash can find it half written: {ev:?}")
+            });
+            assert!(
+                ev.at_after(Op::DirSync, &sdir, renamed).is_some(),
+                "{range:?} was renamed into a directory that was never synced after it: {ev:?}"
+            );
+        }
+        drop(db);
+
+        // The read side of the same two-line file, which is the other half of
+        // what it means. An empty line is how RANGE spells an unbounded end,
+        // and reading it as the bound `""` instead of as `None` is not a
+        // decoding detail: `""` sorts below every key, so the top shard's `hi`
+        // becomes `Some("")` and it owns nothing at all -- every insert above
+        // the split is refused with `no shard owns key`, and no later check
+        // notices, because every shard still agrees with itself.
+        let mut re = Db::open(&dir, DbOpts::default()).unwrap();
+        let ranges: Vec<_> =
+            re.shards("notes").unwrap().iter().map(|s| s.key_range.clone()).collect();
+        assert_eq!(
+            ranges,
+            vec![Some((None, Some("m".to_string()))), Some((Some("m".to_string()), None))],
+            "an empty RANGE line is an unbounded end, not a bound: {ranges:?}"
+        );
+        // And the consequence, from the outside: both ends of the key space
+        // still route somewhere.
+        re.insert("notes", note("zzz")).unwrap();
+        re.insert("notes", note("aaa")).unwrap();
+        drop(re);
+
+        // What a crash between the dirent and the data used to leave.
+        let range = cdir.join("shard-0001").join("RANGE");
+        fs::write(&range, b"").unwrap();
+        match Db::open(&dir, DbOpts::default()) {
+            Err(Error::Storage(m)) => assert!(m.contains("RANGE"), "{m}"),
+            Err(e) => panic!("the wrong failure: {e}"),
+            Ok(_) => panic!("an empty tablet map was read as a shard that owns every key"),
+        }
+        fs::remove_file(&range).unwrap();
+        assert!(
+            matches!(Db::open(&dir, DbOpts::default()), Err(Error::Storage(_))),
+            "a missing tablet map was read as a shard that owns every key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The catalog's half of the skip guard. `Shard::persist_manifest` has one
+    /// of these and the two are separate call sites: removing
+    /// `still_published` from this one leaves a `Db` that has published CATALOG
+    /// once agreeing, for the rest of its life, that a catalog which is no
+    /// longer there is still published -- and every mutating statement in the
+    /// shells acknowledging durability against it.
+    #[test]
+    fn a_catalog_that_disappeared_is_republished_rather_than_skipped() {
+        let dir = tmp("catalog-regone");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let published = fs::read(dir.join("CATALOG")).unwrap();
+        fs::remove_file(dir.join("CATALOG")).unwrap();
+
+        durability_probe::start();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("CATALOG")).is_some(),
+            "the catalog is gone and a persist reported success without rewriting it: {ev:?}"
+        );
+        assert_eq!(fs::read(dir.join("CATALOG")).unwrap(), published);
+
+        // And the same for a file of the same length that this `Db` did not
+        // write: the comparison is the bytes, not the size.
+        let mut other = published.clone();
+        let last = other.len() - 1;
+        other[last] ^= 0xff;
+        fs::write(dir.join("CATALOG"), &other).unwrap();
+        durability_probe::start();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("CATALOG")).is_some(),
+            "a different file of the same length was accepted as the published catalog: {ev:?}"
+        );
+        assert_eq!(fs::read(dir.join("CATALOG")).unwrap(), published);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every publication in the database, whatever wrote it: a rename, and then
+    /// an fsync of the directory the new name landed in.
+    ///
+    /// The second half is the half that keeps being left out, and it is left
+    /// out one call site at a time. CATALOG, MANIFEST and RANGE each got a test
+    /// of their own as they were written; `Shard::persist_segment` was added
+    /// after them and got none, and a `.seg` published without the directory
+    /// fsync is a segment the durable MANIFEST names and a crash can unname --
+    /// the reopen fails with `segment ... named by the manifest is missing`,
+    /// with every byte of the segment on the disk.
+    ///
+    /// So this is deliberately not a fourth per-call-site test. It is the
+    /// invariant read off the whole event log, and the workload is chosen to
+    /// drive one of everything the database publishes: the catalog, a tablet
+    /// map per shard, a segment, a manifest and a delete log. The call site
+    /// written next is covered by it on the day it is written, which is the
+    /// property the per-call-site tests kept failing to have.
+    #[test]
+    fn every_publication_fsyncs_the_directory_it_renamed_into() {
+        let dir = tmp("published");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+
+        durability_probe::start();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        for id in ["a", "b", "y", "z"] {
+            db.insert("notes", note(id)).unwrap();
+        }
+        db.flush("notes").unwrap();
+        assert!(db.delete_key("notes", "a").unwrap(), "nothing was deleted");
+        db.flush("notes").unwrap();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+
+        // Proving nothing is how an invariant test fails, so first: the
+        // workload really did publish one of each kind.
+        let renamed = ev.paths(Op::Rename);
+        let named = |what: &str| renamed.iter().any(|p| p.file_name().is_some_and(|n| n == what));
+        let with_ext = |e: &str| renamed.iter().any(|p| p.extension().is_some_and(|x| x == e));
+        for what in ["CATALOG", "RANGE", "MANIFEST"] {
+            assert!(named(what), "{what} was never published, so this says nothing about it");
+        }
+        assert!(with_ext("seg"), "no segment was published: {renamed:?}");
+        assert!(with_ext("dlog"), "no delete log was published: {renamed:?}");
+
+        let unpublished = ev.unpublished_renames();
+        assert!(
+            unpublished.is_empty(),
+            "renamed into place and then left in a directory nobody fsynced: the bytes are \
+             durable and the NAME is not, so a crash takes the file back and whatever names it \
+             -- a manifest, a catalog -- names nothing: {unpublished:?}"
+        );
+
+        // And the consequence the invariant is standing in for.
+        drop(db);
+        let re = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(re.shards("notes").unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The catalog's half of "a publication that failed AFTER the rename is
+    /// retried rather than believed". `Shard::persist_manifest` has a test for
+    /// that and this call site had none, so a cache assigned a line too early
+    /// was caught for MANIFEST and invisible for CATALOG: the same
+    /// second-call-site weakness, one level up.
+    ///
+    /// Only an injected failure reaches the window, and the window is the whole
+    /// point: the rename has already happened, so the bytes on disk ARE the
+    /// bytes the cache holds and `still_published` agrees with it. A cache
+    /// written before `atomic_write` returned therefore skips every later
+    /// publication of a catalog whose name was never made durable -- for the
+    /// life of the process, with every mutating statement in the shells
+    /// acknowledged against it.
+    #[test]
+    fn a_catalog_publication_that_failed_after_the_rename_is_retried() {
+        let dir = tmp("catalog-retry");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let published = fs::read(dir.join("CATALOG")).unwrap();
+
+        // A statement that changes the catalog and creates no directories, so
+        // the arming lands on CATALOG's own publication rather than on the
+        // directory chain a CREATE COLLECTION walks first.
+        durability_probe::fail_next(Op::DirSync, &dir);
+        let e = db.execute("CREATE INDEX notes_body ON notes USING fulltext (body)").unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "a directory fsync that failed was swallowed: {e}");
+        assert_ne!(
+            fs::read(dir.join("CATALOG")).unwrap(),
+            published,
+            "the rename happened: the bytes on disk are the ones a cache written too early \
+             would be believed against"
+        );
+
+        durability_probe::start();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("CATALOG")).is_some(),
+            "the catalog was believed published by a call that returned `Err`, so the name that \
+             reaches those bytes is never made durable: {ev:?}"
+        );
+        assert!(
+            ev.at(Op::DirSync, &dir).is_some(),
+            "the catalog was republished and its directory was not synced: {ev:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same change, and the reason the first half is
+    /// affordable: an acknowledged statement that changed no published file
+    /// writes nothing at all. Only the segment set and the catalog live in
+    /// those files, and an insert changes neither.
+    #[test]
+    fn a_persist_after_a_statement_that_changed_no_published_file_writes_nothing() {
+        let dir = tmp("persist-noop");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("notes", note("a")).unwrap();
+        db.persist().unwrap();
+
+        durability_probe::start();
+        db.insert("notes", note("b")).unwrap();
+        db.persist().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.paths(Op::Rename).is_empty() && ev.paths(Op::DirSync).is_empty(),
+            "the catalog and the manifest are byte for byte what they already were: {ev:?}"
+        );
+
+        // The documents are durable anyway -- that is the WAL sync's job, not
+        // this one's -- so declining to rewrite the manifest loses nothing.
+        drop(db);
+        let re = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(re.shards("notes").unwrap()[0].num_docs(crate::time::MAX_TS), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 }

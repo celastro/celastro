@@ -1217,13 +1217,28 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// request was well formed and authorised, so what the database thinks of the
 /// statement is content, not protocol.
 ///
-/// A statement that changed something is made durable before it is
-/// acknowledged. Without that, `celastro-cli --dir ./data serve` writes through
-/// the console and loses every one of those writes to a Ctrl-C or a closed
-/// terminal, which is the worst thing this tool could do to somebody. Persist
-/// is a no-op for an in-memory database, so this costs nothing where there is
-/// nothing to lose; and when it fails the client is told, because an ack that
-/// claims a durability the disk does not have is worse than an error.
+/// A statement that changed something is durable before it is acknowledged.
+/// Without that, `celastro-cli --dir ./data serve` writes through the console
+/// and loses every one of those writes to a Ctrl-C or a closed terminal, which
+/// is the worst thing this tool could do to somebody.
+///
+/// Two things make that true and only the second one is here. The documents are
+/// already on the disk when `execute` returns: `Shard::insert` and
+/// `Shard::delete` fsync the WAL record before the change is visible to a
+/// reader, one record per document, so a crash between `execute` and this line
+/// takes back nothing the client is about to be told about. What `persist` adds
+/// is the published state a reopen needs in order not to replay from the
+/// beginning — the catalog and each shard's manifest — and it writes only the
+/// ones whose bytes actually changed. For a stream of inserts into a collection
+/// with no secondary index that is none of them: the segment set does not move
+/// until a seal, and the catalog does not move at all. It is not none of them
+/// in general — a query against an indexed collection moves that index's
+/// activity clock, which lives in the catalog, so the next mutating statement
+/// republishes CATALOG. The skip is what makes the common case free, not a
+/// promise that nothing is ever written.
+/// Persist is a no-op for an in-memory database, so this costs nothing where
+/// there is nothing to lose; and when it fails the client is told, because an
+/// ack that claims a durability the disk does not have is worse than an error.
 fn run_sql(db: &mut Db, sql: &str) -> Response {
     let started = Instant::now();
     let outcome = db.execute(sql);

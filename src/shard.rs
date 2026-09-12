@@ -35,6 +35,16 @@ use crate::time::{Hlc, Timestamp, MAX_TS};
 use crate::value::Value;
 use crate::vector::VectorStore;
 
+/// Re-exported under the name the tests and [`crate::engine`] use it by: the
+/// probe lives inside [`durable`] because the code that may write a sync
+/// record has to be the code that makes the syscall.
+#[cfg(test)]
+pub(crate) use durable::probe as durability_probe;
+#[cfg(test)]
+use durable::probe::Op;
+pub(crate) use durable::sync_dir;
+use durable::sync_file;
+
 /// Separator between the partition key and the primary key in the composite
 /// sort key. `\u{1}` sorts below every printable character, so a tenant's
 /// documents form a contiguous run and a prefix range is exact.
@@ -510,17 +520,409 @@ impl Manifest {
 // Write-ahead log
 // --------------------------------------------------------------------------
 
-/// Write durably: temp file, fsync, rename. Exposed because every file the
-/// database cannot afford to find half-written goes through it.
+/// Write durably: temp file, fsync, rename, fsync the directory the rename
+/// landed in. Exposed because every file the database cannot afford to find
+/// half-written goes through it.
+///
+/// The last step is the one that is easy to leave out and impossible to notice
+/// missing. `fs::rename` is atomic with respect to a *reader*, but the
+/// directory entry it rewrites is dirty metadata like any other: a crash can
+/// leave the new bytes durable and the name still resolving to the old file, or
+/// to nothing at all. Syncing the temp file makes the contents durable; only
+/// syncing the directory makes the publication durable, and a file nothing
+/// names is not published.
+///
+/// The contents half holds on every target. The publication half is a POSIX
+/// guarantee and only that: fsyncing a directory means opening it, which
+/// Windows refuses, so there the bytes of the file are made durable and the
+/// durability of the new directory entry is left to the platform. That is a
+/// real difference in what this function promises, and it is written here
+/// rather than left to be discovered.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish(path, bytes)?;
+    sync_dir_of(path)
+}
+
+/// [`atomic_write`] without the directory fsync: temp file, fsync, rename.
+///
+/// For a caller publishing several files into the SAME directory, which can
+/// make all of their names durable with one fsync afterwards instead of one
+/// each. It is not a weaker `atomic_write` -- a caller of this owes the
+/// directory fsync before it may treat any of the names as published, and
+/// [`Shard::persist_manifest`] is the only caller.
+fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        sync_file(&f, &tmp)?;
     }
     fs::rename(&tmp, path)?;
+    #[cfg(test)]
+    durability_probe::note_rename(path);
     Ok(())
+}
+
+/// Is `path` still the file this process published `bytes` to?
+///
+/// The skip in [`Shard::persist_manifest`] and the matching one on the catalog
+/// rest on this process being the only writer of these files, which is true --
+/// but "the file is still there" is not something to take on trust when the
+/// answer decides whether a save may report success. A database directory that
+/// was removed underneath a running process has to keep failing loudly rather
+/// than being quietly agreed with.
+///
+/// Byte for byte, not by length. The event this check exists for -- one of
+/// these files being restored from a snapshot, or otherwise written by
+/// something that is not this process -- routinely leaves a file of exactly the
+/// length that was published and different contents: two manifests over the
+/// same segment count, two delete logs over the same number of entries. A skip
+/// that accepted one of those would leave the stale file in place for good, and
+/// a reopen would read it instead of the state this shard is in. These files
+/// are kilobytes and the bytes to compare are already in hand, so this is one
+/// page-cache read against the two fsyncs and a rename it is deciding whether
+/// to skip.
+pub(crate) fn still_published(path: &Path, bytes: &[u8]) -> bool {
+    fs::read(path).map(|b| b == bytes).unwrap_or(false)
+}
+
+/// The three fsyncs on the write path, and the only code in the crate that can
+/// say one happened.
+///
+/// An fsync leaves nothing behind that a later read can find, so the only way a
+/// test can learn that one happened is a record the code writes as it happens
+/// -- and a record a call site can write is a record a call site can write
+/// while syncing nothing. That is not hypothetical. The mutation that survived
+/// the previous round of this work was a call site that performed its rename
+/// correctly, wrote the probe's `DirSync` itself, called no fsync at all, and
+/// passed the whole suite: in a release build, a database with no directory
+/// fsync on the write path and no test able to say so.
+///
+/// So the syscalls and the records of them live in here together, and
+/// [`probe::note_sync`] -- the only function that can put `DirSync`,
+/// `TempSync` or `WalSync` into the log -- is private to this module. A call
+/// site elsewhere cannot claim a sync it did not make, because it cannot write
+/// the claim at all: it has to come through one of these three functions. What
+/// those three do is pinned from outside, by
+/// `the_three_fsyncs_are_syscalls_and_not_bookkeeping`, which hands each of
+/// them a descriptor the kernel refuses to sync and requires the refusal to
+/// come back, and by the injected-failure tests, which arm [`probe::check`] --
+/// private here too -- and follow the `Err` out to the caller.
+///
+/// The limit of that argument belongs here rather than being left to be
+/// discovered. It holds against a call site that stops calling, and against a
+/// helper that stops syncing. It does not hold against an edit made INSIDE
+/// this module: a fourth function here that recorded without syncing would be
+/// believed. That is why the module is three functions long, and why the three
+/// are exactly the ones the syscall proof names.
+pub(crate) mod durable {
+    use crate::error::Result;
+    use std::fs;
+    use std::path::Path;
+
+    /// fsync a file's contents and metadata, and record that it happened.
+    ///
+    /// The syscall and the record of it are one statement at the call site,
+    /// deliberately. A counter next to a call is satisfied by a counter that
+    /// moves with no call at all -- which is how this crate came to have a WAL
+    /// sync no test could tell apart from bookkeeping -- so the only line that
+    /// can be deleted to silence the probe is the line that does the work.
+    // `path` is read only by the probe, so it is unused once the probe is not
+    // compiled -- which is the point: the seam costs a release build nothing.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    pub(crate) fn sync_file(f: &fs::File, path: &Path) -> Result<()> {
+        f.sync_all()?;
+        #[cfg(test)]
+        probe::note_sync(probe::Op::TempSync, path);
+        Ok(())
+    }
+
+    /// fdatasync a log's contents, which for the WAL is all of what matters:
+    /// the file's size is part of its data, and nothing else about the inode
+    /// is. It cannot create the directory entry that names the file --
+    /// [`super::Shard::attach_dir`] does that, by fsyncing the directory the
+    /// log was created in.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    pub(crate) fn sync_data(f: &fs::File, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        probe::check(probe::Op::WalSync, path)?;
+        f.sync_data()?;
+        // Recorded after the call returns `Ok`, never before: a sync that
+        // failed made nothing durable and must not be able to satisfy an
+        // assertion that one did.
+        #[cfg(test)]
+        probe::note_sync(probe::Op::WalSync, path);
+        Ok(())
+    }
+
+    /// fsync `dir` itself, which is what makes the names it holds durable: a
+    /// rename's new entry, a freshly created subdirectory, a WAL that has just
+    /// been created. fdatasync on a file flushes that file's data and size and
+    /// cannot create the directory entry that reaches it, so a file whose
+    /// directory was never synced is a file nothing names after a crash.
+    ///
+    /// `pub(crate)` because directory *creation* has to be made durable too,
+    /// and the code that creates the collection and shard directories lives in
+    /// [`crate::engine`].
+    ///
+    /// Opening a directory in order to fsync it is a POSIX contract and only
+    /// that: on Windows `File::open` on a directory fails, so doing it
+    /// unconditionally would make every [`super::atomic_write`] return `Err`
+    /// *after* the rename had already happened, and no on-disk database could
+    /// be created there at all. The publication of a rename is therefore
+    /// durable on unix and best-effort elsewhere. That is a real difference and
+    /// it is written down rather than left to be found: the bytes of every file
+    /// are fsynced on every target, and it is the directory entry -- and the
+    /// crash guarantee that rests on it -- that unix gets and Windows does not.
+    #[cfg(unix)]
+    pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+        #[cfg(test)]
+        probe::check(probe::Op::DirSync, dir)?;
+        fs::File::open(dir)?.sync_all()?;
+        #[cfg(test)]
+        probe::note_sync(probe::Op::DirSync, dir);
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    /// A test-only, ordered log of the durability operations on the write path,
+    /// and the switch that makes one of them fail.
+    ///
+    /// Recording *that* an operation happened is not enough on its own: "the
+    /// directory was synced" and "the directory was synced after the rename"
+    /// are different claims, and only the second one is durability. A probe
+    /// that cannot tell them apart passes on a publication that syncs the
+    /// directory first and leaves the rename to be lost, which is the defect
+    /// the directory fsync was added for. So the events are ordered, each
+    /// carries the path it acted on, and the tests assert positions rather than
+    /// presence.
+    ///
+    /// Who may write an event is the other half, and it is why this module is
+    /// nested inside [`durable`] rather than sitting beside it. See that
+    /// module's own comment: [`note_sync`] and [`check`] are private to it, so
+    /// the three fsync records can only be written by the three fsyncs, while
+    /// the events a call site DOES write for itself -- an append, a rename, a
+    /// truncation, the creation of a log -- are all operations that leave
+    /// something behind for the same test to read off the disk.
+    ///
+    /// [`check`] is the other half of the failure story: a comment saying a
+    /// failed sync is reported to the caller is a claim about an error path,
+    /// and an error path no test ever enters is decoration. Arming an operation
+    /// makes it fail exactly where the real one fails -- immediately before the
+    /// syscall, so nothing it was meant to make durable has happened -- and the
+    /// test follows the `Err` out to the caller and checks what was left behind.
+    ///
+    /// Thread-local rather than process-wide because the test binary runs tests
+    /// in parallel threads, and a shared log would let one test's syncs satisfy
+    /// another test's assertion.
+    #[cfg(test)]
+    pub(crate) mod probe {
+        use crate::error::{Error, Result};
+        use std::cell::RefCell;
+        use std::path::{Path, PathBuf};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub(crate) enum Op {
+            /// A WAL file was opened, creating it if it was not there. The
+            /// event the directory fsync that publishes its name comes after.
+            WalCreate,
+            /// A WAL record reached `write_all`.
+            WalAppend,
+            /// A WAL record was fdatasync'd.
+            WalSync,
+            /// The WAL was emptied, forgetting every record in it.
+            WalTruncate,
+            /// A temp file was fsynced.
+            TempSync,
+            /// A temp file was renamed over the name it publishes. The path is
+            /// the destination, not the temp file.
+            Rename,
+            /// A directory was fsynced.
+            DirSync,
+        }
+
+        #[derive(Clone, Debug)]
+        pub(crate) struct Event {
+            pub(crate) op: Op,
+            pub(crate) path: PathBuf,
+        }
+
+        /// What the probe saw, oldest first, with the questions the tests ask
+        /// of it.
+        #[derive(Debug)]
+        pub(crate) struct Events(Vec<Event>);
+
+        impl Events {
+            /// Where `op` first happened to `path`, or `None` if it never did.
+            /// Comparing two of these is how a test asserts an order.
+            pub(crate) fn at(&self, op: Op, path: &Path) -> Option<usize> {
+                self.0.iter().position(|e| e.op == op && e.path == path)
+            }
+
+            /// Where `op` first happened to `path` after position `after`.
+            /// "The directory was synced" is not the claim; "the directory was
+            /// synced after the rename" is, and a directory that was synced for
+            /// some earlier reason must not be able to answer it.
+            pub(crate) fn at_after(&self, op: Op, path: &Path, after: usize) -> Option<usize> {
+                self.0
+                    .iter()
+                    .enumerate()
+                    .position(|(i, e)| i > after && e.op == op && e.path == path)
+            }
+
+            /// `a` happened, `b` happened, and `a` came first.
+            ///
+            /// Not `at(a) < at(b)`: `None < Some(_)` is true, so an operation
+            /// that never happened at all would satisfy an assertion that it
+            /// came first. A durability test whose assertion is satisfied by
+            /// the absence of the operation it is about is the whole failure
+            /// this module exists to stop being possible.
+            pub(crate) fn ordered(&self, a: (Op, &Path), b: (Op, &Path)) -> bool {
+                match (self.at(a.0, a.1), self.at(b.0, b.1)) {
+                    (Some(x), Some(y)) => x < y,
+                    _ => false,
+                }
+            }
+
+            /// How many times `op` happened to `path`.
+            pub(crate) fn count(&self, op: Op, path: &Path) -> usize {
+                self.0.iter().filter(|e| e.op == op && e.path == path).count()
+            }
+
+            /// Every path `op` happened to, in order.
+            pub(crate) fn paths(&self, op: Op) -> Vec<PathBuf> {
+                self.0.iter().filter(|e| e.op == op).map(|e| e.path.clone()).collect()
+            }
+
+            /// Every rename in the log that no fsync of the directory it landed
+            /// in followed -- which is to say, every publication whose bytes are
+            /// durable and whose NAME is not.
+            ///
+            /// The invariant, rather than a list of call sites, and that is the
+            /// point of it. Each of `atomic_write`, `publish` + a batched
+            /// `sync_dir`, and the tablet map's own publication had a test of
+            /// its own; the call site added after them did not, and published
+            /// a `.seg` that nothing fsynced a directory for -- a segment named
+            /// by a durable MANIFEST whose directory entry a crash could take,
+            /// which reopens as `segment ... named by the manifest is missing`.
+            /// A publication written tomorrow is covered by this the day it is
+            /// written, without anyone remembering to add anything.
+            pub(crate) fn unpublished_renames(&self) -> Vec<PathBuf> {
+                self.0
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        e.op == Op::Rename
+                            && self.at_after(Op::DirSync, parent_of(&e.path), *i).is_none()
+                    })
+                    .map(|(_, e)| e.path.clone())
+                    .collect()
+            }
+        }
+
+        /// The directory a path names something in, the way `sync_dir_of`
+        /// resolves it: `Path::parent` of a bare file name is `Some("")`.
+        fn parent_of(path: &Path) -> &Path {
+            match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            }
+        }
+
+        thread_local! {
+            static SEEN: RefCell<Option<Vec<Event>>> = const { RefCell::new(None) };
+            static ARMED: RefCell<Option<(Op, PathBuf)>> = const { RefCell::new(None) };
+        }
+
+        /// Start recording on this thread, discarding anything already recorded.
+        pub(crate) fn start() {
+            SEEN.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        }
+
+        /// Stop recording and return what was seen, oldest first.
+        pub(crate) fn take() -> Events {
+            Events(SEEN.with(|s| s.borrow_mut().take()).unwrap_or_default())
+        }
+
+        fn note(op: Op, path: &Path) {
+            SEEN.with(|s| {
+                if let Some(seen) = s.borrow_mut().as_mut() {
+                    seen.push(Event { op, path: path.to_path_buf() });
+                }
+            });
+        }
+
+        /// Record one of the three fsyncs. Private to [`super`], which is the
+        /// whole of the seam's integrity: a call site that wanted to claim a
+        /// directory fsync it never made cannot name this function.
+        pub(super) fn note_sync(op: Op, path: &Path) {
+            note(op, path);
+        }
+
+        // The events a call site writes for itself. Each of them leaves
+        // something behind that the same test can read off the disk -- the
+        // renamed file is there, the appended record replays, the truncated log
+        // is empty -- so a forged one is caught by the assertion next to it,
+        // and the record only has to be honest about WHEN it happened.
+        pub(crate) fn note_create(path: &Path) {
+            note(Op::WalCreate, path);
+        }
+
+        pub(crate) fn note_append(path: &Path) {
+            note(Op::WalAppend, path);
+        }
+
+        pub(crate) fn note_truncate(path: &Path) {
+            note(Op::WalTruncate, path);
+        }
+
+        pub(crate) fn note_rename(path: &Path) {
+            note(Op::Rename, path);
+        }
+
+        /// Make the next `op` on `path` fail instead of happening. One shot:
+        /// the arming is consumed by the operation it stops, so a test can
+        /// watch what the caller does about it and then let the next attempt
+        /// through.
+        pub(crate) fn fail_next(op: Op, path: &Path) {
+            ARMED.with(|a| *a.borrow_mut() = Some((op, path.to_path_buf())));
+        }
+
+        /// Called immediately before the syscall, and returns the injected
+        /// error in its place. Private to [`super`] for the same reason
+        /// [`note_sync`] is: a call site that could arm and answer its own
+        /// failures could pass the tests that exist to follow a real one out.
+        pub(super) fn check(op: Op, path: &Path) -> Result<()> {
+            let armed = ARMED.with(|a| {
+                let hit = matches!(&*a.borrow(), Some((o, p)) if *o == op && p == path);
+                if hit {
+                    *a.borrow_mut() = None;
+                }
+                hit
+            });
+            if armed {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "injected {op:?} failure on {}",
+                    path.display()
+                ))));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// fsync the directory `path` sits in, so the name is as durable as the bytes.
+fn sync_dir_of(path: &Path) -> Result<()> {
+    // `Path::parent` of a bare file name is `Some("")`, which opens as nothing.
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    sync_dir(dir)
 }
 
 pub const WAL_INSERT: u8 = 1;
@@ -548,9 +950,41 @@ pub struct Wal {
     path: PathBuf,
 }
 
+/// Empty `path`, and record that it happened, in one statement.
+///
+/// Welded together for the same reason [`durable::sync_file`] is: a record
+/// next to the work is satisfied by a record with no work at all, so the only
+/// line that can be deleted to silence the probe has to be the line that does
+/// the job. This was the last place in the write path where it was not true --
+/// `WalTruncate` was noted two statements below the opens that empty the log,
+/// so deleting both opens left a seal that recorded a truncation it had not
+/// performed, and every reopen from then on replayed a log that is never
+/// emptied.
+///
+/// Unlike an fsync the work here IS observable afterwards, so the record only
+/// has to be honest about WHEN: `a_seal_publishes_the_manifest_before_it_
+/// empties_the_wal` reads the log's length as well as the order.
+fn truncate_file(path: &Path) -> Result<fs::File> {
+    let f = fs::OpenOptions::new().write(true).truncate(true).create(true).open(path)?;
+    #[cfg(test)]
+    durability_probe::note_truncate(path);
+    Ok(f)
+}
+
 impl Wal {
+    /// Open the log, creating it if this is a fresh shard directory.
+    ///
+    /// The creation is recorded because it is the event the directory fsync in
+    /// [`Shard::attach_dir`] has to come AFTER. A directory fsync above this
+    /// call is not a missing fsync -- the syscall count is the same and the
+    /// event log still reads `DirSync(dir)` before `WalSync(wal.log)` -- it is
+    /// a directory made durable before it named the log, so the first
+    /// acknowledged insert is fdatasync'd into a file whose name a crash still
+    /// takes. Recording the creation is what lets a test tell those apart.
     pub fn open(path: &Path) -> Result<Wal> {
         let file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
+        #[cfg(test)]
+        durability_probe::note_create(path);
         Ok(Wal { file, path: path.to_path_buf() })
     }
 
@@ -573,12 +1007,30 @@ impl Wal {
         put_u32(&mut out, crc32(&body));
         out.extend_from_slice(&body);
         self.file.write_all(&out)?;
+        // Recorded so that a test can assert the sync below happens AFTER this.
+        // Syncing before the append is not a missing sync -- the count is the
+        // same and every call still makes a syscall -- it is record N reaching
+        // the platter only when record N+1 arrives, so every acknowledged write
+        // is one record behind durable.
+        #[cfg(test)]
+        durability_probe::note_append(&self.path);
         Ok(())
     }
 
+    /// fdatasync this log: the records appended to it are on the disk when
+    /// this returns `Ok`.
+    ///
+    /// `sync_data` rather than `sync_all` because the log's size is part of its
+    /// data and nothing else about the inode matters. It cannot create the
+    /// directory entry that names the file: [`Shard::attach_dir`] does that
+    /// once, by fsyncing the directory the log was created in.
+    ///
+    /// The syscall is in `durable::sync_data` rather than here, with the
+    /// record of it and the injected-failure check, because the code that may
+    /// say an fsync happened has to be the code that makes it -- see that
+    /// module.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()?;
-        Ok(())
+        durable::sync_data(&self.file, &self.path)
     }
 
     /// Replay. A torn tail — a record whose length or checksum does not check
@@ -630,9 +1082,19 @@ impl Wal {
         Ok(out)
     }
 
+    /// Forget every record in the log.
+    ///
+    /// Only a caller that has already made the records' effect durable some
+    /// other way may do this -- in practice [`Shard::flush`], after
+    /// `persist_manifest` has published the segments they were sealed into.
+    /// Recorded for the probe because "the manifest is durable before the WAL
+    /// is emptied" is an ordering claim, and the wrong order loses every
+    /// document in the sealed memtable.
     pub fn truncate(&mut self) -> Result<()> {
-        self.file =
-            fs::OpenOptions::new().write(true).truncate(true).create(true).open(&self.path)?;
+        // Two opens: the first empties the file, the second is the append-mode
+        // handle the log goes on being written through. Assigning both to
+        // `self.file` closes the first at the second assignment.
+        self.file = truncate_file(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
         Ok(())
     }
@@ -717,6 +1179,20 @@ pub struct Shard {
     /// a reader. Swept whenever the last reference goes away; without this the
     /// files are simply never unlinked.
     retiring: Vec<Arc<SegmentHandle>>,
+    /// The MANIFEST body and each segment's delete log exactly as this shard
+    /// last published them, so that a persist which would rewrite a file byte
+    /// for byte can decline to.
+    ///
+    /// It is a record of what this process put on the disk, not a cache of
+    /// what is there: nothing else writes these files, so the bytes cannot
+    /// change behind it. They can still be taken *away*, which is what
+    /// [`still_published`] checks before a skip is allowed. Empty until the
+    /// first successful publication, so a fresh or reopened shard always writes
+    /// once before it starts skipping.
+    ///
+    /// Behind a lock because [`Shard::persist_manifest`] is `&self` and public.
+    published_manifest: RwLock<Option<Vec<u8>>>,
+    published_deletes: RwLock<BTreeMap<u64, Vec<u8>>>,
 }
 
 impl Shard {
@@ -738,6 +1214,8 @@ impl Shard {
             compactions: 0,
             retain_floor: 0,
             retiring: Vec::new(),
+            published_manifest: RwLock::new(None),
+            published_deletes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -765,7 +1243,28 @@ impl Shard {
         fs::create_dir_all(dir.join("archive"))?;
         fs::create_dir_all(dir.join("deletes"))?;
         self.wal = Some(Wal::open(&dir.join("wal.log"))?);
+        // Every one of those creations is a new entry in `dir`, and a directory
+        // entry is dirty metadata like any other. The WAL's own fdatasync
+        // flushes the record and cannot create the name that reaches it, so
+        // without this the first acknowledged insert is durable inside a file a
+        // crash still takes away -- the shard reopens empty, or `Db::open`'s
+        // scan stops at a shard directory that is not there and the collection
+        // is in the catalog with no shards at all. Once per attach, off the
+        // per-write path. The directory `dir` itself is named in is the
+        // caller's to sync, because only the caller knows where the tree stops:
+        // see `Db::build_shards`.
+        sync_dir(dir)?;
         self.dir = Some(dir.to_path_buf());
+        // Another directory holds another MANIFEST, and what was published to
+        // the last one says nothing about what is in this one. This keeps the
+        // field's contract true rather than being the thing that prevents a
+        // wrong skip -- `still_published` compares the candidate bytes against
+        // the file, so a cache carried over from another directory cannot make
+        // a skip happen that should not have. Both, deliberately: the check on
+        // disk is what the skip rests on, and a cache that means what it says
+        // is what the next reader of this code rests on.
+        *self.published_manifest.write().unwrap() = None;
+        self.published_deletes.write().unwrap().clear();
         Ok(())
     }
 
@@ -903,6 +1402,27 @@ impl Shard {
                 supersedes: prev.is_some(),
                 segment_id: 0,
             })?;
+            // `append` ends at `write_all`, which reaches the page cache and
+            // stops there, so without this the timestamp returned below names a
+            // commit that a power loss still takes back. The record is framed
+            // `len | crc32` and replay ends cleanly on a torn tail, so one
+            // document's record is already all-or-nothing on disk; this is what
+            // makes it *on* the disk. Per document, deliberately: the unit that
+            // is promised is the document, and a sync that covered every
+            // document since the last one would be group commit.
+            //
+            // It also sits above the mutations below rather than after them,
+            // so a sync that fails returns `Err` with the in-memory shard
+            // exactly as it was, instead of having already superseded the
+            // previous version for a record that was never made durable. The
+            // LOG is not as it was: `append` completed its `write_all` on the
+            // line above, so the record is whole and its CRC checks out, and a
+            // writeback that later succeeds anyway makes a rejected document
+            // live again on the next reopen. That is the honest statement of
+            // what this ordering buys -- the process keeps serving the state it
+            // reported, and the failed write is not compounded by a supersede
+            // for a record nobody can vouch for.
+            w.sync()?;
         }
         if let Some(p) = prev {
             self.mark_superseded(p, ts);
@@ -959,6 +1479,11 @@ impl Shard {
                 supersedes: true,
                 segment_id: 0,
             })?;
+            // Durable before `mark_superseded` below makes the removal visible,
+            // for the same reason as in `insert` and more sharply: this shard
+            // would otherwise drop the old version for a delete the log never
+            // recorded, and a reopen would resurrect the document.
+            w.sync()?;
         }
         self.mark_superseded(prev, ts);
         Ok(Some(ts))
@@ -1292,6 +1817,13 @@ impl Shard {
         // that had not happened yet, and the field's contract is that at or
         // above it nothing has been collected.
         self.retain_floor = self.retain_floor.max(retain_from);
+        // The manifest is published before the log is emptied, and the `?` is
+        // load-bearing. The WAL holds the only other copy of the rows this seal
+        // just wrote: truncating it before `persist_manifest` -- or despite a
+        // `persist_manifest` that failed -- leaves the old MANIFEST, which does
+        // not name the new segments, beside a log that no longer holds the
+        // documents. Every document in the sealed memtable is gone, and nothing
+        // anywhere returns an error to say so.
         self.persist_manifest()?;
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
@@ -1330,23 +1862,80 @@ impl Shard {
         }
     }
 
-    /// Write the manifest durably: temp file, fsync, rename.
+    /// Write the manifest durably: temp file, fsync, rename, fsync the
+    /// directory.
     ///
     /// A bare `fs::write` truncates in place, so a crash halfway through leaves
     /// a manifest that will not decode — every segment file intact and the
-    /// shard unable to open. The rename is what makes the switch atomic.
+    /// shard unable to open. The rename is what makes the switch atomic, and
+    /// [`atomic_write`]'s directory fsync is what makes the rename survive.
+    ///
+    /// The delete logs go first and are durable before MANIFEST's rename is
+    /// even attempted, because MANIFEST is what names the segments those logs
+    /// belong to: a manifest that arrives without them describes segments whose
+    /// deletes have been forgotten, and every deleted document comes back.
+    ///
+    /// A file whose bytes have not changed since this shard published them is
+    /// not rewritten. This is not an optimisation of a rare case — inserts land
+    /// in the memtable and nothing touches the segment set until a seal, so in
+    /// steady state *every* call would otherwise rewrite the same manifest, at
+    /// a temp file, two fsyncs and a rename each, to say what the disk already
+    /// says. Making the publication durable, above, roughly doubles what that
+    /// waste costs; not doing it is what pays for it.
     pub fn persist_manifest(&self) -> Result<()> {
         let Some(dir) = self.dir.as_ref() else { return Ok(()) };
+        let ddir = dir.join("deletes");
+        let mut published: Vec<(u64, Vec<u8>)> = Vec::new();
         for h in &self.segments {
             let d = h.encode_deletes();
-            if !d.is_empty() {
-                atomic_write(&dir.join("deletes").join(format!("{:016x}.dlog", h.id())), &d)?;
+            if d.is_empty() {
+                continue;
+            }
+            let p = ddir.join(format!("{:016x}.dlog", h.id()));
+            if self.published_deletes.read().unwrap().get(&h.id()) == Some(&d)
+                && still_published(&p, &d)
+            {
+                continue;
+            }
+            publish(&p, &d)?;
+            published.push((h.id(), d));
+        }
+        if !published.is_empty() {
+            // One fsync of `deletes/` for the whole batch rather than one per
+            // log. They all land in the same directory, so the fsyncs after the
+            // first say nothing new -- and a single `DELETE ... WHERE` spanning
+            // twenty sealed segments makes twenty of them dirty at once. The
+            // ordering the claim below rests on is untouched: this still
+            // precedes MANIFEST's rename.
+            sync_dir(&ddir)?;
+            // Cached only now. Until that fsync the renames are not published,
+            // and an entry recording a name a crash can still take away would
+            // skip the rewrite that is the only thing that would put it back.
+            let mut cache = self.published_deletes.write().unwrap();
+            for (id, d) in published {
+                cache.insert(id, d);
             }
         }
+        // Segment ids ascend and are never reused, so a segment that has left
+        // the manifest is never coming back and its entry is dead weight.
+        self.published_deletes
+            .write()
+            .unwrap()
+            .retain(|id, _| self.segments.iter().any(|h| h.id() == *id));
         let mut body = self.manifest().encode();
         let crc = crc32(&body);
         put_u32(&mut body, crc);
-        atomic_write(&dir.join("MANIFEST"), &body)
+        let p = dir.join("MANIFEST");
+        if self.published_manifest.read().unwrap().as_deref() == Some(body.as_slice())
+            && still_published(&p, &body)
+        {
+            return Ok(());
+        }
+        atomic_write(&p, &body)?;
+        // Only after the rename is durable: a failed write must leave the next
+        // call willing to try again.
+        *self.published_manifest.write().unwrap() = Some(body);
+        Ok(())
     }
 
     /// Reopen from disk: install the manifest, then replay the WAL.
@@ -2484,6 +3073,19 @@ mod tests {
         let mut s2 = Shard::open(coll(), Arc::new(Hlc::new()), opts, &dir).unwrap();
         assert_eq!(s2.num_docs(MAX_TS), pre_max, "at the tip");
         assert_eq!(s2.num_docs(horizon), pre_pin, "at the pin");
+        // Every record in that log describes a version the seal already wrote,
+        // so convergence means replay adds NOTHING: the memtable is empty. This
+        // is where `ts >= r.ts` earns the `=`. With `>`, the record whose
+        // timestamp equals the sealed version's is re-applied -- the sealed row
+        // is tombstoned at its own commit timestamp, which no read can see, and
+        // a copy of the document lands back in the memtable to be written into
+        // a second segment by the next seal. The counts above cannot see it,
+        // because the row it duplicates was made invisible in the same breath.
+        assert!(
+            s2.memtable.is_empty(),
+            "replay re-applied a record whose effect was already sealed: the document is now in \
+             a segment and in the memtable, and the next seal makes that permanent"
+        );
         // And it stays fixed: a duplicate pair survives the next seal, because
         // the memtable copy is dead only above the pin, so it is written into a
         // fresh segment and outlives the WAL that could explain it.
@@ -2951,5 +3553,692 @@ mod tests {
         let mut out = BTreeSet::new();
         let e = s.prefix_terms("body", "vec", MAX_TS, 512, None, &mut out).unwrap_err().to_string();
         assert!(e.contains("archived"), "the refusal has to reach the caller: {e}");
+    }
+    // ----------------------------------------------------------------------
+    // Durability: the operations, and the order they happen in.
+    //
+    // These read the probe in `super::durability_probe`. What each of them is
+    // worth is measured by what breaks it, so each says which production line
+    // it is the red light for -- and the ORDER assertions are the point. A
+    // probe that only records that a directory was synced cannot tell "synced
+    // after the rename" from "synced before it", and the second one is the
+    // defect the directory fsync was added to fix.
+    // ----------------------------------------------------------------------
+
+    /// Everything below asserts on events the probe recorded, and an event is
+    /// worth nothing if the thing it records is not the syscall. This is the
+    /// floor under all of it: hand each of the three fsync helpers a descriptor
+    /// the kernel refuses to sync, and require the refusal to come back.
+    ///
+    /// A helper that had been reduced to bookkeeping -- the exact mutation that
+    /// survived the previous round, `sync_data` deleted and the counter next to
+    /// it left alone -- returns `Ok(())` here and this goes red.
+    ///
+    /// Linux-only because it names the descriptors: fsync on `/dev/null` and on
+    /// a procfs directory is `EINVAL` there, since neither has a filesystem
+    /// behind it to flush. The production code is not Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_three_fsyncs_are_syscalls_and_not_bookkeeping() {
+        let null = Path::new("/dev/null");
+        // Recording, so that the second half of the claim is checked too: none
+        // of these syncs happened, so none of them may be in the log. A probe
+        // note written above its syscall rather than below it records a
+        // durability that failed, and every assertion downstream believes it.
+        durability_probe::start();
+        let mut w = Wal::open(null).unwrap();
+        w.append(&WalRecord {
+            kind: WAL_INSERT,
+            key: "k".into(),
+            ts: 1,
+            doc: None,
+            supersedes: false,
+            segment_id: 0,
+        })
+        .unwrap();
+        let e = w.sync().unwrap_err();
+        assert!(
+            matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput),
+            "`Wal::sync` did not fdatasync its own descriptor: {e}"
+        );
+
+        let f = fs::File::open(null).unwrap();
+        let e = sync_file(&f, null).unwrap_err();
+        assert!(
+            matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput),
+            "`sync_file` did not fsync the file it was handed: {e}"
+        );
+
+        // procfs has no fsync operation either, so this is the same refusal for
+        // the directory half.
+        let e = sync_dir(Path::new("/proc/self")).unwrap_err();
+        assert!(
+            matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput),
+            "`sync_dir` did not fsync the directory it was handed: {e}"
+        );
+
+        let ev = durability_probe::take();
+        assert!(
+            ev.paths(Op::WalSync).is_empty()
+                && ev.paths(Op::TempSync).is_empty()
+                && ev.paths(Op::DirSync).is_empty(),
+            "a sync that failed was recorded as a sync that happened: {ev:?}"
+        );
+    }
+
+    /// Publication, in order: the temp file's own contents are durable, then
+    /// the rename puts the name over them, then the directory holding the name
+    /// is durable.
+    ///
+    /// Delete `sync_file` from `publish` and the first assertion goes red; move
+    /// the directory fsync above the rename -- which is the defect this whole
+    /// line of work exists for, a publication whose new directory entry a crash
+    /// takes back -- and the last one does.
+    #[test]
+    fn a_publication_syncs_the_bytes_then_renames_then_syncs_the_name() {
+        let dir = std::env::temp_dir().join(format!("celastro-pub-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("FILE");
+
+        durability_probe::start();
+        atomic_write(&p, b"published").unwrap();
+        let ev = durability_probe::take();
+
+        let bytes = ev.at(Op::TempSync, &p.with_extension("tmp"));
+        let name = ev.at(Op::Rename, &p);
+        let dirent = ev.at(Op::DirSync, &dir);
+        assert!(bytes.is_some(), "the temp file's contents were never made durable: {ev:?}");
+        assert!(name.is_some(), "nothing was renamed into place: {ev:?}");
+        assert!(dirent.is_some(), "the directory the rename landed in was never synced: {ev:?}");
+        assert!(bytes < name, "a rename published bytes that were still only in the cache: {ev:?}");
+        assert!(
+            name < dirent,
+            "the directory was synced BEFORE the rename, which makes the new entry exactly as \
+             durable as it was without the fsync -- not at all: {ev:?}"
+        );
+        assert_eq!(fs::read(&p).unwrap(), b"published");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The WAL sync has to be reached *from* `Shard::insert`, and it has to be
+    /// reached AFTER the append. Syncing first is not a missing sync -- the
+    /// syscall count is identical -- it is record N reaching the platter only
+    /// when record N+1 arrives, so every acknowledged write is one behind
+    /// durable. Only an ordered probe can tell the two apart.
+    #[test]
+    fn an_insert_appends_its_wal_record_and_then_makes_it_durable() {
+        let dir = std::env::temp_dir().join(format!("celastro-walsync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+
+        durability_probe::start();
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        let ev = durability_probe::take();
+
+        assert_eq!(
+            ev.count(Op::WalSync, &log),
+            1,
+            "`insert` returned a commit timestamp for a record that is still only in the page \
+             cache: {ev:?}"
+        );
+        assert!(
+            ev.ordered((Op::WalAppend, &log), (Op::WalSync, &log)),
+            "the record was synced before it was appended, so it is the PREVIOUS write this \
+             fsync made durable: {ev:?}"
+        );
+        // And the directory entry that names the log is durable before the
+        // first record is: an fdatasync flushes the file's data and cannot
+        // create the name that reaches it.
+        assert!(
+            ev.ordered((Op::DirSync, &dir), (Op::WalSync, &log)),
+            "the WAL was fsynced inside a directory nobody had made durable, so the record is \
+             on the disk in a file a crash can still take the name of: {ev:?}"
+        );
+        // And that claim is about the order the two happen in, not about which
+        // one is in the log first. `dir` does not name `wal.log` until
+        // `Wal::open` has created it, so a `sync_dir(dir)` moved ABOVE the
+        // `Wal::open` in `attach_dir` fsyncs a directory that does not yet hold
+        // the entry -- the log's name is left as dirty metadata for ever, which
+        // is the defect the fsync was added for -- and it satisfies the
+        // assertion above while doing it, because `DirSync` still precedes
+        // `WalSync`. Only the creation being an event of its own separates
+        // them.
+        let created = ev
+            .at(Op::WalCreate, &log)
+            .unwrap_or_else(|| panic!("the log was never opened: {ev:?}"));
+        assert!(
+            ev.at_after(Op::DirSync, &dir, created).is_some(),
+            "the directory was fsynced before it named {log:?}, so nothing has ever made that \
+             name durable and a crash takes the whole log: {ev:?}"
+        );
+
+        durability_probe::start();
+        s.insert(doc(2)).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!(ev.count(Op::WalSync, &log), 1, "one sync per document, not one per batch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a write that supersedes an existing document, which is the
+    /// leg that was never exercised: losing THIS record does not lose a new
+    /// document, it resurrects an old one, because the memtable has already
+    /// stopped answering for the version the log still describes as live.
+    #[test]
+    fn an_insert_that_supersedes_a_document_syncs_the_record_that_supersedes_it() {
+        let dir = std::env::temp_dir().join(format!("celastro-resync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+
+        let mut second = doc(1);
+        second.set_path("body", Value::Str("rewritten".into()));
+        durability_probe::start();
+        s.insert(second).unwrap();
+        let ev = durability_probe::take();
+
+        assert_eq!(
+            ev.count(Op::WalSync, &log),
+            1,
+            "the record that supersedes the previous version was left in the page cache: {ev:?}"
+        );
+        assert!(ev.ordered((Op::WalAppend, &log), (Op::WalSync, &log)), "{ev:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The delete path, where losing the record is worse still: the removal is
+    /// visible in memory and the document comes back on reopen.
+    #[test]
+    fn a_delete_makes_its_wal_record_durable_before_it_returns() {
+        let dir = std::env::temp_dir().join(format!("celastro-delsync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+
+        durability_probe::start();
+        s.delete(&format!("t1{KEY_SEP}d0001")).unwrap();
+        // A key that is not here appends nothing, so there is nothing to sync.
+        assert!(s.delete("no-such-key").unwrap().is_none());
+        let ev = durability_probe::take();
+
+        assert_eq!(ev.count(Op::WalSync, &log), 1, "the delete record is not on disk: {ev:?}");
+        assert_eq!(ev.count(Op::WalAppend, &log), 1, "a delete of nothing wrote a record");
+        assert!(ev.ordered((Op::WalAppend, &log), (Op::WalSync, &log)), "{ev:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "A sync that fails returns `Err` with the shard exactly as it was" is a
+    /// claim about an error path, so it is worth what an error path costs to
+    /// enter. The probe arms the next WAL sync to fail where the real one
+    /// fails -- before the syscall, nothing made durable -- and this follows
+    /// the `Err` out and looks at what was left behind.
+    ///
+    /// Three production lines are red lights here: swallowing the error from
+    /// `w.sync()` in `insert` or in `delete`, and moving that `sync` below the
+    /// `mark_superseded`/`memtable.insert` pair it deliberately sits above.
+    #[test]
+    fn a_wal_sync_that_fails_is_reported_and_leaves_the_shard_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("celastro-syncfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let key = format!("t1{KEY_SEP}d0001");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        let before = s.get(&key, MAX_TS).unwrap().unwrap();
+        let count = s.num_docs(MAX_TS);
+
+        let mut second = doc(1);
+        second.set_path("body", Value::Str("rewritten".into()));
+        durability_probe::start();
+        durability_probe::fail_next(Op::WalSync, &log);
+        let e = s.insert(second).unwrap_err();
+        let ev = durability_probe::take();
+        assert!(matches!(e, Error::Io(_)), "the failed sync was swallowed: {e}");
+        assert_eq!(
+            ev.count(Op::WalSync, &log),
+            0,
+            "a sync that failed made nothing durable and must not be recorded as one that did"
+        );
+        assert_eq!(
+            s.get(&key, MAX_TS).unwrap().unwrap(),
+            before,
+            "the previous version was superseded for a record that was never made durable"
+        );
+        assert_eq!(s.num_docs(MAX_TS), count, "the rejected document is in the memtable");
+
+        // The delete leg of the same claim.
+        durability_probe::fail_next(Op::WalSync, &log);
+        let e = s.delete(&key).unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "the failed sync was swallowed: {e}");
+        assert_eq!(
+            s.get(&key, MAX_TS).unwrap().unwrap(),
+            before,
+            "the document was removed for a delete record that was never made durable"
+        );
+
+        // The other half of what that comment says, and the reason it no longer
+        // claims the shard is untouched: `append` completed before the sync was
+        // reached, so the log DOES hold a record for a write the caller was
+        // told had failed, and a reopen replays it. Pinned rather than fixed --
+        // fencing it means truncating the log back or poisoning the `Wal`, and
+        // that is a different change -- but pinned, so that the day it is
+        // fenced this test says so.
+        assert_eq!(
+            Wal::replay(&log).unwrap().len(),
+            3,
+            "the first insert, the rejected insert and the rejected delete: the records of the \
+             two rejected writes are in the log, which is what the comment in `insert` says"
+        );
+
+        // And the arming is one shot, so this is the control: the same insert
+        // with nothing armed goes through.
+        let mut third = doc(1);
+        third.set_path("body", Value::Str("rewritten".into()));
+        s.insert(third).unwrap();
+        assert_ne!(s.get(&key, MAX_TS).unwrap().unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two claims in one recording, because they are the same claim: a rename
+    /// nobody fsynced the directory for can be lost, so MANIFEST's rename being
+    /// ordered after the delete logs' means nothing until the logs' names are
+    /// durable too.
+    #[test]
+    fn a_seal_publishes_the_delete_logs_durably_and_before_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("celastro-puborder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        // A delete against the sealed segment, so its `.dlog` has something in
+        // it the next publication has to carry.
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap();
+        for i in 40..60 {
+            s.insert(doc(i)).unwrap();
+        }
+
+        durability_probe::start();
+        s.flush().unwrap();
+        let ev = durability_probe::take();
+
+        let dlog = ev
+            .paths(Op::Rename)
+            .into_iter()
+            .find(|p| p.extension().is_some_and(|e| e == "dlog"))
+            .unwrap_or_else(|| panic!("no delete log was published: {ev:?}"));
+        let dlogs = ev.at(Op::DirSync, &dir.join("deletes"));
+        let manifest = ev.at(Op::Rename, &dir.join("MANIFEST"));
+        let shard = ev.at(Op::DirSync, &dir);
+        assert!(
+            ev.ordered((Op::Rename, &dlog), (Op::DirSync, &dir.join("deletes"))),
+            "the `.dlog` rename is not durable: {ev:?}"
+        );
+        assert!(
+            dlogs.is_some() && manifest.is_some() && dlogs < manifest,
+            "MANIFEST names the segments those delete logs belong to, so a crash between them \
+             must not be able to leave the manifest and lose the deletes -- which means the \
+             logs' names must be DURABLE before MANIFEST is renamed, not merely written: {ev:?}"
+        );
+        assert!(shard.is_some() && manifest < shard, "the MANIFEST rename is not durable: {ev:?}");
+        assert_eq!(
+            ev.count(Op::DirSync, &dir.join("deletes")),
+            1,
+            "one fsync of `deletes/` covers every log renamed into it: {ev:?}"
+        );
+
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(re.get(&format!("t0{KEY_SEP}d0003"), MAX_TS).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seal publishes the manifest before it empties the log, and the log is
+    /// the only other copy of the rows it just sealed. Truncating first leaves
+    /// the old MANIFEST -- which does not name the new segments -- beside a WAL
+    /// that no longer holds the documents, and every document in the sealed
+    /// memtable is gone with no error anywhere.
+    #[test]
+    fn a_seal_publishes_the_manifest_before_it_empties_the_wal() {
+        let dir = std::env::temp_dir().join(format!("celastro-sealorder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+
+        durability_probe::start();
+        s.flush().unwrap();
+        let ev = durability_probe::take();
+
+        let truncated = ev.at(Op::WalTruncate, &dir.join("wal.log"));
+        assert!(truncated.is_some(), "the seal did not empty the log: {ev:?}");
+        // The event says when; the file says whether. Without this the only
+        // thing pinning the truncation is a probe record, and a record is not
+        // the work -- the log going on growing, and every reopen replaying
+        // every record ever written, is invisible to an event log that says it
+        // was emptied.
+        assert_eq!(
+            fs::metadata(dir.join("wal.log")).unwrap().len(),
+            0,
+            "the seal recorded a truncation it did not perform: the sealed records are still in \
+             the log, which grows without bound and is replayed in full at every reopen"
+        );
+        assert!(
+            ev.ordered(
+                (Op::Rename, &dir.join("MANIFEST")),
+                (Op::WalTruncate, &dir.join("wal.log"))
+            ),
+            "the log was emptied before the manifest that names what it was sealed into: {ev:?}"
+        );
+        assert!(
+            ev.ordered((Op::DirSync, &dir), (Op::WalTruncate, &dir.join("wal.log"))),
+            "the log was emptied while the manifest's own name was still only in the cache, \
+             so a crash there loses the new MANIFEST and the WAL that could rebuild it: {ev:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And when the manifest cannot be published at all, the seal says so and
+    /// keeps the log. Injected by putting a directory where MANIFEST's temp
+    /// file has to be created, which is a real `fs::File::create` failure at
+    /// the first step of `atomic_write`.
+    #[test]
+    fn a_seal_whose_manifest_cannot_be_published_keeps_the_wal() {
+        let dir = std::env::temp_dir().join(format!("celastro-sealfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        fs::create_dir_all(dir.join("MANIFEST.tmp")).unwrap();
+
+        durability_probe::start();
+        let e = s.flush().unwrap_err();
+        let ev = durability_probe::take();
+        assert!(matches!(e, Error::Io(_)), "a manifest that could not be written was not: {e}");
+        assert_eq!(
+            ev.count(Op::WalTruncate, &dir.join("wal.log")),
+            0,
+            "the log was emptied for a manifest that was never published: {ev:?}"
+        );
+        assert_eq!(
+            Wal::replay(&dir.join("wal.log")).unwrap().len(),
+            40,
+            "the only surviving copy of the sealed documents was thrown away"
+        );
+
+        // Cleared, the same shard publishes: the failed attempt cached nothing.
+        fs::remove_dir(dir.join("MANIFEST.tmp")).unwrap();
+        s.persist_manifest().unwrap();
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.num_docs(MAX_TS), 40);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A publication that failed AFTER the rename is the case the cache can
+    /// get wrong and nothing else can catch: the bytes are on the disk, so
+    /// `still_published` agrees with the cache, and a cache written before
+    /// `atomic_write` returned makes every later call skip a file whose name is
+    /// not durable. The directory fsync is armed to fail, which is exactly that
+    /// window.
+    #[test]
+    fn a_publication_that_failed_after_the_rename_is_retried_rather_than_believed() {
+        let dir = std::env::temp_dir().join(format!("celastro-retry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+
+        // The MANIFEST leg. The seal publishes a manifest, so the rename
+        // happens and the fsync of the directory it landed in is what fails.
+        durability_probe::fail_next(Op::DirSync, &dir);
+        let e = s.flush().unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "a directory fsync that failed was swallowed: {e}");
+        assert_eq!(
+            fs::read(dir.join("MANIFEST")).unwrap(),
+            {
+                let mut body = s.manifest().encode();
+                let crc = crc32(&body);
+                put_u32(&mut body, crc);
+                body
+            },
+            "the rename happened: the bytes on disk are the ones a cache written too early \
+             would be believed against"
+        );
+        durability_probe::start();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("MANIFEST")).is_some(),
+            "the manifest was believed published by a call that returned `Err`, so its name \
+             will never be made durable: {ev:?}"
+        );
+        assert!(ev.at(Op::DirSync, &dir).is_some(), "{ev:?}");
+
+        // The delete-log leg, which caches the same way.
+        s.delete(&format!("t0{KEY_SEP}d0006")).unwrap().expect("nothing was deleted");
+        durability_probe::fail_next(Op::DirSync, &dir.join("deletes"));
+        let e = s.persist_manifest().unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "{e}");
+        durability_probe::start();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.paths(Op::Rename).iter().any(|p| p.extension().is_some_and(|e| e == "dlog")),
+            "the delete log was believed published by a call that returned `Err`: {ev:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Inserts land in the memtable, so the segment set -- and therefore the
+    /// manifest -- changes once per seal and not once per write. The shells
+    /// persist after every acknowledged statement, so without this every one of
+    /// them republished the same bytes at two fsyncs and a rename apiece.
+    #[test]
+    fn a_persist_that_would_rewrite_the_same_manifest_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("celastro-nowrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap();
+        s.persist_manifest().unwrap();
+        let published = fs::read(dir.join("MANIFEST")).unwrap();
+
+        durability_probe::start();
+        for i in 60..70 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.persist_manifest().unwrap();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.paths(Op::Rename).is_empty(),
+            "nothing changed on disk and something was \
+             written: {ev:?}"
+        );
+        assert!(ev.paths(Op::DirSync).is_empty(), "{ev:?}");
+
+        // Skipped, not lost: the file is still the one a reopen needs.
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), published);
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.segments.len(), 1);
+        assert_eq!(re.num_docs(MAX_TS), 49, "40 sealed less one deleted, plus 10 replayed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The skip believes what this process published, so it has to check that
+    /// what it published is still there -- and that it is still the same file.
+    /// Gone is the easy half. The hard half is a file of the same LENGTH: two
+    /// manifests over the same segment count have it, and a length comparison
+    /// accepts the wrong one and skips forever, leaving a stale manifest that a
+    /// reopen reads in place of the state the shard is actually in.
+    #[test]
+    fn a_manifest_that_was_replaced_underneath_the_shard_is_republished() {
+        let dir = std::env::temp_dir().join(format!("celastro-regone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        let published = fs::read(dir.join("MANIFEST")).unwrap();
+        fs::remove_file(dir.join("MANIFEST")).unwrap();
+
+        durability_probe::start();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("MANIFEST")).is_some(),
+            "the manifest is gone and nothing rewrote it: {ev:?}"
+        );
+
+        // Same length, different bytes -- a restored snapshot of this file, or
+        // any other writer's idea of it.
+        let mut other = published.clone();
+        let last = other.len() - 1;
+        other[last] ^= 0xff;
+        assert_eq!(other.len(), published.len());
+        fs::write(dir.join("MANIFEST"), &other).unwrap();
+        durability_probe::start();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &dir.join("MANIFEST")).is_some(),
+            "a different file of the same length was accepted as the one this shard \
+             published: {ev:?}"
+        );
+        assert_eq!(fs::read(dir.join("MANIFEST")).unwrap(), published);
+
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.num_docs(MAX_TS), 40);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A shard that is attached to a second directory publishes into it. The
+    /// caches say what was published to the FIRST one, and what was published
+    /// there says nothing about what is here.
+    #[test]
+    fn a_reattached_shard_publishes_into_its_new_directory() {
+        let base = std::env::temp_dir().join(format!("celastro-reattach-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (one, two) = (base.join("one"), base.join("two"));
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&one).unwrap();
+        for i in 0..40 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap();
+        s.persist_manifest().unwrap();
+        let first = fs::read(one.join("MANIFEST")).unwrap();
+
+        s.attach_dir(&two).unwrap();
+        durability_probe::start();
+        s.persist_manifest().unwrap();
+        let ev = durability_probe::take();
+        assert!(
+            ev.at(Op::Rename, &two.join("MANIFEST")).is_some(),
+            "the new directory has no manifest: {ev:?}"
+        );
+        assert!(
+            ev.paths(Op::Rename).iter().any(|p| p.extension().is_some_and(|e| e == "dlog")),
+            "the new directory has no delete log, so the deleted document is back: {ev:?}"
+        );
+        assert_eq!(fs::read(one.join("MANIFEST")).unwrap(), first, "the old directory was written");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Per-document atomicity is the guarantee, and the CRC is the whole of its
+    /// implementation: a record that was half written when the power went is
+    /// discarded, and everything before it is kept. Nothing tested that. Flip
+    /// one byte inside the second record's body and replay has to stop there.
+    ///
+    /// THREE records, and the damaged one in the middle, because "stop" and
+    /// "skip" are the same thing to a log whose last record is the damaged one.
+    /// They are not the same thing at all: a torn tail means the process died
+    /// mid-write, so everything after the tear was written by nobody, and
+    /// resuming past it applies records the WAL never promised were contiguous
+    /// -- a document committed after a commit that was lost. A `continue` where
+    /// the `break` is replays two records here instead of one.
+    #[test]
+    fn replay_stops_at_a_record_whose_crc_does_not_match() {
+        let dir = std::env::temp_dir().join(format!("celastro-walcrc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        {
+            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+            s.attach_dir(&dir).unwrap();
+            s.insert(doc(1)).unwrap();
+            s.insert(doc(2)).unwrap();
+            s.insert(doc(3)).unwrap();
+        }
+        let good = fs::read(&log).unwrap();
+        // The control: all three records are there and all three replay.
+        let replayed = Wal::replay(&log).unwrap();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].key, format!("t1{KEY_SEP}d0001"));
+
+        // The frame is `len | crc | body`, so the second record's body starts
+        // eight bytes into what follows the first.
+        let first = u32::from_le_bytes(good[0..4].try_into().unwrap()) as usize;
+        let body = 8 + first + 8;
+        let mut torn = good.clone();
+        torn[body + 1] ^= 0x01;
+        assert_eq!(torn.len(), good.len(), "the damage is one flipped bit, not a truncation");
+        fs::write(&log, &torn).unwrap();
+
+        let replayed = Wal::replay(&log).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "a record whose checksum does not match its body was applied, or the replay carried \
+             on past it to the intact record after it: half a document, a document that was \
+             never committed, or a write resumed across a gap the log never promised"
+        );
+        assert_eq!(replayed[0].key, format!("t1{KEY_SEP}d0001"), "the good record was dropped");
+
+        // And through the shard, which is where it matters: the damaged record
+        // is not there, the one before it is, and the intact record AFTER the
+        // damage is not -- the replay stopped, it did not skip.
+        let re = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(re.num_docs(MAX_TS), 1);
+        assert!(re.get(&format!("t1{KEY_SEP}d0001"), MAX_TS).unwrap().is_some());
+        assert!(
+            re.get(&format!("t0{KEY_SEP}d0003"), MAX_TS).unwrap().is_none(),
+            "the record after the damaged one was applied, so the replay skipped a torn record \
+             instead of stopping at it"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
