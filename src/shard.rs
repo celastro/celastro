@@ -586,6 +586,27 @@ pub(crate) fn still_published(path: &Path, bytes: &[u8]) -> bool {
     fs::read(path).map(|b| b == bytes).unwrap_or(false)
 }
 
+/// Read a file that is allowed not to exist: `None` when it is genuinely
+/// absent, its bytes when it is there, and an error naming it for anything
+/// else.
+///
+/// The distinction is the whole point. CATALOG, MANIFEST and every delete log
+/// used to be read with `if let Ok(b)`, which turned EIO and EACCES into "the
+/// file was never there": a database with no collections, a shard with no
+/// segments, a segment with no deletions -- each opened successfully, and the
+/// next persist wrote that emptiness over the real file. The same code treated
+/// a short or checksum-mismatched file as fatal two lines later, so a file
+/// that could not be read at all was the one failure it believed. `NotFound`
+/// is the only kind that means absent; everything else is reported, as
+/// [`Wal::replay`] already did.
+pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Storage(format!("{}: {e}", path.display()))),
+    }
+}
+
 /// The three fsyncs on the write path, and the only code in the crate that can
 /// say one happened.
 ///
@@ -948,11 +969,24 @@ fn sync_dir_of(path: &Path) -> Result<()> {
 /// therefore overwrites a temp file and loses nothing. There is no path to a
 /// loss without changing that write order, which is the change that would make
 /// this line load-bearing; it is cheaper to keep it than to notice then.
-fn first_unused_segment_id(dir: &Path) -> u64 {
+fn first_unused_segment_id(dir: &Path) -> Result<u64> {
     let mut next = 1u64;
     for sub in ["segments", "archive", "deletes"] {
-        let Ok(entries) = fs::read_dir(dir.join(sub)) else { continue };
-        for e in entries.flatten() {
+        let d = dir.join(sub);
+        // A listing that fails is not a directory with nothing in it. This is
+        // the guard against reusing an id whose delete log is still on the
+        // disk, and an EACCES read as "empty" would hand that id out again --
+        // the read-as-absent shape that `read_optional` closes for the files,
+        // closed here for the directories that name them. Only `NotFound`
+        // means empty. Untested, because the one injection is a permission
+        // bit the test would have to be unprivileged to rely on.
+        let entries = match fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::Storage(format!("{}: {e}", d.display()))),
+        };
+        for e in entries {
+            let e = e.map_err(|e| Error::Storage(format!("{}: {e}", d.display())))?;
             let name = e.file_name();
             let Some(stem) = name.to_str().and_then(|n| n.split('.').next()) else { continue };
             if let Ok(id) = u64::from_str_radix(stem, 16) {
@@ -960,7 +994,7 @@ fn first_unused_segment_id(dir: &Path) -> u64 {
             }
         }
     }
-    next
+    Ok(next)
 }
 
 /// Unlink the files of segment ids the manifest does not name.
@@ -1136,11 +1170,7 @@ impl Wal {
     /// out — ends the replay rather than failing it: the process died mid-write
     /// and everything before that point is still good.
     pub fn replay(path: &Path) -> Result<Vec<WalRecord>> {
-        let b = match fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
+        let Some(b) = read_optional(path)? else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + 8 <= b.len() {
@@ -1384,7 +1414,7 @@ impl Shard {
         // for this either, because it runs only where a MANIFEST says what is
         // live and the directory that lost its manifest is exactly the one
         // where reusing an id costs documents.
-        self.next_segment_id = self.next_segment_id.max(first_unused_segment_id(dir));
+        self.next_segment_id = self.next_segment_id.max(first_unused_segment_id(dir)?);
         // Another directory holds another MANIFEST, and what was published to
         // the last one says nothing about what is in this one. This keeps the
         // field's contract true rather than being the thing that prevents a
@@ -2161,7 +2191,10 @@ impl Shard {
     pub fn open(coll: Collection, clock: Arc<Hlc>, opts: ShardOpts, dir: &Path) -> Result<Shard> {
         let mut s = Shard::new(coll, clock, opts);
         s.attach_dir(dir)?;
-        if let Ok(b) = fs::read(dir.join("MANIFEST")) {
+        // `Some` or an error, never "absent" for a file that is there and
+        // cannot be read: that opened a shard with zero segments over a
+        // directory full of them, and the next flush published the empty set.
+        if let Some(b) = read_optional(&dir.join("MANIFEST"))? {
             if b.len() < 4 {
                 return Err(Error::Storage("manifest: truncated".into()));
             }
@@ -2193,10 +2226,14 @@ impl Shard {
                 };
                 let seg = Segment::open(src)?;
                 s.adopt_segment(&seg);
-                let dl = match fs::read(dir.join("deletes").join(format!("{:016x}.dlog", meta.id)))
-                {
-                    Ok(d) => DeleteLog::decode(&d)?,
-                    Err(_) => DeleteLog::new(),
+                // An empty delete log is never written, so absent means no
+                // deletions. Unreadable does not: it used to, and every
+                // document the log recorded as deleted came back.
+                let dl = match read_optional(
+                    &dir.join("deletes").join(format!("{:016x}.dlog", meta.id)),
+                )? {
+                    Some(d) => DeleteLog::decode(&d)?,
+                    None => DeleteLog::new(),
                 };
                 s.segments.push(SegmentHandle::new(seg, dl, Some(p)));
             }
@@ -4909,6 +4946,88 @@ mod tests {
             s.next_segment_id
         );
         assert!(seg.exists() && dlog.exists(), "a directory with no MANIFEST was emptied");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable MANIFEST is not an absent one. Read as absent it opened a
+    /// shard with zero segments over a directory full of them, and the next
+    /// flush published that empty set -- while a MANIFEST that was short or
+    /// checksum-mismatched was refused two lines later. A directory where the
+    /// file goes is the injection: `fs::read` on a directory fails with
+    /// EISDIR, which is neither `NotFound` nor decodable.
+    ///
+    /// Both halves are pinned, because each is the mutation that satisfies
+    /// the other: a genuinely absent MANIFEST still opens (narrowing to
+    /// nothing would refuse a fresh directory), and an unreadable one fails
+    /// the open naming the file (narrowing to everything is the defect). The
+    /// segment file is asserted still there afterwards: nothing that runs
+    /// only where a manifest was read may run where it could not be.
+    #[test]
+    fn a_manifest_that_cannot_be_read_fails_the_open_rather_than_opening_empty() {
+        let dir = test_dir("manifest-unreadable");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        drop(s);
+        let manifest = dir.join("MANIFEST");
+        let seg = dir.join("segments").join(format!("{:016x}.seg", 1));
+        assert!(manifest.is_file() && seg.is_file());
+
+        fs::rename(&manifest, dir.join("MANIFEST.aside")).unwrap();
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir)
+            .expect("an absent manifest is a shard with no segments");
+        assert!(s.segments.is_empty());
+        drop(s);
+
+        fs::create_dir(&manifest).unwrap();
+        match Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir) {
+            Err(Error::Storage(m)) => assert!(m.contains("MANIFEST"), "{m}"),
+            Err(e) => panic!("the wrong failure: {e}"),
+            Ok(s) => panic!(
+                "a manifest that could not be read opened a shard with {} segments",
+                s.segments.len()
+            ),
+        }
+        assert!(seg.is_file(), "a reopen that failed to read the manifest reclaimed a segment");
+        assert!(manifest.is_dir(), "something replaced the manifest the open could not read");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The delete log's copy of the rule, where being read as absent costs
+    /// the other direction: every document the log recorded as deleted comes
+    /// back, and the next delete rewrites the log without them.
+    #[test]
+    fn a_delete_log_that_cannot_be_read_fails_the_open_rather_than_resurrecting() {
+        let dir = test_dir("dlog-unreadable");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+        drop(s);
+        let dlog = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        assert!(dlog.is_file(), "the delete was not published to a delete log");
+
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.num_docs(s.clock.peek()), 19, "the delete log was not applied");
+        drop(s);
+
+        fs::remove_file(&dlog).unwrap();
+        fs::create_dir(&dlog).unwrap();
+        match Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir) {
+            Err(Error::Storage(m)) => assert!(m.contains(".dlog"), "{m}"),
+            Err(e) => panic!("the wrong failure: {e}"),
+            Ok(s) => panic!(
+                "a delete log that could not be read opened a shard with {} documents",
+                s.num_docs(s.clock.peek())
+            ),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

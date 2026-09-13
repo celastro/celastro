@@ -383,7 +383,10 @@ impl Db {
         let mut db = Db::with_opts(opts);
         fs::create_dir_all(dir)?;
         db.dir = Some(dir.to_path_buf());
-        if let Ok(b) = fs::read(dir.join("CATALOG")) {
+        // Absent is a fresh database. Unreadable is not: read as absent it
+        // opened a database with no collections, and the next DDL published
+        // that catalog over the real one.
+        if let Some(b) = crate::shard::read_optional(&dir.join("CATALOG"))? {
             db.catalog = Catalog::decode(&b)?;
         }
         let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
@@ -4906,6 +4909,34 @@ mod tests {
             "a missing tablet map was read as a shard that owns every key"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable CATALOG is not an absent one. `Db::open` read it with
+    /// `if let Ok(b)`, so EIO or EACCES opened a database with no collections
+    /// and the next DDL published that catalog over the real one. A directory
+    /// where the file goes is the injection -- `fs::read` on it fails with
+    /// EISDIR -- and the fresh open first is the other half: a genuinely
+    /// absent catalog is a new database, and a fix that refused it would pass
+    /// the second assertion alone.
+    #[test]
+    fn a_catalog_that_cannot_be_read_fails_the_open_rather_than_opening_empty() {
+        let dir = tmp("catalog-unreadable");
+        let db = Db::open(&dir, DbOpts::default()).expect("an absent catalog is a new database");
+        assert!(db.catalog.collections.is_empty());
+        drop(db);
+
+        let catalog = dir.join("CATALOG");
+        fs::create_dir(&catalog).unwrap();
+        match Db::open(&dir, DbOpts::default()) {
+            Err(Error::Storage(m)) => assert!(m.contains("CATALOG"), "{m}"),
+            Err(e) => panic!("the wrong failure: {e}"),
+            Ok(db) => panic!(
+                "a catalog that could not be read opened a database with {} collections",
+                db.catalog.collections.len()
+            ),
+        }
+        assert!(catalog.is_dir(), "something replaced the catalog the open could not read");
         let _ = fs::remove_dir_all(&dir);
     }
 
