@@ -181,11 +181,19 @@ function renderRows(res) {
   // A partial result rendered as a complete one is the worst failure this
   // console has, so it gets its own block and goes into the live region too.
   var missing = Array.isArray(res.missing) ? res.missing : [];
+  var warnings = [];
   if (missing.length) {
-    var warning = 'PARTIAL RESULT: ' + missing.join(', ') +
-      ' did not answer. Rows held only there are missing from this table.';
-    results.appendChild(el('p', 'warn', warning));
-    setStatus(summary + '. ' + warning, 'warn');
+    warnings.push('PARTIAL RESULT: ' + missing.join(', ') +
+      ' did not answer. Rows held only there are missing from this table.');
+  }
+  // `truncated_prefixes` is `missing`'s sibling: both say the answer is
+  // short. A wide `a*` comes back cut on every surface, and this console was
+  // the one surface that showed the short table and said nothing.
+  var cut = Array.isArray(res.truncated_prefixes) ? res.truncated_prefixes : [];
+  cut.forEach(function (line) { warnings.push('TRUNCATED — ' + line); });
+  if (warnings.length) {
+    warnings.forEach(function (w) { results.appendChild(el('p', 'warn', w)); });
+    setStatus(summary + '. ' + warnings.join(' '), 'warn');
   } else {
     setStatus(summary);
   }

@@ -230,21 +230,30 @@ fn run_one(db: &mut Db, sql: &str) -> Result<()> {
 }
 
 fn print_rows(r: &QueryResult) {
+    let stdout = io::stdout();
+    render_rows(r, &mut stdout.lock());
+}
+
+/// The whole of what a query prints, into `out`, so that a test can pin
+/// where each part lands and not only what each part says.
+fn render_rows(r: &QueryResult, out: &mut dyn Write) {
     for row in &r.rows {
         let key = row.key.replace('\u{1}', "/");
-        match (row.score, row.distance) {
-            (_, Some(d)) => println!("{key}  distance={d:.6}  {}", json::to_string(&row.doc)),
-            (Some(s), None) => println!("{key}  score={s:.6}  {}", json::to_string(&row.doc)),
-            _ => println!("{key}  {}", json::to_string(&row.doc)),
-        }
+        let _ = match (row.score, row.distance) {
+            (_, Some(d)) => writeln!(out, "{key}  distance={d:.6}  {}", json::to_string(&row.doc)),
+            (Some(s), None) => writeln!(out, "{key}  score={s:.6}  {}", json::to_string(&row.doc)),
+            _ => writeln!(out, "{key}  {}", json::to_string(&row.doc)),
+        };
     }
     if !r.missing.is_empty() {
-        println!("PARTIAL RESULTS — missing: {:?}", r.missing);
+        let _ = writeln!(out, "PARTIAL RESULTS — missing: {:?}", r.missing);
     }
-    print!("{}", truncation_report(r));
-    println!("{} row(s)", r.rows.len());
+    // Between the rows and the count, where a reader who stops at the count
+    // has already read it.
+    let _ = write!(out, "{}", truncation_report(r));
+    let _ = writeln!(out, "{} row(s)", r.rows.len());
     if let Some(c) = &r.next_cursor {
-        println!("next cursor: {}", c.replace('\u{1}', "/"));
+        let _ = writeln!(out, "next cursor: {}", c.replace('\u{1}', "/"));
     }
 }
 
@@ -470,6 +479,7 @@ fn section(title: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celastro::plan::exec::Row;
 
     #[test]
     fn demo_with_a_dir_is_refused_rather_than_running_in_memory_and_saving_nothing() {
@@ -504,6 +514,40 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         assert_eq!(persist_status(&mut db), 1);
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Where the block lands: after the rows, before the count, before the
+    /// cursor. Tested through the writer, because a `println!` is reachable
+    /// from no test and a block that moved below the count passed every gate.
+    #[test]
+    fn a_cut_prefix_is_printed_between_the_rows_and_the_row_count() {
+        let mut r = QueryResult::default();
+        for k in ["a", "b"] {
+            r.rows.push(Row {
+                key: k.to_string(),
+                doc: Value::obj(vec![("id".into(), Value::Str(k.into()))]),
+                score: Some(0.5),
+                distance: None,
+            });
+        }
+        r.truncated_prefixes = vec!["text_match(body, 'a*') was cut: documents are missing".into()];
+        r.next_cursor = Some("#00000000|2|b".into());
+        let mut out = Vec::new();
+        render_rows(&r, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        let last_row = at("b  score=0.500000");
+        let cut = at("TRUNCATED — text_match(body, 'a*') was cut");
+        let count = at("2 row(s)");
+        let cursor = at("next cursor:");
+        assert!(last_row < cut && cut < count && count < cursor, "{text}");
+        assert_eq!(count - cut, 1, "something came between the block and the count: {text}");
     }
 
     #[test]

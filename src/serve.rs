@@ -1725,6 +1725,21 @@ mod tests {
         assert_eq!(version, Some(env!("CARGO_PKG_VERSION")));
     }
 
+    /// The console reads `truncated_prefixes` off the wire and renders it the
+    /// way it renders `missing`. This is a static check on the script -- the
+    /// console has no runtime here to execute it in -- so what it pins is
+    /// that the field is read at all and that the rendering says what the
+    /// shells say. A script that read the field into nothing would pass it;
+    /// a script that dropped the field, which is what shipped, does not.
+    #[test]
+    fn the_console_script_reads_and_renders_a_truncated_expansion() {
+        let read = APP_JS.find("res.truncated_prefixes").expect("the field is never read");
+        let shown = APP_JS.find("'TRUNCATED — '").expect("the field is never rendered");
+        assert!(read < shown, "rendered before it is read");
+        let partial = APP_JS.find("PARTIAL RESULT").unwrap();
+        assert!((read as i64 - partial as i64).abs() < 1200, "not beside the partial-result block");
+    }
+
     /// The console executes SQL for whoever holds the token, over HTTP, which
     /// is the interaction AGPL §13 attaches a source offer to. The offer is
     /// on the page a user sees, names THIS version, and is an absolute URL --

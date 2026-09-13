@@ -21,6 +21,11 @@ that ran out listed as missing. `EXPLAIN ANALYZE` shows the budget. A
 statement that used to finish slowly may now be refused; name a budget if
 thirty seconds is not enough.
 
+**The console says when a query was cut.** A wide prefix that hit the
+expansion cap was reported by the shells and both JSON wires and not by the
+browser console, which showed the short table and said nothing. It now shows
+the same `TRUNCATED —` lines beside its partial-result warning.
+
 ## 0.7.0 — 2026-09-13
 
 A new predicate shape, hence a minor. No public signature changed and the

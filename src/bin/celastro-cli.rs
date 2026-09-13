@@ -753,18 +753,30 @@ fn print_outcome(o: &Outcome, d: Duration) {
 }
 
 fn print_rows(r: &QueryResult) {
+    let stdout = io::stdout();
+    render_rows(r, &mut stdout.lock());
+}
+
+/// The whole of what a query prints, into `out`, so that a test can pin
+/// where each part lands and not only what each part says. A write that
+/// fails is a closed pipe; the row count has nowhere to go and neither has
+/// the complaint.
+fn render_rows(r: &QueryResult, out: &mut dyn Write) {
     if r.rows.is_empty() {
-        println!("(no rows)");
+        let _ = writeln!(out, "(no rows)");
     } else {
-        print_table(&r.rows);
+        write_table(&r.rows, out);
     }
     if !r.missing.is_empty() {
-        println!("PARTIAL RESULTS — missing: {:?}", r.missing);
+        let _ = writeln!(out, "PARTIAL RESULTS — missing: {:?}", r.missing);
     }
-    print!("{}", truncation_report(r));
-    println!("{} row(s)", r.rows.len());
+    // Between the table and the count: a reader who stops at the count has
+    // read the complaint, and a reader who scans for the count finds it where
+    // it always is.
+    let _ = write!(out, "{}", truncation_report(r));
+    let _ = writeln!(out, "{} row(s)", r.rows.len());
     if let Some(c) = &r.next_cursor {
-        println!("next cursor: {}", c.replace('\u{1}', "/"));
+        let _ = writeln!(out, "next cursor: {}", c.replace('\u{1}', "/"));
     }
 }
 
@@ -857,7 +869,7 @@ fn columns(rows: &[Row]) -> Vec<Col> {
     cols
 }
 
-fn print_table(rows: &[Row]) {
+fn write_table(rows: &[Row], out: &mut dyn Write) {
     let cols = columns(rows);
     let header: Vec<String> = cols.iter().map(|c| c.header().to_string()).collect();
     let mut lines: Vec<Vec<String>> = vec![header];
@@ -873,10 +885,10 @@ fn print_table(rows: &[Row]) {
     // The rule is drawn from the measured widths rather than a fixed string, so
     // it lines up with whatever the widest cell turned out to be.
     let rule: Vec<String> = width.iter().map(|w| "-".repeat(*w)).collect();
-    println!("{}", pad_join(&lines[0], &width));
-    println!("{}", rule.join("-+-"));
+    let _ = writeln!(out, "{}", pad_join(&lines[0], &width));
+    let _ = writeln!(out, "{}", rule.join("-+-"));
     for line in &lines[1..] {
-        println!("{}", pad_join(line, &width));
+        let _ = writeln!(out, "{}", pad_join(line, &width));
     }
 }
 
@@ -1513,6 +1525,41 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         assert_eq!(persist_status(&mut db, false), 1);
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Where the block lands, not only what it says: after the table, before
+    /// the row count, before the cursor. The block used to be tested for what
+    /// it built while `print_rows` wrote straight to stdout, so a change that
+    /// moved it below the count -- or dropped it -- passed every gate.
+    #[test]
+    fn a_cut_prefix_is_printed_between_the_table_and_the_row_count() {
+        let mut r = QueryResult::default();
+        for k in ["a", "b"] {
+            r.rows.push(Row {
+                key: k.to_string(),
+                doc: Value::obj(vec![("id".into(), Value::Str(k.into()))]),
+                score: Some(0.5),
+                distance: None,
+            });
+        }
+        r.truncated_prefixes = vec!["text_match(body, 'a*') was cut: documents are missing".into()];
+        r.next_cursor = Some("#00000000|2|b".into());
+        let mut out = Vec::new();
+        render_rows(&r, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        let last_row = at("b   | 0.500000 | b");
+        let cut = at("TRUNCATED — text_match(body, 'a*') was cut");
+        let count = at("2 row(s)");
+        let cursor = at("next cursor:");
+        assert!(last_row < cut && cut < count && count < cursor, "{text}");
+        assert_eq!(count - cut, 1, "something came between the block and the count: {text}");
     }
 
     #[test]
