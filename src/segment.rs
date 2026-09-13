@@ -55,6 +55,7 @@ pub const MIN_READABLE_VERSION: u32 = 1;
 const MAGIC: &[u8; 4] = b"CLST";
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct BuildOpts {
     pub quantizer: Quantizer,
     pub hnsw: HnswParams,

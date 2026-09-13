@@ -21,6 +21,7 @@ use crate::text::query::TextQuery;
 use crate::text::{PostingsRef, TextSource};
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Bm25Params {
     pub k1: f32,
     pub b: f32,
@@ -647,7 +648,7 @@ impl Scorer for BitmapScorer {
 /// enumerates PAST the dead ones rather than counting them against the cap: a
 /// dead term contributes no rows either way, but under a cap it would otherwise
 /// displace a live term, which puts the compaction schedule back in the answer.
-/// See [`crate::shard::Shard::prefix_terms`].
+/// See `crate::shard::Shard::prefix_terms`.
 ///
 /// A wide prefix is therefore a PARTIAL answer, and the honest bound is
 /// recall, not correctness: `a*` keeps the terms nearest the start of the

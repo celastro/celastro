@@ -36,6 +36,7 @@ pub enum Tier {
 pub const FLAT_TIER_MAX: usize = 4_096;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SearchOpts {
     /// Candidate breadth for graph traversal.
     pub ef_search: usize,
@@ -98,6 +99,7 @@ impl Strategy {
 /// because these decisions are invisible without it and they are the decisions
 /// that explain a latency or recall surprise.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct VectorReport {
     pub strategy: Option<Strategy>,
     pub selectivity: f64,

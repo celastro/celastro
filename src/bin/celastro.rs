@@ -444,11 +444,8 @@ fn run_demo(db: &mut Db) -> Result<()> {
         let holders = replicas
             .iter()
             .filter(|me| {
-                celastro::residency::Placement {
-                    node_id: (*me).clone(),
-                    replicas: replicas.clone(),
-                }
-                .holds("notes/text:body")
+                celastro::residency::Placement::new((*me).clone(), replicas.clone())
+                    .holds("notes/text:body")
             })
             .count();
         println!("    {n} replica(s) -> {holders} decoded copy(ies)");

@@ -31,6 +31,7 @@ pub enum TextStrategy {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TextExplain {
     pub source: String,
     pub strategy: TextStrategy,
@@ -54,6 +55,7 @@ pub struct TextExplain {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct UnitExplain {
     pub label: String,
     pub docs: usize,
@@ -72,6 +74,7 @@ pub struct UnitExplain {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ShardExplain {
     pub index: usize,
     pub pruned: bool,
@@ -83,6 +86,7 @@ pub struct ShardExplain {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Explain {
     pub statement: String,
     pub snapshot_ts: u64,

@@ -91,6 +91,7 @@ const PREFIX_LEAVES_LIMIT: usize = STATS_TERM_CAP / PREFIX_EXPANSION_LIMIT;
 const ACTIVITY_PERSIST_MICROS: u64 = 60_000_000;
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DbOpts {
     pub thresholds: FlushThresholds,
     pub build: BuildOpts,
@@ -144,7 +145,7 @@ pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 
 /// The periodically refreshed global statistics of §8.2. All three numbers —
 /// `num_docs`, `total_doc_len` and `doc_freq` — are masked sums at one
-/// instant: exactly the triple [`Shard::term_stats`] answers on the exact
+/// instant: exactly the triple `Shard::term_stats` answers on the exact
 /// path, summed over every shard of the collection, gathered at a timestamp
 /// the current query pins. What the cache buys is not a cheaper *kind* of
 /// number; it is not gathering one per query.
@@ -156,7 +157,7 @@ pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 /// gathered, because a single query may ask for more terms than the cap holds
 /// and would otherwise evict its own terms before they were read back.
 ///
-/// Every fill rewrites the two globals from the same [`Shard::term_stats`]
+/// Every fill rewrites the two globals from the same `Shard::term_stats`
 /// call that produced its frequencies, which is what keeps a freshly measured
 /// `df` coherent with the `num_docs` it is about to be divided by — and it is
 /// free, because that call computed them anyway. Gathering the two halves
@@ -200,7 +201,7 @@ pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 /// One approximation is *not* addressed here, and it is shared with
 /// `WITH (exact_scoring)` rather than particular to this cache: `avgdl` is
 /// diluted by documents that carry no text on the path, which
-/// [`Shard::term_stats`] documents where the dilution happens. So what this
+/// `Shard::term_stats` documents where the dilution happens. So what this
 /// buys is parity with `WITH (exact_scoring)` for Term, Phrase and Prefix
 /// queries, not blanket invariance.
 ///
@@ -341,7 +342,7 @@ pub struct Db {
     stats_baseline: BTreeMap<String, PathTally>,
     /// The catalog exactly as this process last published it, so that a persist
     /// which would rewrite CATALOG byte for byte can decline to. See
-    /// [`Shard::persist_manifest`], which does the same for the manifests, and
+    /// `Shard::persist_manifest`, which does the same for the manifests, and
     /// for the same reason: the shells persist after every acknowledged
     /// statement, and almost no statement changes the catalog.
     published_catalog: Option<Vec<u8>>,
@@ -843,8 +844,8 @@ impl Db {
     ///
     /// `exact: true` has no such precondition and is the supported way to read
     /// the past: it writes nothing, and at a `ts` below
-    /// [`Shard::retain_floor`] it is best-effort in exactly the sense
-    /// [`Shard::term_stats`] documents, which a pinned `gc_horizon` makes
+    /// `Shard::retain_floor` it is best-effort in exactly the sense
+    /// `Shard::term_stats` documents, which a pinned `gc_horizon` makes
     /// exact again.
     pub fn gather_stats(
         &mut self,
@@ -1056,7 +1057,7 @@ impl Db {
     /// more than the exact path for the same query, and usually costs nothing.
     ///
     /// One drift survives and it is not a write: a lifecycle transition that
-    /// makes a segment refuse reads changes what [`Shard::term_stats`] can see
+    /// makes a segment refuse reads changes what `Shard::term_stats` can see
     /// without touching `Db::writes`. That is a refusal rather than a drift,
     /// and it is the same on the exact path.
     ///
@@ -1064,8 +1065,8 @@ impl Db {
     /// silently undoes everything above: `ts` must be a timestamp pinned by
     /// the CURRENT query — `run_select` computes it as
     /// `clock.peek().max(last_commit)`. Never store the timestamp a refresh
-    /// used and re-read at it later. [`Shard::term_stats`] is a pure function
-    /// of the live corpus only at or above [`Shard::retain_floor`], and
+    /// used and re-read at it later. `Shard::term_stats` is a pure function
+    /// of the live corpus only at or above `Shard::retain_floor`, and
     /// `retain_from` returns `now` when no `gc_horizon` is pinned, so a seal
     /// or a compaction walks the floor up past any stored timestamp and the
     /// triple gathered at it becomes best-effort — worse, best-effort in a way
@@ -2243,7 +2244,7 @@ impl Db {
 ///
 /// [`Db::gather_stats`] is public, on a published crate, and takes a
 /// `Vec<String>` per path — so `["dup", "dup"]` is expressible, and before
-/// this it was double counted on BOTH arms. [`Shard::term_stats`] walks one
+/// this it was double counted on BOTH arms. `Shard::term_stats` walks one
 /// posting cursor per element of the slice it is handed and accumulates into
 /// the same `df` entry, so a term named twice came back at twice its real
 /// frequency: on a corpus of 80 documents all holding `dup`, `df = 160`

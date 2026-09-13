@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 use crate::vector::{distance, SearchOpts};
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RecallReport {
     pub collection: String,
     pub path: String,

@@ -5,7 +5,7 @@
 //! documents, its own inverted index, its own vector index. **Reads fan out,
 //! writes do not** (§3.1): a write touches one shard and commits through that
 //! shard's Raft group, with no distributed transaction on the ingest path. That
-//! is why [`Shard::insert`] can commit the document, its columns, its postings,
+//! is why `Shard::insert` can commit the document, its columns, its postings,
 //! its vector entry and the delete-log entry for the superseded version as one
 //! atomic append (§6).
 //!
@@ -130,7 +130,11 @@ pub struct SegmentHandle {
 }
 
 impl SegmentHandle {
-    pub fn new(segment: Segment, deletes: DeleteLog, path: Option<PathBuf>) -> Arc<SegmentHandle> {
+    pub(crate) fn new(
+        segment: Segment,
+        deletes: DeleteLog,
+        path: Option<PathBuf>,
+    ) -> Arc<SegmentHandle> {
         Arc::new(SegmentHandle {
             segment: Arc::new(segment),
             deletes: RwLock::new(deletes),
@@ -152,7 +156,7 @@ impl SegmentHandle {
         self.segment.id
     }
 
-    pub fn mark_deleted(&self, ord: u32, ts: Timestamp) {
+    pub(crate) fn mark_deleted(&self, ord: u32, ts: Timestamp) {
         self.deletes.write().unwrap().mark(ord, ts);
         self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
         self.vis.clear();
@@ -189,7 +193,7 @@ impl SegmentHandle {
     /// absent is how a reopen learns a segment has no deletions, and the
     /// encoding is not empty for an empty log -- it carries its frame -- so
     /// the decision is taken on the entries, not on the bytes.
-    pub fn encode_deletes(&self) -> Option<Vec<u8>> {
+    pub(crate) fn encode_deletes(&self) -> Option<Vec<u8>> {
         let d = self.deletes.read().unwrap();
         if d.is_empty() {
             None
@@ -556,18 +560,18 @@ impl Manifest {
 /// durability of the new directory entry is left to the platform. That is a
 /// real difference in what this function promises, and it is written here
 /// rather than left to be discovered.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     publish(path, bytes)?;
     sync_dir_of(path)
 }
 
-/// [`atomic_write`] without the directory fsync: temp file, fsync, rename.
+/// `atomic_write` without the directory fsync: temp file, fsync, rename.
 ///
 /// For a caller publishing several files into the SAME directory, which can
 /// make all of their names durable with one fsync afterwards instead of one
 /// each. It is not a weaker `atomic_write` -- a caller of this owes the
 /// directory fsync before it may treat any of the names as published, and
-/// [`Shard::persist_manifest`] is the only caller.
+/// `Shard::persist_manifest` is the only caller.
 fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -583,7 +587,7 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Is `path` still the file this process published `bytes` to?
 ///
-/// The skip in [`Shard::persist_manifest`] and the matching one on the catalog
+/// The skip in `Shard::persist_manifest` and the matching one on the catalog
 /// rest on this process being the only writer of these files, which is true --
 /// but "the file is still there" is not something to take on trust when the
 /// answer decides whether a save may report success. A database directory that
@@ -616,7 +620,7 @@ pub(crate) fn still_published(path: &Path, bytes: &[u8]) -> bool {
 /// a short or checksum-mismatched file as fatal two lines later, so a file
 /// that could not be read at all was the one failure it believed. `NotFound`
 /// is the only kind that means absent; everything else is reported, as
-/// [`Wal::replay`] already did.
+/// `Wal::replay` already did.
 pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(b) => Ok(Some(b)),
@@ -1049,7 +1053,7 @@ fn first_unused_segment_id(dir: &Path) -> Result<u64> {
 /// recover into an empty one.
 ///
 /// It must run AFTER the id guard, and that is why the guard is in
-/// [`Shard::attach_dir`]: the evidence this unlinks is the same evidence
+/// `Shard::attach_dir`: the evidence this unlinks is the same evidence
 /// `first_unused_segment_id` reads, so a reclamation that went first would
 /// hand the ids it just freed straight back out. `attach_dir` runs before any
 /// manifest is read, so the counter is already past every id the directory
@@ -1076,14 +1080,15 @@ fn reclaim_orphans(dir: &Path, live: &[u64]) {
     }
 }
 
-pub const WAL_INSERT: u8 = 1;
-pub const WAL_DELETE: u8 = 2;
-pub const WAL_SEALED: u8 = 3;
+pub(crate) const WAL_INSERT: u8 = 1;
+pub(crate) const WAL_DELETE: u8 = 2;
+// Kind 3 was reserved for a seal marker and is never written; a record
+// carrying it is skipped by the replay like any other unknown kind.
 
 /// One record per commit. A document, its indexes and the delete-log entry for
 /// the version it supersedes are all in the same record, because they must all
 /// become visible at the same instant or none of them may (§6).
-pub struct WalRecord {
+pub(crate) struct WalRecord {
     pub kind: u8,
     pub key: String,
     pub ts: Timestamp,
@@ -1096,7 +1101,7 @@ pub struct WalRecord {
     pub segment_id: u64,
 }
 
-pub struct Wal {
+pub(crate) struct Wal {
     file: fs::File,
     path: PathBuf,
 }
@@ -1126,20 +1131,20 @@ impl Wal {
     /// Open the log, creating it if this is a fresh shard directory.
     ///
     /// The creation is recorded because it is the event the directory fsync in
-    /// [`Shard::attach_dir`] has to come AFTER. A directory fsync above this
+    /// `Shard::attach_dir` has to come AFTER. A directory fsync above this
     /// call is not a missing fsync -- the syscall count is the same and the
     /// event log still reads `DirSync(dir)` before `WalSync(wal.log)` -- it is
     /// a directory made durable before it named the log, so the first
     /// acknowledged insert is fdatasync'd into a file whose name a crash still
     /// takes. Recording the creation is what lets a test tell those apart.
-    pub fn open(path: &Path) -> Result<Wal> {
+    pub(crate) fn open(path: &Path) -> Result<Wal> {
         let file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
         #[cfg(test)]
         durability_probe::note_create(path);
         Ok(Wal { file, path: path.to_path_buf() })
     }
 
-    pub fn append(&mut self, r: &WalRecord) -> Result<()> {
+    pub(crate) fn append(&mut self, r: &WalRecord) -> Result<()> {
         let mut body = Vec::new();
         body.push(r.kind);
         put_str(&mut body, &r.key);
@@ -1173,21 +1178,21 @@ impl Wal {
     ///
     /// `sync_data` rather than `sync_all` because the log's size is part of its
     /// data and nothing else about the inode matters. It cannot create the
-    /// directory entry that names the file: [`Shard::attach_dir`] does that
+    /// directory entry that names the file: `Shard::attach_dir` does that
     /// once, by fsyncing the directory the log was created in.
     ///
     /// The syscall is in `durable::sync_data` rather than here, with the
     /// record of it and the injected-failure check, because the code that may
     /// say an fsync happened has to be the code that makes it -- see that
     /// module.
-    pub fn sync(&mut self) -> Result<()> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
         durable::sync_data(&self.file, &self.path)
     }
 
     /// Replay. A torn tail — a record whose length or checksum does not check
     /// out — ends the replay rather than failing it: the process died mid-write
     /// and everything before that point is still good.
-    pub fn replay(path: &Path) -> Result<Vec<WalRecord>> {
+    pub(crate) fn replay(path: &Path) -> Result<Vec<WalRecord>> {
         let Some(b) = read_optional(path)? else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         let mut i = 0usize;
@@ -1232,14 +1237,14 @@ impl Wal {
     /// Forget every record in the log.
     ///
     /// Only a caller that has already made the records' effect durable some
-    /// other way may do this -- in practice [`Shard::flush`], after its call to
+    /// other way may do this -- in practice `Shard::flush`, after its call to
     /// `publish_segments` has returned `Ok` for a set that names the segments
     /// they were sealed into. Not `persist_manifest`, which publishes the set
     /// the shard is already in and so has no ordering property to offer.
     /// Recorded for the probe because "the manifest is durable before the WAL
     /// is emptied" is an ordering claim, and the wrong order loses every
     /// document in the sealed memtable.
-    pub fn truncate(&mut self) -> Result<()> {
+    pub(crate) fn truncate(&mut self) -> Result<()> {
         // Two opens: the first empties the file, the second is the append-mode
         // handle the log goes on being written through. Assigning both to
         // `self.file` closes the first at the second assignment.
@@ -1251,7 +1256,7 @@ impl Wal {
 
 /// Where a particular version of a document lives right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Loc {
+pub(crate) enum Loc {
     Mem(u32),
     /// A memtable that has been frozen but whose segment is not committed yet.
     Frozen(usize, u32),
@@ -1259,6 +1264,7 @@ pub enum Loc {
 }
 
 #[derive(Default)]
+#[non_exhaustive]
 pub struct ShardOpts {
     pub thresholds: FlushThresholds,
     pub build: BuildOpts,
@@ -1279,17 +1285,29 @@ pub struct ShardOpts {
 /// the manifest still moved and the WAL was still truncated, which is why
 /// "sealed nothing" cannot be spelled `None`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Sealed {
+pub(crate) struct Sealed {
     pub segment_ids: Vec<u64>,
 }
 
 impl Sealed {
     /// The segment holding the surviving version of every key this seal wrote.
-    pub fn newest(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn newest(&self) -> Option<u64> {
         self.segment_ids.last().copied()
     }
 }
 
+/// One tablet: a key range of a collection, with its memtable, its sealed
+/// segments and its write-ahead log.
+///
+/// Reachable through `Db::shards` for READING -- `coll`, `key_range`,
+/// `segments`, `manifest_version`, a snapshot and what it holds, `get`,
+/// `num_docs`, `manifest`, `segment_summary`, `residency_rows`. Everything
+/// that writes or touches storage -- insert, delete, flush, compaction,
+/// publication, the WAL, the statistics gathers with documented
+/// preconditions -- is crate-private: a `Db` is the only writer, and a
+/// precondition on a crate-private call is the crate's own to keep rather
+/// than a contract offered to a caller who cannot see the reasoning.
 pub struct Shard {
     pub coll: Collection,
     /// The documents this shard has sealed into segments since it was opened,
@@ -1305,8 +1323,8 @@ pub struct Shard {
     /// will not re-observe makes the count exact in both directions: a record
     /// the WAL holds and the catalog does not -- a crash between the WAL sync
     /// and the persist -- is counted by the replay, once.
-    pub sealed: PathTally,
-    pub unsealed: PathTally,
+    pub(crate) sealed: PathTally,
+    pub(crate) unsealed: PathTally,
     /// This shard's half-open key range `[lo, hi)`, from the tablet map.
     /// `None` on either side means unbounded. Range partitioning on the
     /// composite `(partition_key, primary_key)` is what lets a query
@@ -1314,19 +1332,19 @@ pub struct Shard {
     /// hash partitioning cannot, because a large tenant would pin to one shard
     /// forever.
     pub key_range: Option<(Option<String>, Option<String>)>,
-    pub memtable: Memtable,
-    pub frozen: Vec<Arc<Memtable>>,
+    pub(crate) memtable: Memtable,
+    pub(crate) frozen: Vec<Arc<Memtable>>,
     pub segments: Vec<Arc<SegmentHandle>>,
     pub manifest_version: u64,
-    pub next_segment_id: u64,
-    pub opts: ShardOpts,
-    pub clock: Arc<Hlc>,
+    pub(crate) next_segment_id: u64,
+    pub(crate) opts: ShardOpts,
+    pub(crate) clock: Arc<Hlc>,
     dir: Option<PathBuf>,
     wal: Option<Wal>,
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
-    pub flushes: u64,
-    pub compactions: u64,
+    pub(crate) flushes: u64,
+    pub(crate) compactions: u64,
     /// The horizon the last version-collecting operation actually ran at,
     /// maxed over every flush and compaction since this shard was opened. At
     /// or above it nothing has been collected; below it a snapshot read may
@@ -1338,7 +1356,7 @@ pub struct Shard {
     /// reading. That is why the default must not narrow further than it
     /// already has: an unpinned seal forgets only versions a write had already
     /// superseded, never a row that a snapshot below the seal can still read.
-    pub retain_floor: Timestamp,
+    pub(crate) retain_floor: Timestamp,
     /// Segments removed from the manifest whose files are still referenced by
     /// a reader. Swept whenever the last reference goes away; without this the
     /// files are simply never unlinked.
@@ -1354,13 +1372,13 @@ pub struct Shard {
     /// first successful publication, so a fresh or reopened shard always writes
     /// once before it starts skipping.
     ///
-    /// Behind a lock because [`Shard::persist_manifest`] is `&self` and public.
+    /// Behind a lock because `Shard::persist_manifest` is `&self` and public.
     published_manifest: RwLock<Option<Vec<u8>>>,
     published_deletes: RwLock<BTreeMap<u64, Vec<u8>>>,
 }
 
 impl Shard {
-    pub fn new(coll: Collection, clock: Arc<Hlc>, opts: ShardOpts) -> Shard {
+    pub(crate) fn new(coll: Collection, clock: Arc<Hlc>, opts: ShardOpts) -> Shard {
         let memtable = Memtable::new(&coll, opts.budget.clone());
         Shard {
             coll,
@@ -1388,7 +1406,7 @@ impl Shard {
     /// Assign this shard's key range. Under replication this comes from the
     /// control
     /// plane's tablet map (§10) and changes on split and merge.
-    pub fn with_key_range(mut self, lo: Option<String>, hi: Option<String>) -> Shard {
+    pub(crate) fn with_key_range(mut self, lo: Option<String>, hi: Option<String>) -> Shard {
         self.key_range = Some((lo, hi));
         self
     }
@@ -1404,7 +1422,7 @@ impl Shard {
         }
     }
 
-    pub fn attach_dir(&mut self, dir: &Path) -> Result<()> {
+    pub(crate) fn attach_dir(&mut self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir.join("segments"))?;
         fs::create_dir_all(dir.join("archive"))?;
         fs::create_dir_all(dir.join("deletes"))?;
@@ -1576,7 +1594,7 @@ impl Shard {
     /// document store with any secondary index pays anyway; in return, one
     /// delete-log entry invalidates that version across every index type at
     /// once (§4.4).
-    pub fn insert(&mut self, mut doc: Value) -> Result<Timestamp> {
+    pub(crate) fn insert(&mut self, mut doc: Value) -> Result<Timestamp> {
         self.coll.validate(&doc)?;
         self.coll.coerce(&mut doc);
         let key = sort_key(&self.coll, &doc)?;
@@ -1663,7 +1681,7 @@ impl Shard {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<Option<Timestamp>> {
+    pub(crate) fn delete(&mut self, key: &str) -> Result<Option<Timestamp>> {
         let ts = self.clock.now();
         let Some(prev) = self.locate(key, MAX_TS) else { return Ok(None) };
         if let Some(w) = self.wal.as_mut() {
@@ -1687,7 +1705,7 @@ impl Shard {
 
     /// The version of `key` live at `t`.
     ///
-    /// Reads at a `t` below [`Shard::retain_floor`] are best-effort: a version
+    /// Reads at a `t` below `Shard::retain_floor` are best-effort: a version
     /// that a write had already superseded before the last seal or compaction
     /// may have been forgotten there, and this returns whatever survived.
     /// Holding history across those operations means pinning `opts.gc_horizon`
@@ -1719,7 +1737,7 @@ impl Shard {
     /// searchable through the new index immediately) and an empty one is simply
     /// rebuilt. Older sealed segments pick the index up through a rolling
     /// rebuild at compaction (§12.3).
-    pub fn adopt_catalog(&mut self, coll: Collection) -> Result<()> {
+    pub(crate) fn adopt_catalog(&mut self, coll: Collection) -> Result<()> {
         // The seal below runs against the *new* definition and can fail — a
         // vector index whose declared dims disagree with a document already in
         // the memtable, say. Keep the definition being replaced so that failure
@@ -1759,7 +1777,7 @@ impl Shard {
     /// The catalog's copy holds the aggregate across every shard. Assigning it
     /// wholesale would give this shard credit for the other shards' documents,
     /// and the next aggregation would then multiply by the shard count.
-    pub fn adopt_definition(&mut self, coll: Collection) {
+    pub(crate) fn adopt_definition(&mut self, coll: Collection) {
         let docs = self.coll.doc_count;
         let paths = std::mem::take(&mut self.coll.paths);
         self.coll = coll;
@@ -1779,7 +1797,7 @@ impl Shard {
 
     /// Release every component whose tier says it has been idle too long.
     /// Returns the bytes freed.
-    pub fn unload_idle(&self, now: u64) -> usize {
+    pub(crate) fn unload_idle(&self, now: u64) -> usize {
         self.segments.iter().map(|h| h.segment.unload_idle(now)).sum()
     }
 
@@ -1794,7 +1812,7 @@ impl Shard {
     /// invariant (§4.2) that makes hybrid retrieval a bitmap intersection.
     ///
     /// Returns the number of files relocated.
-    pub fn sync_archive(&mut self) -> Result<usize> {
+    pub(crate) fn sync_archive(&mut self) -> Result<usize> {
         let Some(dir) = self.dir.clone() else { return Ok(0) };
         let want_archive = self.coll.all_indexes_archived();
         let mut moved = 0;
@@ -1849,7 +1867,7 @@ impl Shard {
     /// at it; a flush drains at it only while something is pinned — unpinned it
     /// keeps every row and drops superseded versions instead, by keeping layer
     /// 0. Both read it from here, and both report it through
-    /// [`Shard::retain_floor`], so it lives in one place.
+    /// `Shard::retain_floor`, so it lives in one place.
     pub fn retain_from(&self, now: Timestamp) -> Timestamp {
         if self.opts.gc_horizon > 0 {
             self.opts.gc_horizon.min(now)
@@ -1858,7 +1876,7 @@ impl Shard {
         }
     }
 
-    pub fn maybe_flush(&mut self) -> Result<bool> {
+    pub(crate) fn maybe_flush(&mut self) -> Result<bool> {
         if self.memtable.should_flush(&self.opts.thresholds) {
             self.flush()?;
             Ok(true)
@@ -1885,16 +1903,16 @@ impl Shard {
     /// and each row's tombstone is re-resolved into the segment's delete log,
     /// exactly as it always was. Compaction stays the only collector of
     /// TOMBSTONED rows; superseded versions go here, as they always did — which
-    /// is why an unpinned seal still raises [`Shard::retain_floor`], and why a
+    /// is why an unpinned seal still raises `Shard::retain_floor`, and why a
     /// snapshot below that floor may have lost versions it could once see.
     ///
     /// `None` means nothing was sealed, and it means only that: the memtable
-    /// was empty. [`Sealed`] carries the ids a seal did write, newest last,
+    /// was empty. `Sealed` carries the ids a seal did write, newest last,
     /// and is empty when a pinned drain collected every row — which is still a
     /// seal, and `Db::flush` still counts it.
     ///
     /// [`compaction::run`]: crate::compaction::run
-    pub fn flush(&mut self) -> Result<Option<Sealed>> {
+    pub(crate) fn flush(&mut self) -> Result<Option<Sealed>> {
         if self.memtable.is_empty() {
             return Ok(None);
         }
@@ -2113,7 +2131,7 @@ impl Shard {
     /// degenerate case of the publication a seal or a compaction performs: the
     /// set being published and the set the shard is already describing are the
     /// same one, so there is no order for it to get wrong.
-    pub fn persist_manifest(&self) -> Result<()> {
+    pub(crate) fn persist_manifest(&self) -> Result<()> {
         self.publish_segments(&self.segments, self.manifest_version)
     }
 
@@ -2123,7 +2141,7 @@ impl Shard {
     /// A bare `fs::write` truncates in place, so a crash halfway through leaves
     /// a manifest that will not decode — every segment file intact and the
     /// shard unable to open. The rename is what makes the switch atomic, and
-    /// [`atomic_write`]'s directory fsync is what makes the rename survive.
+    /// `atomic_write`'s directory fsync is what makes the rename survive.
     ///
     /// The delete logs go first and are durable before MANIFEST's rename is
     /// even attempted, because MANIFEST is what names the segments those logs
@@ -2131,7 +2149,7 @@ impl Shard {
     /// deletes have been forgotten, and every deleted document comes back.
     ///
     /// The set is a PARAMETER, and that is the whole of the ordering property.
-    /// [`Shard::flush`] and [`Shard::install_compaction`] call this with the
+    /// `Shard::flush` and `Shard::install_compaction` call this with the
     /// set they are about to install and install it only if this returns `Ok`,
     /// so a publication that fails leaves the shard describing exactly what is
     /// on the disk. A publication that read `self.segments` could not be used
@@ -2148,7 +2166,7 @@ impl Shard {
     /// that does not exist; all three call sites passed the field.
     ///
     /// What this ordering does NOT buy is worth stating beside it. Publishing
-    /// is [`atomic_write`]'s rename followed by the fsync that makes the new
+    /// is `atomic_write`'s rename followed by the fsync that makes the new
     /// name durable, so a publication that reports failure may still be the
     /// MANIFEST on the disk — the rename landed and only the fsync did not.
     /// The shard then rolls back and a later publication writes version v again
@@ -2227,7 +2245,12 @@ impl Shard {
     }
 
     /// Reopen from disk: install the manifest, then replay the WAL.
-    pub fn open(coll: Collection, clock: Arc<Hlc>, opts: ShardOpts, dir: &Path) -> Result<Shard> {
+    pub(crate) fn open(
+        coll: Collection,
+        clock: Arc<Hlc>,
+        opts: ShardOpts,
+        dir: &Path,
+    ) -> Result<Shard> {
         let mut s = Shard::new(coll, clock, opts);
         s.attach_dir(dir)?;
         // `Some` or an error, never "absent" for a file that is there and
@@ -2354,7 +2377,7 @@ impl Shard {
     /// Replace `inputs` with `outputs` atomically from a reader's point of
     /// view: the manifest version moves in one step, and readers already
     /// holding the old handles keep them alive through their `Arc`s.
-    pub fn install_compaction(
+    pub(crate) fn install_compaction(
         &mut self,
         input_ids: &[u64],
         outputs: Vec<Segment>,
@@ -2416,7 +2439,7 @@ impl Shard {
     /// `Arc::strong_count == 1` means this list is the last owner. A segment
     /// whose reader is still alive stays on the list and is swept next time —
     /// checking once at compaction and then forgetting leaks the file forever.
-    pub fn sweep_retired(&mut self) {
+    pub(crate) fn sweep_retired(&mut self) {
         let Some(dir) = self.dir.clone() else {
             self.retiring.retain(|h| Arc::strong_count(h) > 1);
             return;
@@ -2447,7 +2470,7 @@ impl Shard {
     /// re-applied to the output, each identified by `(key, commit_ts)` rather
     /// than by key alone: a segment holds one version per key, so a bare key
     /// would match whichever version survived, not the one that died.
-    pub fn collect_for_compaction(
+    pub(crate) fn collect_for_compaction(
         &self,
         ids: &[u64],
         retain_from: Timestamp,
@@ -2494,7 +2517,7 @@ impl Shard {
     /// that names one.
     ///
     /// This is a dictionary read rather than a statistic — it answers which
-    /// terms the query names, and [`Shard::term_stats`] then measures how many
+    /// terms the query names, and `Shard::term_stats` then measures how many
     /// live documents hold each of them — but it is a read of the LIVE
     /// dictionary, and the difference is not cosmetic. A term whose every
     /// posting is dead does contribute a cursor that matches nothing; what it
@@ -2543,14 +2566,14 @@ impl Shard {
     /// uses, breaks the argument above.
     ///
     /// `text_handle` is the FALLIBLE spelling for the same reason
-    /// [`Shard::term_stats`] uses it: an archived segment configured to refuse
+    /// `Shard::term_stats` uses it: an archived segment configured to refuse
     /// reads must surface the refusal, not look like a path carrying no index
     /// and silently drop its terms out of the expansion. A unit holding
     /// nothing visible at `t` is skipped before that call and so does not
     /// surface its refusal — which is the same answer either way, since the
     /// terms it could refuse to name are terms it holds no visible document
     /// for.
-    pub fn prefix_terms(
+    pub(crate) fn prefix_terms(
         &self,
         path: &str,
         prefix: &str,
@@ -2562,7 +2585,7 @@ impl Shard {
         let snap = self.snapshot_at(t);
         for s in self.sources(&snap) {
             // Once per unit, not once per term. For a segment this is the
-            // cached bitmap [`Shard::term_stats`] reads at the same `t`; for
+            // cached bitmap `Shard::term_stats` reads at the same `t`; for
             // the memtable it is the same O(n) build the gather already pays
             // on every query.
             let mut vis = s.visibility(t);
@@ -2605,7 +2628,7 @@ impl Shard {
     /// quantity and the same guarantee.
     ///
     /// All three numbers are masked by visibility at `t`, so for `t >=`
-    /// [`Shard::retain_floor`] the triple is a pure function of the keys live
+    /// `Shard::retain_floor` the triple is a pure function of the keys live
     /// at `t`, their field lengths and their postings: independent of how many
     /// physical versions or tombstones are resident, of when any shard sealed,
     /// and of whether a compaction has run. Below the floor it stays
@@ -2622,7 +2645,7 @@ impl Shard {
     /// from it. Deduplicating is the caller's job rather than this function's
     /// because this one is per shard and runs once per shard per query, while
     /// the caller does it once.
-    pub fn term_stats(
+    pub(crate) fn term_stats(
         &self,
         path: &str,
         terms: &[String],
@@ -2638,7 +2661,7 @@ impl Shard {
             // A unit with nothing visible at `t` contributes zero to all three
             // numbers — no documents, `visible_doc_len` over an empty mask is
             // zero, and the `df` loop counts only visible postings — so skip
-            // it before paying for its dictionary. See [`Shard::prefix_terms`]
+            // it before paying for its dictionary. See `Shard::prefix_terms`
             // for why a shard can hold many such units at once.
             if vis.popcount() == 0 {
                 continue;

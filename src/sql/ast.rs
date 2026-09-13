@@ -246,6 +246,7 @@ pub enum Projection {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct WithOpts {
     /// Brute-force vector search over every segment and exact two-phase term
     /// statistics. Far too slow for production; it exists so that "same results

@@ -505,6 +505,17 @@ deadline into a refusal naming the budget, or, under `partial_results`, into
 the shard listed as missing. Nothing a timed-out shard produced reaches the
 merge. Writes, DDL and maintenance carry no budget.
 
+**What is API is stated, and it is small.** `Db` and what it hands out.
+Options structs are `#[non_exhaustive]` and built from `Default` field by
+field; report structs are `#[non_exhaustive]` and read. A field added to
+either is not a breaking change, which matters for a `0.x` crate that has
+grown one in most releases. `Shard` is reachable through `Db::shards` for
+reading -- its catalog, key range, segment set, snapshot and summaries -- and
+its writes, flush, compaction, publication and WAL are crate-private, along
+with the statistics gathers whose preconditions are documented rather than
+enforced: a precondition on a crate-private call is the crate's own to keep.
+The crate docs carry the contract as a doctest.
+
 **Three query shapes are refused rather than mis-answered.** `AFTER` with
 `COLLAPSE BY`, `AFTER` with `ORDER BY <field>`, and a negation as one side of an
 explicit `OR`. Each has a defensible semantics that is not implemented; refusing

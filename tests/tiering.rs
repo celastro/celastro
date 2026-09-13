@@ -375,7 +375,7 @@ fn exactly_one_replica_holds_a_minimal_index() {
     for key in ["items/text:body", "items/vec:embedding", "orders/col:status"] {
         let holders: Vec<String> = replicas
             .iter()
-            .filter(|n| Placement { node_id: (*n).clone(), replicas: replicas.clone() }.holds(key))
+            .filter(|n| Placement::new((*n).clone(), replicas.clone()).holds(key))
             .cloned()
             .collect();
         assert_eq!(holders.len(), 1, "`{key}` is held by {holders:?}, not by exactly one node");
@@ -389,10 +389,7 @@ fn the_holder_count_does_not_grow_with_the_replica_count() {
         let replicas: Vec<String> = (0..n).map(|i| format!("node-{i:02}")).collect();
         let holders = replicas
             .iter()
-            .filter(|x| {
-                Placement { node_id: (*x).clone(), replicas: replicas.clone() }
-                    .holds("items/text:body")
-            })
+            .filter(|x| Placement::new((*x).clone(), replicas.clone()).holds("items/text:body"))
             .count();
         assert_eq!(holders, 1, "{n} replicas produced {holders} holders");
     }
@@ -404,9 +401,8 @@ fn the_holder_count_does_not_grow_with_the_replica_count() {
 fn the_designation_is_agreed_without_coordination_and_is_stable() {
     let replicas: Vec<String> = vec!["b".into(), "a".into(), "c".into()];
     let shuffled: Vec<String> = vec!["c".into(), "b".into(), "a".into()];
-    let from = |r: &Vec<String>, me: &str| {
-        Placement { node_id: me.into(), replicas: r.clone() }.holder_for("items/text:body")
-    };
+    let from =
+        |r: &Vec<String>, me: &str| Placement::new(me, r.clone()).holder_for("items/text:body");
     let want = from(&replicas, "a");
     assert!(want.is_some());
     for me in ["a", "b", "c"] {
@@ -458,15 +454,13 @@ fn the_holder_keeps_a_minimal_index_resident() {
 #[test]
 fn a_node_that_is_not_the_holder_treats_minimal_as_cached() {
     let replicas: Vec<String> = vec!["n0".into(), "n1".into(), "n2".into()];
-    let holder = Placement { node_id: "n0".into(), replicas: replicas.clone() }
-        .holder_for("items/text:body")
-        .unwrap();
+    let holder = Placement::new("n0", replicas.clone()).holder_for("items/text:body").unwrap();
     let bystander = replicas.iter().find(|n| **n != holder).unwrap().clone();
 
     let d = dir("min-bystander");
     let mut o = DbOpts::default();
     o.residency.cached_idle_unload = std::time::Duration::from_secs(0);
-    o.placement = Placement { node_id: bystander.clone(), replicas };
+    o.placement = Placement::new(bystander.clone(), replicas);
     let mut db = Db::open(&d, o).unwrap();
     minimal_setup(&mut db, 300);
 
@@ -620,8 +614,7 @@ fn a_node_missing_from_its_own_replica_list_is_refused() {
     let d = dir("misplaced");
     let mut o = DbOpts::default();
     // The likeliest mistake: set the replica list, leave node_id at default.
-    o.placement =
-        Placement { node_id: "node-0".into(), replicas: vec!["a".into(), "b".into(), "c".into()] };
+    o.placement = Placement::new("node-0", vec!["a".into(), "b".into(), "c".into()]);
     let e = match Db::open(&d, o) {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
@@ -633,7 +626,7 @@ fn a_node_missing_from_its_own_replica_list_is_refused() {
 
     // An empty list is the single-node case and is fine.
     let mut o = DbOpts::default();
-    o.placement = Placement { node_id: "whoever".into(), replicas: Vec::new() };
+    o.placement = Placement::new("whoever", Vec::new());
     assert!(Db::open(&d, o).is_ok());
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -643,14 +636,12 @@ fn a_node_missing_from_its_own_replica_list_is_refused() {
 #[test]
 fn resolution_never_leaks_back_into_the_catalog() {
     let replicas: Vec<String> = vec!["n0".into(), "n1".into(), "n2".into()];
-    let holder = Placement { node_id: "n0".into(), replicas: replicas.clone() }
-        .holder_for("items/text:body")
-        .unwrap();
+    let holder = Placement::new("n0", replicas.clone()).holder_for("items/text:body").unwrap();
     let bystander = replicas.iter().find(|n| **n != holder).unwrap().clone();
 
     let d = dir("no-leak");
     let mut o = DbOpts::default();
-    o.placement = Placement { node_id: bystander, replicas };
+    o.placement = Placement::new(bystander, replicas);
     let mut db = Db::open(&d, o).unwrap();
     minimal_setup(&mut db, 60);
 

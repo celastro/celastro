@@ -33,6 +33,7 @@ use crate::value::Value;
 use crate::vector::VectorStore;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct FlushThresholds {
     /// Byte threshold for this memtable.
     pub max_bytes: usize,

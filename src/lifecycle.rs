@@ -186,6 +186,7 @@ impl LifecyclePolicy {
 
 /// Per-index facts a policy is evaluated against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IndexActivity {
     /// When the index was defined.
     pub created_micros: u64,

@@ -21,6 +21,35 @@
 //! `(primary_key, source, raw_score)` candidates and fusion happens exclusively
 //! in [`plan::fusion`] at the coordinator, because fusing segment-local ranks
 //! is not equivalent to fusing global ranks (§7.2).
+//!
+//! ## What is API
+//!
+//! The library's surface is [`Db`] and what it hands out. Two rules keep that
+//! surface stable while the crate is `0.x` and grows a field somewhere in
+//! most releases:
+//!
+//! - **Options are built from `Default` and set field by field.** Every
+//!   options struct -- [`DbOpts`], [`vector::SearchOpts`],
+//!   [`residency::ResidencyOpts`], [`residency::Placement`] and the rest -- is
+//!   `#[non_exhaustive]`, so a struct literal outside this crate does not
+//!   compile and a new field cannot break a caller who never named it.
+//! - **Reports are read, not built.** [`plan::exec::QueryResult`],
+//!   [`plan::explain::Explain`], [`vector::VectorReport`] and the other
+//!   structs a query returns are `#[non_exhaustive]` for the same reason.
+//!
+//! ```
+//! use celastro::{Db, DbOpts};
+//! let mut opts = DbOpts::default();
+//! opts.recall_sample_rate = 1;
+//! opts.build.flat_tier_max = 64;
+//! let db = Db::with_opts(opts);
+//! assert!(db.placement().replicas.is_empty());
+//! ```
+//!
+//! [`shard::Shard`] is reachable through [`Db::shards`] for reading -- its
+//! catalog, key range, segment set and snapshot -- and for nothing else:
+//! everything that writes or touches storage is crate-private, so that a
+//! precondition documented on a read is the crate's own to keep.
 
 pub mod bitmap;
 pub mod catalog;

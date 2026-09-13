@@ -204,6 +204,7 @@ impl Tier {
 /// what makes the tier implementable at all in a design where the control
 /// plane publishes a tablet map and the data plane never blocks on it (§10).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Placement {
     /// This node's identity in the replica list.
     pub node_id: String,
@@ -220,6 +221,13 @@ impl Default for Placement {
 }
 
 impl Placement {
+    /// This node's identity and the replica list it is part of. The one
+    /// constructor: the struct is `#[non_exhaustive]`, so a caller builds it
+    /// here or from `Default` and sets fields.
+    pub fn new(node_id: impl Into<String>, replicas: Vec<String>) -> Placement {
+        Placement { node_id: node_id.into(), replicas }
+    }
+
     pub fn single(node_id: &str) -> Placement {
         Placement { node_id: node_id.to_string(), replicas: vec![node_id.to_string()] }
     }
@@ -327,6 +335,7 @@ pub enum ArchivedAccess {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ResidencyOpts {
     /// Node-level ceiling on decoded index structures. Like the memtable
     /// budget (§4.3), this is a *node* number: a node hosts hundreds of

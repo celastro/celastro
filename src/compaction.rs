@@ -22,6 +22,7 @@ use crate::shard::Shard;
 use crate::time::Timestamp;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CompactionOpts {
     /// Segments at one level before they merge.
     pub tier_fanout: usize,
@@ -126,7 +127,7 @@ pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
 /// Version GC happens here and nowhere else. Documents not visible at
 /// `retain_from` are dropped; readers that pinned an older snapshot are
 /// unaffected because they hold `Arc`s to the *input* segments, which
-/// [`Shard::install_compaction`] does not unlink while anyone still references
+/// `Shard::install_compaction` does not unlink while anyone still references
 /// them. A backup pins `gc_horizon`, which holds `retain_from` back (§12.5),
 /// and a version superseded after it is kept as well — in an output segment of
 /// its own, because one segment holds one version per key.

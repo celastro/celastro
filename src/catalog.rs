@@ -65,6 +65,7 @@ const SPARSE_BELOW: f64 = 0.60;
 const TYPE_NOISE_FLOOR: f64 = 0.001;
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PathStats {
     /// Occurrences per concrete type. `Null` is counted but never makes a path
     /// polymorphic on its own.

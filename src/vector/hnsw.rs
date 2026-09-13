@@ -24,6 +24,7 @@ use crate::codec::*;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct HnswParams {
     /// Neighbours per node above level 0.
     pub m: usize,

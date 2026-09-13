@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The public surface is deliberate.** Every options struct (`DbOpts`,
+`SearchOpts`, `ResidencyOpts`, `Placement`, `FlushThresholds`,
+`CompactionOpts`, `BuildOpts`, `HnswParams`, `Bm25Params`, `ShardOpts`,
+`WithOpts`) and every report struct (`Explain` and its parts,
+`VectorReport`, `RecallReport`, `IndexActivity`, `PathStats`) is `#[non_exhaustive]`: build options from `Default` and set
+fields, read reports, and a field added later cannot break you again the
+way 0.3.0 and 0.8.0 did. `Placement::new(node_id, replicas)` replaces its
+struct literal. `Shard` is reachable through `Db::shards` for reading only;
+its writes, its flush and compaction, its publication and its write-ahead
+log are crate-private now, as are its statistics gathers with documented
+preconditions. Breaking for a caller who built any of those structs
+literally or called into a shard's storage; both were undocumented.
+
 ## 0.8.0 — 2026-09-13
 
 Two behaviour changes on a published crate, hence a minor: every statement

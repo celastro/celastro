@@ -272,7 +272,7 @@ impl<'a> TextSource<'a> {
     /// about: which garbage a unit has not yet compacted away then decides what
     /// the query means. Here the enumeration runs PAST a dead run, so the
     /// answer is a function of the live corpus at `t` alone — see
-    /// [`crate::shard::Shard::prefix_terms`] for why unioning per-unit answers
+    /// `crate::shard::Shard::prefix_terms` for why unioning per-unit answers
     /// is still exactly the collection's first `limit` live terms.
     ///
     /// Cost is one probe per term enumerated, and the probe stops at a term's
@@ -342,7 +342,7 @@ impl<'a> TextSource<'a> {
     /// Neither number is masked by visibility, so both count versions a write
     /// superseded and rows a delete tombstoned, and which of those still exist
     /// is a per-shard seal and compaction decision: an IDF built from this
-    /// moves with the shard count. [`crate::shard::Shard::term_stats`] answers
+    /// moves with the shard count. `crate::shard::Shard::term_stats` answers
     /// the same question masked at a snapshot, and that is what both scoring
     /// paths ask. What is left here is fixtures and assertions that want the
     /// physical picture, which is a real thing to want — just not to rank by.

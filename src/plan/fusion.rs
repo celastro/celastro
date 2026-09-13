@@ -76,6 +76,7 @@ pub struct Fused {
 }
 
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FusionExplain {
     pub method: String,
     pub sources: Vec<String>,
