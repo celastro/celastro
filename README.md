@@ -56,6 +56,33 @@ Breaking for library users: `GlobalStats` gained `expansions` and `QueryResult`
 gained `truncated_prefixes`, so struct literals of either need updating. Both
 are now `#[non_exhaustive]`, so the next field will not break you.
 
+**Upgrading from 0.3.0.** An acknowledged write now survives a power loss.
+Nothing on the 0.3.0 write path was fsynced: the WAL record was written and
+never synced, and the rename that publishes a segment or a manifest was never
+made durable, so an acknowledged insert could be lost with the page cache. The
+record is now synced before the acknowledgement and every publication is
+followed by a directory fsync. It is also faster, because a persist used to
+rewrite CATALOG and every MANIFEST with unchanged bytes on every statement: an
+acknowledged insert went from 2360 to 644 microseconds at one shard and from
+8856 to 688 at six.
+
+Three things change on the way back in. A reopen now unlinks segment and
+delete-log files the manifest does not name — the leftovers of a publication
+that failed — and never hands their ids out again, where 0.3.0 could reopen a
+new segment carrying a dead one's delete log. A segment whose whole-body
+checksum does not match is refused at open; 0.3.0 wrote the checksum and did
+not check it. And a value nested deeper than 128 levels, reachable only
+through `set_path` and never through SQL or JSON, is refused on decode rather
+than aborting the process.
+
+Two answers move. An integer past 2^53 in a shredded `Number` column used to be
+rounded to a double on the way in, so `2^53 = 2^53 + 1` was true; such values
+are now compared exactly. And a negative `dims`, `ef_search` or `deadline_ms`
+is refused rather than wrapped to the maximum.
+
+No public signature changed and the on-disk format is the same, so a 0.3.0
+directory opens as it is.
+
 ---
 
 ## The load-bearing idea
