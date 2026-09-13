@@ -1916,3 +1916,52 @@ fn a_distance_threshold_returns_the_same_rows_at_every_shard_count() {
     assert_eq!(one, three, "1 shard vs 3 shards");
     assert_eq!(one, six, "1 shard vs 6 shards");
 }
+
+/// Bit-identity across shard counts holds through a score tie at the k-th
+/// slot inside a memtable. Three hundred identical documents, inserted in
+/// reverse key order and never flushed, tie on score; a unit hands up its
+/// best `k'` of them -- fifty here, so that the depth binds, which the
+/// default would not against three hundred -- and a memtable used to pick
+/// those by push order, the LAST fifty inserted, the largest keys, so the coordinator
+/// never saw the smallest keys, and how many memtables the corpus was split
+/// across decided which keys it did see. The unit now hands up the smallest
+/// keys, at one, three and six shards alike, and the answer is the same after
+/// a flush, where the sealed segment's ordinals are its keys.
+#[test]
+fn a_score_tie_inside_a_memtable_is_bit_identical_across_shard_counts() {
+    let n = 300;
+    let run = |splits: &[&str], flush: bool| {
+        let mut db = Db::with_opts(opts(64));
+        setup(&mut db, 4, splits);
+        for i in (0..n).rev() {
+            let d = json::parse(&format!(
+                r#"{{"id":"doc-{i:05}","tenant_id":"t{}","status":"published","body":"tie tie break"}}"#,
+                i % 3
+            ))
+            .unwrap();
+            db.insert("items", d).unwrap();
+        }
+        if flush {
+            db.execute("FLUSH items").unwrap();
+        }
+        let r = db
+            .query(
+                "SELECT id FROM items ORDER BY hybrid(text_match(body, 'tie break'), k => 50) \
+                 LIMIT 5 WITH (exact_scoring)",
+            )
+            .unwrap();
+        r.rows.iter().map(|x| (x.key.clone(), x.score.unwrap().to_bits())).collect::<Vec<_>>()
+    };
+    let mut keys: Vec<String> = (0..n).map(|i| format!("t{}\u{1}doc-{i:05}", i % 3)).collect();
+    keys.sort();
+    let smallest: Vec<String> = keys.into_iter().take(5).collect();
+
+    let one = run(&[], false);
+    assert_eq!(one.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), smallest, "one memtable");
+    let three = run(&["t1", "t2"], false);
+    let six = run(&["t0\u{1}doc-00150", "t1", "t1\u{1}doc-00150", "t2", "t2\u{1}doc-00150"], false);
+    assert_eq!(one, three, "1 shard vs 3 shards, unflushed");
+    assert_eq!(one, six, "1 shard vs 6 shards, unflushed");
+    assert_eq!(one, run(&[], true), "unflushed vs sealed");
+    assert_eq!(one, run(&["t1", "t2"], true), "1 memtable vs 3 sealed segments");
+}

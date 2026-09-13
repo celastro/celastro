@@ -6,6 +6,15 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A score tie inside a memtable no longer depends on insertion order.** A
+unit hands the coordinator its best `k'` candidates, and inside a memtable a
+tie at the last slot went by push order rather than by key, so with more
+tied documents than `k'` in an unflushed memtable the answer depended on how
+many memtables the corpus was split across. Ties now go by key everywhere, at
+a cost only the memtable pays.
+
 ## 0.9.0 — 2026-09-13
 
 Breaking for library callers who built an options or report struct

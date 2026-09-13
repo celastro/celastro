@@ -1049,15 +1049,26 @@ pub struct Hit {
 /// tree after every heap replacement. Rejected candidates cost one `advance`,
 /// and a candidate outside the filter costs one jump to the next admitted
 /// ordinal — never a scan of the gap.
-pub fn collect_top_k(
+pub fn collect_top_k<'k>(
     mut scorer: Box<dyn Scorer + '_>,
     filter: &Bitmap,
     excluded: Option<&Bitmap>,
     k: usize,
+    key_of: Option<&dyn Fn(u32) -> &'k str>,
 ) -> Vec<Hit> {
     if k == 0 {
         return Vec::new();
     }
+    // The bar WAND prunes to. In a sealed segment it is the k-th score
+    // itself: a later candidate with an equal score has the larger ordinal,
+    // which is the larger key, and loses the tie -- so a document that can
+    // only tie is correctly never scored. In a memtable the ordinal says
+    // nothing about the key, so a document that ties may be the one that
+    // should win, and it has to be scored to find out: the bar is one ULP
+    // below the k-th score, which admits exactly the ties. That un-prunes
+    // every tie in the unit, and the unit is a memtable, whose size the
+    // flush thresholds bound; a sealed segment pays nothing.
+    let bar = |kth: f32| if key_of.is_some() { next_down(kth) } else { kth };
     let mut heap: Vec<Hit> = Vec::with_capacity(k.min(4096) + 1);
     let mut d = scorer.advance(0);
     while d != EXHAUSTED {
@@ -1077,52 +1088,84 @@ pub fn collect_top_k(
             }
         }
         let s = scorer.score();
+        // Worst first: ascending score, and within a score the LOSER of the
+        // tie first -- the larger key where keys are known, else the larger
+        // ordinal, which in a sealed segment is the larger key.
+        let worse = |a: &Hit, b: &Hit| -> std::cmp::Ordering {
+            a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| {
+                match key_of {
+                    Some(key) => key(b.ord).cmp(key(a.ord)),
+                    None => b.ord.cmp(&a.ord),
+                }
+            })
+        };
         if heap.len() < k {
             heap.push(Hit { ord: d, score: s });
             if heap.len() == k {
-                heap.sort_by(cmp_hit);
+                heap.sort_by(worse);
                 // The heap is full: from here the k-th best score is the bar
                 // every later candidate has to clear, and WAND prunes to it.
-                scorer.set_threshold(heap[0].score);
+                scorer.set_threshold(bar(heap[0].score));
             }
-        } else if better(s, d, heap[0].score, heap[0].ord) {
+        } else if better(s, d, &heap[0], key_of) {
             heap[0] = Hit { ord: d, score: s };
-            heap.sort_by(cmp_hit);
-            scorer.set_threshold(heap[0].score);
+            heap.sort_by(worse);
+            scorer.set_threshold(bar(heap[0].score));
         }
         d = scorer.advance(d + 1);
     }
-    // Descending by score, then ascending by ordinal. The ordinal tie-break is
-    // a local stand-in for the primary-key tie-break the coordinator applies
-    // (§7.2). The two agree inside a sealed segment, which is primary-key
-    // sorted. They do NOT agree inside the memtable, whose ordinals are push
-    // order, so a memtable score tie is broken by insertion order and the
-    // wrong one of two tied documents can take the last slot.
-    //
-    // That is known and not fixed here, because it is not a local change. The
-    // k-th score is also the WAND threshold, and `DisjunctionScorer::advance`
-    // prunes on `sum > threshold`, so a document that can only *tie* the k-th
-    // score is skipped before it is ever scored — a key-aware tie-break here
-    // would never see it. Admitting it means pushing a threshold below the
-    // k-th score, which un-prunes every tie in the collection and is paid on
-    // every multi-term query. The tie-break is not worth that price.
+    // Descending by score, then ascending by key: the coordinator's order
+    // (§7.2), so that what a unit hands up under a binding `k'` is what the
+    // coordinator would have kept. Inside a sealed segment the ordinal IS the
+    // key order, so `key_of` is `None` there and the ordinal stands in; a
+    // memtable's ordinals are push order, so it passes its keys, and the
+    // pruning bar above admits the ties the comparator has to see.
     heap.sort_by(|a, b| {
-        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.ord.cmp(&b.ord))
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(
+            || match key_of {
+                Some(key) => key(a.ord).cmp(key(b.ord)),
+                None => a.ord.cmp(&b.ord),
+            },
+        )
     });
     heap
 }
 
-fn cmp_hit(a: &Hit, b: &Hit) -> std::cmp::Ordering {
-    a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal).then(b.ord.cmp(&a.ord))
+/// The largest `f32` strictly below `x`: `f32::next_down`, which the declared
+/// MSRV predates. Scores are positive and finite, and the other cases are
+/// handled so the helper is total.
+fn next_down(x: f32) -> f32 {
+    if x.is_nan() || x == f32::NEG_INFINITY {
+        return x;
+    }
+    if x == f32::INFINITY {
+        return f32::MAX;
+    }
+    if x == 0.0 {
+        return -f32::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if x > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
 }
 
-/// Strictly greater, deliberately. Candidates are visited in ascending ordinal
-/// order, so a later document with an equal score always has the larger ordinal
-/// and must lose the tie — which is exactly what WAND's `> threshold` pivot
-/// assumes. Anything looser here and the pruned plan stops agreeing with the
-/// brute-force one.
-fn better(s: f32, _ord: u32, worst_s: f32, _worst_ord: u32) -> bool {
-    s > worst_s
+/// Whether a candidate displaces the worst retained hit. In a sealed segment,
+/// strictly greater: candidates arrive in ascending ordinal order, so a later
+/// document with an equal score has the larger ordinal, which is the larger
+/// key, and loses the tie -- exactly what WAND's `> threshold` pivot assumes.
+/// In a memtable an equal score is decided by the key, because the arrival
+/// order says nothing about it.
+fn better<'k>(s: f32, ord: u32, worst: &Hit, key_of: Option<&dyn Fn(u32) -> &'k str>) -> bool {
+    if s > worst.score {
+        return true;
+    }
+    match key_of {
+        Some(key) if s == worst.score => key(ord) < key(worst.ord),
+        _ => false,
+    }
 }
 
 /// Evaluate to a plain matching set. This is `text_match(...)` in `WHERE`,
@@ -1255,7 +1298,7 @@ mod tests {
                 let want = brute_force(&src, &st, &q, &all, k);
                 let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
                 let got = match c.scorer {
-                    Some(s) => collect_top_k(s, &all, c.excluded.as_ref(), k),
+                    Some(s) => collect_top_k(s, &all, c.excluded.as_ref(), k, None),
                     None => Vec::new(),
                 };
                 assert_eq!(got.len(), want.len(), "query `{qs}` k={k}");
@@ -1279,7 +1322,7 @@ mod tests {
         }
         let q = TextQuery::parse("quick brown fox vector graph", Analyzer::English).unwrap();
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
-        let got = collect_top_k(c.scorer.unwrap(), &f, c.excluded.as_ref(), 10);
+        let got = collect_top_k(c.scorer.unwrap(), &f, c.excluded.as_ref(), 10, None);
         assert!(!got.is_empty());
         assert!(got.iter().all(|h| h.ord % 2 == 1), "{got:?}");
         let want = brute_force(&src, &st, &q, &f, 10);
@@ -1287,6 +1330,65 @@ mod tests {
             got.iter().map(|h| h.ord).collect::<Vec<_>>(),
             want.iter().map(|h| h.ord).collect::<Vec<_>>()
         );
+    }
+
+    /// The bar one ULP below a score: the helper stands in for a std method
+    /// the MSRV predates, so it is pinned against the arithmetic it replaces.
+    #[test]
+    fn next_down_is_the_largest_float_strictly_below() {
+        for x in [1.0f32, 0.5, 3.75, 1e-30, 1e30, f32::MIN_POSITIVE] {
+            let d = next_down(x);
+            assert!(d < x, "{x}");
+            assert!(f32::from_bits(d.to_bits() + 1) == x, "{x}: not adjacent");
+        }
+        assert!(next_down(0.0) < 0.0);
+        assert_eq!(next_down(f32::INFINITY), f32::MAX);
+        assert!(next_down(f32::NAN).is_nan());
+    }
+
+    /// Inside a memtable the ordinals are push order, so five identical
+    /// documents pushed in reverse key order tie on score with their keys in
+    /// the wrong order. With its keys the collector keeps the smallest keys
+    /// and returns them in key order; without them it keeps what the
+    /// ordinals say, which is the same list only because a sealed segment's
+    /// ordinals are its keys. The pruning is exercised too: WAND's bar is
+    /// the k-th score, and the tie that should win arrives after the heap is
+    /// full, so a bar that did not admit ties would never score it.
+    #[test]
+    fn a_memtable_score_tie_is_broken_by_key_and_not_by_push_order() {
+        let mut b = InvertedBuilder::new();
+        let keys = ["k4", "k3", "k2", "k1", "k0"];
+        for i in 0..keys.len() as u32 {
+            let mut toks = Vec::new();
+            Analyzer::English.analyze("tie tie break", 0, &mut toks);
+            b.add_doc(i, &toks);
+        }
+        let (dict, post, _) = b.finish();
+        let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
+        let lens = b.doc_lens.clone();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        let st = stats(&src);
+        let q = TextQuery::parse("tie break", Analyzer::English).unwrap();
+        let key_of = |ord: u32| keys[ord as usize];
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+        let got: Vec<&str> = collect_top_k(
+            c.scorer.unwrap(),
+            &Bitmap::all(5),
+            c.excluded.as_ref(),
+            2,
+            Some(&key_of),
+        )
+        .into_iter()
+        .map(|h| keys[h.ord as usize])
+        .collect();
+        assert_eq!(got, vec!["k0", "k1"], "the memtable tie went by push order");
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+        let by_ordinal: Vec<u32> =
+            collect_top_k(c.scorer.unwrap(), &Bitmap::all(5), c.excluded.as_ref(), 2, None)
+                .into_iter()
+                .map(|h| h.ord)
+                .collect();
+        assert_eq!(by_ordinal, vec![0, 1], "a sealed segment's tie goes by ordinal");
     }
 
     /// Scoring and filtering both stop when the statement's deadline has
@@ -1311,14 +1413,15 @@ mod tests {
         {
             let _expired = crate::deadline::arm(Some(0));
             let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
-            let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10);
+            let got =
+                collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10, None);
             assert!(got.is_empty(), "scoring ran past the deadline: {} hits", got.len());
             let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
             assert_eq!(evaluate_to_bitmap(c, 40).popcount(), 0, "the filter ran past the deadline");
         }
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
         assert_eq!(
-            collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10).len(),
+            collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10, None).len(),
             10
         );
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
@@ -1345,7 +1448,7 @@ mod tests {
         let st = stats(&src);
         let q = TextQuery::parse("\"small world\"", Analyzer::English).unwrap();
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
-        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(2), c.excluded.as_ref(), 10);
+        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(2), c.excluded.as_ref(), 10, None);
         assert_eq!(got.iter().map(|h| h.ord).collect::<Vec<_>>(), vec![1]);
     }
 
@@ -1559,7 +1662,7 @@ mod tests {
         // And the same query through the pruning collector, which is where the
         // threshold the pivot is compared against actually comes from.
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
-        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 4);
+        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 4, None);
         assert_eq!(got.len(), 4);
         assert!(got.iter().all(|h| h.score > 0.0), "{got:?}");
     }
@@ -1687,7 +1790,7 @@ mod tests {
         };
         let q = TextQuery::parse("alpha*", Analyzer::English).unwrap();
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
-        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 2);
+        let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(DOCS.len()), None, 2, None);
         assert_eq!(got[0].ord, 8, "expected the rare expanded term to win: {got:?}");
         assert_eq!(got[1].ord, 0, "{got:?}");
     }

@@ -1148,7 +1148,24 @@ fn run_source(
             let st = stats.get(path).unwrap_or(&empty);
             let c = scorer::compile(query, &src, vis, st, Bm25Params::default())?;
             let hits = match c.scorer {
-                Some(s) => scorer::collect_top_k(s, filter, c.excluded.as_ref(), k_prime),
+                // A memtable's ordinals are push order, so it hands the
+                // collector its keys; a sealed segment's are key order
+                // already. See `collect_top_k`.
+                Some(s) => match unit {
+                    Searchable::Mem(m) => {
+                        let key_of = |ord: u32| m.docs[ord as usize].sort_key.as_str();
+                        scorer::collect_top_k(
+                            s,
+                            filter,
+                            c.excluded.as_ref(),
+                            k_prime,
+                            Some(&key_of),
+                        )
+                    }
+                    Searchable::Seg(_) => {
+                        scorer::collect_top_k(s, filter, c.excluded.as_ref(), k_prime, None)
+                    }
+                },
                 None => Vec::new(),
             };
             ux.text.push(TextExplain {

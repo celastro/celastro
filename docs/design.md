@@ -285,6 +285,18 @@ only function in the engine that assigns one. Score normalisation has the same
 shape — normalising per shard makes the scale shard-dependent, so it happens
 once, over the merged set.
 
+**A score tie at the `k'` boundary inside a memtable is broken by key, at a
+price only the memtable pays.** A unit hands the coordinator its best `k'`
+candidates in the coordinator's own order, score then key. A sealed segment's
+ordinals are its keys, so the ordinal stands in for free and WAND's bar is the
+k-th score itself: a document that can only tie has the larger key and
+correctly loses without being scored. A memtable's ordinals are push order, so
+it hands the collector its keys, and the bar is one ULP below the k-th score
+so that the ties the comparator has to see are scored rather than pruned.
+That un-prunes every tie in the unit -- the cost the earlier attempts refused
+to pay collection-wide -- and pays it only inside a memtable, whose size the
+flush thresholds bound.
+
 **`k'` truncation, not approximation, is what breaks shard-count identity.**
 `n` shards each return up to `k'` candidates where one shard returns `k'`, so
 the candidate union differs with the shard count and the fusion differs with it
@@ -579,7 +591,7 @@ guarantee:
 | hybrid queries provably correct | `hybrid_retrieval_is_a_union_of_all_three_modes`, `text_match_is_a_must_in_where_and_a_should_in_hybrid` |
 | harness trusted | `the_recall_harness_catches_a_deliberate_regression` |
 | recall@10 ≥ 0.95 under sustained deletes | `recall_at_10_holds_under_sustained_deletes` (40% deleted, before / after / post-compaction) |
-| exact mode bit-identical across shard counts | `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards), `exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes` (linear fusion, so a length norm can reach the assertion) |
+| exact mode bit-identical across shard counts, through a score tie at the k-th slot inside a memtable | `a_score_tie_inside_a_memtable_is_bit_identical_across_shard_counts` (300 tied documents in reverse key order, unflushed, at 1, 3 and 6 shards, and equal to the sealed answer), `text::scorer::tests::a_memtable_score_tie_is_broken_by_key_and_not_by_push_order` (the collector, with the tie arriving after the heap is full so the pruning bar is exercised), `exact_mode_is_bit_identical_across_shard_counts` (1, 3, 6 shards), `exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes` (linear fusion, so a length norm can reach the assertion) |
 | exact global statistics are a function of the live corpus | `exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `shard::tests::the_length_numerator_matches_a_brute_force_fold_at_every_snapshot` |
 | a freshly refreshed default gather matches `WITH (exact_scoring)` for Term, Phrase and Prefix queries, and the default triple is identical at every shard count fresh or stale | `default_statistics_are_identical_across_shard_counts_under_updates_and_deletes`, `default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes`, `engine::tests::a_freshly_refreshed_cache_answers_exactly_what_the_exact_gather_answers`, `engine::tests::a_prefix_query_in_a_fresh_epoch_ranks_like_exact_scoring` (the Prefix leg: the only test that runs both arms and compares them), `engine::tests::a_prefix_only_query_still_gets_real_globals` (a prefix query's globals, which is a different claim) |
 | a prefix query means the same thing at every shard count | `a_prefix_query_ranks_the_same_at_every_shard_count` (the document frequencies), `a_prefix_query_finds_the_same_documents_at_every_shard_count` (the expansion set itself, positive and negated, with no scoring in it), `engine::tests::a_prefix_resolves_to_the_same_terms_at_every_shard_count` (the cap applies to the union), `engine::tests::a_prefix_term_living_in_one_shard_is_weighted_by_the_whole_collection` |

@@ -1359,7 +1359,7 @@ mod tests {
         // bitmap is this source's actual visibility.
         let live = Bitmap::all(n);
         let c = compile(&q, &src, &live, &stats, Bm25Params::default()).unwrap();
-        let hits = collect_top_k(c.scorer.unwrap(), &filter, c.excluded.as_ref(), 10);
+        let hits = collect_top_k(c.scorer.unwrap(), &filter, c.excluded.as_ref(), 10, None);
         assert_eq!(hits.len(), 10);
         assert!(hits.iter().all(|h| filter.get(h.ord as usize)));
 
