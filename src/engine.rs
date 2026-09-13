@@ -4945,6 +4945,55 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The SELECT list narrows what comes back. It used to be parsed and read
+    /// nowhere, so `SELECT id FROM notes` returned the whole document on
+    /// every surface and the shells printed every field. Each claim below is
+    /// the mutation that would pass the others: a named path is kept and an
+    /// unnamed one is not; an alias renames; a nested path is keyed as
+    /// written; a path the document lacks is `Null` rather than absent, so the
+    /// rows share a shape; `*` keeps everything; and a ranked query's `score`
+    /// is on the row whether or not the list names it.
+    #[test]
+    fn the_select_list_decides_what_a_row_carries() {
+        let dir = tmp("select-list");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let mut n1 = note("n1");
+        n1.set_path("meta.tag", Value::Str("kept".into()));
+        db.insert("notes", n1).unwrap();
+        db.insert("notes", note("n2")).unwrap();
+
+        let r = db.query("SELECT id, title AS t, meta.tag FROM notes LIMIT 10").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        for row in &r.rows {
+            let Value::Object(fields) = &row.doc else { panic!("{:?}", row.doc) };
+            let names: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(names, vec!["id", "meta.tag", "t"], "key {}", row.key);
+            assert!(row.doc.get("body").is_none(), "an unnamed field came back: {:?}", row.doc);
+            assert_eq!(row.doc.get("t").and_then(|v| v.as_str()), Some("a title"));
+        }
+        let by_key = |k: &str| r.rows.iter().find(|row| row.key == k).unwrap();
+        assert_eq!(by_key("n1").doc.get("meta.tag").and_then(|v| v.as_str()), Some("kept"));
+        assert_eq!(by_key("n2").doc.get("meta.tag"), Some(&Value::Null));
+
+        let whole = db.query("SELECT * FROM notes WHERE id = 'n2' LIMIT 1").unwrap();
+        assert_eq!(whole.rows[0].doc, note("n2"));
+
+        let ranked = db
+            .query("SELECT id FROM notes ORDER BY hybrid(text_match(body, 'segments')) LIMIT 2")
+            .unwrap();
+        assert_eq!(ranked.rows.len(), 2);
+        for row in &ranked.rows {
+            assert!(row.score.is_some(), "the score left the row with the projection");
+            assert_eq!(row.doc, Value::obj(vec![("id".into(), Value::Str(row.key.clone()))]));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Every document is counted once, however many times the directory is
     /// reopened. The persisted catalog used to count the memtable's documents,
     /// which the WAL also holds, so every reopen replayed and re-observed

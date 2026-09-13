@@ -26,8 +26,8 @@ Releases and what changes between them are in [CHANGELOG.md](https://github.com/
 ## Quick start
 
 Put this in `quickstart.sql`. Documents are JSON; the collection declares the
-primary key and any typed columns, and an index declares how a path is
-searched.
+primary key and any typed columns, an index declares how a path is searched,
+and the SELECT list picks the fields that come back.
 
 ```sql
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT);
@@ -40,13 +40,13 @@ INSERT INTO notes VALUES ('{"id":"n3","topic":"storage","body":"An LSM tree seal
 INSERT INTO notes VALUES ('{"id":"n4","topic":"storage","body":"Compaction merges segments and drops dead versions","embedding":[0.0,0.0,0.1,0.9]}');
 
 -- a structured predicate
-SELECT * FROM notes WHERE topic = 'storage';
+SELECT id, topic FROM notes WHERE topic = 'storage';
 -- full text: text_match in WHERE is a must
-SELECT * FROM notes WHERE text_match(body, 'segments');
+SELECT id FROM notes WHERE text_match(body, 'segments');
 -- nearest neighbours
-SELECT * FROM notes ORDER BY embedding <=> [0.8,0.2,0.0,0.0] LIMIT 2;
+SELECT id FROM notes ORDER BY embedding <=> [0.8,0.2,0.0,0.0] LIMIT 2;
 -- all three in one plan, fused with reciprocal rank fusion
-SELECT * FROM notes
+SELECT id, topic FROM notes
 ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf')
 LIMIT 3;
 ```
@@ -60,25 +60,31 @@ index `notes_body` created on the active tier
 index `notes_emb` created on the active tier
 1 document(s) written at ts 7328898005277564928
 ...
-key | body                                             | embedding         | id | topic
-----+--------------------------------------------------+-------------------+----+--------
-n3  | An LSM tree seals a memtable into immutable seg… | [0.0,0.0,0.9,0.1] | n3 | storage
-n4  | Compaction merges segments and drops dead versi… | [0.0,0.0,0.1,0.9] | n4 | storage
+key | id | topic
+----+----+--------
+n3  | n3 | storage
+n4  | n4 | storage
 2 row(s)
-...
-key | distance | body                                             | embedding         | id | topic
-----+----------+--------------------------------------------------+-------------------+----+-------
-n1  | 0.009008 | BM25 ranks documents by term frequency and docu… | [0.9,0.1,0.0,0.0] | n1 | search
-n2  | 0.651813 | Vector search finds the nearest neighbours in e… | [0.1,0.9,0.0,0.0] | n2 | search
+key | id
+----+---
+n3  | n3
+n4  | n4
 2 row(s)
-...
-key | score    | body                                             | embedding         | id | topic
-----+----------+--------------------------------------------------+-------------------+----+--------
-n1  | 0.032787 | BM25 ranks documents by term frequency and docu… | [0.9,0.1,0.0,0.0] | n1 | search
-n2  | 0.032258 | Vector search finds the nearest neighbours in e… | [0.1,0.9,0.0,0.0] | n2 | search
-n3  | 0.015873 | An LSM tree seals a memtable into immutable seg… | [0.0,0.0,0.9,0.1] | n3 | storage
+key | distance | id
+----+----------+---
+n1  | 0.009008 | n1
+n2  | 0.651813 | n2
+2 row(s)
+key | score    | id | topic
+----+----------+----+--------
+n1  | 0.032787 | n1 | search
+n2  | 0.032258 | n2 | search
+n3  | 0.015873 | n3 | storage
 3 row(s)
 ```
+
+`key` is the row's primary key and `score` or `distance` its rank, whichever
+the query produced; the rest of the columns are the SELECT list.
 
 Every write is on the disk before it is acknowledged, so the collection is
 there in the next process:

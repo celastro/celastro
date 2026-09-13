@@ -471,8 +471,10 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         ex.total_micros = t0.elapsed().as_micros();
         let cut = truncated_prefixes(input.stats);
         ex.notes.extend(cut.iter().cloned());
+        let mut rows = out.0;
+        project(&input.select.projections, &mut rows);
         return Ok(QueryResult {
-            rows: out.0,
+            rows,
             explain: if input.analyze { Some(ex) } else { None },
             missing: out.1,
             truncated_prefixes: cut,
@@ -681,6 +683,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     ex.total_micros = t0.elapsed().as_micros();
     let cut = truncated_prefixes(input.stats);
     ex.notes.extend(cut.iter().cloned());
+    project(&input.select.projections, &mut rows);
     Ok(QueryResult {
         rows,
         explain: if input.analyze { Some(ex) } else { None },
@@ -688,6 +691,38 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         truncated_prefixes: cut,
         next_cursor,
     })
+}
+
+/// Apply the SELECT list to the rows, in place, as the last step of a query.
+///
+/// `*` anywhere in the list keeps the whole document. Otherwise the document
+/// becomes an object holding one entry per named path: the value at the
+/// path, or `Null` where the document has none, so that every row has the
+/// same shape and a table over them has the same columns -- a projection
+/// over polymorphic documents shows its gaps rather than hiding them. A
+/// nested path is keyed by its alias, or by the path as written; the row's
+/// `key`, `score` and `distance` are not document fields and are untouched.
+/// `score` and `distance` in the list are accepted for readability and
+/// change nothing: a ranked query carries them whether or not they are named.
+///
+/// Last, after collapse, the cursor and the fetch, because each of those
+/// reads fields the list may not name: `COLLAPSE BY` its path, the cursor its
+/// sort key, the fetch the whole payload. The list used to be parsed and read
+/// nowhere, so every surface returned the whole document whatever was asked.
+fn project(projections: &[Projection], rows: &mut [Row]) {
+    if projections.iter().any(|p| matches!(p, Projection::All)) {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let mut fields: Vec<(String, Value)> = Vec::new();
+        for p in projections {
+            let Projection::Path { path, alias } = p else { continue };
+            let name = alias.clone().unwrap_or_else(|| path.clone());
+            let value = row.doc.path(path).cloned().unwrap_or(Value::Null);
+            fields.push((name, value));
+        }
+        row.doc = Value::obj(fields);
+    }
 }
 
 fn cmp_dir(d: Direction, a: f32, b: f32) -> std::cmp::Ordering {

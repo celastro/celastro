@@ -155,7 +155,7 @@ fn hybrid_retrieval_is_a_union_of_all_three_modes() {
 
     let q = c.query_near(2, 0.02);
     let sql = format!(
-        "SELECT id FROM items WHERE tenant_id = 't1' \
+        "SELECT * FROM items WHERE tenant_id = 't1' \
          ORDER BY hybrid(text_match(body, 'quokka bandersnatch'), embedding <=> {}, method => 'rrf') \
          LIMIT 10",
         vec_literal(&q)
@@ -206,7 +206,7 @@ fn text_match_is_a_must_in_where_and_a_should_in_hybrid() {
     // rows come from the vector source. A should never filters.
     let should = db
         .query(&format!(
-            "SELECT id FROM items ORDER BY hybrid(text_match(body, 'bandersnatch'), embedding <=> {q}) LIMIT 10"
+            "SELECT id, body FROM items ORDER BY hybrid(text_match(body, 'bandersnatch'), embedding <=> {q}) LIMIT 10"
         ))
         .unwrap();
     assert_eq!(should.rows.len(), 10);
@@ -221,7 +221,7 @@ fn text_match_is_a_must_in_where_and_a_should_in_hybrid() {
     // As a must: exactly the matching set, and nothing else.
     let must = db
         .query(&format!(
-            "SELECT id FROM items WHERE text_match(body, 'bandersnatch') \
+            "SELECT id, body FROM items WHERE text_match(body, 'bandersnatch') \
              ORDER BY embedding <=> {q} LIMIT 10"
         ))
         .unwrap();
@@ -238,7 +238,7 @@ fn text_match_is_a_must_in_where_and_a_should_in_hybrid() {
     // ranks inside it.
     let both = db
         .query(&format!(
-            "SELECT id FROM items WHERE text_match(body, 'saturation') \
+            "SELECT id, body FROM items WHERE text_match(body, 'saturation') \
              ORDER BY hybrid(text_match(body, 'curve postings'), embedding <=> {q}) LIMIT 5"
         ))
         .unwrap();
@@ -262,7 +262,7 @@ fn fresh_writes_are_searchable_at_exact_recall_before_any_flush() {
     assert_eq!(db.shards("items").unwrap()[0].segments.len(), 0);
 
     // Query exactly one stored document's vector back.
-    let target = db.query("SELECT id FROM items LIMIT 1").unwrap();
+    let target = db.query("SELECT id, embedding FROM items LIMIT 1").unwrap();
     let key = target.rows[0].key.clone();
     let emb: Vec<f32> = target.rows[0]
         .doc
@@ -297,7 +297,7 @@ fn structured_filters_are_admission_predicates_not_post_filters() {
     // space. A post-filter over a top-10 would return almost nothing.
     let r = db
         .query(&format!(
-            "SELECT id FROM items WHERE ANY(tags) = 'starred' AND status = 'published' \
+            "SELECT * FROM items WHERE ANY(tags) = 'starred' AND status = 'published' \
              ORDER BY embedding <=> {q} LIMIT 10"
         ))
         .unwrap();
@@ -1331,7 +1331,7 @@ fn snapshot_isolation_and_read_your_writes() {
     db.insert("items", d).unwrap();
 
     // Read-your-writes: the very next query sees the update.
-    let r = db.query("SELECT id FROM items WHERE status = 'archived' LIMIT 10").unwrap();
+    let r = db.query("SELECT id, body FROM items WHERE status = 'archived' LIMIT 10").unwrap();
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0].doc.path("body").unwrap().as_str(), Some("rewritten body"));
 
@@ -1367,8 +1367,9 @@ fn counts_are_stable_across_flush_and_compaction() {
     assert_eq!(count(&mut db), 300);
 
     // Text and vector agree with the structured scan after the rewrite.
-    let text =
-        db.query("SELECT id FROM items WHERE text_match(body, 'compaction') LIMIT 1000").unwrap();
+    let text = db
+        .query("SELECT id, topic FROM items WHERE text_match(body, 'compaction') LIMIT 1000")
+        .unwrap();
     assert!(!text.rows.is_empty());
     assert!(text.rows.iter().all(|r| r.doc.path("topic").unwrap().as_str() == Some("storage")));
 }
@@ -1508,7 +1509,9 @@ fn collapse_by_keeps_the_best_child_per_parent() {
     db.execute("FLUSH chunks").unwrap();
 
     let plain = db
-        .query("SELECT id FROM chunks ORDER BY embedding <-> [0.5,0.51,0.52,0.53] LIMIT 5")
+        .query(
+            "SELECT id, parent_id FROM chunks ORDER BY embedding <-> [0.5,0.51,0.52,0.53] LIMIT 5",
+        )
         .unwrap();
     let parents_plain: Vec<String> = plain
         .rows
@@ -1524,7 +1527,7 @@ fn collapse_by_keeps_the_best_child_per_parent() {
 
     let collapsed = db
         .query(
-            "SELECT id FROM chunks ORDER BY embedding <-> [0.5,0.51,0.52,0.53] LIMIT 5 \
+            "SELECT id, parent_id FROM chunks ORDER BY embedding <-> [0.5,0.51,0.52,0.53] LIMIT 5 \
              COLLAPSE BY parent_id",
         )
         .unwrap();
@@ -1669,7 +1672,7 @@ fn an_update_before_a_flush_does_not_lose_the_document() {
     db.execute("FLUSH items").unwrap();
 
     assert_eq!(db.query("SELECT id FROM items LIMIT 1000").unwrap().rows.len(), 40);
-    let got = db.query("SELECT id FROM items WHERE id = 'doc-00007' LIMIT 5").unwrap();
+    let got = db.query("SELECT id, body FROM items WHERE id = 'doc-00007' LIMIT 5").unwrap();
     assert_eq!(got.rows.len(), 1);
     assert_eq!(got.rows[0].doc.path("body").unwrap().as_str(), Some("rewritten"));
 }

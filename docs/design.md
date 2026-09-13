@@ -454,6 +454,16 @@ a query, disturbs residency, and runs the same query expecting identical rows.
 Without that property the `minimal` tier is not implementable at all, because a
 node that is not the designated holder has to answer anyway.
 
+**The SELECT list narrows the document; `key`, `score` and `distance` are the
+row's own.** A row is the primary key, the fused score or the distance where
+the query ranked, and the document cut down to the named paths — `Null` where
+a document has no such path, so that a projection over polymorphic documents
+shows its gaps as empty cells rather than ragged rows. Naming `score` or
+`distance` is accepted and changes nothing: a ranked query carries them
+whether or not they are asked for. Projection is the last step, after
+`COLLAPSE BY`, the cursor and the fetch, because each of those reads fields
+the list may not name.
+
 **Three query shapes are refused rather than mis-answered.** `AFTER` with
 `COLLAPSE BY`, `AFTER` with `ORDER BY <field>`, and a negation as one side of an
 explicit `OR`. Each has a defensible semantics that is not implemented; refusing
@@ -544,6 +554,7 @@ guarantee:
 | a file the open could not read is reported, never read as absent | `engine::tests::a_catalog_that_cannot_be_read_fails_the_open_rather_than_opening_empty`, `shard::tests::a_manifest_that_cannot_be_read_fails_the_open_rather_than_opening_empty`, `shard::tests::a_delete_log_that_cannot_be_read_fails_the_open_rather_than_resurrecting` (each pins both halves: absent still opens, unreadable fails naming the file -- a short or corrupt file was already refused, so an unreadable one was the only failure the open believed) |
 | a damaged delete log is refused, never read as a shorter one | `shard::tests::a_damaged_delete_log_fails_the_open_rather_than_losing_a_deletion` (every truncation and every flipped bit of a published log fails the open naming the file), `mvcc::tests::a_framed_delete_log_refuses_every_truncation_and_every_flipped_byte` (the count and the checksum are separately load-bearing: a log that lost a record and was re-signed is refused by the count), `shard::tests::a_delete_log_written_before_the_frame_opens_and_is_rewritten_framed`, `mvcc::tests::a_delete_log_without_the_frame_still_decodes` (an existing database opens, and the next publication closes its unframed window) |
 | the catalog counts every document once, however many times the directory is reopened | `engine::tests::a_reopen_with_an_unflushed_wal_counts_its_documents_once` (three claims, each the mutation that passes the others: right before any statement, unchanged across reopens with an unflushed WAL, and a record no persist ever saw is counted once) |
+| the SELECT list decides what a row carries | `engine::tests::the_select_list_decides_what_a_row_carries` (a named path is kept and an unnamed one is not, an alias renames, a nested path is keyed as written, a missing path is `Null` rather than absent, `*` keeps everything, and a ranked query keeps its `score`) |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The SELECT list is honoured.** It was parsed and read nowhere, so every
+query returned the whole document on every surface: the shells printed every
+field and the JSON wire carried the whole `doc` whatever was asked. A row now
+carries the named paths only, keyed by alias or by the path as written, with
+`Null` where a document lacks one so that rows share a shape. `*` keeps the
+whole document, and a ranked query's `score` and `distance` stay on the row
+whether or not the list names them. Anything that read a field it did not
+name gets `Null` for it now; name it.
+
 ## 0.5.0 — 2026-09-13
 
 The delete log gained a frame, so this is a format change with a compatible
