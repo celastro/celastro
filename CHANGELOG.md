@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.6.1 — 2026-09-13
+
+A patch: nothing observable moves except how much memory and time a scan
+costs.
 
 **An unranked scan holds one page, not the collection.** `SELECT * FROM docs
 LIMIT 1` used to decode and buffer every matching document before taking one
