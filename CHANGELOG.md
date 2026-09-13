@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.10.1 — 2026-09-13
+
+A patch: a durability fix, and documentation. Nothing observable moves
+short of a power loss during a tier move.
 
 **A tier move is durable, and the durability guarantee says where it
 stops.** Moving a segment between `segments/` and `archive/` renamed the
