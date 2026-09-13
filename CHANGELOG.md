@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.13.0 — 2026-09-13
+
+A new verb and a chart, hence a minor. `/api/health` no longer requires the
+token. The on-disk format is unchanged.
 
 **A Helm chart, and a health probe for it.** `chart/celastro` deploys one
 instance as a `StatefulSet` with a persistent data volume, probes that ask
