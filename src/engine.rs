@@ -207,12 +207,12 @@ pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 ///
 /// A note on the cadence, now that staleness is the only residual and the
 /// cadence is the only knob left: `refreshed_at_writes` is compared against
-/// `Db::writes`, which counts writes to the whole ENGINE rather than to this
-/// collection, so traffic on an unrelated collection ages this entry. The
-/// load-bearing property is that the counter is shard-count independent, not
-/// that it is per collection: an engine-wide counter only makes an epoch end
-/// sooner, and it ends sooner by the same amount at every shard count. But it
-/// does mean the interval is an upper bound on how fresh these numbers can be,
+/// the write count of THIS collection, so the interval describes the
+/// staleness rather than bounding it -- traffic on an unrelated collection
+/// neither ages an entry nor unanchors it. It used to compare against the
+/// engine-wide counter, which was shard-count independent too (the
+/// load-bearing property) but made the interval an upper bound on how fresh
+/// these numbers could be,
 /// not a description of how fresh they are.
 ///
 /// And a note on what the cache costs, because "not gathering one per query"
@@ -256,12 +256,12 @@ struct CachedStats {
     /// pops names that are no longer present — removing nothing while draining
     /// the queue.
     fill_order: VecDeque<String>,
-    /// `Db::writes` at the last epoch reset. The refresh gate.
+    /// The collection's write count at the last epoch reset. The refresh gate.
     refreshed_at_writes: u64,
-    /// `Db::writes` when the numbers below were measured, meaningful only when
-    /// `anchored`. Equal to `Db::writes` means no insert and no delete has
-    /// landed since, in any collection, so the live corpus has not moved and a
-    /// further gather measures the same one.
+    /// The collection's write count when the numbers below were measured,
+    /// meaningful only when `anchored`. Equal to the current count means no
+    /// insert and no delete has landed in THIS collection since, so the live
+    /// corpus has not moved and a further gather measures the same one.
     measured_at_writes: u64,
     /// Whether the globals have been measured in this epoch. An epoch starts
     /// unanchored, and the first fill of the epoch measures them. This cannot
@@ -347,6 +347,12 @@ pub struct Db {
     /// statement, and almost no statement changes the catalog.
     published_catalog: Option<Vec<u8>>,
     writes: u64,
+    /// Writes per collection, for the statistics cache: its refresh gate and
+    /// its anchor compare against the collection whose statistics they guard,
+    /// so traffic on an unrelated collection neither ages an entry nor
+    /// unanchors it. `writes` stays engine-wide for the lifecycle interval,
+    /// which is about the node's activity rather than one collection's.
+    collection_writes: BTreeMap<String, u64>,
     lifecycle_checked_at_writes: u64,
     activity_persisted_micros: u64,
     query_log: Vec<LoggedVectorQuery>,
@@ -388,6 +394,7 @@ impl Db {
             stats_baseline: BTreeMap::new(),
             published_catalog: None,
             writes: 0,
+            collection_writes: BTreeMap::new(),
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
             query_log: Vec::new(),
@@ -714,9 +721,16 @@ impl Db {
             .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
         let ts = shards[idx].insert(doc)?;
         self.writes += 1;
+        *self.collection_writes.entry(collection.to_string()).or_insert(0) += 1;
         self.last_commit = self.last_commit.max(ts);
         self.maybe_run_lifecycle()?;
         Ok(ts)
+    }
+
+    /// Writes this collection has taken: what the statistics cache measures
+    /// staleness in.
+    fn writes_to(&self, collection: &str) -> u64 {
+        self.collection_writes.get(collection).copied().unwrap_or(0)
     }
 
     /// Fire the lifecycle runner on a write interval, if one is configured.
@@ -742,6 +756,7 @@ impl Db {
             if s.owns(key) {
                 if let Some(ts) = s.delete(key)? {
                     self.writes += 1;
+                    *self.collection_writes.entry(collection.to_string()).or_insert(0) += 1;
                     self.last_commit = self.last_commit.max(ts);
                     return Ok(true);
                 }
@@ -1003,9 +1018,10 @@ impl Db {
     /// two.
     fn reset_stats_if_stale(&mut self, collection: &str, path: &str) {
         let key = cache_key(collection, path);
+        let writes = self.writes_to(collection);
         let stale = match self.stats.get(&key) {
             None => true,
-            Some(c) => self.writes.saturating_sub(c.refreshed_at_writes) >= STATS_REFRESH_WRITES,
+            Some(c) => writes.saturating_sub(c.refreshed_at_writes) >= STATS_REFRESH_WRITES,
         };
         if !stale {
             return;
@@ -1022,7 +1038,7 @@ impl Db {
                 total_doc_len: 0,
                 doc_freq: BTreeMap::new(),
                 fill_order: VecDeque::new(),
-                refreshed_at_writes: self.writes,
+                refreshed_at_writes: writes,
                 measured_at_writes: 0,
                 anchored: false,
             },
@@ -1086,11 +1102,12 @@ impl Db {
         ts: Timestamp,
     ) -> Result<Option<StatsTriple>> {
         let key = cache_key(collection, path);
+        let writes = self.writes_to(collection);
         let (missing, anchored, same_instant) = match self.stats.get(&key) {
             Some(c) => (
                 terms.iter().filter(|t| !c.doc_freq.contains_key(*t)).cloned().collect::<Vec<_>>(),
                 c.anchored,
-                c.anchored && c.measured_at_writes == self.writes,
+                c.anchored && c.measured_at_writes == writes,
             ),
             None => (terms.to_vec(), false, false),
         };
@@ -1107,7 +1124,6 @@ impl Db {
         // the globals about to be written over it.
         let (gather, stale_generation) =
             if same_instant { (missing, false) } else { (terms.to_vec(), true) };
-        let writes = self.writes;
         let mut num_docs = 0u64;
         let mut total_doc_len = 0u64;
         let mut df: BTreeMap<String, u64> = BTreeMap::new();
@@ -4967,6 +4983,70 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The staleness gate counts writes to the collection whose statistics it
+    /// guards. It used to count writes to the whole engine, so a burst on an
+    /// unrelated collection ended this one's epoch and unanchored its
+    /// globals. Both halves are pinned: a refresh interval of writes to B
+    /// leaves A's epoch and anchor where they were, and the same writes to A
+    /// end it.
+    #[test]
+    fn writes_to_another_collection_do_not_age_this_ones_statistics() {
+        let mut db = Db::with_opts(DbOpts::default());
+        for name in ["notes", "other"] {
+            db.execute(&format!("CREATE COLLECTION {name} (id TEXT PRIMARY KEY)")).unwrap();
+            db.execute(&format!(
+                "CREATE INDEX {name}_body ON {name} USING fulltext (body) WITH (analyzer = 'english')"
+            ))
+            .unwrap();
+        }
+        for i in 0..40 {
+            db.insert("notes", note(&format!("n{i:02}"))).unwrap();
+        }
+        let want = |terms: &[&str]| {
+            BTreeMap::from([(
+                "body".to_string(),
+                terms.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            )])
+        };
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(&["segments"]), ts, false).unwrap();
+        let before = {
+            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            (c.refreshed_at_writes, c.measured_at_writes, c.num_docs, c.anchored)
+        };
+        assert!(before.3, "the first gather did not anchor");
+
+        for i in 0..STATS_REFRESH_WRITES as usize {
+            db.insert("other", note(&format!("o{i:04}"))).unwrap();
+        }
+        let ts = db.clock.peek();
+        let gathered_before =
+            crate::shard::TERMS_GATHERED.load(std::sync::atomic::Ordering::Relaxed);
+        db.gather_stats("notes", &want(&["segments", "postings"]), ts, false).unwrap();
+        let gathered = crate::shard::TERMS_GATHERED.load(std::sync::atomic::Ordering::Relaxed)
+            - gathered_before;
+        // One shard, one missing term: an anchor that compared the engine-wide
+        // count would find it moved and re-measure both.
+        assert_eq!(gathered, 1, "writes to `other` made `notes` re-gather {gathered} terms");
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert_eq!(
+            (c.refreshed_at_writes, c.num_docs, c.anchored),
+            (before.0, before.2, true),
+            "writes to `other` aged `notes`"
+        );
+        assert_eq!(c.measured_at_writes, before.1, "writes to `other` unanchored `notes`");
+        assert_ne!(c.measured_at_writes, db.writes, "the anchor is the engine-wide count");
+        assert!(c.doc_freq.contains_key("postings"), "the new term was not filled");
+
+        for i in 0..STATS_REFRESH_WRITES as usize {
+            db.insert("notes", note(&format!("m{i:04}"))).unwrap();
+        }
+        let ts = db.clock.peek();
+        db.gather_stats("notes", &want(&["segments"]), ts, false).unwrap();
+        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        assert!(c.refreshed_at_writes > before.0, "writes to `notes` did not end its epoch");
     }
 
     /// A tier move is a publication. `sync_archive` relocates a segment

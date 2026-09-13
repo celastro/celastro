@@ -6,6 +6,14 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The statistics cache ages by its own collection's writes.** The refresh
+gate compared against an engine-wide write count, so a burst on an
+unrelated collection ended this one's epoch and unanchored its globals. It
+counts writes to the collection it guards now, so the refresh interval
+describes the staleness rather than bounding it.
+
 ## 0.10.1 — 2026-09-13
 
 A patch: a durability fix, and documentation. Nothing observable moves

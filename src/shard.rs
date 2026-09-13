@@ -430,6 +430,13 @@ impl<'a> Searchable<'a> {
 #[cfg(test)]
 pub(crate) static DOCUMENTS_DECODED: AtomicU64 = AtomicU64::new(0);
 
+/// How many terms `Shard::term_stats` has been asked for, summed over calls
+/// and shards, for the tests that pin what a gather does NOT re-measure: the
+/// anchor's whole value is that a second gather at the same instant asks
+/// only for the terms it is missing.
+#[cfg(test)]
+pub(crate) static TERMS_GATHERED: AtomicU64 = AtomicU64::new(0);
+
 /// A borrowed or reference-counted full-text index.
 pub enum TextHandle<'a> {
     Sealed(Arc<crate::segment::SealedText>),
@@ -2667,6 +2674,8 @@ impl Shard {
         terms: &[String],
         t: Timestamp,
     ) -> Result<(u64, u64, BTreeMap<String, u64>)> {
+        #[cfg(test)]
+        TERMS_GATHERED.fetch_add(terms.len() as u64, AtomicOrdering::Relaxed);
         let snap = self.snapshot_at(t);
         let mut df: BTreeMap<String, u64> = BTreeMap::new();
         let mut total_len = 0u64;
