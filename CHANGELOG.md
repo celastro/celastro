@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.11.0 — 2026-09-13
+
+A new capability and a behaviour change, hence a minor. No public signature
+changed beyond a new `signal` module; the on-disk format is unchanged.
 
 **`serve` handles SIGTERM and SIGINT.** As PID 1 in a container it received
 neither, so `docker stop` waited ten seconds and killed it; it now ends the
