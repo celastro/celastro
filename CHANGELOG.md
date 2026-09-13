@@ -23,6 +23,17 @@ refuses every truncation and every flipped byte. A log written by an earlier
 version still decodes, and the next publication that touches it rewrites it
 framed.
 
+**The catalog counts every document once.** The persisted catalog used to
+include the memtable's documents, which the write-ahead log also holds, so
+every reopen replayed and counted them again on top of a total that already
+had them: four documents read as 8, 16 and 24 across four sessions, while
+`SELECT *` answered 4 rows throughout. `SHOW CATALOG`, the `catalog` verb and
+the planner's per-path `present` counts were all wrong by the same amount. The
+persisted catalog now counts sealed documents only and the replay counts the
+rest, so the number is exact whether or not the last session persisted. An
+existing directory's inflated count is not repaired — the persisted total is
+trusted as the sealed baseline — but it stops growing.
+
 ## 0.4.0 — 2026-09-13
 
 An acknowledged write now survives a power loss.

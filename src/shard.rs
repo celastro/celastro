@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 use crate::bitmap::Bitmap;
-use crate::catalog::Collection;
+use crate::catalog::{Collection, PathTally};
 use crate::codec::*;
 use crate::column::CmpOp;
 use crate::error::{Error, Result};
@@ -1283,6 +1283,21 @@ impl Sealed {
 
 pub struct Shard {
     pub coll: Collection,
+    /// The documents this shard has sealed into segments since it was opened,
+    /// and the documents still in its memtable, tallied separately from the
+    /// statistics in `coll`, which hold both.
+    ///
+    /// What the catalog persists is `sealed`. The memtable's documents are
+    /// also in the WAL, and a reopen replays the WAL and observes every record
+    /// again -- so a persisted count that already included them was counted a
+    /// second time at every reopen, and the sum written down to be counted
+    /// again: four documents read as 8, 16, 24 across four sessions, with
+    /// `SELECT *` answering 4 rows throughout. Persisting only what a replay
+    /// will not re-observe makes the count exact in both directions: a record
+    /// the WAL holds and the catalog does not -- a crash between the WAL sync
+    /// and the persist -- is counted by the replay, once.
+    pub sealed: PathTally,
+    pub unsealed: PathTally,
     /// This shard's half-open key range `[lo, hi)`, from the tablet map.
     /// `None` on either side means unbounded. Range partitioning on the
     /// composite `(partition_key, primary_key)` is what lets a query
@@ -1340,6 +1355,8 @@ impl Shard {
         let memtable = Memtable::new(&coll, opts.budget.clone());
         Shard {
             coll,
+            sealed: PathTally::default(),
+            unsealed: PathTally::default(),
             key_range: None,
             memtable,
             frozen: Vec::new(),
@@ -1597,6 +1614,7 @@ impl Shard {
             self.mark_superseded(p, ts);
         }
         self.coll.observe_doc(&doc);
+        self.unsealed.observe_doc(&doc);
         self.memtable.insert(key, ts, doc)?;
         self.maybe_flush()?;
         Ok(ts)
@@ -2008,6 +2026,12 @@ impl Shard {
         self.segments = next;
         self.manifest_version = version;
         self.flushes += 1;
+        // The memtable's documents are on the disk under a published
+        // manifest, so the next persist may count them: from here a reopen
+        // finds them in segments and not in the WAL, and will not observe
+        // them again.
+        self.sealed.merge(&self.unsealed);
+        self.unsealed = PathTally::default();
         let old = std::mem::replace(
             &mut self.memtable,
             Memtable::new(&self.coll, self.opts.budget.clone()),
@@ -2296,7 +2320,14 @@ impl Shard {
                         s.mark_superseded(loc, r.ts);
                     }
                     if let Some(d) = r.doc {
+                        // Into the live view and the unsealed tally, exactly
+                        // as the insert that wrote the record did. The
+                        // persisted catalog did not count this record: it
+                        // persists sealed documents only, so that this
+                        // observation is the record's first and not its
+                        // second. See `Shard::sealed`.
                         s.coll.observe_doc(&d);
+                        s.unsealed.observe_doc(&d);
                         s.memtable.insert(r.key, r.ts, d)?;
                     }
                 }

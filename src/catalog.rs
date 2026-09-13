@@ -238,6 +238,46 @@ pub struct ColumnDef {
     pub not_null: bool,
 }
 
+/// Walk every path of `doc`, nested objects included, into `paths`.
+pub fn observe_paths(paths: &mut BTreeMap<String, PathStats>, doc: &Value) {
+    let Value::Object(fields) = doc else { return };
+    let mut stack: Vec<(String, &Value)> = fields.iter().map(|(k, v)| (k.clone(), v)).collect();
+    while let Some((path, v)) = stack.pop() {
+        paths.entry(path.clone()).or_default().observe(v);
+        if let Value::Object(sub) = v {
+            for (k, sv) in sub {
+                stack.push((format!("{path}.{k}"), sv));
+            }
+        }
+    }
+}
+
+/// A document count and the per-path statistics of those documents, kept
+/// apart from a [`Collection`] so that one set of documents can be tallied
+/// twice into different totals -- the live view a planner reads, and the
+/// sealed view a persist writes. Additive: `merge` sums counts and unions the
+/// cardinality sketches, so tallies of disjoint document sets combine into
+/// the tally of their union.
+#[derive(Debug, Clone, Default)]
+pub struct PathTally {
+    pub docs: u64,
+    pub paths: BTreeMap<String, PathStats>,
+}
+
+impl PathTally {
+    pub fn observe_doc(&mut self, doc: &Value) {
+        self.docs += 1;
+        observe_paths(&mut self.paths, doc);
+    }
+
+    pub fn merge(&mut self, other: &PathTally) {
+        self.docs += other.docs;
+        for (p, st) in &other.paths {
+            self.paths.entry(p.clone()).or_default().merge(st);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Collection {
     pub name: String,
@@ -367,16 +407,7 @@ impl Collection {
     /// the data by more than a flush.
     pub fn observe_doc(&mut self, doc: &Value) {
         self.doc_count += 1;
-        let Value::Object(fields) = doc else { return };
-        let mut stack: Vec<(String, &Value)> = fields.iter().map(|(k, v)| (k.clone(), v)).collect();
-        while let Some((path, v)) = stack.pop() {
-            self.paths.entry(path.clone()).or_default().observe(v);
-            if let Value::Object(sub) = v {
-                for (k, sv) in sub {
-                    stack.push((format!("{path}.{k}"), sv));
-                }
-            }
-        }
+        observe_paths(&mut self.paths, doc);
     }
 
     /// Validate a document against declared columns. Undeclared paths are

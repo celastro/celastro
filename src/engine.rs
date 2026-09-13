@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind};
+use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally};
 use crate::compaction::{self, CompactionOpts};
 use crate::error::{Error, Result};
 use crate::lifecycle::{self, IndexActivity, LifecyclePolicy};
@@ -311,15 +311,20 @@ pub struct Db {
     budget: Arc<MemtableBudget>,
     residency: Arc<ResidencyManager>,
     stats: BTreeMap<String, CachedStats>,
-    /// Inferred path statistics as of the last reopen, per collection.
+    /// Inferred path statistics as the catalog on disk held them at the last
+    /// reopen, per collection: the documents sealed into segments by then.
     ///
-    /// A shard accumulates statistics for the documents *it* observes, and
-    /// `absorb_shard_catalogs` sums the shards. On reopen each shard is handed a
-    /// copy of the catalog's collection, which already holds the aggregate — so
-    /// summing three shards trebles it, and the next persist writes the trebled
-    /// number down to be trebled again. The shards' copies are cleared at open
-    /// and this holds what they no longer carry.
-    stats_baseline: BTreeMap<String, (u64, BTreeMap<String, crate::catalog::PathStats>)>,
+    /// A shard accumulates statistics for the documents *it* observes since it
+    /// was opened, and `absorb_shard_catalogs` sums the baseline and the
+    /// shards into the live view planning reads. On reopen each shard is handed
+    /// a copy of the catalog's collection with its statistics cleared, and
+    /// this holds what they no longer carry — summing three shards that each
+    /// held the aggregate would treble it.
+    ///
+    /// The persisted catalog counts sealed documents only, never the
+    /// memtable's: those are in the WAL, and a reopen observes them again as it
+    /// replays. See `Shard::sealed`, and `persisted_catalog` below.
+    stats_baseline: BTreeMap<String, PathTally>,
     /// The catalog exactly as this process last published it, so that a persist
     /// which would rewrite CATALOG byte for byte can decline to. See
     /// [`Shard::persist_manifest`], which does the same for the manifests, and
@@ -393,9 +398,13 @@ impl Db {
         for name in names {
             let mut coll = db.catalog.get(&name)?.clone();
             // What is already counted stays in the baseline; the shards start
-            // from zero and count only what they see from here.
-            db.stats_baseline
-                .insert(name.clone(), (coll.doc_count, std::mem::take(&mut coll.paths)));
+            // from zero and count only what they see from here -- which
+            // includes the WAL they are about to replay, and which the
+            // baseline therefore must not.
+            db.stats_baseline.insert(
+                name.clone(),
+                PathTally { docs: coll.doc_count, paths: std::mem::take(&mut coll.paths) },
+            );
             coll.doc_count = 0;
             let cdir = dir.join("collections").join(&name);
             let mut shards = Vec::new();
@@ -438,6 +447,14 @@ impl Db {
             if !shards.is_empty() {
                 db.shards.insert(name, shards);
             }
+        }
+        // The catalog as decoded describes sealed documents. Until the
+        // replayed ones are folded in, `SHOW CATALOG` and the `catalog` verb
+        // would report a database with an unflushed WAL as smaller than it
+        // is, and a statement is not required before the first question.
+        let names: Vec<String> = db.shards.keys().cloned().collect();
+        for name in names {
+            db.absorb_shard_catalogs(&name)?;
         }
         Ok(db)
     }
@@ -597,9 +614,30 @@ impl Db {
         Ok(())
     }
 
+    /// The catalog as it is written: the definitions as they are, with each
+    /// collection's statistics counting the documents sealed into segments and
+    /// not the ones still in a memtable. The memtable's are in the WAL, and a
+    /// reopen observes every replayed record, so a count that included them
+    /// would count them again at every reopen. A side effect worth having: an
+    /// insert no longer changes these bytes, so a persist after one is a skip
+    /// rather than a rewrite of CATALOG.
+    fn persisted_catalog(&self) -> Catalog {
+        let mut catalog = self.catalog.clone();
+        for (name, shards) in &self.shards {
+            let Some(coll) = catalog.collections.get_mut(name) else { continue };
+            let mut tally = self.stats_baseline.get(name).cloned().unwrap_or_default();
+            for s in shards {
+                tally.merge(&s.sealed);
+            }
+            coll.doc_count = tally.docs;
+            coll.paths = tally.paths;
+        }
+        catalog
+    }
+
     fn persist_catalog(&mut self) -> Result<()> {
         if let Some(dir) = &self.dir {
-            let bytes = self.catalog.encode();
+            let bytes = self.persisted_catalog().encode();
             let p = dir.join("CATALOG");
             // The same bytes as last time mean the same file on the disk, and
             // rewriting it durably costs two fsyncs and a rename to say
@@ -632,20 +670,15 @@ impl Db {
     fn absorb_shard_catalogs(&mut self, collection: &str) -> Result<()> {
         let mut merged = self.catalog.get(collection)?.clone();
         if let Some(shards) = self.shards.get(collection) {
-            merged.paths.clear();
-            merged.doc_count = 0;
-            if let Some((docs, paths)) = self.stats_baseline.get(collection) {
-                merged.doc_count = *docs;
-                for (p, st) in paths {
-                    merged.paths.entry(p.clone()).or_default().merge(st);
-                }
-            }
+            let mut tally = self.stats_baseline.get(collection).cloned().unwrap_or_default();
             for s in shards {
-                merged.doc_count += s.coll.doc_count;
+                tally.docs += s.coll.doc_count;
                 for (p, st) in &s.coll.paths {
-                    merged.paths.entry(p.clone()).or_default().merge(st);
+                    tally.paths.entry(p.clone()).or_default().merge(st);
                 }
             }
+            merged.doc_count = tally.docs;
+            merged.paths = tally.paths;
         }
         *self.catalog.get_mut(collection)? = merged;
         Ok(())
@@ -4909,6 +4942,57 @@ mod tests {
             "a missing tablet map was read as a shard that owns every key"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every document is counted once, however many times the directory is
+    /// reopened. The persisted catalog used to count the memtable's documents,
+    /// which the WAL also holds, so every reopen replayed and re-observed
+    /// them on top of a baseline that already had them: 4, 8, 12, 16. Three
+    /// claims, each the mutation that would pass the others: the count is
+    /// right immediately after an open with nothing asked yet (open absorbs);
+    /// it is unchanged across reopens with an unflushed WAL (the persisted
+    /// catalog counts sealed documents only); and a record the WAL holds that
+    /// no persist ever saw is still counted, once (replay observes).
+    #[test]
+    fn a_reopen_with_an_unflushed_wal_counts_its_documents_once() {
+        let dir = tmp("count-once");
+        let stats = |db: &Db| {
+            let c = db.catalog.get("notes").unwrap();
+            (c.doc_count, c.paths.get("title").map(|p| p.present).unwrap_or(0))
+        };
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT)").unwrap();
+        for i in 0..4 {
+            db.insert("notes", note(&format!("n{i}"))).unwrap();
+        }
+        db.execute("SHOW CATALOG notes").unwrap();
+        assert_eq!(stats(&db), (4, 4));
+        db.persist().unwrap();
+        drop(db);
+
+        for round in 1..=3 {
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            assert_eq!(stats(&db), (4, 4), "reopen {round}, before any statement");
+            db.execute("SHOW CATALOG notes").unwrap();
+            assert_eq!(stats(&db), (4, 4), "reopen {round}, after SHOW CATALOG");
+            db.persist().unwrap();
+        }
+
+        // A record that reached the WAL after the last persist: nobody wrote
+        // the catalog after it, so only the replay can count it.
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.insert("notes", note("n4")).unwrap();
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(stats(&db), (5, 5), "a record the catalog never saw");
+        db.execute("FLUSH notes").unwrap();
+        db.persist().unwrap();
+        drop(db);
+        for round in 1..=2 {
+            let db = Db::open(&dir, DbOpts::default()).unwrap();
+            assert_eq!(stats(&db), (5, 5), "reopen {round} after the flush");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
