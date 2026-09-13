@@ -882,6 +882,27 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Compare { path, op: CmpOp::ArrayContains, lit });
         }
         let path = self.path()?;
+        // `path <=> [..] < 0.2`: a distance threshold. The operator decides
+        // the metric, exactly as it does under `ORDER BY`, and the
+        // comparison that follows is an ordinary one against a number.
+        if let Some(op) = self.dist_op() {
+            let query = self.vector_literal()?;
+            let cmp = self.comparison(&path)?;
+            let threshold = match self.literal()? {
+                Value::Int(i) => i as f64,
+                Value::Float(f) => f,
+                other => {
+                    return Err(Error::Sql(format!(
+                        "a distance threshold must be a number, found {}",
+                        crate::json::to_string(&other)
+                    )))
+                }
+            };
+            if !threshold.is_finite() {
+                return Err(Error::Sql("a distance threshold must be finite".into()));
+            }
+            return Ok(Expr::VectorDistance { path, op, query, cmp, threshold });
+        }
         if self.eat_kw("IS") {
             let not = self.eat_kw("NOT");
             self.expect_kw("NULL")?;
@@ -923,7 +944,14 @@ impl<'a> Parser<'a> {
             let lit = self.literal()?;
             return Ok(Expr::Compare { path, op: CmpOp::ArrayContains, lit });
         }
-        let op = match self.next() {
+        let op = self.comparison(&path)?;
+        let lit = self.literal()?;
+        Ok(Expr::Compare { path, op, lit })
+    }
+
+    /// One of the six orderings, or an error naming what was found instead.
+    fn comparison(&mut self, path: &str) -> Result<CmpOp> {
+        Ok(match self.next() {
             Tok::Punct("=") => CmpOp::Eq,
             Tok::Punct("<>") | Tok::Punct("!=") => CmpOp::Ne,
             Tok::Punct("<") => CmpOp::Lt,
@@ -936,9 +964,7 @@ impl<'a> Parser<'a> {
                     other.describe()
                 )))
             }
-        };
-        let lit = self.literal()?;
-        Ok(Expr::Compare { path, op, lit })
+        })
     }
 
     // ------------------------------------------------------------- literals
@@ -1432,5 +1458,37 @@ mod tests {
         // Nesting a human would write is unaffected.
         let ok = format!("SELECT * FROM a WHERE {}x = 1{}", "(".repeat(8), ")".repeat(8));
         assert!(parse(&ok, &[]).is_ok(), "{ok}");
+    }
+    /// `path <op> [..] <cmp> number` in WHERE is a predicate, not an order:
+    /// the statement carries no `ORDER BY`, the leaf holds the operator, the
+    /// vector, the comparison and the number, and it composes under AND like
+    /// any other leaf. A threshold that is not a number is refused.
+    #[test]
+    fn a_distance_threshold_parses_as_a_predicate_and_not_as_an_order() {
+        let sel = |sql: &str| match parse(sql, &[]).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let s =
+            sel("SELECT id FROM notes WHERE embedding <=> [1, 0] < 0.25 AND topic = 'a' LIMIT 5");
+        assert!(s.order.is_none());
+        let Some(Expr::And(parts)) = &s.predicate else { panic!("{:?}", s.predicate) };
+        assert!(matches!(
+            &parts[0],
+            Expr::VectorDistance { path, op: DistOp::Cosine, query, cmp: CmpOp::Lt, threshold }
+                if path == "embedding" && *query == vec![1.0, 0.0] && *threshold == 0.25
+        ));
+        let s = sel("SELECT id FROM notes WHERE embedding <-> [1, 0] = 0");
+        assert!(matches!(
+            &s.predicate,
+            Some(Expr::VectorDistance { op: DistOp::L2, cmp: CmpOp::Eq, threshold, .. }) if *threshold == 0.0
+        ));
+        let s = sel("SELECT id FROM notes WHERE embedding <#> [1, 0] >= -0.5");
+        assert!(matches!(
+            &s.predicate,
+            Some(Expr::VectorDistance { op: DistOp::InnerProduct, cmp: CmpOp::Ge, threshold, .. }) if *threshold == -0.5
+        ));
+        assert!(parse("SELECT id FROM notes WHERE embedding <=> [1, 0] < 'near'", &[]).is_err());
+        assert!(parse("SELECT id FROM notes WHERE embedding <=> [1, 0] IN (0)", &[]).is_err());
     }
 }

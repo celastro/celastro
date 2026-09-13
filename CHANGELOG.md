@@ -6,6 +6,24 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A distance threshold in `WHERE`.** `WHERE embedding <=> [..] < 0.2` is a
+predicate: it composes with structured and text predicates, contributes no
+rank, and selects exactly the rows whose `distance` column on the
+nearest-neighbour path would satisfy the comparison, for the same operator.
+Exact match is `<-> [..] <= 0` for L2; for cosine, normalisation leaves an
+identical vector within rounding of 0 rather than at it, so ask for
+`<=> [..] < 0.000001`. It is evaluated exactly, by a full-precision pass over
+the rows the other predicates left, and `EXPLAIN ANALYZE` says so. Under
+`NOT` it is three-valued: a document with no vector is on neither side.
+
+**The console offers its source.** The page names the licence and links the
+source of the running version, and `/api/health` carries the same URL and
+the licence identifier. The link is the repository the crate declares at the
+tag of the running version; a fork that serves the console must point
+`repository` in Cargo.toml at its own source.
+
 ## 0.6.1 — 2026-09-13
 
 A patch: nothing observable moves except how much memory and time a scan

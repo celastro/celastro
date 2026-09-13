@@ -215,6 +215,53 @@ impl VectorStore {
         bm
     }
 
+    /// Every document whose vector's distance to `query` satisfies `keep`,
+    /// over the documents `doc_filter` admits, as a bitmap in the DOCUMENT
+    /// ordinal space of size `n`.
+    ///
+    /// Exact, by a full-precision pass over the admitted vectors. A threshold
+    /// is a predicate, and an approximate traversal can miss a vector inside
+    /// the threshold -- a predicate that is sometimes false for a row that
+    /// satisfies it is not one. The cost is `survivors × dims`, the same as
+    /// the brute-force arm of `search`, and the executor applies it after the
+    /// cheaper conjuncts so that `survivors` is what they left.
+    pub fn within(
+        &self,
+        query: &[f32],
+        doc_filter: &Bitmap,
+        n: usize,
+        keep: impl Fn(f32) -> bool,
+    ) -> (Bitmap, VectorReport) {
+        let admit = self.admit_bitmap(doc_filter);
+        let survivors = admit.popcount();
+        let report = VectorReport {
+            tier: Some(self.tier()),
+            strategy: Some(Strategy::BruteForce),
+            survivors,
+            selectivity: if self.is_empty() { 0.0 } else { survivors as f64 / self.len() as f64 },
+            reranked: survivors,
+            ..Default::default()
+        };
+        let mut out = Bitmap::new(n);
+        for v in admit.iter() {
+            let d = distance::distance(self.metric, query, self.vector(v as usize));
+            if keep(d) {
+                out.set(self.vec_to_doc[v as usize] as usize);
+            }
+        }
+        (out, report)
+    }
+
+    /// The documents that have a vector in this store, in the document ordinal
+    /// space of size `n`: where a distance predicate is defined at all.
+    pub fn present_docs(&self, n: usize) -> Bitmap {
+        let mut bm = Bitmap::new(n);
+        for &d in &self.vec_to_doc {
+            bm.set(d as usize);
+        }
+        bm
+    }
+
     /// Search, returning `(document ordinal, distance)` ascending.
     ///
     /// `doc_filter` must already have visibility ANDed in. That is not an

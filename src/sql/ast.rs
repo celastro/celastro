@@ -138,6 +138,17 @@ pub enum Expr {
         path: String,
         query: String,
     },
+    /// `embedding <=> $q < 0.2` in `WHERE`: a distance threshold, which is a
+    /// filter contributing no rank. The threshold is compared with the
+    /// distance as the `distance` column presents it for the same operator,
+    /// so the two agree by construction. `cmp` is one of the six orderings.
+    VectorDistance {
+        path: String,
+        op: DistOp,
+        query: Vec<f32>,
+        cmp: CmpOp,
+        threshold: f64,
+    },
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Not(Box<Expr>),

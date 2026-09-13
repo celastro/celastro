@@ -464,6 +464,25 @@ whether or not they are asked for. Projection is the last step, after
 `COLLAPSE BY`, the cursor and the fetch, because each of those reads fields
 the list may not name.
 
+**A distance threshold in `WHERE` is a filter, exact, in the units the
+`distance` column shows.** `embedding <=> $q < 0.2` selects the rows whose
+distance to `$q` is below 0.2 and ranks nothing; it composes with the other
+predicates as a bitmap, and it is applied after the cheaper ones so that the
+full-precision distance is computed only for what they left. Exact on
+purpose: an approximate traversal can miss a vector inside the threshold, and
+a predicate that is sometimes false for a row that satisfies it is not a
+predicate. So the cost is `survivors × dims`, which is what a filter over the
+candidates costs, and `EXPLAIN ANALYZE` reports it as brute force. The
+comparison is against the presented distance -- for cosine after the query is
+normalised, as the ranked path prepares it, so a stored vector and any positive
+scaling of it are within rounding of 0 -- within, not at: the normalised
+components are f32-rounded, so `1 - dot` of a vector with itself lands a few
+ULPs either side of zero, and exact match for cosine is `< 0.000001` rather
+than `<= 0`. L2 is exactly 0 for identical vectors, so `<= 0` is exact there.
+For `<#>` the presented value is the negated inner product, so a threshold on
+it reads the other way.
+Under `NOT` a document with no vector has no distance and is on neither side.
+
 **Three query shapes are refused rather than mis-answered.** `AFTER` with
 `COLLAPSE BY`, `AFTER` with `ORDER BY <field>`, and a negation as one side of an
 explicit `OR`. Each has a defensible semantics that is not implemented; refusing
@@ -556,6 +575,8 @@ guarantee:
 | the catalog counts every document once, however many times the directory is reopened | `engine::tests::a_reopen_with_an_unflushed_wal_counts_its_documents_once` (three claims, each the mutation that passes the others: right before any statement, unchanged across reopens with an unflushed WAL, and a record no persist ever saw is counted once) |
 | the SELECT list decides what a row carries | `engine::tests::the_select_list_decides_what_a_row_carries` (a named path is kept and an unnamed one is not, an alias renames, a nested path is keyed as written, a missing path is `Null` rather than absent, `*` keeps everything, and a ranked query keeps its `score`) |
 | an unranked scan holds one page, and answers like one that held everything | `plan::exec::tests::a_scan_retains_no_more_rows_than_the_page_and_the_same_rows_as_a_full_sort` (the collector: never more than the page at any point of a scrambled arrival, under `COLLAPSE BY`, and the same rows a full sort-collapse-page yields), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (a key-ordered scan decodes exactly the rows it returns, past an `OFFSET` and a cursor; a field order decodes every survivor and still answers the same; a collapse returns one row per parent) |
+| a distance threshold in `WHERE` agrees with the `distance` column, composes, and is three-valued | `engine::tests::a_distance_threshold_in_where_agrees_with_the_distance_column` (both metrics, five thresholds each way, an AND with a structured predicate, `NOT` leaving the vectorless document on neither side, exact match at `<= 0`, the plan naming brute force, and the three refusals), `a_distance_threshold_returns_the_same_rows_at_every_shard_count` (equality, not a tolerance: there is no candidate depth in a predicate), `sql::parser::tests::a_distance_threshold_parses_as_a_predicate_and_not_as_an_order` |
+| the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

@@ -1733,11 +1733,8 @@ mod tests {
     /// health endpoint for a client that never renders the page.
     #[test]
     fn the_console_offers_the_source_of_the_running_version() {
-        let expected = format!(
-            "{}/tree/v{}",
-            env!("CARGO_PKG_REPOSITORY"),
-            env!("CARGO_PKG_VERSION")
-        );
+        let expected =
+            format!("{}/tree/v{}", env!("CARGO_PKG_REPOSITORY"), env!("CARGO_PKG_VERSION"));
         assert!(expected.starts_with("https://"), "{expected}");
         let page = answer_to("GET /?t=tok HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
         assert_eq!(status_line(&page), "HTTP/1.1 200 OK");

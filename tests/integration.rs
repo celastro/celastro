@@ -1876,3 +1876,43 @@ fn unicode_literals_and_query_text_do_not_panic() {
     let r = db.query("SELECT id FROM items WHERE text_match(body, 'Caf*') LIMIT 5").unwrap();
     assert_eq!(r.rows.len(), 1);
 }
+
+/// A distance threshold is a predicate, and a predicate answers the same rows
+/// however the data is laid out: the same corpus at 1, 3 and 6 shards, half
+/// sealed and half in memtables, selects the same documents. Exact by
+/// construction -- no candidate depth, no `k'`, no traversal -- so this is
+/// equality, not a tolerance.
+#[test]
+fn a_distance_threshold_returns_the_same_rows_at_every_shard_count() {
+    let run = |splits: &[&str]| {
+        let dir = std::env::temp_dir().join(format!(
+            "celastro-thr-{}-{}",
+            std::process::id(),
+            splits.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, opts(64)).unwrap();
+        setup(&mut db, 12, splits);
+        let c = build(&mut db, 400, 12, 7);
+        db.execute("FLUSH items").unwrap();
+        let mut c2 = c;
+        for i in 400..600 {
+            let d = c2.doc(i);
+            db.insert("items", d).unwrap();
+        }
+        let q = vec_literal(&c2.query_near(1, 0.02));
+        let mut k = keys(
+            &db.query(&format!("SELECT id FROM items WHERE embedding <=> {q} < 0.35 LIMIT 10000"))
+                .unwrap(),
+        );
+        k.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        k
+    };
+    let one = run(&[]);
+    let three = run(&["t1", "t2"]);
+    let six = run(&["t0\u{1}doc-00300", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+    assert!(!one.is_empty() && one.len() < 600, "the threshold selected {} of 600", one.len());
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+}

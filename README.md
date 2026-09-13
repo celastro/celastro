@@ -45,6 +45,8 @@ SELECT id, topic FROM notes WHERE topic = 'storage';
 SELECT id FROM notes WHERE text_match(body, 'segments');
 -- nearest neighbours
 SELECT id FROM notes ORDER BY embedding <=> [0.8,0.2,0.0,0.0] LIMIT 2;
+-- a distance threshold is a filter; this one is exact match for cosine
+SELECT id FROM notes WHERE embedding <=> [0.9,0.1,0.0,0.0] < 0.000001;
 -- all three in one plan, fused with reciprocal rank fusion
 SELECT id, topic FROM notes
 ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf')
@@ -75,6 +77,10 @@ key | distance | id
 n1  | 0.009008 | n1
 n2  | 0.651813 | n2
 2 row(s)
+key | id
+----+---
+n1  | n1
+1 row(s)
 key | score    | id | topic
 ----+----------+----+--------
 n1  | 0.032787 | n1 | search
@@ -84,7 +90,10 @@ n3  | 0.015873 | n3 | storage
 ```
 
 `key` is the row's primary key and `score` or `distance` its rank, whichever
-the query produced; the rest of the columns are the SELECT list.
+the query produced; the rest of the columns are the SELECT list. A distance in
+`WHERE` selects rows and ranks nothing, in the same units the `distance`
+column shows: for cosine an identical vector lands within floating-point
+rounding of zero, so exact match is a small threshold; for L2 it is `<= 0`.
 
 Every write is on the disk before it is acknowledged, so the collection is
 there in the next process:

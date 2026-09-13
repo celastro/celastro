@@ -2299,6 +2299,7 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
         match e {
             Expr::Compare { path, .. } => out.push((path.clone(), IndexUse::Scalar)),
             Expr::TextMatch { path, .. } => out.push((path.clone(), IndexUse::Text)),
+            Expr::VectorDistance { path, .. } => out.push((path.clone(), IndexUse::Vector)),
             Expr::And(v) | Expr::Or(v) => v.iter().for_each(|x| walk(x, out)),
             Expr::Not(b) => walk(b, out),
             Expr::True => {}
@@ -4943,6 +4944,149 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A distance threshold in WHERE is a filter that agrees with the
+    /// `distance` column of the nearest-neighbour path for the same vector
+    /// and operator, at every threshold and for both metrics; composes with
+    /// a structured predicate; is three-valued under NOT, so a document with
+    /// no vector is on neither side; and reports its strategy. Exact match
+    /// is `<= 0` for L2, where identical vectors are at exactly 0, and a
+    /// small threshold for cosine, where normalisation leaves an identical
+    /// vector within floating-point rounding of 0 and not reliably at it.
+    /// Each claim is the mutation that passes the others: comparing
+    /// the raw metric value rather than the presented one moves every L2
+    /// threshold; a leaf that answered "every vector" or "none" fails the
+    /// agreement at the first threshold; a two-valued NOT puts the
+    /// vectorless document on the outside.
+    #[test]
+    fn a_distance_threshold_in_where_agrees_with_the_distance_column() {
+        for metric in ["cosine", "l2"] {
+            let dir = tmp(&format!("threshold-{metric}"));
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            db.execute("CREATE COLLECTION pts (id TEXT PRIMARY KEY, kind TEXT)").unwrap();
+            db.execute(&format!(
+                "CREATE INDEX pts_v ON pts USING vector (v) WITH (dims = 4, metric = '{metric}')"
+            ))
+            .unwrap();
+            let mut seed = 0x2545f4914f6cdd1du64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+            };
+            for i in 0..120 {
+                let v: Vec<String> = (0..4).map(|_| format!("{:.6}", next())).collect();
+                let doc = format!(
+                    r#"{{"id":"p{i:03}","kind":"{}","v":[{}]}}"#,
+                    if i % 3 == 0 { "a" } else { "b" },
+                    v.join(",")
+                );
+                db.insert("pts", crate::json::parse(&doc).unwrap()).unwrap();
+                if i == 59 {
+                    db.execute("FLUSH pts").unwrap();
+                }
+            }
+            db.insert("pts", crate::json::parse(r#"{"id":"p999","kind":"a"}"#).unwrap()).unwrap();
+            let sorted = |r: QueryResult| {
+                let mut k: Vec<String> = r.rows.into_iter().map(|x| x.key).collect();
+                k.sort();
+                k
+            };
+            let op = if metric == "cosine" { "<=>" } else { "<->" };
+            let q = "[0.5,0.25,-0.25,0.1]";
+            let ranked =
+                db.query(&format!("SELECT id FROM pts ORDER BY v {op} {q} LIMIT 1000")).unwrap();
+            assert_eq!(ranked.rows.len(), 120);
+            let shown = |keep: &dyn Fn(f64) -> bool| {
+                let mut k: Vec<String> = ranked
+                    .rows
+                    .iter()
+                    .filter(|r| keep(r.distance.unwrap() as f64))
+                    .map(|r| r.key.clone())
+                    .collect();
+                k.sort();
+                k
+            };
+            for t in [0.0, 0.05, 0.3, 0.8, 1.5] {
+                let got = sorted(
+                    db.query(&format!("SELECT id FROM pts WHERE v {op} {q} < {t} LIMIT 1000"))
+                        .unwrap(),
+                );
+                assert_eq!(got, shown(&|d| d < t), "{metric} < {t}");
+                let got = sorted(
+                    db.query(&format!("SELECT id FROM pts WHERE v {op} {q} >= {t} LIMIT 1000"))
+                        .unwrap(),
+                );
+                assert_eq!(got, shown(&|d| d >= t), "{metric} >= {t}");
+            }
+            let got = sorted(
+                db.query(&format!(
+                    "SELECT id FROM pts WHERE kind = 'a' AND v {op} {q} < 0.8 LIMIT 1000"
+                ))
+                .unwrap(),
+            );
+            let want: Vec<String> = shown(&|d| d < 0.8)
+                .into_iter()
+                .filter(|k| k[1..].parse::<usize>().unwrap() % 3 == 0)
+                .collect();
+            assert!(!want.is_empty());
+            assert_eq!(got, want, "{metric}: the threshold did not compose with kind = 'a'");
+
+            let inside = sorted(
+                db.query(&format!("SELECT id FROM pts WHERE v {op} {q} < 0.8 LIMIT 1000")).unwrap(),
+            );
+            let outside = sorted(
+                db.query(&format!("SELECT id FROM pts WHERE NOT (v {op} {q} < 0.8) LIMIT 1000"))
+                    .unwrap(),
+            );
+            assert_eq!(
+                inside.len() + outside.len(),
+                120,
+                "{metric}: NOT is not the complement over vectors"
+            );
+            assert!(
+                !outside.contains(&"p999".to_string()),
+                "{metric}: a document with no vector is outside"
+            );
+
+            let stored = db.query("SELECT v FROM pts WHERE id = 'p007' LIMIT 1").unwrap();
+            let lit = crate::json::to_string(stored.rows[0].doc.get("v").unwrap());
+            let zero = if metric == "l2" { "<= 0" } else { "< 0.000001" };
+            let exact = sorted(
+                db.query(&format!("SELECT id FROM pts WHERE v {op} {lit} {zero} LIMIT 10"))
+                    .unwrap(),
+            );
+            assert_eq!(exact, vec!["p007".to_string()], "{metric}: exact match");
+
+            let text = match db
+                .execute(&format!(
+                    "EXPLAIN ANALYZE SELECT id FROM pts WHERE v {op} {q} < 0.3 LIMIT 5"
+                ))
+                .unwrap()
+            {
+                Outcome::Explain(t) => t,
+                _ => panic!("expected a plan"),
+            };
+            assert!(text.contains("strategy=brute_force"), "{text}");
+            assert!(text.contains(&format!("v {op} [4] < 0.3 [filter]")), "{text}");
+
+            let wrong = if metric == "cosine" { "<->" } else { "<=>" };
+            assert!(matches!(
+                db.query(&format!("SELECT id FROM pts WHERE v {wrong} {q} < 0.3")),
+                Err(Error::Plan(_))
+            ));
+            assert!(matches!(
+                db.query("SELECT id FROM pts WHERE kind <=> [1,2,3,4] < 0.3"),
+                Err(Error::Plan(_))
+            ));
+            assert!(matches!(
+                db.query(&format!("SELECT id FROM pts WHERE v {op} [1,2,3] < 0.3")),
+                Err(Error::Plan(_))
+            ));
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// A scan under a small `LIMIT` decodes the page and not the collection.

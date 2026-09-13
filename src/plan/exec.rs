@@ -405,6 +405,21 @@ pub(crate) fn partition_constraint(coll: &Collection, e: Option<&Expr>) -> Optio
 }
 
 pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
+    // A distance threshold is checked against the catalog once, here, with
+    // the same checks and the same messages as an `ORDER BY` distance: the
+    // index exists, the dimensions agree, the operator matches the metric.
+    // Inside a unit those are already true or the unit has no vectors.
+    fn check_thresholds(coll: &Collection, e: &Expr) -> Result<()> {
+        match e {
+            Expr::VectorDistance { path, op, query, .. } => check_vector(coll, path, *op, query),
+            Expr::And(v) | Expr::Or(v) => v.iter().try_for_each(|x| check_thresholds(coll, x)),
+            Expr::Not(x) => check_thresholds(coll, x),
+            Expr::Compare { .. } | Expr::TextMatch { .. } | Expr::True => Ok(()),
+        }
+    }
+    if let Some(e) = &input.select.predicate {
+        check_thresholds(input.coll, e)?;
+    }
     let t0 = Instant::now();
     let sel = input.select;
     let k = sel.limit.unwrap_or(10);
@@ -966,6 +981,46 @@ fn eval_expr(
             }
             bm
         }
+        Expr::VectorDistance { path, op, query, cmp, threshold } => {
+            // A **must** with a distance in it: a filter, contributing no
+            // rank, and exact -- see `VectorStore::within`. The threshold is
+            // compared with the PRESENTED distance, the number the `distance`
+            // column shows for the same operator, so `< 0.2` here and
+            // `distance < 0.2` on the ranked path select the same rows. For
+            // cosine that is after the query is normalised, exactly as the
+            // ranked path prepares it, so a stored vector and any positive
+            // scaling of it are both at 0.
+            let label = format!(
+                "{path} {} [{}] {} {threshold} [filter]",
+                op.symbol(),
+                query.len(),
+                cmp.name()
+            );
+            ux.access_paths.push(label.clone());
+            match unit.vector_handle(path)? {
+                None => Bitmap::new(n),
+                Some(vs) => {
+                    let q = prepare_query(vs.metric, query);
+                    let metric = vs.metric;
+                    let (bm, report) = vs.within(&q, candidates, n, |d| {
+                        let shown = distance::present(metric, d) as f64;
+                        match cmp {
+                            CmpOp::Eq => shown == *threshold,
+                            CmpOp::Ne => shown != *threshold,
+                            CmpOp::Lt => shown < *threshold,
+                            CmpOp::Le => shown <= *threshold,
+                            CmpOp::Gt => shown > *threshold,
+                            CmpOp::Ge => shown >= *threshold,
+                            _ => false,
+                        }
+                    });
+                    if analyze {
+                        ux.vector.push((label, report));
+                    }
+                    bm
+                }
+            }
+        }
     })
 }
 
@@ -1004,6 +1059,17 @@ fn eval_defined(
         Expr::Compare { path, op, lit } => unit.comparable(path, *op, lit, candidates)?,
         // A text match is two-valued: a document either matches or it does not.
         Expr::TextMatch { .. } => Bitmap::all(n),
+        // A distance is defined where the document has a vector; elsewhere the
+        // predicate is NULL, so `NOT (d < t)` does not select a document that
+        // has no distance to be outside the threshold with.
+        Expr::VectorDistance { path, .. } => match unit.vector_handle(path)? {
+            Some(vs) => {
+                let mut bm = vs.present_docs(n);
+                bm.and_inplace(candidates);
+                bm
+            }
+            None => Bitmap::new(n),
+        },
     })
 }
 
@@ -1017,6 +1083,9 @@ fn predicate_cost(unit: &Searchable<'_>, e: &Expr) -> u32 {
             _ => 10,
         },
         Expr::TextMatch { .. } => 5,
+        // A full-precision distance per survivor: the most expensive leaf,
+        // so it sees only what every other conjunct left.
+        Expr::VectorDistance { .. } => 20,
         Expr::And(v) | Expr::Or(v) => v.iter().map(|x| predicate_cost(unit, x)).max().unwrap_or(1),
         Expr::Not(x) => predicate_cost(unit, x) + 1,
         Expr::True => 0,
