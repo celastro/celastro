@@ -1,0 +1,95 @@
+# Changelog
+
+What changed for someone running the previous version. Each entry is written
+from the point of view of upgrading INTO that version, so the paragraph under
+0.4.0 is what a 0.3.0 user needs to know. Versions on
+[crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
+repository.
+
+## Unreleased
+
+**An unreadable file fails the open instead of opening empty.** CATALOG,
+MANIFEST and every delete log used to be read as absent when the read failed
+with anything but "no such file", so an I/O error at open produced a database
+with no collections, a shard with no segments or a segment with no deletions —
+and the next persist wrote that emptiness over the real file. Each now fails
+the open with an error naming the file. A genuinely absent file still means
+absent.
+
+**The delete log is framed.** It was the one file in the format with no magic,
+version or checksum, so a log that lost its tail at a record boundary decoded
+as a shorter log and the documents in the lost records came back. A framed log
+refuses every truncation and every flipped byte. A log written by an earlier
+version still decodes, and the next publication that touches it rewrites it
+framed.
+
+## 0.4.0 — 2026-09-13
+
+An acknowledged write now survives a power loss.
+Nothing on the 0.3.0 write path was fsynced: the WAL record was written and
+never synced, and the rename that publishes a segment or a manifest was never
+made durable, so an acknowledged insert could be lost with the page cache. The
+record is now synced before the acknowledgement and every publication is
+followed by a directory fsync. It is also faster, because a persist used to
+rewrite CATALOG and every MANIFEST with unchanged bytes on every statement: an
+acknowledged insert went from 2360 to 644 microseconds at one shard and from
+8856 to 688 at six.
+
+Three things change on the way back in. A reopen now unlinks segment and
+delete-log files the manifest does not name — the leftovers of a publication
+that failed — and never hands their ids out again, where 0.3.0 could reopen a
+new segment carrying a dead one's delete log. A segment whose whole-body
+checksum does not match is refused at open; 0.3.0 wrote the checksum and did
+not check it. And a value nested deeper than 128 levels, reachable only
+through `set_path` and never through SQL or JSON, is refused on decode rather
+than aborting the process.
+
+Two answers move. An integer past 2^53 in a shredded `Number` column used to be
+rounded to a double on the way in, so `2^53 = 2^53 + 1` was true; such values
+are now compared exactly. And a negative `dims`, `ef_search` or `deadline_ms`
+is refused rather than wrapped to the maximum.
+
+No public signature changed and the on-disk format is the same, so a 0.3.0
+directory opens as it is.
+
+## 0.3.0 — 2026-09-11
+
+Cut hours after 0.2.0 because 0.2.0 can lose data. 0.2.0 and 0.1.0 are yanked
+for the same reason; both still resolve for anyone pinned to them.
+
+Fix a data-loss bug, and two things break.
+
+A `DELETE` whose `text_match` predicate was cut by the expansion cap used to
+run. In the negated shape that is not a short answer, it is a wrong one: a
+truncated exclusion set deletes documents the predicate asked to spare, and
+0.2.0 destroyed 488 rows in a case whose correct answer was none. Such a
+statement is now REFUSED and nothing is written. If you relied on it completing,
+spell the prefix as narrower pieces — each deletes exactly what it names.
+
+A prefix query also used to answer differently depending on how the data
+happened to be laid out on disk. The expansion cap applied per storage unit, so
+`WHERE text_match(body,'a*')` returned 2199, 3928 or 3953 rows of the same 6000
+matching documents at one, three and six shards. The expansion is now resolved
+once against the live corpus, so the answer is the same everywhere — and, where
+the cap binds, smaller than the largest of those. It is a real trade and the
+number is in the prefix section below.
+
+Breaking for library users: `GlobalStats` gained `expansions` and `QueryResult`
+gained `truncated_prefixes`, so struct literals of either need updating. Both
+are now `#[non_exhaustive]`, so the next field will not break you.
+
+## 0.2.0 — 2026-09-11 (yanked)
+
+Absolute BM25 scores move. The default query path
+used to derive its statistics from physical rows, which counted superseded and
+tombstoned versions and so drifted with flush and compaction timing — and, since
+those are per shard, with the shard count. It now measures the live corpus, so
+the same documents in the same order come back with different numbers against
+them. Relative ranking is what this corrects rather than disturbs: a term is no
+longer weighted by how much dead data happens to be on disk beside it. Anything
+comparing scores against a stored threshold needs re-baselining; anything
+comparing them against each other does not.
+
+## 0.1.0 — 2026-09-10 (yanked)
+
+First published version.

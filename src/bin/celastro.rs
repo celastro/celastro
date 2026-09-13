@@ -251,7 +251,7 @@ fn print_rows(r: &QueryResult) {
 /// The `TRUNCATED —` lines a cut query prints, as one block of text.
 ///
 /// Returned rather than printed, because this shell is one of the surfaces the
-/// README promises reports a cut prefix expansion and a `println!` inside
+/// design notes promise reports a cut prefix expansion and a `println!` inside
 /// `print_rows` is reachable from no test at all: both JSON renderings of the
 /// same report are pinned, and the two shells' line was not. Empty when
 /// nothing was cut, so the caller prints it unconditionally.

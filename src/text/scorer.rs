@@ -661,8 +661,9 @@ impl Scorer for BitmapScorer {
 /// returns go roughly as `n · (1 − (1 − cap/V)^t)` for a collection of `n`
 /// documents over a matching vocabulary of `V` terms with `t` of them per
 /// document, so recall improves sub-linearly in the cap while the work — one
-/// cursor per resolved term, in every unit — grows with it directly. README's
-/// "A wide `foo*` is a partial answer" note carries the measured numbers.
+/// cursor per resolved term, in every unit — grows with it directly. The
+/// "A wide `foo*` is a partial answer" note in `docs/design.md` carries the
+/// measured numbers.
 pub const PREFIX_EXPANSION_LIMIT: usize = 512;
 
 pub struct Compiled<'a> {

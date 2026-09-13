@@ -15,7 +15,7 @@ a week.
 
 ## Supported versions
 
-celastro is pre-1.0 at `0.1.x`. Only `main` is supported; there are no
+celastro is pre-1.0, at `0.x`. Only `main` is supported; there are no
 backported fixes to earlier tags.
 
 ## The two trust boundaries

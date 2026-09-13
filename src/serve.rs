@@ -1750,8 +1750,8 @@ mod tests {
         let missing = parsed.get("missing").and_then(|v| v.as_array()).unwrap();
         assert_eq!(missing[0].as_str(), Some("tablet\"1"));
         // `truncated_prefixes` is `missing`'s sibling on the wire and the most
-        // user-facing sentence the README makes ("every query that was cut says
-        // so"), so it gets the same escaping proof rather than being left to an
+        // user-facing sentence the design notes make ("every query that was cut
+        // says so"), so it gets the same escaping proof rather than being left to an
         // envelope that only ever carried it empty. The prefix here is a legal
         // one — `text_match` takes a quoted string — so this is the real shape,
         // not a contrived one.
