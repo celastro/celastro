@@ -185,8 +185,17 @@ impl SegmentHandle {
             && !self.deletes.read().unwrap().is_deleted_at(ord, t)
     }
 
-    pub fn encode_deletes(&self) -> Vec<u8> {
-        self.deletes.read().unwrap().encode()
+    /// `None` for a log with nothing in it. An empty log is never published:
+    /// absent is how a reopen learns a segment has no deletions, and the
+    /// encoding is not empty for an empty log -- it carries its frame -- so
+    /// the decision is taken on the entries, not on the bytes.
+    pub fn encode_deletes(&self) -> Option<Vec<u8>> {
+        let d = self.deletes.read().unwrap();
+        if d.is_empty() {
+            None
+        } else {
+            Some(d.encode())
+        }
     }
 }
 
@@ -2131,10 +2140,7 @@ impl Shard {
         let ddir = dir.join("deletes");
         let mut published: Vec<(u64, Vec<u8>)> = Vec::new();
         for h in segments {
-            let d = h.encode_deletes();
-            if d.is_empty() {
-                continue;
-            }
+            let Some(d) = h.encode_deletes() else { continue };
             let p = ddir.join(format!("{:016x}.dlog", h.id()));
             if self.published_deletes.read().unwrap().get(&h.id()) == Some(&d)
                 && still_published(&p, &d)
@@ -2228,11 +2234,14 @@ impl Shard {
                 s.adopt_segment(&seg);
                 // An empty delete log is never written, so absent means no
                 // deletions. Unreadable does not: it used to, and every
-                // document the log recorded as deleted came back.
-                let dl = match read_optional(
-                    &dir.join("deletes").join(format!("{:016x}.dlog", meta.id)),
-                )? {
-                    Some(d) => DeleteLog::decode(&d)?,
+                // document the log recorded as deleted came back. Neither
+                // does damaged, which is reported with the file's name.
+                let dpath = dir.join("deletes").join(format!("{:016x}.dlog", meta.id));
+                let dl = match read_optional(&dpath)? {
+                    Some(d) => DeleteLog::decode(&d).map_err(|e| match e {
+                        Error::Storage(m) => Error::Storage(format!("{}: {m}", dpath.display())),
+                        e => e,
+                    })?,
                     None => DeleteLog::new(),
                 };
                 s.segments.push(SegmentHandle::new(seg, dl, Some(p)));
@@ -5028,6 +5037,87 @@ mod tests {
                 s.num_docs(s.clock.peek())
             ),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delete log that lost its tail is refused, naming the file, rather
+    /// than opened with one deletion fewer. Before the frame this was the one
+    /// file in the format where a cut at a record boundary read as a shorter
+    /// log; now every cut and every flipped byte fails the open. The whole
+    /// file is walked, because a frame that covers most of the file is the
+    /// mutation that satisfies a test of one cut.
+    #[test]
+    fn a_damaged_delete_log_fails_the_open_rather_than_losing_a_deletion() {
+        let dir = test_dir("dlog-damaged");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        for i in [3, 5, 8] {
+            s.delete(&format!("t{}{KEY_SEP}d{i:04}", i % 3)).unwrap().expect("nothing was deleted");
+        }
+        s.persist_manifest().unwrap();
+        drop(s);
+        let dlog = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        let published = fs::read(&dlog).unwrap();
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.num_docs(s.clock.peek()), 17);
+        drop(s);
+
+        let refuse = |b: &[u8], what: &str| {
+            fs::write(&dlog, b).unwrap();
+            match Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir) {
+                Err(Error::Storage(m)) => assert!(m.contains(".dlog"), "{what}: {m}"),
+                Err(e) => panic!("{what}: the wrong failure: {e}"),
+                Ok(s) => panic!(
+                    "{what}: the open succeeded with {} documents where 17 were live",
+                    s.num_docs(s.clock.peek())
+                ),
+            }
+        };
+        for n in 0..published.len() {
+            refuse(&published[..n], &format!("cut to {n} bytes"));
+        }
+        for i in 0..published.len() {
+            let mut b = published.clone();
+            b[i] ^= 0x80;
+            refuse(&b, &format!("flipped a bit at {i}"));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database whose delete logs predate the frame opens with every
+    /// deletion intact, and the next publication that touches a log rewrites
+    /// it framed -- the cache of what this shard published is empty after a
+    /// reopen, and the bytes on disk are not the bytes it would write, so the
+    /// skip cannot fire. That rewrite is what closes the unframed window.
+    #[test]
+    fn a_delete_log_written_before_the_frame_opens_and_is_rewritten_framed() {
+        let dir = test_dir("dlog-legacy");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.flush().unwrap();
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap().expect("nothing was deleted");
+        s.persist_manifest().unwrap();
+        drop(s);
+        let dlog = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        let framed = fs::read(&dlog).unwrap();
+        assert!(framed.starts_with(crate::mvcc::DELETE_LOG_MAGIC));
+        // The same entries as a pre-frame publication wrote them: bare
+        // records, which is the body of the framed file without its frame.
+        let legacy = framed[4 + 4 + 8..framed.len() - 4].to_vec();
+        assert_eq!(legacy.len(), 12);
+        fs::write(&dlog, &legacy).unwrap();
+
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.num_docs(s.clock.peek()), 19, "the unframed delete log was not applied");
+        s.persist_manifest().unwrap();
+        assert_eq!(fs::read(&dlog).unwrap(), framed, "the unframed log was not rewritten framed");
         let _ = fs::remove_dir_all(&dir);
     }
 
