@@ -1980,7 +1980,8 @@ impl Shard {
     }
 
     pub(crate) fn maybe_flush(&mut self) -> Result<bool> {
-        if self.memtable.should_flush(&self.opts.thresholds) {
+        let pinned = self.opts.gc_horizon > 0;
+        if self.memtable.should_flush_pinned(&self.opts.thresholds, pinned) {
             self.flush()?;
             Ok(true)
         } else {
@@ -3591,6 +3592,61 @@ mod tests {
     #[test]
     fn replay_is_idempotent_when_a_pinned_seal_emitted_one_segment_per_version() {
         replay_reproduces_the_seal(true);
+    }
+
+    /// `D` retained versions cost `D` segments at a pinned seal, and the
+    /// memtable's byte threshold was the only bound on `D`. Under a pin the
+    /// flush now fires on version depth, so one seal emits at most
+    /// `max_versions` segments; twelve versions of one key at a threshold of
+    /// four are three seals of four, never one of twelve. Unpinned, depth is
+    /// not a reason to seal — that seal keeps one version per key and emits
+    /// one segment however deep the chain ran, and firing it early would be a
+    /// flush policy change for no file it saves. Each half is the mutation
+    /// that fails the other: dropping the pin guard seals the unpinned run,
+    /// and dropping the depth term leaves the pinned one a burst of twelve.
+    #[test]
+    fn a_pinned_seal_fans_out_to_at_most_max_versions_segments() {
+        let run = |pin: bool| {
+            let dir = test_dir(if pin { "depth-pinned" } else { "depth-unpinned" });
+            fs::create_dir_all(&dir).unwrap();
+            let mut opts = ShardOpts::default();
+            opts.thresholds.max_versions = 4;
+            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts);
+            s.attach_dir(&dir).unwrap();
+            s.insert(doc(0)).unwrap();
+            if pin {
+                s.opts.gc_horizon = s.clock.peek();
+            }
+            let (mut bursts, mut segs, mut flushes) = (Vec::new(), s.segments.len(), s.flushes);
+            for v in 1..12 {
+                let mut d = doc(0);
+                d.set_path("body", Value::Str(format!("version {v}"))).unwrap();
+                s.insert(d).unwrap();
+                if s.flushes != flushes {
+                    bursts.push(s.segments.len() - segs);
+                    segs = s.segments.len();
+                    flushes = s.flushes;
+                }
+            }
+            let depth_before_seal = s.memtable.version_depth();
+            s.flush().unwrap();
+            bursts.push(s.segments.len() - segs);
+            let _ = fs::remove_dir_all(&dir);
+            (bursts, depth_before_seal)
+        };
+        let (pinned, _) = run(true);
+        assert_eq!(
+            pinned,
+            vec![4, 4, 4, 0],
+            "three seals of four, and nothing left over: {pinned:?}"
+        );
+        let (unpinned, depth) = run(false);
+        assert_eq!(depth, 12, "the whole chain sat in one memtable");
+        assert_eq!(
+            unpinned,
+            vec![1],
+            "no seal on depth, and the one seal is one segment: {unpinned:?}"
+        );
     }
 
     /// The differential test behind "shredding is a physical decision, not a

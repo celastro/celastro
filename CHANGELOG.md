@@ -8,6 +8,13 @@ repository.
 
 ## Unreleased
 
+**A seal under a pinned `gc_horizon` emits at most `max_versions` segments.**
+`FlushThresholds` gains `max_versions` (default 8): while a horizon is pinned
+the memtable seals once its longest version chain reaches it, so a hot key's
+retained versions fan out into bounded bursts instead of one flush of as many
+files as versions. Unpinned behaviour is unchanged. `Memtable` gains
+`should_flush_pinned` and `version_depth`.
+
 **`Value::set_path` is fallible** and refuses a value that would nest deeper
 than 128, the bound `json::parse` and the variant decoder already apply; the
 constant is `value::MAX_DEPTH` and `Value::depth()` reports a value's

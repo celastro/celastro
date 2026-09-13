@@ -236,6 +236,21 @@ one, and it is not done.
 
 ---
 
+**A pinned seal fans out, and the fan-out is bounded by depth rather than by
+bytes.** A segment holds one version per key, so a seal under a pinned
+`gc_horizon` emits one segment per retained version layer: `D` retained
+versions of one hot key are `D` files, and the memtable's byte threshold was
+the only bound on `D`. The memtable now tracks its longest version chain and,
+while a horizon is pinned, seals when it reaches `FlushThresholds::max_versions`
+(8 by default), so one seal emits at most that many segments. That bounds the
+burst and not the total: it trades more frequent seals for smaller ones. The
+fix that would reduce the total — a segment holding a run of versions of one
+key, with `Ordinals::find` picking the version visible at `t` inside the run —
+is an on-disk format change plus a redesign of the MVCC ordinal layout, and it
+is deliberately not taken until something needs it. Unpinned, depth is not a
+reason to seal: that seal keeps one version per key and emits one segment
+however deep the chains ran.
+
 ## Two limits a document can meet
 
 A value may nest at most 128 deep, counted as containers enclosing a value,
@@ -736,6 +751,7 @@ guarantee:
 | an unranked scan holds one page, and answers like one that held everything | `plan::exec::tests::a_scan_retains_no_more_rows_than_the_page_and_the_same_rows_as_a_full_sort` (the collector: never more than the page at any point of a scrambled arrival, under `COLLAPSE BY`, and the same rows a full sort-collapse-page yields), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (a key-ordered scan decodes exactly the rows it returns, past an `OFFSET` and a cursor; a field order decodes every survivor and still answers the same; a collapse returns one row per parent) |
 | a distance threshold in `WHERE` agrees with the `distance` column, composes, and is three-valued | `engine::tests::a_distance_threshold_in_where_agrees_with_the_distance_column` (both metrics, five thresholds each way, an AND with a structured predicate, `NOT` leaving the vectorless document on neither side, exact match at `<= 0`, the plan naming brute force, and the three refusals), `a_distance_threshold_returns_the_same_rows_at_every_shard_count` (equality, not a tolerance: there is no candidate depth in a predicate), `sql::parser::tests::a_distance_threshold_parses_as_a_predicate_and_not_as_an_order` |
 | a collection's prefix expansion cap is a setting, its leaf budget is derived from it, and the cache is the ceiling | `engine::tests::a_collection_can_raise_its_prefix_expansion_and_pays_with_its_leaf_budget` (the union cut, the budget, the ceiling, the persisted setting, the export, the DELETE refusal and the CREATE option, each the mutation that fails it), `text::scorer::tests::an_expansion_reports_truncation_only_when_a_term_was_actually_dropped` (the no-coordinator arm reads the cap off the statistics), `catalog::tests::a_version_2_catalog_is_read_with_every_collection_at_the_default_cap` (the format step: 2 reads at the default, 1 and 4 are refused), `sql::parser::tests::a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later` |
+| a pinned seal emits at most `max_versions` segments, and an unpinned one does not seal on depth | `shard::tests::a_pinned_seal_fans_out_to_at_most_max_versions_segments` (twelve versions at a threshold of four: three seals of four pinned, one seal of one unpinned) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |

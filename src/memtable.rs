@@ -40,11 +40,27 @@ pub struct FlushThresholds {
     /// Vector-count threshold. Order 20–50k; the bound on the brute-force scan
     /// is what makes freshness cheap.
     pub max_vectors: usize,
+    /// Version-depth threshold, applied only while a `gc_horizon` is pinned.
+    ///
+    /// A seal under a pin emits one segment per retained version of a key,
+    /// because a segment holds one version per key — so `D` retained
+    /// versions of one hot key cost `D` segments, and without this the only
+    /// bound on how many files one flush fans out into was the memtable's
+    /// byte threshold. Sealing once the longest version chain reaches this
+    /// depth caps the burst at this many segments per seal; it trades more
+    /// frequent seals for smaller ones and reduces the total not at all.
+    /// Unpinned, depth is not a reason to seal: an unpinned seal keeps one
+    /// version per key and emits one segment however deep the chains ran.
+    ///
+    /// The real fix — a segment holding a run of versions of one key — is an
+    /// on-disk format change, recorded in docs/design.md as deliberately not
+    /// taken yet.
+    pub max_versions: usize,
 }
 
 impl Default for FlushThresholds {
     fn default() -> Self {
-        FlushThresholds { max_bytes: 64 << 20, max_vectors: 32_768 }
+        FlushThresholds { max_bytes: 64 << 20, max_vectors: 32_768, max_versions: 8 }
     }
 }
 
@@ -112,6 +128,10 @@ pub struct Memtable {
     pub vectors: BTreeMap<String, VectorStore>,
     pub bytes: usize,
     budget: Option<Arc<MemtableBudget>>,
+    /// The longest chain in `by_key`: how many segments a seal under a pinned
+    /// horizon would emit. Kept as a running maximum on the write path, so
+    /// `should_flush` is a comparison and not a walk of every chain.
+    depth: usize,
 }
 
 impl Memtable {
@@ -140,6 +160,7 @@ impl Memtable {
             text,
             vectors,
             bytes: 0,
+            depth: 0,
             budget,
         }
     }
@@ -209,7 +230,9 @@ impl Memtable {
             b.add(sz);
         }
         self.ordinals.push(sort_key.clone(), commit_ts);
-        self.by_key.entry(sort_key.clone()).or_default().push(ord);
+        let chain = self.by_key.entry(sort_key.clone()).or_default();
+        chain.push(ord);
+        self.depth = self.depth.max(chain.len());
         self.docs.push(MemDoc { sort_key, commit_ts, doc });
         Ok(ord)
     }
@@ -278,6 +301,19 @@ impl Memtable {
         self.bytes >= th.max_bytes
             || self.num_vectors() >= th.max_vectors
             || self.budget.as_ref().map(|b| b.under_pressure()).unwrap_or(false)
+    }
+
+    /// [`should_flush`](Self::should_flush), plus the version-depth threshold
+    /// when a horizon is pinned — the one situation in which depth decides
+    /// how many segments the seal emits.
+    pub fn should_flush_pinned(&self, th: &FlushThresholds, pinned: bool) -> bool {
+        self.should_flush(th) || (pinned && self.depth >= th.max_versions)
+    }
+
+    /// The longest version chain held: what a seal under a pinned horizon
+    /// would fan out into.
+    pub fn version_depth(&self) -> usize {
+        self.depth
     }
 
     /// Hand the contents to a segment builder. Documents already dead at
@@ -385,7 +421,11 @@ mod tests {
         let budget = MemtableBudget::new(1024);
         let c = coll();
         let mut m = Memtable::new(&c, Some(budget.clone()));
-        let th = FlushThresholds { max_bytes: usize::MAX, max_vectors: usize::MAX };
+        let th = FlushThresholds {
+            max_bytes: usize::MAX,
+            max_vectors: usize::MAX,
+            max_versions: usize::MAX,
+        };
         assert!(!m.should_flush(&th));
         for i in 0..50 {
             m.insert(
