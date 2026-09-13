@@ -22,6 +22,24 @@
 //! in [`plan::fusion`] at the coordinator, because fusing segment-local ranks
 //! is not equivalent to fusing global ranks (§7.2).
 //!
+//! ## Durability, and where it stops
+//!
+//! An acknowledged write is on the disk: the write-ahead log record is
+//! fsynced before the insert returns, and every file the database publishes
+//! -- a segment, a manifest, a delete log, the catalog -- is written to a
+//! temporary name, fsynced, renamed into place, and followed by an fsync of
+//! the directory the rename landed in, so that the name is as durable as the
+//! bytes. A tier move that relocates a segment between `segments/` and
+//! `archive/` fsyncs both directories the same way.
+//!
+//! The directory fsync is a POSIX operation: it opens the directory and calls
+//! `fsync` on it. **Off unix it is a no-op**, so on Windows the guarantee
+//! weakens to what the filesystem does on its own -- the bytes of each file
+//! are still fsynced, but a name a crash takes back is not something this
+//! crate can prevent there. Nothing targets Windows today, which is why the
+//! crate carries no platform-specific path; it carries this paragraph instead,
+//! so that the limit is read where the guarantee is.
+//!
 //! ## What is API
 //!
 //! The library's surface is [`Db`] and what it hands out. Two rules keep that

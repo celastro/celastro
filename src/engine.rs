@@ -4969,6 +4969,62 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A tier move is a publication. `sync_archive` relocates a segment
+    /// between `segments/` and `archive/`, and the manifest finds it by id in
+    /// whichever holds it -- so a rename whose directory entries a crash took
+    /// back was a segment the manifest named and neither directory held. It
+    /// was the one rename outside the publication path, invisible to the
+    /// probe and to the invariant over the whole event log. Both directions
+    /// are pinned, each followed by a reopen that has to find the segment.
+    #[test]
+    fn an_archive_move_fsyncs_both_directories_and_survives_a_reopen() {
+        let dir = tmp("archive-move");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for id in ["a", "b", "c"] {
+            db.insert("notes", note(id)).unwrap();
+        }
+        db.flush("notes").unwrap();
+        let sdir = dir.join("collections").join("notes").join("shard-0000");
+        for (tier, sub) in [("archived", "archive"), ("active", "segments")] {
+            durability_probe::start();
+            db.execute(&format!("ALTER INDEX notes_body ON notes SET TIER '{tier}'")).unwrap();
+            let ev = durability_probe::take();
+            let moved: Vec<PathBuf> = ev
+                .paths(Op::Rename)
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "seg"))
+                .collect();
+            assert!(!moved.is_empty(), "{tier}: no segment was moved, so this says nothing");
+            assert!(
+                moved.iter().all(|p| p.starts_with(sdir.join(sub))),
+                "{tier}: a segment was moved somewhere other than {sub}/: {moved:?}"
+            );
+            let unpublished = ev.unpublished_renames();
+            assert!(unpublished.is_empty(), "{tier}: moved and not fsynced: {unpublished:?}");
+            assert!(
+                ev.at(Op::DirSync, &sdir.join("segments")).is_some()
+                    && ev.at(Op::DirSync, &sdir.join("archive")).is_some(),
+                "{tier}: only one of the two directories was synced: {ev:?}"
+            );
+            drop(db);
+            db = Db::open(&dir, DbOpts::default()).unwrap();
+            assert_eq!(
+                db.query("SELECT id FROM notes WHERE text_match(body, 'segments') LIMIT 10")
+                    .unwrap()
+                    .rows
+                    .len(),
+                3,
+                "{tier}: the moved segment was not found at the reopen"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A statement that cannot finish within its deadline is refused with the
     /// budget named and the two ways to change it, on every query shape, and
     /// by DEFAULT: this `Db` was given a budget of nothing and the statements

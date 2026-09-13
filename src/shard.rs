@@ -1840,6 +1840,8 @@ impl Shard {
             // are about to move.
             h.segment.unload_all();
             fs::rename(from, to)?;
+            #[cfg(test)]
+            durability_probe::note_rename(to);
             h.segment.set_source(if want_archive {
                 SegmentSource::Archive(to.clone())
             } else {
@@ -1847,6 +1849,20 @@ impl Shard {
             });
             h.set_path(Some(to.clone()));
             moved += 1;
+        }
+        // A tier move is a publication: the manifest names these segments by
+        // id and finds them by looking in `segments/` and then `archive/`, so
+        // a rename whose directory entries a crash takes back is a segment
+        // the manifest names and neither directory holds -- the open fails.
+        // Both parents, once per batch rather than once per file, and the
+        // destination first: with the new name durable and the old one not,
+        // a crash leaves the file findable in both places, which the open
+        // resolves; the other order leaves it in neither.
+        if moved > 0 {
+            let (from_dir, to_dir) =
+                if want_archive { ("segments", "archive") } else { ("archive", "segments") };
+            sync_dir(&dir.join(to_dir))?;
+            sync_dir(&dir.join(from_dir))?;
         }
         Ok(moved)
     }

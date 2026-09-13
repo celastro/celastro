@@ -213,7 +213,9 @@ treated as a load-bearing invariant.
 
 Around it: immutable segments with a self-describing footer, size-tiered
 compaction, MVCC with snapshot reads, a write-ahead log that is fsynced before
-a write is acknowledged, block-max WAND for BM25, a tiered HNSW index with SQ8
+a write is acknowledged (the directory fsync behind that guarantee is a POSIX
+operation, so off unix the guarantee is best-effort), block-max WAND for BM25,
+a tiered HNSW index with SQ8
 and 1-bit codes and full-precision rerank, runtime selection between brute
 force, post-filter and filter-aware vector search, and storage tiers with
 lifecycle policies.

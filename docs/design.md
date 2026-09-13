@@ -504,6 +504,19 @@ For `<#>` the presented value is the negated inner product, so a threshold on
 it reads the other way.
 Under `NOT` a document with no vector has no distance and is on neither side.
 
+**Durability is unix-shaped, and every mover is inside it.** The guarantee
+rests on fsyncing the directory a rename landed in, which is a POSIX
+operation; off unix `sync_dir` is a no-op and the guarantee weakens to what
+the filesystem does on its own. The crate docs say so where the guarantee is
+stated, because a guarantee that silently weakens by platform belongs in the
+document a reader meets and not in a comment. Every rename the database makes
+is followed by that fsync, and the invariant test reads the whole event log
+to prove it -- including the tier move that relocates a segment between
+`segments/` and `archive/`, which used to be the one rename outside the
+publication path: the manifest names the segment by id and looks for it in
+both directories, so a rename whose entries a crash took back was a segment
+the manifest named and neither directory held.
+
 **A statement's cost is bounded by a deadline that is on by default and
 checked inside the loops.** Thirty seconds unless the `Db` or the statement
 says otherwise; `WITH (deadline_ms = N)` raises it, `WITH (no_deadline)` lifts
@@ -624,6 +637,7 @@ guarantee:
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |
+| a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

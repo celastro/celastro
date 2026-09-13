@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A tier move is durable, and the durability guarantee says where it
+stops.** Moving a segment between `segments/` and `archive/` renamed the
+file and fsynced nothing, so a crash could take the new name back and leave
+a segment the manifest names in neither directory; both directories are
+fsynced now, destination first, like every other publication. The crate
+docs, the README and the design notes state that the directory fsync behind
+the guarantee is a POSIX operation and a no-op off unix.
+
 ## 0.10.0 — 2026-09-13
 
 A behaviour change for a query with more tied documents than its candidate
