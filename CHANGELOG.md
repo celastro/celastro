@@ -6,7 +6,11 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.12.0 — 2026-09-13
+
+A new capability, hence a minor. `DbOpts` gained a field, which the
+contract stated at 0.9.0 makes a non-breaking addition; the on-disk format
+is unchanged.
 
 **The `archived` tier can live in an S3-compatible object store.** Set
 `DbOpts::archive` -- from the CLI, `CELASTRO_ARCHIVE_ENDPOINT` and
