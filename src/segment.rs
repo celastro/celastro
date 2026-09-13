@@ -1364,6 +1364,7 @@ mod tests {
             // No coordinator in this test: the segment is the whole world.
             expansions: Default::default(),
             exact: true,
+            prefix_cap: crate::text::scorer::PREFIX_EXPANSION_LIMIT,
         };
         let q = TextQuery::parse("hybrid retrieval", Analyzer::English).unwrap();
         // No deletes in this fixture, so every ordinal is visible and a full

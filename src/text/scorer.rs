@@ -104,7 +104,7 @@ pub struct PrefixUse {
 ///
 /// `#[non_exhaustive]` because this grew a field in a breaking release and the
 /// next statistic should not need another one.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GlobalStats {
     pub num_docs: u64,
@@ -128,6 +128,26 @@ pub struct GlobalStats {
     /// when read from the periodically refreshed cache. Reported by
     /// `EXPLAIN ANALYZE` so a scoring anomaly can be attributed.
     pub exact: bool,
+    /// The collection's prefix expansion cap, for the no-coordinator arm of
+    /// `build`: a prefix `Db::run_select` did not resolve is expanded there,
+    /// per unit, to this many terms. `Db::gather_stats` sets it from the
+    /// catalog. The default is [`PREFIX_EXPANSION_LIMIT`] and never zero, so a
+    /// `GlobalStats::default()` expands a prefix the way an unconfigured
+    /// collection does.
+    pub prefix_cap: usize,
+}
+
+impl Default for GlobalStats {
+    fn default() -> Self {
+        GlobalStats {
+            num_docs: 0,
+            avg_doc_len: 0.0,
+            doc_freq: BTreeMap::new(),
+            expansions: BTreeMap::new(),
+            exact: false,
+            prefix_cap: PREFIX_EXPANSION_LIMIT,
+        }
+    }
 }
 
 impl GlobalStats {
@@ -658,6 +678,11 @@ impl Scorer for BitmapScorer {
 /// every query — ranked or filtered, `EXPLAIN ANALYZE` or not — and repeated
 /// per unit in `EXPLAIN ANALYZE`.
 ///
+/// This is the default. A collection sets its own with
+/// `ALTER COLLECTION ... SET (prefix_expansion = N)`, up to the engine's
+/// statistics cache, and its statements are then held to a leaf budget derived
+/// from it; `Db::set_prefix_expansion` has the bound and the arithmetic.
+///
 /// Raising it is a recall dial with a real price. The rows a wide prefix
 /// returns go roughly as `n · (1 − (1 − cap/V)^t)` for a collection of `n`
 /// documents over a matching vocabulary of `V` terms with `t` of them per
@@ -824,10 +849,11 @@ fn build<'a>(
                     // called both of them truncation. The extra term is the
                     // whole difference: if it comes back, something was left
                     // behind.
-                    owned = src.live_terms_with_prefix(p, PREFIX_EXPANSION_LIMIT + 1, vis);
-                    if owned.len() > PREFIX_EXPANSION_LIMIT {
+                    let cap = stats.prefix_cap;
+                    owned = src.live_terms_with_prefix(p, cap + 1, vis);
+                    if owned.len() > cap {
                         *truncated = true;
-                        &owned[..PREFIX_EXPANSION_LIMIT]
+                        &owned[..cap]
                     } else {
                         &owned
                     }
@@ -1240,6 +1266,7 @@ mod tests {
             doc_freq: Default::default(),
             expansions: Default::default(),
             exact: true,
+            prefix_cap: PREFIX_EXPANSION_LIMIT,
         };
         for (t, df) in src.all_terms() {
             s.doc_freq.insert(t, df as u64);
@@ -1555,7 +1582,7 @@ mod tests {
     /// the second.
     #[test]
     fn an_expansion_reports_truncation_only_when_a_term_was_actually_dropped() {
-        let expand = |vocab: usize| {
+        let expand = |vocab: usize, cap: usize| {
             let mut b = InvertedBuilder::new();
             for i in 0..vocab {
                 let mut toks = Vec::new();
@@ -1566,7 +1593,12 @@ mod tests {
             let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
             let lens = b.doc_lens.clone();
             let src = TextSource::sealed(&dict, &post, &lens);
-            let st = GlobalStats { num_docs: vocab as u64, avg_doc_len: 1.0, ..Default::default() };
+            let st = GlobalStats {
+                num_docs: vocab as u64,
+                avg_doc_len: 1.0,
+                prefix_cap: cap,
+                ..Default::default()
+            };
             let q = TextQuery::parse("a*", Analyzer::English).unwrap();
             let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
             let truncated = c.prefix_truncated;
@@ -1574,15 +1606,24 @@ mod tests {
         };
 
         assert_eq!(
-            expand(PREFIX_EXPANSION_LIMIT),
+            expand(PREFIX_EXPANSION_LIMIT, PREFIX_EXPANSION_LIMIT),
             (false, PREFIX_EXPANSION_LIMIT),
             "exactly the cap: every term is in the answer, so there is nothing to warn about"
         );
         assert_eq!(
-            expand(PREFIX_EXPANSION_LIMIT + 1),
+            expand(PREFIX_EXPANSION_LIMIT + 1, PREFIX_EXPANSION_LIMIT),
             (true, PREFIX_EXPANSION_LIMIT),
             "one term over: one document is unreachable, and the answer has to say so"
         );
+        // The cap this arm applies is the collection's, carried on the
+        // statistics, and not the default: a collection that raised it gets
+        // the whole vocabulary, and one that lowered it is cut where it said.
+        assert_eq!(
+            expand(PREFIX_EXPANSION_LIMIT + 1, PREFIX_EXPANSION_LIMIT + 1),
+            (false, PREFIX_EXPANSION_LIMIT + 1),
+            "a raised cap admits the term the default would have dropped"
+        );
+        assert_eq!(expand(64, 32), (true, 32), "a lowered cap cuts where the collection said");
     }
 
     #[test]
@@ -1653,6 +1694,7 @@ mod tests {
             doc_freq: Default::default(),
             expansions: Default::default(),
             exact: false,
+            prefix_cap: PREFIX_EXPANSION_LIMIT,
         };
         let q = TextQuery::parse("graph*", Analyzer::English).unwrap();
         assert_eq!(q, TextQuery::Prefix("graph".into()));
@@ -1787,6 +1829,7 @@ mod tests {
             doc_freq: Default::default(),
             expansions: Default::default(),
             exact: false,
+            prefix_cap: PREFIX_EXPANSION_LIMIT,
         };
         let q = TextQuery::parse("alpha*", Analyzer::English).unwrap();
         let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();

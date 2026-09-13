@@ -6,6 +6,27 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A collection's prefix expansion cap is a setting.** `CREATE COLLECTION ...
+WITH (prefix_expansion = N)` and `ALTER COLLECTION <name> SET
+(prefix_expansion = N)` set how many dictionary terms a prefix on that
+collection expands to; the default is still 512 and `SHOW CATALOG` shows the
+value in force. The ceiling is 4096, the size of the per-path statistics
+cache. The number of distinct prefixes one statement may name is now derived
+from the cap — `4096 / prefix_expansion`, so eight at the default, two at
+2048 — instead of being a second constant, and the refusals for a cut
+`DELETE` and for an over-budget statement name the collection's cap. The
+library gains `Db::set_prefix_expansion`, `Statement::AlterCollection`,
+`CreateCollection::prefix_expansion`, `Collection::prefix_expansion` /
+`prefix_cap()` and `GlobalStats::prefix_cap`; `GlobalStats` now implements
+`Default` by hand, with the cap at 512.
+
+**The catalog format is version 3.** This build reads a version-2 catalog and
+a version-2 export, with every collection at the default cap. A 0.14 or
+earlier build refuses a catalog or export written by this one, so take a copy
+before upgrading if you may want to go back.
+
 ## 0.14.0 — 2026-09-13
 
 A new capability, hence a minor. Two verbs and three library calls were

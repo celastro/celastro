@@ -350,7 +350,8 @@ update-heavy the mask *deletes* work rather than adding it: 200 dead terms of
 all 512, because the dead terms never reach the frequency gather at all.
 
 **A wide `foo*` is a partial answer, and pinning it made the answer smaller.**
-A prefix expands to at most `PREFIX_EXPANSION_LIMIT` (512) dictionary terms.
+A prefix expands to at most the collection's `prefix_expansion` dictionary
+terms, 512 unless set.
 That cap used to be applied by each searchable unit to its own dictionary, so
 the terms a query named were the union of every unit's own lexicographic cut —
 more units meant a larger union. Measured on 6000 documents each holding two
@@ -387,6 +388,29 @@ around 1200 ms ranked and 1000 ms filtered — roughly 7x, because the work is o
 cursor per resolved term in every unit and that grows with the cap directly
 while recall improves sub-linearly.
 
+The dial is per collection: `CREATE COLLECTION ... WITH (prefix_expansion = N)`
+or `ALTER COLLECTION items SET (prefix_expansion = 2048)`, shown by
+`SHOW CATALOG`, persisted in the catalog and carried by an export, so a copy
+answers a prefix the way its source does. The ceiling is 4096, the size of the
+per-path statistics cache, because one expansion wider than the cache would
+evict its own terms and never warm. The leaf budget below is *derived* from the
+cap rather than set beside it — `4096 / prefix_expansion`, so eight distinct
+prefixes per statement at 512, four at 1024, two at 2048, one at the ceiling —
+which is the one way to keep the two from contradicting each other: an operator
+sets one number, and no statement can be admitted that the cache cannot hold.
+
+What that shape costs, stated so nobody rediscovers it. Every query on the
+collection pays the raised cap, and two full-text paths on one collection share
+it: there is no per-statement or per-path dial. A wide cap and many prefixes
+in one statement are not both available, because the cache behind both is
+fixed. The answer to `a*` becomes a function of a setting as well as of the
+data, so two instances agree only at the same setting — which is why the export
+carries it. The statement deadline still binds, so on a large collection a
+raised cap can turn a cut answer into a deadline refusal unless the deadline is
+raised with it. And the setting moved the catalog format to version 3: this
+build reads version 2, while a 0.14 build refuses a catalog or export written
+here, so a downgrade after the first open means restoring a copy.
+
 **Every query that was cut says so, whether or not it asked.** Truncation is
 reported on `QueryResult::truncated_prefixes` — as `truncated_prefixes` in the
 HTTP and `--json` responses, as a `TRUNCATED —` line in the shells between the
@@ -415,12 +439,14 @@ set covering 512 of the terms made the other 488 deletable and they went. The
 direction of the damage cannot be read off the leaf either — SQL's `NOT` wraps
 the whole `text_match` call and inverts it, and one statement may spell both
 polarities — so the refusal covers both shapes and names the leaf that was cut.
-Delete by key, or narrow the prefix until it expands to at most 512 terms and
-delete the pieces; that loop deletes exactly what each piece names.
+Delete by key, or narrow the prefix until it expands to at most the
+collection's cap and delete the pieces; that loop deletes exactly what each
+piece names. The refusal names the cap in force.
 
-One statement may name at most eight distinct `(path, prefix)` pairs, *summed*
-over its indexed paths. Each distinct one costs a dictionary walk in every unit
-of every shard plus up to 512 gathered frequencies, and nothing in the
+One statement may name at most `4096 / prefix_expansion` distinct
+`(path, prefix)` pairs — eight at the default cap — *summed* over its indexed
+paths. Each distinct one costs a dictionary walk in every unit of every shard
+plus up to the cap's worth of gathered frequencies, and nothing in the
 `text_match` grammar bounds how many a query string holds: 24 of them measured
 at 1.2 s and gathered 12288 terms into a 4096-entry statistics cache, which then
 evicted its own entries so the identical statement never warmed. Repeats of one
@@ -687,6 +713,7 @@ guarantee:
 | the SELECT list decides what a row carries | `engine::tests::the_select_list_decides_what_a_row_carries` (a named path is kept and an unnamed one is not, an alias renames, a nested path is keyed as written, a missing path is `Null` rather than absent, `*` keeps everything, and a ranked query keeps its `score`) |
 | an unranked scan holds one page, and answers like one that held everything | `plan::exec::tests::a_scan_retains_no_more_rows_than_the_page_and_the_same_rows_as_a_full_sort` (the collector: never more than the page at any point of a scrambled arrival, under `COLLAPSE BY`, and the same rows a full sort-collapse-page yields), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (a key-ordered scan decodes exactly the rows it returns, past an `OFFSET` and a cursor; a field order decodes every survivor and still answers the same; a collapse returns one row per parent) |
 | a distance threshold in `WHERE` agrees with the `distance` column, composes, and is three-valued | `engine::tests::a_distance_threshold_in_where_agrees_with_the_distance_column` (both metrics, five thresholds each way, an AND with a structured predicate, `NOT` leaving the vectorless document on neither side, exact match at `<= 0`, the plan naming brute force, and the three refusals), `a_distance_threshold_returns_the_same_rows_at_every_shard_count` (equality, not a tolerance: there is no candidate depth in a predicate), `sql::parser::tests::a_distance_threshold_parses_as_a_predicate_and_not_as_an_order` |
+| a collection's prefix expansion cap is a setting, its leaf budget is derived from it, and the cache is the ceiling | `engine::tests::a_collection_can_raise_its_prefix_expansion_and_pays_with_its_leaf_budget` (the union cut, the budget, the ceiling, the persisted setting, the export, the DELETE refusal and the CREATE option, each the mutation that fails it), `text::scorer::tests::an_expansion_reports_truncation_only_when_a_term_was_actually_dropped` (the no-coordinator arm reads the cap off the statistics), `catalog::tests::a_version_2_catalog_is_read_with_every_collection_at_the_default_cap` (the format step: 2 reads at the default, 1 and 4 are refused), `sql::parser::tests::a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later` |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |

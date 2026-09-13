@@ -32,7 +32,7 @@ use crate::segment::BuildOpts;
 use crate::segment::{PendingDoc, SegmentBuilder, SegmentSource};
 use crate::shard::{sort_key, Searchable, SegmentHandle, Shard, ShardOpts};
 use crate::sql::{self, ast::*};
-use crate::text::scorer::{Expansion, GlobalStats, PREFIX_EXPANSION_LIMIT};
+use crate::text::scorer::{Expansion, GlobalStats};
 use crate::time::{Hlc, Timestamp};
 use crate::value::Value;
 
@@ -51,7 +51,8 @@ const STATS_REFRESH_WRITES: u64 = 512;
 const STATS_TERM_CAP: usize = 4096;
 
 /// How many distinct `(path, prefix)` pairs one statement may name, SUMMED
-/// over its indexed paths.
+/// over its indexed paths, on a collection whose prefix expansion cap is
+/// `cap`.
 ///
 /// Summed, not per path: `Db::run_select` compares the total against this, and
 /// a rule stated per path is a rule an operator cannot use — five prefixes on
@@ -66,10 +67,10 @@ const STATS_TERM_CAP: usize = 4096;
 /// dictionary it came from.
 ///
 /// Each one costs a dictionary enumeration in every unit of every shard plus
-/// up to [`PREFIX_EXPANSION_LIMIT`] gathered document frequencies, and the
-/// `text_match` grammar puts no bound on how many of them a query string holds
-/// — so without this the multiplier is chosen by whoever writes the query.
-/// Measured over 20000 documents in 6 units: one leaf 48 ms, 24 leaves 1.2 s,
+/// up to `cap` gathered document frequencies, and the `text_match` grammar
+/// puts no bound on how many of them a query string holds — so without this
+/// the multiplier is chosen by whoever writes the query. Measured over 20000
+/// documents in 6 units at the default cap: one leaf 48 ms, 24 leaves 1.2 s,
 /// and the 24-leaf statement never warms, because its 12288 gathered terms
 /// evict each other out of a [`STATS_TERM_CAP`]-entry map.
 ///
@@ -85,7 +86,40 @@ const STATS_TERM_CAP: usize = 4096;
 /// this change exists to stop prefix queries from silently answering less than
 /// they were asked, and a silent aggregate cap would be the same failure one
 /// level up.
-const PREFIX_LEAVES_LIMIT: usize = STATS_TERM_CAP / PREFIX_EXPANSION_LIMIT;
+///
+/// DERIVED from the cap rather than set beside it, which is what keeps the two
+/// from contradicting each other: an operator who raises a collection's
+/// `prefix_expansion` has, by that one act, lowered how many prefixes its
+/// statements may carry — eight at 512, two at 2048, one at the ceiling — and
+/// no second setting can admit a statement the cache cannot hold.
+fn prefix_leaves_limit(cap: usize) -> usize {
+    // At least one: a cap the ceiling admits always fits the cache once, and a
+    // budget of zero would refuse every prefix.
+    (STATS_TERM_CAP / cap).max(1)
+}
+
+/// The most a collection's `prefix_expansion` can be set to: the size of the
+/// per-path statistics cache, so that even a single expansion fits it whole.
+/// Over this, one prefix would evict its own terms out of the cache and the
+/// statement would never warm, which is the cost `prefix_leaves_limit`
+/// exists to bound.
+pub const PREFIX_EXPANSION_CEILING: usize = STATS_TERM_CAP;
+
+/// Refuse a `prefix_expansion` the engine cannot honour: zero expands nothing,
+/// and over the ceiling a single prefix overruns the statistics cache. Also
+/// what an import checks, since an export carries its collection's cap and a
+/// build with a smaller cache than the one that wrote it must refuse rather
+/// than overrun.
+fn check_prefix_cap(n: usize) -> Result<()> {
+    if n == 0 || n > PREFIX_EXPANSION_CEILING {
+        return Err(Error::Plan(format!(
+            "prefix_expansion must be between 1 and {PREFIX_EXPANSION_CEILING}, not {n}: the \
+             ceiling is the {STATS_TERM_CAP}-term statistics cache each indexed path keeps, and \
+             one expansion wider than the cache would evict its own terms and never warm"
+        )));
+    }
+    Ok(())
+}
 
 /// How coarsely the per-index access clocks are written to disk. The lifecycle
 /// DSL's finest unit is a minute, so persisting to within a minute is exact at
@@ -745,6 +779,9 @@ impl Db {
         if self.catalog.collections.contains_key(&name) {
             return Err(Error::Plan(format!("collection `{name}` already exists here")));
         }
+        if let Some(n) = coll.prefix_expansion {
+            check_prefix_cap(n)?;
+        }
         let src = from.join("collections").join(&name);
         let dest = dir.join("collections").join(&name);
         let tmp = dir.join("collections").join(format!("{name}.import.tmp"));
@@ -1142,6 +1179,7 @@ impl Db {
         exact: bool,
     ) -> Result<BTreeMap<String, GlobalStats>> {
         let mut out = BTreeMap::new();
+        let prefix_cap = self.catalog.get(collection)?.prefix_cap();
         for (path, terms) in want {
             // Once, here, for both arms: the shard gather walks a posting list
             // per element of the slice it is handed, so a term named twice is
@@ -1173,6 +1211,7 @@ impl Db {
                         // Filled in by `run_select`, which is the only caller
                         // that knows the statement's prefixes.
                         expansions: Default::default(),
+                        prefix_cap,
                         exact: true,
                     },
                 );
@@ -1258,6 +1297,7 @@ impl Db {
                         doc_freq: df,
                         expansions: Default::default(),
                         exact: false,
+                        prefix_cap,
                     },
                 );
             }
@@ -1527,6 +1567,10 @@ impl Db {
                     .map(|x| x.path.clone())
                     .unwrap_or_else(|| "id".to_string());
                 let mut coll = Collection::new(&c.name, &pk, c.partition_by.clone());
+                if let Some(n) = c.prefix_expansion {
+                    check_prefix_cap(n)?;
+                    coll.prefix_expansion = Some(n);
+                }
                 for col in &c.columns {
                     coll.declared.push(ColumnDef {
                         path: col.path.clone(),
@@ -1628,15 +1672,17 @@ impl Db {
                 // each piece names, which is the property a re-run loop over a
                 // cut predicate never had.
                 if !cut.is_empty() {
+                    let cap = self.catalog.get(&d.collection)?.prefix_cap();
                     return Err(Error::Plan(format!(
                         "DELETE refused and NOTHING was deleted: its predicate was CUT at \
-                         {PREFIX_EXPANSION_LIMIT} expanded terms, so the documents it selects \
-                         are not the documents it describes. A cut `a*` names only part of \
-                         what it matches; a cut `-a*` is a short EXCLUSION set, so the \
-                         statement would delete documents the predicate EXCLUDES — and a \
-                         delete cannot be taken back either way. Narrow the prefix until it \
-                         expands to at most {PREFIX_EXPANSION_LIMIT} terms and delete the \
-                         pieces, or delete by key; the same predicate as a SELECT shows what \
+                         {cap} expanded terms (this collection's prefix_expansion), so the \
+                         documents it selects are not the documents it describes. A cut `a*` \
+                         names only part of what it matches; a cut `-a*` is a short EXCLUSION \
+                         set, so the statement would delete documents the predicate EXCLUDES \
+                         — and a delete cannot be taken back either way. Narrow the prefix \
+                         until it expands to at most {cap} terms and delete the pieces, raise \
+                         the collection's prefix_expansion if its vocabulary fits under the \
+                         ceiling, or delete by key; the same predicate as a SELECT shows what \
                          was cut — {}",
                         cut.join("; ")
                     )));
@@ -1687,8 +1733,12 @@ impl Db {
                     self.absorb_shard_catalogs(&n)?;
                     let c = self.catalog.get(&n)?;
                     out.push_str(&format!(
-                        "collection {} (pk={}, partition_by={:?}, docs={})\n",
-                        c.name, c.primary_key, c.partition_key, c.doc_count
+                        "collection {} (pk={}, partition_by={:?}, docs={}, prefix_expansion={})\n",
+                        c.name,
+                        c.primary_key,
+                        c.partition_key,
+                        c.doc_count,
+                        c.prefix_cap()
                     ));
                     for i in &c.indexes {
                         // The tier belongs here, not only in `SHOW RESIDENCY`:
@@ -1744,6 +1794,14 @@ impl Db {
                     "index `{index}` moved {} -> {}",
                     from.name(),
                     tier.name()
+                )))
+            }
+            Statement::AlterCollection { collection, prefix_expansion } => {
+                let from = self.set_prefix_expansion(&collection, prefix_expansion)?;
+                Ok(Outcome::Ack(format!(
+                    "collection `{collection}` prefix_expansion {from} -> {prefix_expansion}; \
+                     its statements may now name {} distinct prefix(es)",
+                    prefix_leaves_limit(prefix_expansion)
                 )))
             }
             Statement::CreateLifecyclePolicy(d) => {
@@ -1809,6 +1867,42 @@ impl Db {
 
     /// Move one index to a tier by operator command. This restates the
     /// baseline, so a later access will not undo it.
+    /// Set how many dictionary terms a prefix on `collection` expands to, and
+    /// persist it. Refused outside `1..=PREFIX_EXPANSION_CEILING`; the leaf
+    /// budget its statements are held to follows from it, see
+    /// `prefix_leaves_limit`. Returns the cap that was in force. Takes effect
+    /// for the next statement: an expansion is resolved per statement and
+    /// never cached, and the budget is derived when the statement runs.
+    pub fn set_prefix_expansion(&mut self, collection: &str, cap: usize) -> Result<usize> {
+        check_prefix_cap(cap)?;
+        let c = self.catalog.get_mut(collection)?;
+        let before = c.prefix_expansion;
+        let from = c.prefix_cap();
+        c.prefix_expansion = Some(cap);
+        let coll = c.clone();
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                s.adopt_definition(coll.clone());
+            }
+        }
+        // As `set_index_tier`: a setting the disk did not take is not a
+        // setting, and leaving it in memory would let the next unrelated
+        // persist write it.
+        if let Err(e) = self.persist_catalog() {
+            if let Ok(c) = self.catalog.get_mut(collection) {
+                c.prefix_expansion = before;
+                let coll = c.clone();
+                if let Some(shards) = self.shards.get_mut(collection) {
+                    for s in shards.iter_mut() {
+                        s.adopt_definition(coll.clone());
+                    }
+                }
+            }
+            return Err(e);
+        }
+        Ok(from)
+    }
+
     pub fn set_index_tier(&mut self, collection: &str, index: &str, tier: Tier) -> Result<Tier> {
         let c = self.catalog.get_mut(collection)?;
         let Some(def) = c.indexes.iter_mut().find(|i| i.name == index) else {
@@ -2315,8 +2409,8 @@ impl Db {
         // liveness forever is not a trade worth making.
         let prefixes_by_path = exec::required_prefixes(&coll, sel);
         // One statement, one budget. Each DISTINCT prefix costs a dictionary
-        // walk in every unit of every shard plus up to `PREFIX_EXPANSION_LIMIT`
-        // gathered frequencies, and nothing in the grammar bounds how many of
+        // walk in every unit of every shard plus up to the collection's
+        // `prefix_expansion` gathered frequencies, and nothing in the grammar bounds how many of
         // them a `text_match` string may name — measured at 24 in one
         // statement for 1.0 s a query, with the aggregate expansion (12288
         // terms) so far over `STATS_TERM_CAP` that the statement evicts its own
@@ -2340,18 +2434,21 @@ impl Db {
         // leaves, costs one expansion, and is admitted — so an operator
         // counting the leaves in their own statement could not predict, or
         // meet, this refusal.
+        let cap = coll.prefix_cap();
+        let leaves = prefix_leaves_limit(cap);
         let distinct: usize = prefixes_by_path.values().map(|v| v.len()).sum();
-        if distinct > PREFIX_LEAVES_LIMIT {
+        if distinct > leaves {
             return Err(Error::Plan(format!(
                 "this statement names {distinct} distinct prefixes across its indexed paths \
-                 and the limit is {PREFIX_LEAVES_LIMIT}; each DISTINCT one expands against \
-                 every unit of every shard and gathers up to {PREFIX_EXPANSION_LIMIT} document \
-                 frequencies, which is the cost this bounds — {PREFIX_LEAVES_LIMIT} is how \
-                 many full-cap expansions fit the {STATS_TERM_CAP}-term statistics cache each \
-                 indexed path keeps. Repeats of one prefix on one path are expanded and \
-                 gathered once, which is what this limit counts; each occurrence is still \
-                 evaluated separately in every unit. Split the statement, or narrow the \
-                 prefixes."
+                 and the limit is {leaves}; each DISTINCT one expands against every unit of \
+                 every shard and gathers up to {cap} document frequencies (the collection's \
+                 prefix_expansion), which is the cost this bounds — {leaves} is how many \
+                 full-cap expansions fit the {STATS_TERM_CAP}-term statistics cache each \
+                 indexed path keeps, so the budget is {STATS_TERM_CAP} / prefix_expansion. \
+                 Repeats of one prefix on one path are expanded and gathered once, which is \
+                 what this limit counts; each occurrence is still evaluated separately in \
+                 every unit. Split the statement, narrow the prefixes, or lower the \
+                 collection's prefix_expansion."
             )));
         }
         // The same prune execution applies, applied to the EXPANSION too. A
@@ -2389,22 +2486,15 @@ impl Db {
                 // exists to refuse.
                 let mut union: BTreeSet<String> = BTreeSet::new();
                 for s in self.shards(&sel.collection)? {
-                    s.prefix_terms(
-                        &path,
-                        &p,
-                        ts,
-                        PREFIX_EXPANSION_LIMIT + 1,
-                        part.as_deref(),
-                        &mut union,
-                    )?;
+                    s.prefix_terms(&path, &p, ts, cap + 1, part.as_deref(), &mut union)?;
                 }
                 // Over LIVE terms, so it says the honest thing: the
                 // collection really does hold more than `cap` matching terms a
                 // visible document carries, and the answer really is short.
                 // Decided over the physical dictionary it fired on complete
                 // answers, which is a warning nobody could act on.
-                let truncated = union.len() > PREFIX_EXPANSION_LIMIT;
-                let terms: Vec<String> = union.into_iter().take(PREFIX_EXPANSION_LIMIT).collect();
+                let truncated = union.len() > cap;
+                let terms: Vec<String> = union.into_iter().take(cap).collect();
                 // The expanded terms join the statement's own terms, so the
                 // gather is still one pass per path over one deduplicated list.
                 //
@@ -2647,6 +2737,7 @@ mod tests {
     use super::*;
 
     use crate::shard::durability_probe::{self, Op};
+    use crate::text::scorer::PREFIX_EXPANSION_LIMIT;
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("celastro-engine-{tag}-{}", std::process::id()));
@@ -4127,13 +4218,14 @@ mod tests {
         // say so rather than answer less.
         let dir = tmp("prefix-leaf-budget");
         let mut db = cap_fixture(&dir, 64);
+        let budget = prefix_leaves_limit(PREFIX_EXPANSION_LIMIT);
         let q = |n: usize| {
             let leaves = (0..n).map(|i| format!("a{i:05}*")).collect::<Vec<_>>().join(" ");
             format!("SELECT id FROM notes WHERE text_match(body, '{leaves}') LIMIT 5")
         };
-        assert!(db.query(&q(PREFIX_LEAVES_LIMIT)).is_ok(), "the budget itself is admitted");
-        let e = db.query(&q(PREFIX_LEAVES_LIMIT + 1)).unwrap_err().to_string();
-        assert!(e.contains(&PREFIX_LEAVES_LIMIT.to_string()), "the bound, so it can be met: {e}");
+        assert!(db.query(&q(budget)).is_ok(), "the budget itself is admitted");
+        let e = db.query(&q(budget + 1)).unwrap_err().to_string();
+        assert!(e.contains(&budget.to_string()), "the bound, so it can be met: {e}");
 
         // What the bound COUNTS, and the message saying the same thing. The
         // budget is taken over distinct `(path, prefix)` pairs, because the
@@ -4182,7 +4274,7 @@ mod tests {
                  AND text_match(title, '{leaves}') LIMIT 5"
             )
         };
-        let half = PREFIX_LEAVES_LIMIT / 2;
+        let half = budget / 2;
         assert!(db2.query(&two(half)).is_ok(), "{half} on each of two paths is the budget");
         let e = db2.query(&two(half + 1)).unwrap_err().to_string();
         assert!(e.contains(&(2 * (half + 1)).to_string()), "the summed count: {e}");
@@ -4190,6 +4282,115 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// The expansion cap is a per-collection setting, and the leaf budget is
+    /// derived from it. Each leg names the mutation that fails it: the union
+    /// cut still reading the constant (600 terms at a cap of 1024 come back as
+    /// 512); the budget still reading the constant (five prefixes admitted at
+    /// 1024, where four is the budget); the ceiling unchecked (4097 accepted);
+    /// the setting not persisted (a reopen answers 512 again); the export not
+    /// carrying it (the copy answers 512); the DELETE refusal naming the
+    /// constant rather than the cap; and CREATE ignoring its option.
+    #[test]
+    fn a_collection_can_raise_its_prefix_expansion_and_pays_with_its_leaf_budget() {
+        fn ack(db: &mut Db, sql: &str) -> String {
+            match db.execute(sql).unwrap() {
+                Outcome::Ack(m) => m,
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+        let dir = tmp("prefix-cap-dial");
+        // ONE unit, so that the per-unit ask is observable: spread over three,
+        // each unit holds 200 terms and answers all of them whether it was
+        // asked for `cap + 1` or for `512 + 1`, and a coordinator still asking
+        // every unit for the default would pass. In one unit the raised cap
+        // has to reach the ask, or 600 terms come back as 513.
+        let mut db = cap_fixture_in(&dir, 600, 1);
+        let wide = "SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 1000";
+        let r = db.query(wide).unwrap();
+        assert_eq!(r.rows.len(), PREFIX_EXPANSION_LIMIT, "the default cap cuts 600 to 512");
+        assert!(!r.truncated_prefixes.is_empty(), "and says so");
+        assert!(ack(&mut db, "SHOW CATALOG notes").contains("prefix_expansion=512"));
+
+        let m = ack(&mut db, "ALTER COLLECTION notes SET (prefix_expansion = 1024)");
+        assert!(m.contains("512 -> 1024") && m.contains("4 distinct"), "{m}");
+        let r = db.query(wide).unwrap();
+        assert_eq!(r.rows.len(), 600, "the whole vocabulary fits the raised cap");
+        assert!(r.truncated_prefixes.is_empty(), "so nothing was cut: {:?}", r.truncated_prefixes);
+
+        // The budget followed the cap down: 4096 / 1024.
+        let q = |n: usize| {
+            let leaves = (0..n).map(|i| format!("a{i:05}*")).collect::<Vec<_>>().join(" ");
+            format!("SELECT id FROM notes WHERE text_match(body, '{leaves}') LIMIT 5")
+        };
+        assert!(db.query(&q(4)).is_ok(), "four is the budget at 1024");
+        let e = db.query(&q(5)).unwrap_err().to_string();
+        assert!(e.contains("limit is 4") && e.contains("1024"), "the budget and the cap: {e}");
+
+        // The ceiling is the cache, and a refusal changes nothing.
+        for bad in [0usize, PREFIX_EXPANSION_CEILING + 1] {
+            let e = db
+                .execute(&format!("ALTER COLLECTION notes SET (prefix_expansion = {bad})"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&PREFIX_EXPANSION_CEILING.to_string()), "{bad}: {e}");
+        }
+        assert!(ack(&mut db, "SHOW CATALOG notes").contains("prefix_expansion=1024"));
+        ack(&mut db, "ALTER COLLECTION notes SET (prefix_expansion = 4096)");
+        assert!(db.query(&q(1)).is_ok(), "one full expansion is exactly the cache");
+        assert!(db.query(&q(2)).is_err(), "and two do not fit it");
+
+        // A DELETE's refusal names the cap in force, not the constant.
+        ack(&mut db, "ALTER COLLECTION notes SET (prefix_expansion = 256)");
+        let e =
+            db.execute("DELETE FROM notes WHERE text_match(body, 'a*')").unwrap_err().to_string();
+        assert!(e.contains("CUT at 256"), "{e}");
+        assert_eq!(db.query(wide).unwrap().rows.len(), 256, "a lowered cap cuts where it says");
+
+        // Persisted: the setting is what the next open reads.
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert!(ack(&mut db, "SHOW CATALOG notes").contains("prefix_expansion=256"));
+        assert_eq!(db.query(wide).unwrap().rows.len(), 256);
+
+        // Carried by an export, so the copy answers as its source does.
+        let exported = tmp("prefix-cap-export");
+        db.export_collection("notes").unwrap().write_to(&exported).unwrap();
+        let dst_dir = tmp("prefix-cap-import");
+        let mut dst = Db::open(&dst_dir, DbOpts::default()).unwrap();
+        dst.import_collection(&exported).unwrap();
+        assert!(ack(&mut dst, "SHOW CATALOG notes").contains("prefix_expansion=256"));
+        assert_eq!(dst.query(wide).unwrap().rows.len(), 256);
+        // An export claiming a cap this build's cache cannot hold is refused
+        // at import, before anything is adopted. Written by hand, because no
+        // build with this ceiling can write one.
+        let mut over = db.export_collection("notes").unwrap();
+        over.catalog.collections.get_mut("notes").unwrap().prefix_expansion = Some(5000);
+        let over_dir = tmp("prefix-cap-export-over");
+        over.write_to(&over_dir).unwrap();
+        let mut third = Db::open(&tmp("prefix-cap-import-over"), DbOpts::default()).unwrap();
+        let e = third.import_collection(&over_dir).unwrap_err().to_string();
+        assert!(e.contains("4096") && e.contains("5000"), "{e}");
+        assert!(third.execute("SHOW CATALOG notes").is_err(), "and nothing was adopted");
+
+        // And at creation, with the same check.
+        let m = ack(
+            &mut dst,
+            "CREATE COLLECTION wide (id TEXT PRIMARY KEY) WITH (prefix_expansion = 2048)",
+        );
+        assert!(m.contains("created"), "{m}");
+        assert!(ack(&mut dst, "SHOW CATALOG wide").contains("prefix_expansion=2048"));
+        let e = dst
+            .execute("CREATE COLLECTION wider (id TEXT PRIMARY KEY) WITH (prefix_expansion = 5000)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("4096"), "{e}");
+        assert!(dst.execute("SHOW CATALOG wider").is_err(), "a refused CREATE created nothing");
+
+        for d in [&dir, &exported, &dst_dir, &over_dir, &tmp("prefix-cap-import-over")] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     #[test]

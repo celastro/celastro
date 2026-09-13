@@ -305,7 +305,7 @@ pub fn required_prefixes(
     let mut out: BTreeMap<String, BTreeMap<String, PrefixUse>> = BTreeMap::new();
     let mut add = |path: &str, q: &str, sql_negated: bool| {
         // As in [`required_terms`], and for the same reason. It also takes an
-        // unindexed path out of the `PREFIX_LEAVES_LIMIT` count, which is
+        // unindexed path out of the prefix-leaf budget's count, which is
         // right: that bound counts expansions that will be PAID for, and a
         // prefix on a path with no dictionary to walk costs nothing before the
         // statement fails.

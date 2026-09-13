@@ -38,6 +38,12 @@ pub enum Statement {
         index: String,
         tier: Tier,
     },
+    /// `ALTER COLLECTION <name> SET (prefix_expansion = N)` — set how many
+    /// dictionary terms a prefix on the collection expands to.
+    AlterCollection {
+        collection: String,
+        prefix_expansion: usize,
+    },
     CreateLifecyclePolicy(LifecycleDecl),
     DropLifecyclePolicy {
         name: String,
@@ -86,6 +92,9 @@ pub struct CreateCollection {
     /// multi-shard
     /// collection is created today.
     pub splits: Vec<String>,
+    /// `WITH (prefix_expansion = N)`: how many dictionary terms a prefix on
+    /// the collection expands to, or `None` for the engine's default.
+    pub prefix_expansion: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

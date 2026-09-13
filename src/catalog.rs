@@ -30,7 +30,13 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 2;
+const CATALOG_VERSION: u8 = 3;
+/// The oldest format this build reads. Version 3 differs from 2 only by the
+/// per-collection prefix expansion cap, appended after each collection's path
+/// statistics, so a 2 is read as a 3 whose every collection is at the default
+/// and nothing else moves. Version 1 is refused: its tier bytes name different
+/// tiers.
+const CATALOG_VERSION_OLDEST: u8 = 2;
 
 /// How a path behaves across the collection. Drives shredding eligibility and
 /// predicate semantics, not storage layout directly — shredding is a physical,
@@ -291,6 +297,14 @@ pub struct Collection {
     /// Inferred, aggregated from per-segment statistics.
     pub paths: BTreeMap<String, PathStats>,
     pub doc_count: u64,
+    /// How many dictionary terms a prefix on this collection expands to, or
+    /// `None` for the default, `PREFIX_EXPANSION_LIMIT`. Set by
+    /// `CREATE COLLECTION ... WITH (prefix_expansion = N)` and
+    /// `ALTER COLLECTION ... SET (prefix_expansion = N)`. The engine bounds it
+    /// by its statistics cache, which is why the bound is not enforced here.
+    /// Travels with an export, so a copy answers a prefix the way its source
+    /// does.
+    pub prefix_expansion: Option<usize>,
 }
 
 impl Collection {
@@ -303,7 +317,14 @@ impl Collection {
             indexes: Vec::new(),
             paths: BTreeMap::new(),
             doc_count: 0,
+            prefix_expansion: None,
         }
+    }
+
+    /// The prefix expansion cap in force: the collection's own, or the
+    /// default.
+    pub fn prefix_cap(&self) -> usize {
+        self.prefix_expansion.unwrap_or(crate::text::scorer::PREFIX_EXPANSION_LIMIT)
     }
 
     pub fn declared_type(&self, path: &str) -> Option<ValueType> {
@@ -542,12 +563,21 @@ impl Catalog {
     /// intact. The manifest has done it this way from the start; the catalog
     /// now does too.
     pub fn encode(&self) -> Vec<u8> {
-        let mut body = self.encode_body();
+        self.encode_as(CATALOG_VERSION)
+    }
+
+    /// The catalog laid out as a given format version writes it. Only the
+    /// current version is ever written; the older layout is produced here so
+    /// the read path for it is tested against bytes shaped the way an older
+    /// build shaped them, not against a current body with its version byte
+    /// changed.
+    fn encode_as(&self, format: u8) -> Vec<u8> {
+        let mut body = self.encode_body(format);
         let crc = crc32(&body);
         put_u32(&mut body, crc);
         let mut out = Vec::with_capacity(body.len() + 5);
         out.extend_from_slice(CATALOG_MAGIC);
-        out.push(CATALOG_VERSION);
+        out.push(format);
         out.extend_from_slice(&body);
         out
     }
@@ -557,8 +587,8 @@ impl Catalog {
             return Err(Error::Storage("catalog: not a celastro catalog (bad magic)".into()));
         }
         let v = b[4];
-        if v != CATALOG_VERSION {
-            let why = if v < CATALOG_VERSION {
+        if !(CATALOG_VERSION_OLDEST..=CATALOG_VERSION).contains(&v) {
+            let why = if v < CATALOG_VERSION_OLDEST {
                 "; its tier bytes name different tiers in this build, so reading it would \
                  shift every index one rung up the ladder"
             } else {
@@ -566,7 +596,7 @@ impl Catalog {
             };
             return Err(Error::Storage(format!(
                 "catalog format version {v} is not readable by this build (expected \
-                 {CATALOG_VERSION}){why}"
+                 {CATALOG_VERSION_OLDEST} to {CATALOG_VERSION}){why}"
             )));
         }
         let rest = &b[5..];
@@ -574,10 +604,10 @@ impl Catalog {
         if crc32(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
             return Err(Error::Storage("catalog: checksum mismatch".into()));
         }
-        Catalog::decode_body(body)
+        Catalog::decode_body(body, v)
     }
 
-    fn encode_body(&self) -> Vec<u8> {
+    fn encode_body(&self, format: u8) -> Vec<u8> {
         let mut out = Vec::new();
         put_uvarint(&mut out, self.version);
         put_uvarint(&mut out, self.collections.len() as u64);
@@ -628,13 +658,18 @@ impl Catalog {
                 }
                 out.extend_from_slice(&s.hll.regs);
             }
+            // Version 3 appends the cap; zero is "unset", which is why the
+            // setting itself can never be zero.
+            if format >= 3 {
+                put_uvarint(&mut out, c.prefix_expansion.unwrap_or(0) as u64);
+            }
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
         crate::lifecycle::encode_activity(&self.activity, &mut out);
         out
     }
 
-    fn decode_body(b: &[u8]) -> Result<Catalog> {
+    fn decode_body(b: &[u8], format: u8) -> Result<Catalog> {
         let bad = || Error::Storage("catalog: truncated".into());
         let mut i = 0usize;
         let version = get_uvarint(b, &mut i).ok_or_else(bad)?;
@@ -715,6 +750,10 @@ impl Catalog {
                 i += HLL_M;
                 st.hll.regs.copy_from_slice(regs);
                 c.paths.insert(path, st);
+            }
+            if format >= 3 {
+                let cap = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                c.prefix_expansion = if cap == 0 { None } else { Some(cap) };
             }
             collections.insert(name, c);
         }
@@ -806,6 +845,7 @@ mod tests {
             crate::residency::Tier::Cached,
         ));
         c.observe_doc(&json::parse(r#"{"id":"a","tenant_id":"t1"}"#).unwrap());
+        c.prefix_expansion = Some(2048);
         cat.create(c).unwrap();
         let back = Catalog::decode(&cat.encode()).unwrap();
         let a = back.get("articles").unwrap();
@@ -813,6 +853,61 @@ mod tests {
         assert_eq!(a.indexes[0].tier, crate::residency::Tier::Cached, "tier survives a reopen");
         assert_eq!(a.vector_dims("embedding"), Some(8));
         assert_eq!(a.doc_count, 1);
+        assert_eq!(a.prefix_expansion, Some(2048), "the prefix cap survives a reopen");
+    }
+
+    /// A catalog written by a 0.14 build has no cap field: it is read at the
+    /// default, with everything that follows the collections -- policies and
+    /// activity -- still found where the older layout put them. The bytes are
+    /// laid out by the version-2 writer, not by the current one with a
+    /// changed version byte, because the difference between the two IS the
+    /// field this test is about. The far side is pinned too: a version this
+    /// build does not know is refused naming the range it reads, and version
+    /// 1 still gets the reason it is refused.
+    #[test]
+    fn a_version_2_catalog_is_read_with_every_collection_at_the_default_cap() {
+        let mut cat = Catalog::default();
+        let mut c = Collection::new("articles", "id", None);
+        c.indexes.push(IndexDef::new(
+            "articles_body",
+            "body",
+            IndexKind::FullText { analyzer: "english".into() },
+            crate::residency::Tier::Active,
+        ));
+        c.observe_doc(&json::parse(r#"{"id":"a","body":"x"}"#).unwrap());
+        c.prefix_expansion = Some(1024);
+        cat.create(c).unwrap();
+        cat.activity.insert(
+            ("articles".into(), "articles_body".into()),
+            crate::lifecycle::IndexActivity::new(7),
+        );
+
+        let old = cat.encode_as(2);
+        assert_eq!(old[4], 2);
+        let back = Catalog::decode(&old).unwrap();
+        let a = back.get("articles").unwrap();
+        assert_eq!(a.prefix_expansion, None, "no field, so the default");
+        assert_eq!(a.prefix_cap(), crate::text::scorer::PREFIX_EXPANSION_LIMIT);
+        assert_eq!(a.doc_count, 1, "and the rest of the collection is intact");
+        assert_eq!(a.indexes.len(), 1);
+        assert!(
+            back.activity.contains_key(&("articles".into(), "articles_body".into())),
+            "what follows the collections is found where the old layout put it"
+        );
+        assert_eq!(
+            Catalog::decode(&cat.encode()).unwrap().get("articles").unwrap().prefix_expansion,
+            Some(1024),
+            "the current layout carries the setting"
+        );
+
+        let mut future = cat.encode();
+        future[4] = CATALOG_VERSION + 1;
+        let e = Catalog::decode(&future).unwrap_err().to_string();
+        assert!(e.contains("not readable") && e.contains("expected 2 to 3"), "{e}");
+        let mut ancient = cat.encode();
+        ancient[4] = 1;
+        let e = Catalog::decode(&ancient).unwrap_err().to_string();
+        assert!(e.contains("tier bytes"), "version 1 is refused for its own reason: {e}");
     }
 
     /// A path declared twice is not a harmless repetition. With disagreeing

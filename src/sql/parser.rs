@@ -175,7 +175,37 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_kw("ALTER") {
-            self.expect_kw("INDEX")?;
+            if self.eat_kw("COLLECTION") {
+                let collection = self.ident()?;
+                self.expect_kw("SET")?;
+                let mut prefix_expansion = None;
+                for (key, v) in self.option_list()? {
+                    match key.as_str() {
+                        "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
+                        "splits" => {
+                            return Err(Error::Sql(
+                                "splits are fixed when the collection is created and cannot \
+                                 be altered"
+                                    .into(),
+                            ))
+                        }
+                        other => {
+                            return Err(Error::Sql(format!("unknown collection option `{other}`")))
+                        }
+                    }
+                }
+                let Some(prefix_expansion) = prefix_expansion else {
+                    return Err(Error::Sql(
+                        "ALTER COLLECTION ... SET names no option; the one it takes is \
+                         prefix_expansion"
+                            .into(),
+                    ));
+                };
+                return Ok(Statement::AlterCollection { collection, prefix_expansion });
+            }
+            if !self.eat_kw("INDEX") {
+                return Err(Error::Sql("expected COLLECTION or INDEX after ALTER".into()));
+            }
             let index = self.ident()?;
             self.expect_kw("ON")?;
             let collection = self.ident()?;
@@ -326,13 +356,10 @@ impl<'a> Parser<'a> {
             }
         }
         let mut splits = Vec::new();
+        let mut prefix_expansion = None;
         if self.eat_kw("WITH") {
-            self.expect_punct("(")?;
-            loop {
-                let key = self.ident()?;
-                self.expect_punct("=")?;
-                let v = self.literal()?;
-                match key.to_ascii_lowercase().as_str() {
+            for (key, v) in self.option_list()? {
+                match key.as_str() {
                     "splits" => {
                         splits = v
                             .as_array()
@@ -344,17 +371,37 @@ impl<'a> Parser<'a> {
                             })
                             .collect()
                     }
+                    "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
                     other => {
                         return Err(Error::Sql(format!("unknown collection option `{other}`")))
                     }
                 }
-                if !self.eat_punct(",") {
-                    break;
-                }
             }
-            self.expect_punct(")")?;
         }
-        Ok(Statement::CreateCollection(CreateCollection { name, columns, partition_by, splits }))
+        Ok(Statement::CreateCollection(CreateCollection {
+            name,
+            columns,
+            partition_by,
+            splits,
+            prefix_expansion,
+        }))
+    }
+
+    /// `( key = literal, ... )`: the option list `CREATE COLLECTION ... WITH`
+    /// and `ALTER COLLECTION ... SET` share. Keys come back lower-cased.
+    fn option_list(&mut self) -> Result<Vec<(String, Value)>> {
+        self.expect_punct("(")?;
+        let mut out = Vec::new();
+        loop {
+            let key = self.ident()?.to_ascii_lowercase();
+            self.expect_punct("=")?;
+            out.push((key, self.literal()?));
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct(")")?;
+        Ok(out)
     }
 
     fn type_name(&mut self) -> Result<ValueType> {
@@ -1171,6 +1218,15 @@ fn count_option(key: &str, val: Option<Value>) -> Result<u64> {
     }
 }
 
+/// `prefix_expansion`, for `CREATE COLLECTION ... WITH` and `ALTER COLLECTION
+/// ... SET`: a count, as the other integer options are. Whether the engine can
+/// honour it is the engine's decision, because the bound is its cache and not
+/// the grammar's.
+fn cap_option(key: &str, v: Value) -> Result<usize> {
+    let n = count_option(key, Some(v))?;
+    usize::try_from(n).map_err(|_| Error::Sql(format!("`{key}` is out of range")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,5 +1557,50 @@ mod tests {
         ));
         assert!(parse("SELECT id FROM notes WHERE embedding <=> [1, 0] < 'near'", &[]).is_err());
         assert!(parse("SELECT id FROM notes WHERE embedding <=> [1, 0] IN (0)", &[]).is_err());
+    }
+
+    /// The one dial a collection has after creation, spelled the way its
+    /// creation options are: `ALTER COLLECTION ... SET (key = value)`. What is
+    /// pinned is the grammar's half of the contract -- the number reaches the
+    /// engine as a count, the splits cannot be re-set through this door, and
+    /// an option that is not a count is refused here rather than as a zero.
+    #[test]
+    fn a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later() {
+        match parse("ALTER COLLECTION notes SET (prefix_expansion = 2048)", &[]).unwrap() {
+            Statement::AlterCollection { collection, prefix_expansion } => {
+                assert_eq!(collection, "notes");
+                assert_eq!(prefix_expansion, 2048);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY) \
+             WITH (splits = ['m'], PREFIX_EXPANSION = 1024)",
+            &[],
+        )
+        .unwrap()
+        {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.splits, vec!["m".to_string()], "the other option still parses");
+                assert_eq!(c.prefix_expansion, Some(1024), "and the key is case-insensitive");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("CREATE COLLECTION notes (id TEXT PRIMARY KEY)", &[]).unwrap() {
+            Statement::CreateCollection(c) => assert_eq!(c.prefix_expansion, None),
+            other => panic!("{other:?}"),
+        }
+        for (sql, why) in [
+            ("ALTER COLLECTION notes SET (splits = ['m'])", "splits"),
+            ("ALTER COLLECTION notes SET (prefix_expansion = 'wide')", "non-negative integer"),
+            ("ALTER COLLECTION notes SET (prefix_expansion = 1.5)", "non-negative integer"),
+            ("ALTER COLLECTION notes SET (colour = 1)", "unknown collection option"),
+            ("ALTER COLLECTION notes SET ()", "expected"),
+            ("ALTER TABLE notes SET (prefix_expansion = 1)", "COLLECTION or INDEX"),
+            ("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (prefix_expansion = -1)", ""),
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
     }
 }

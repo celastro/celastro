@@ -124,6 +124,21 @@ Query plan  (snapshot ts=7328898005345050624, limit=3, k'=100)
   total: 0.04 ms
 ```
 
+A prefix such as `text_match(body, 'comp*')` names the first 512 matching
+dictionary terms, and a query whose prefix matched more says so with a
+`TRUNCATED` line. That cap is a per-collection setting:
+
+```sql
+ALTER COLLECTION notes SET (prefix_expansion = 2048);
+```
+
+It is a trade rather than a free win. The work is one posting cursor per
+expanded term in every segment, so a wide prefix at 2048 costs roughly seven
+times what it costs at 512 while the recall it buys grows sub-linearly; and a
+statement may name at most `4096 / prefix_expansion` distinct prefixes, eight
+at the default and two at 2048, because 4096 is the size of the statistics
+cache each indexed path keeps and is also the ceiling.
+
 `celastro-cli demo` builds a 400-document corpus across three shards and walks
 through the same ideas at a size where the plan has choices to make. It runs in
 memory and needs nothing.
