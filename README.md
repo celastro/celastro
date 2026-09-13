@@ -139,6 +139,17 @@ statement may name at most `4096 / prefix_expansion` distinct prefixes, eight
 at the default and two at 2048, because 4096 is the size of the statistics
 cache each indexed path keeps and is also the ceiling.
 
+A `DELETE` whose `text_match` prefix was cut is refused and nothing is
+deleted, because a cut predicate selects documents other than the ones it
+describes. There is no flag to run it anyway. Delete by key, raise the
+collection's `prefix_expansion` if its vocabulary fits under the ceiling, or
+spell the prefix as narrower pieces, each of which deletes exactly what it
+names.
+
+Two limits a document can meet: nesting deeper than 128 containers is refused
+on the way in, and a field whose name contains a dot is unreachable by a path
+expression, because `a.b` always means the nested path. Both refusals say so.
+
 `celastro-cli demo` builds a 400-document corpus across three shards and walks
 through the same ideas at a size where the plan has choices to make. It runs in
 memory and needs nothing.

@@ -477,7 +477,10 @@ impl Collection {
             }
             if let Some(Value::Str(s)) = doc.path(&c.path) {
                 if let Some(m) = crate::time::parse_iso8601(s) {
-                    doc.set_path(&c.path, Value::Timestamp(m));
+                    // Cannot be refused: the path already holds a string in a
+                    // document that was parsed under the same depth bound, and
+                    // a scalar replacing a scalar deepens nothing.
+                    let _ = doc.set_path(&c.path, Value::Timestamp(m));
                 }
             }
         }

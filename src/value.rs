@@ -9,6 +9,20 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use crate::error::{Error, Result};
+
+/// The deepest nesting a value may have, counted as containers enclosing a
+/// value: a scalar may sit inside at most `MAX_DEPTH - 1` of them, so a value
+/// holds at most `MAX_DEPTH - 1` nested containers with something in the
+/// innermost. One bound in one place for every door a value comes through --
+/// `json::parse` on the way in, `variant::decode` on the way back from disk,
+/// and [`Value::set_path`] for a value built in memory -- because a value one
+/// door admits and another refuses is a value that encodes and then cannot be
+/// read back. The parser and the writers are recursive, so without a bound an
+/// input like `"[".repeat(200_000)` overflows the stack and aborts the
+/// process, which no `Result` and no `catch_unwind` can contain.
+pub const MAX_DEPTH: usize = 128;
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -150,7 +164,38 @@ impl Value {
         Some(cur)
     }
 
-    pub fn set_path(&mut self, path: &str, v: Value) {
+    /// Set the value at a dotted path, creating the objects along it.
+    ///
+    /// Refused when the result would nest deeper than [`MAX_DEPTH`]: the path's
+    /// segments each add a container, and the value brings its own. Nothing
+    /// is changed by a refusal. This is the one door into a value that is not
+    /// a parse, and it used to be the one that could build a value the
+    /// encoder accepted and the decoder refused -- a document that was written
+    /// and then could not be read.
+    pub fn set_path(&mut self, path: &str, v: Value) -> Result<()> {
+        let segments = path.split('.').count();
+        let depth = segments + v.depth();
+        if depth >= MAX_DEPTH {
+            return Err(Error::Schema(format!(
+                "nesting deeper than {MAX_DEPTH}: setting `{path}` would put a value inside \
+                 {depth} containers"
+            )));
+        }
+        self.set_path_unchecked(path, v);
+        Ok(())
+    }
+
+    /// Containers on the longest path from this value down to a leaf: a scalar
+    /// is 0, an empty container 1.
+    pub fn depth(&self) -> usize {
+        match self {
+            Value::Array(a) => 1 + a.iter().map(Value::depth).max().unwrap_or(0),
+            Value::Object(o) => 1 + o.iter().map(|(_, v)| v.depth()).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn set_path_unchecked(&mut self, path: &str, v: Value) {
         let (head, rest) = match path.split_once('.') {
             Some((h, r)) => (h, Some(r)),
             None => (path, None),
@@ -168,7 +213,7 @@ impl Value {
         };
         match rest {
             None => fields[idx].1 = v,
-            Some(r) => fields[idx].1.set_path(r, v),
+            Some(r) => fields[idx].1.set_path_unchecked(r, v),
         }
     }
 
@@ -340,6 +385,49 @@ mod tests {
 
     fn obj(fields: &[(&str, Value)]) -> Value {
         Value::obj(fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    /// The bound `json::parse` applies is the bound `set_path` applies, and
+    /// both are the one `variant::decode` reads back: the deepest value the
+    /// parser admits also round-trips through the encoder, and one level past
+    /// it is refused at `set_path` rather than after the write. The value's
+    /// own depth counts too, or a shallow path carrying a deep value would be
+    /// the same hole one step over.
+    #[test]
+    fn set_path_refuses_what_the_decoder_could_not_read_back() {
+        let deepest = (0..MAX_DEPTH - 1).map(|_| "a").collect::<Vec<_>>().join(".");
+        let mut v = Value::Null;
+        v.set_path(&deepest, Value::Int(1)).unwrap();
+        assert_eq!(v.depth(), MAX_DEPTH - 1);
+        let bytes = crate::variant::encode_to_vec(&v);
+        let back = crate::variant::decode(&bytes, &mut 0).unwrap();
+        assert_eq!(
+            back.path(&deepest),
+            Some(&Value::Int(1)),
+            "the deepest admitted value reads back"
+        );
+        let rendered = crate::json::to_string(&v);
+        assert_eq!(crate::json::parse(&rendered).unwrap().depth(), v.depth(), "and parses back");
+
+        let one_more = format!("{deepest}.a");
+        let mut w = Value::Null;
+        let e = w.set_path(&one_more, Value::Int(1)).unwrap_err().to_string();
+        assert!(e.contains("nesting deeper than"), "{e}");
+        assert!(matches!(w, Value::Null), "a refusal changes nothing");
+        assert!(
+            crate::json::parse(&format!("{{\"x\":{}}}", rendered)).is_err(),
+            "as the parser refuses it"
+        );
+
+        let mut deep = Value::Null;
+        let mut nested = Value::Int(1);
+        for _ in 0..MAX_DEPTH - 2 {
+            nested = Value::Array(vec![nested]);
+        }
+        assert_eq!(nested.depth(), MAX_DEPTH - 2);
+        deep.set_path("a", nested.clone()).unwrap();
+        let e = deep.set_path("a.b", nested).unwrap_err().to_string();
+        assert!(e.contains("nesting deeper than"), "the value's own depth counts: {e}");
     }
 
     #[test]

@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`Value::set_path` is fallible** and refuses a value that would nest deeper
+than 128, the bound `json::parse` and the variant decoder already apply; the
+constant is `value::MAX_DEPTH` and `Value::depth()` reports a value's
+nesting. Before this, a value built in memory past the limit encoded and then
+could not be decoded. The refusal for a quoted identifier containing a dot
+now says that such a field is unreachable, and the README records both
+limits and that a cut `DELETE` has no opt-in by decision.
+
 ## 0.15.0 — 2026-09-13
 
 A new capability and a catalog format step with a compatible read path,

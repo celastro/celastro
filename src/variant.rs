@@ -66,15 +66,13 @@ pub fn encode_to_vec(v: &Value) -> Vec<u8> {
     out
 }
 
-/// How deeply a stored document may nest.
-///
-/// `decode`, `skip` and `decode_path_at` recurse once per level on bytes read
-/// off disk, so without a bound a corrupt or hostile blob overflows the stack
-/// — and a stack overflow is an abort, not a panic, so no `Result` and no
-/// `catch_unwind` can contain it. The limit is the one `json.rs` already
-/// applies to every document parsed in and to every document rendered out, so
-/// it refuses only blobs no supported write path could have produced.
-const MAX_DEPTH: usize = 128;
+// `decode`, `skip` and `decode_path_at` recurse once per level on bytes read
+// off disk, so without a bound a corrupt or hostile blob overflows the stack
+// — and a stack overflow is an abort, not a panic, so no `Result` and no
+// `catch_unwind` can contain it. The limit is the one every write path
+// applies -- `json::parse` on the way in, `Value::set_path` in memory -- so
+// it refuses only blobs no supported write path could have produced.
+use crate::value::MAX_DEPTH;
 
 pub fn decode(b: &[u8], i: &mut usize) -> Result<Value> {
     decode_at(b, i, 0)

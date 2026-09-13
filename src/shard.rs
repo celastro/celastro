@@ -2919,7 +2919,7 @@ mod tests {
 
         // An update supersedes rather than duplicating.
         let mut d = doc(1);
-        d.set_path("body", Value::Str("rewritten".into()));
+        d.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(d).unwrap();
         let t2 = s.clock.peek();
         assert_eq!(s.num_docs(t2), 50);
@@ -2993,7 +2993,7 @@ mod tests {
         let horizon = s.clock.peek();
         s.delete(&key).unwrap();
         let mut updated = doc(7);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
         s.opts.gc_horizon = horizon;
         s.flush().unwrap();
@@ -3065,7 +3065,7 @@ mod tests {
             s.insert(doc(i)).unwrap();
         }
         let mut updated = doc(1);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
         assert_eq!(s.opts.gc_horizon, 0, "nothing is pinned");
         let terms = ["document".to_string()];
@@ -3129,7 +3129,7 @@ mod tests {
                 1 if !live.is_empty() => {
                     let k = live[rng.next_u64() as usize % live.len()];
                     let mut d = doc(k);
-                    d.set_path("body", Value::Str("rewritten ".repeat(1 + k % 4)));
+                    d.set_path("body", Value::Str("rewritten ".repeat(1 + k % 4))).unwrap();
                     s.insert(d).unwrap();
                     nupd += 1;
                 }
@@ -3262,7 +3262,7 @@ mod tests {
         // Superseded after the pin, so the seal has to emit one segment per
         // version: two.
         let mut updated = doc(7);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
 
         // Ids ascend in write order, so this is the second file the flush
@@ -3355,7 +3355,7 @@ mod tests {
             s.insert(doc(i)).unwrap();
         }
         let mut updated = doc(7);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
         s.flush().unwrap();
         let t = s.clock.peek();
@@ -3381,7 +3381,7 @@ mod tests {
         let horizon = s.clock.peek();
         s.opts.gc_horizon = horizon;
         let mut updated = doc(7);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
 
         let key = format!("t1{KEY_SEP}d0007");
@@ -3443,7 +3443,7 @@ mod tests {
             s.insert(doc(i)).unwrap();
         }
         let mut updated = doc(7);
-        updated.set_path("body", Value::Str("rewritten".into()));
+        updated.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(updated).unwrap();
         s.delete(&format!("t1{KEY_SEP}d0007")).unwrap();
         s.flush().unwrap();
@@ -3461,7 +3461,7 @@ mod tests {
         let before = s.num_docs(s.clock.peek());
         // `emb` is declared with 4 dimensions.
         let mut bad = doc(3);
-        bad.set_path("emb", crate::json::parse("[1.0,2.0,3.0]").unwrap());
+        bad.set_path("emb", crate::json::parse("[1.0,2.0,3.0]").unwrap()).unwrap();
         let e = s.insert(bad).unwrap_err().to_string();
         assert!(e.contains("dimensions"), "{e}");
         assert_eq!(s.num_docs(s.clock.peek()), before, "a failed write must change nothing");
@@ -3476,7 +3476,7 @@ mod tests {
     fn a_non_finite_vector_is_refused_rather_than_poisoning_a_segment() {
         let mut s = shard();
         let mut bad = doc(0);
-        bad.set_path("emb", crate::json::parse("[1e40, 1.0, 1.0, 1.0]").unwrap());
+        bad.set_path("emb", crate::json::parse("[1e40, 1.0, 1.0, 1.0]").unwrap()).unwrap();
         let e = s.insert(bad).unwrap_err().to_string();
         assert!(e.contains("non-finite"), "{e}");
     }
@@ -3538,7 +3538,7 @@ mod tests {
             horizon = s.clock.peek();
             for i in 0..4 {
                 let mut d = doc(i);
-                d.set_path("body", Value::Str(format!("rewritten {i}")));
+                d.set_path("body", Value::Str(format!("rewritten {i}"))).unwrap();
                 s.insert(d).unwrap();
             }
             s.wal.as_mut().unwrap().sync().unwrap();
@@ -3837,7 +3837,7 @@ mod tests {
             // pin, so the seal emits one layer per version.
             for v in 0..6 {
                 let mut d = doc(3);
-                d.set_path("body", Value::Str(format!("vector revision {v}")));
+                d.set_path("body", Value::Str(format!("vector revision {v}"))).unwrap();
                 s.insert(d).unwrap();
             }
             if pin {
@@ -3895,7 +3895,7 @@ mod tests {
             s.opts.gc_horizon = s.clock.peek();
             for v in 0..6 {
                 let mut d = doc(3);
-                d.set_path("body", Value::Str(format!("vector revision {v}")));
+                d.set_path("body", Value::Str(format!("vector revision {v}"))).unwrap();
                 s.insert(d).unwrap();
             }
             s.flush().unwrap();
@@ -4222,7 +4222,7 @@ mod tests {
         s.insert(doc(1)).unwrap();
 
         let mut second = doc(1);
-        second.set_path("body", Value::Str("rewritten".into()));
+        second.set_path("body", Value::Str("rewritten".into())).unwrap();
         durability_probe::start();
         s.insert(second).unwrap();
         let ev = durability_probe::take();
@@ -4281,7 +4281,7 @@ mod tests {
         let count = s.num_docs(MAX_TS);
 
         let mut second = doc(1);
-        second.set_path("body", Value::Str("rewritten".into()));
+        second.set_path("body", Value::Str("rewritten".into())).unwrap();
         durability_probe::start();
         durability_probe::fail_next(Op::WalSync, &log);
         let e = s.insert(second).unwrap_err();
@@ -4326,7 +4326,7 @@ mod tests {
         // And the arming is one shot, so this is the control: the same insert
         // with nothing armed goes through.
         let mut third = doc(1);
-        third.set_path("body", Value::Str("rewritten".into()));
+        third.set_path("body", Value::Str("rewritten".into())).unwrap();
         s.insert(third).unwrap();
         assert_ne!(s.get(&key, MAX_TS).unwrap().unwrap(), before);
         let _ = fs::remove_dir_all(&dir);

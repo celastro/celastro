@@ -236,6 +236,24 @@ one, and it is not done.
 
 ---
 
+## Two limits a document can meet
+
+A value may nest at most 128 deep, counted as containers enclosing a value,
+and the bound is one constant (`value::MAX_DEPTH`) applied at every door:
+`json::parse` on the way in, `variant::decode` on the way back from disk,
+and `Value::set_path` for a value assembled in memory. The last one used to
+be unbounded, so a value built past the limit encoded and then could not be
+decoded — a document written and never readable. It is refused at the call
+now, which makes the encoder's infallibility true rather than assumed.
+
+A field whose name contains a dot cannot be reached by any path expression.
+`a.b` always means the nested path `a` → `b`; a quoted `"a.b"` is refused
+rather than silently resolved against the nested path, and the refusal says
+why. Reaching such a field would need quotedness carried through the token
+and the AST plus an escaping convention in every stored path string, which is
+a format decision deliberately not taken: store the field under a name
+without a dot.
+
 ## What is deliberately not here
 
 Everything that needs more than one process: consensus and replication, follower
@@ -441,7 +459,11 @@ the whole `text_match` call and inverts it, and one statement may spell both
 polarities — so the refusal covers both shapes and names the leaf that was cut.
 Delete by key, or narrow the prefix until it expands to at most the
 collection's cap and delete the pieces; that loop deletes exactly what each
-piece names. The refusal names the cap in force.
+piece names. The refusal names the cap in force. There is deliberately no
+opt-in to run the cut statement anyway: a flag would exist only to make an
+irreversible mistake convenient, and the three ways out — by key, by
+narrowing, or by raising `prefix_expansion` when the vocabulary fits under
+the ceiling — each delete exactly what they name.
 
 One statement may name at most `4096 / prefix_expansion` distinct
 `(path, prefix)` pairs — eight at the default cap — *summed* over its indexed

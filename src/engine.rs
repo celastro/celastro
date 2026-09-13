@@ -6053,7 +6053,7 @@ mod tests {
         )
         .unwrap();
         let mut n1 = note("n1");
-        n1.set_path("meta.tag", Value::Str("kept".into()));
+        n1.set_path("meta.tag", Value::Str("kept".into())).unwrap();
         db.insert("notes", n1).unwrap();
         db.insert("notes", note("n2")).unwrap();
 

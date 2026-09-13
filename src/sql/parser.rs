@@ -138,7 +138,9 @@ impl<'a> Parser<'a> {
         let s = self.ident()?;
         if s.contains('.') {
             return Err(Error::Sql(format!(
-                "a quoted identifier cannot contain `.`: `{s}` would be read as a nested path"
+                "a quoted identifier cannot contain `.`: `{s}` would be read as a nested path. \
+                 A field whose NAME contains a dot cannot be reached by any path expression; \
+                 store it under a name without one"
             )));
         }
         Ok(s)

@@ -8,11 +8,10 @@
 use crate::error::{Error, Result};
 use crate::value::Value;
 
-/// The deepest nesting `parse` accepts, and the deepest the writers will
-/// descend. The parser and the writers are both recursive, so without a bound
-/// an input like `"[".repeat(200_000)` overflows the stack and aborts the
-/// process — no `Result` and no `catch_unwind` can contain that.
-const MAX_DEPTH: usize = 128;
+// The deepest nesting `parse` accepts, and the deepest the writers will
+// descend. Shared with `variant::decode` and `Value::set_path`; the bound and
+// why there is one are documented on the constant.
+use crate::value::MAX_DEPTH;
 
 pub fn parse(input: &str) -> Result<Value> {
     let mut p = Parser { b: input.as_bytes(), i: 0 };

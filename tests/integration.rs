@@ -483,7 +483,7 @@ fn exact_statistics_are_identical_across_shard_counts_under_updates_and_deletes(
         }
         for i in (0..n).step_by(7) {
             let mut d = c.doc(i);
-            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}"))).unwrap();
             db.insert("items", d).unwrap();
         }
         for i in (0..n).step_by(11) {
@@ -567,7 +567,7 @@ fn default_statistics_are_identical_across_shard_counts_under_updates_and_delete
         }
         for i in (0..n).step_by(7) {
             let mut d = c.doc(i);
-            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}"))).unwrap();
             db.insert("items", d).unwrap();
         }
         for i in (0..n).step_by(11) {
@@ -680,7 +680,7 @@ fn default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes()
             let mut d = c.doc(i);
             let base = d.path("body").unwrap().as_str().unwrap().to_string();
             let filler = "padding ".repeat(1 + i % 9);
-            d.set_path("body", Value::Str(format!("{base} {filler}")));
+            d.set_path("body", Value::Str(format!("{base} {filler}"))).unwrap();
             d
         };
         for i in 0..n {
@@ -689,7 +689,7 @@ fn default_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes()
         }
         for i in (0..n).step_by(7) {
             let mut d = varied(&mut c, i);
-            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}"))).unwrap();
             db.insert("items", d).unwrap();
         }
         for i in (0..n).step_by(11) {
@@ -796,7 +796,7 @@ fn a_prefix_query_ranks_the_same_at_every_shard_count() {
         let mut c = Corpus::new(dims, 42);
         let varied = |c: &mut Corpus, i: usize, seed: u64| {
             let mut d = c.doc(i);
-            d.set_path("body", Value::Str(zipf_body(i, VOCAB, seed)));
+            d.set_path("body", Value::Str(zipf_body(i, VOCAB, seed))).unwrap();
             d
         };
         for i in 0..n {
@@ -889,7 +889,7 @@ fn a_prefix_query_finds_the_same_documents_at_every_shard_count() {
             // `zed` is in every document, so the negated leg below has a
             // positive clause that admits everything and measures nothing but
             // the exclusion set.
-            d.set_path("body", Value::Str(format!("zed a{x:05} a{y:05}")));
+            d.set_path("body", Value::Str(format!("zed a{x:05} a{y:05}"))).unwrap();
             db.insert("items", d).unwrap();
         }
         db.execute("FLUSH items").unwrap();
@@ -1249,7 +1249,7 @@ fn exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes() {
             let mut d = c.doc(i);
             let base = d.path("body").unwrap().as_str().unwrap().to_string();
             let filler = "padding ".repeat(1 + i % 9);
-            d.set_path("body", Value::Str(format!("{base} {filler}")));
+            d.set_path("body", Value::Str(format!("{base} {filler}"))).unwrap();
             d
         };
         for i in 0..n {
@@ -1258,7 +1258,7 @@ fn exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes() {
         }
         for i in (0..n).step_by(7) {
             let mut d = varied(&mut c, i);
-            d.set_path("body", Value::Str(format!("rewritten fusion item {i}")));
+            d.set_path("body", Value::Str(format!("rewritten fusion item {i}"))).unwrap();
             db.insert("items", d).unwrap();
         }
         for i in (0..n).step_by(11) {
@@ -1327,7 +1327,7 @@ fn snapshot_isolation_and_read_your_writes() {
         r#"{"id":"doc-00001","tenant_id":"t1","status":"published","body":"rewritten body","tags":["odd"],"embedding":[0,0,0,0,0,0,0,1]}"#,
     )
     .unwrap();
-    d.set_path("status", Value::Str("archived".into()));
+    d.set_path("status", Value::Str("archived".into())).unwrap();
     db.insert("items", d).unwrap();
 
     // Read-your-writes: the very next query sees the update.
@@ -1667,7 +1667,7 @@ fn an_update_before_a_flush_does_not_lose_the_document() {
             "tags":["odd"],"embedding":[1,0,0,0,0,0,0,0]}"#,
     )
     .unwrap();
-    d.set_path("status", Value::Str("archived".into()));
+    d.set_path("status", Value::Str("archived".into())).unwrap();
     db.insert("items", d).unwrap();
     db.execute("FLUSH items").unwrap();
 
