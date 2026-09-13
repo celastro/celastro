@@ -799,6 +799,9 @@ enum Action {
     Reply(Response),
     /// Serialise the catalog; needs `&Db`.
     Catalog,
+    /// Answer the health probe; needs `&Db`, because a probe that does not
+    /// touch the database measures the process and not the database.
+    Health,
     /// Read the body and run the SQL in it; needs `&mut Db`.
     Query,
     /// Acknowledge, then stop serving so the caller can close the database.
@@ -907,6 +910,14 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
     if !host_is_local(host) {
         return Err(Reject::Forbidden);
     }
+    // Health needs no token. It is what a supervisor's probe asks, and a
+    // probe cannot know the token a run printed; what it learns is that a
+    // console is serving on this port and how many collections it holds,
+    // which the loopback bind and the Host check above already confine to
+    // this machine. It executes nothing.
+    if head.method == "GET" && head.path == "/api/health" {
+        return Ok(Action::Health);
+    }
     let given = match presented_token(head) {
         Some(t) => t,
         None => return Err(Reject::Unauthorized),
@@ -918,7 +929,6 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
         ("GET", "/") => Ok(page(token)),
         ("GET", "/app.js") => Ok(asset(CT_JS, APP_JS)),
         ("GET", "/style.css") => Ok(asset(CT_CSS, STYLE_CSS)),
-        ("GET", "/api/health") => Ok(Action::Reply(Response::json(health_json()))),
         ("GET", "/api/catalog") => Ok(Action::Catalog),
         ("POST", "/api/query") => {
             same_site_post(head, port)?;
@@ -980,6 +990,7 @@ fn answer<W: Wire>(io: &mut W, token: &str, port: u16, db: &mut Db, dl: Deadline
     let served = match action {
         Err(r) => Served::keep(r.response()),
         Ok(Action::Reply(response)) => Served::keep(response),
+        Ok(Action::Health) => Served::keep(Response::json(health_json(db))),
         Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(db))),
         Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
@@ -1121,13 +1132,36 @@ fn error_json(message: &str) -> String {
     format!(r#"{{"ok":false,"error":{}}}"#, jstr(message))
 }
 
-fn health_json() -> String {
+fn health_json(db: &Db) -> String {
     let version = jstr(env!("CARGO_PKG_VERSION"));
     let source = jstr(&source_url());
     let license = jstr(env!("CARGO_PKG_LICENSE"));
+    let collections = db.collection_count();
     format!(
-        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license}}}"#
+        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"collections":{collections}}}"#
     )
+}
+
+/// Ask the console on `port` whether it is serving: `Ok(true)` for a 200
+/// that says so, `Ok(false)` for any other answer, `Err` for no answer.
+/// What `celastro-cli health` runs, and what a container's probe runs,
+/// because the image has no shell and no curl and the console binds
+/// loopback, which a probe from outside the pod cannot reach.
+pub fn probe_health(port: u16) -> Result<bool> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    s.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // One write: `write!` would send the request in pieces, one per
+    // formatted fragment, and a server that reads once and closes answers
+    // the first piece with a reset.
+    let request =
+        format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    s.write_all(request.as_bytes())?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)?;
+    let ok_status = raw.starts_with("HTTP/1.1 200 ") || raw.starts_with("HTTP/1.0 200 ");
+    Ok(ok_status && raw.contains(r#""ok":true"#))
 }
 
 /// Where the source of this build is offered, as AGPL §13 requires of a
@@ -1506,11 +1540,16 @@ mod tests {
     fn the_html_console_itself_is_not_served_without_the_token() {
         // The page is not public just because it is only a page: serving it
         // hands out the API surface and invites the browser to go and use it.
-        for path in ["/", "/app.js", "/style.css", "/api/health"] {
+        for path in ["/", "/app.js", "/style.css", "/api/catalog"] {
             let h = get(path, "localhost", None);
             let refused = dispatch(&h, "tok", PORT).err();
             assert_eq!(refused, Some(Reject::Unauthorized), "{path} must require the token");
         }
+        // The one path served without it, by decision: a supervisor's probe
+        // cannot know the token, and health executes nothing. Still behind
+        // the Host check, which the probe test pins.
+        let h = get("/api/health", "localhost", None);
+        assert!(matches!(dispatch(&h, "tok", PORT), Ok(Action::Health)));
         let h = get("/?t=tok", "localhost", None);
         assert!(matches!(dispatch(&h, "tok", PORT), Ok(Action::Reply(_))));
     }
@@ -1739,6 +1778,63 @@ mod tests {
         assert_eq!(version, Some(env!("CARGO_PKG_VERSION")));
     }
 
+    /// Health needs no token, touches the database, and is still behind the
+    /// `Host` check: a probe from the pod's own network namespace gets a 200
+    /// carrying the collection count, and a page on another origin that
+    /// rebinds a name gets the 403 everything else gets. The count is real --
+    /// it moves when a collection is created.
+    #[test]
+    fn the_health_probe_needs_no_token_and_reports_the_database() {
+        let no_token = answer_to("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
+        assert_eq!(status_line(&no_token), "HTTP/1.1 200 OK");
+        let parsed = json::parse(body_of(&no_token)).unwrap();
+        assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(parsed.get("collections").and_then(|v| v.as_i64()), Some(0));
+        let rebound = answer_to("GET /api/health HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        assert_eq!(status_line(&rebound), "HTTP/1.1 403 Forbidden");
+        let mut db = Db::in_memory();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let parsed = json::parse(&health_json(&db)).unwrap();
+        assert_eq!(parsed.get("collections").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    /// The probe's client half: a serving console answers true, a server
+    /// that is up but not well answers false, and a port with nothing on it
+    /// is an error rather than a false -- different answers for a
+    /// supervisor.
+    #[test]
+    fn the_probe_tells_serving_from_unwell_from_absent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let mut s = stream.unwrap();
+                // Read the whole head before answering: closing with unread
+                // bytes is a reset, not an answer.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 256];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body =
+                    if i == 0 { r#"{"ok":true,"collections":0}"# } else { r#"{"ok":false}"# };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        assert!(probe_health(port).unwrap(), "a serving console");
+        assert!(!probe_health(port).unwrap(), "an answer that is not well");
+        let closed =
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert!(probe_health(closed).is_err(), "nothing listening is an error, not a false");
+    }
+
     /// The console reads `truncated_prefixes` off the wire and renders it the
     /// way it renders `missing`. This is a static check on the script -- the
     /// console has no runtime here to execute it in -- so what it pins is
@@ -1959,7 +2055,7 @@ mod tests {
     fn no_response_invites_another_origin_to_read_it() {
         let responses = [
             Response::new(200, "OK", CT_HTML, "<!doctype html>".to_string()),
-            Response::json(health_json()),
+            Response::json(health_json(&Db::in_memory())),
             Reject::Unauthorized.response(),
             Reject::Forbidden.response(),
         ];

@@ -16,7 +16,7 @@ repository = "https://github.com/celastro/celastro"
 # crate as downloaded — cargo also warns on every publish that it is ignoring
 # the test targets. Note this list is the only thing that trims the package:
 # .dockerignore has no effect on `cargo package`, which ships tracked files.
-exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*"]
+exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*", "chart/*"]
 
 [dependencies]
 # Intentionally none. Celastro is std-only: JSON, bitmaps, term dictionaries,

@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "celastro.fullname" . }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  # One, and not a value: celastro is a single process. Its shards run in
+  # that process, and there is no replication, consensus or shared storage
+  # between two of them. A second replica would be a second, unrelated
+  # database that happened to share a name.
+  replicas: 1
+  serviceName: {{ include "celastro.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "celastro.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "celastro.selectorLabels" . | nindent 8 }}
+    spec:
+      # The image runs as 65532 and owns /data in the image; a fresh volume
+      # is not the image's, so the group is set for it to be writable.
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        runAsNonRoot: true
+      # `serve` handles SIGTERM: it stops accepting, saves, and exits 0 well
+      # inside this window.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: celastro
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--dir", "/data", "--port", {{ .Values.port | quote }}, "serve"]
+          {{- if .Values.archive.endpoint }}
+          env:
+            - name: CELASTRO_ARCHIVE_ENDPOINT
+              value: {{ .Values.archive.endpoint | quote }}
+            - name: CELASTRO_ARCHIVE_BUCKET
+              value: {{ .Values.archive.bucket | quote }}
+            - name: CELASTRO_ARCHIVE_PREFIX
+              value: {{ .Values.archive.prefix | quote }}
+            - name: CELASTRO_ARCHIVE_REGION
+              value: {{ .Values.archive.region | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ include "celastro.secretName" . }}
+          {{- end }}
+          ports:
+            - name: console
+              containerPort: {{ .Values.port }}
+          # The probes ask the console itself, from inside the pod, and the
+          # console answers only after it has read its catalog: a process
+          # that is up with a database it cannot open is not ready.
+          readinessProbe:
+            exec:
+              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          livenessProbe:
+            exec:
+              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
+            initialDelaySeconds: 10
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

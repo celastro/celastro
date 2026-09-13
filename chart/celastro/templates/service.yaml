@@ -1,0 +1,16 @@
+# Headless: the StatefulSet needs a service for its stable identity, and
+# nothing routes to the console anyway -- it binds 127.0.0.1 inside the pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "celastro.fullname" . }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "celastro.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: console
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}

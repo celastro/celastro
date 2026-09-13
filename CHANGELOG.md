@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A Helm chart, and a health probe for it.** `chart/celastro` deploys one
+instance as a `StatefulSet` with a persistent data volume, probes that ask
+the database rather than the process, and the `archived` tier optionally in
+a bucket. `celastro-cli health [--port N]` is the probe: it exits 0 when a
+console on that port answers that it is serving. `/api/health` is served
+without the token now -- a probe cannot know one -- and reports the
+collection count, which it reads from the catalog.
+
 ## 0.12.0 — 2026-09-13
 
 A new capability, hence a minor. `DbOpts` gained a field, which the

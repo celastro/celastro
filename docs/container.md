@@ -212,6 +212,19 @@ decides whose name ends up on the files.
 Nothing in celastro resolves a UID to a name, and the image has no `passwd`
 file to resolve it in, so `--user` may name any pair of numbers.
 
+## A probe from inside the image
+
+`celastro-cli health` asks the console on `--port` whether it is serving, and
+exits 0 only for a 200 that says so. It exists because a container's probe
+cannot be anything else here: the image has no shell and no curl, and the
+console binds loopback, which a probe from outside the pod cannot reach. The
+answer comes from the database -- the console reads its catalog to produce it
+-- so a process that is up with a database it could not open is not healthy.
+`/api/health` is the one path served without the token, by decision: a probe
+cannot know a token printed at start, and the answer executes nothing and
+names only the version and the collection count. It stays behind the `Host`
+check. The Helm chart under `chart/` uses it for both probes.
+
 ## The archived tier can live in an object store
 
 `CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP) and

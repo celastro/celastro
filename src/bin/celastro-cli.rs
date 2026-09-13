@@ -57,6 +57,7 @@ COMMANDS:
   repl                       interactive session on stdin
   demo                       build a small hybrid corpus and show it working
   catalog                    list collections and their indexes
+  health [--port N]          exit 0 if a console is serving on 127.0.0.1:N
   help                       this
   version                    print the version
 
@@ -126,6 +127,7 @@ enum Cmd {
     Repl,
     Demo,
     Catalog,
+    Health { port: u16 },
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
@@ -207,7 +209,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let cmd = match verb.as_str() {
         // A stray argument is a typo or a quoting mistake, and both are better
         // said out loud than ignored.
-        "serve" | "repl" | "demo" | "catalog" if !rest.is_empty() => {
+        "serve" | "repl" | "demo" | "catalog" | "health" if !rest.is_empty() => {
             return Cli::Usage(format!("`{verb}` takes no arguments"));
         }
         "serve" => Cmd::Serve { port: port.unwrap_or(DEFAULT_PORT), open },
@@ -224,6 +226,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "repl" => Cmd::Repl,
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
+        "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT) },
         "help" => return Cli::Help { json },
         "version" => return Cli::Version { json },
         other => return Cli::Usage(format!("unknown command `{other}`")),
@@ -231,9 +234,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
 
     // A flag that does nothing where it was written is a mistake, not a
     // courtesy: someone who wrote `--port` expected a server to be listening.
-    if !matches!(cmd, Cmd::Serve { .. }) {
+    if !matches!(cmd, Cmd::Serve { .. } | Cmd::Health { .. }) {
         if port.is_some() {
-            return Cli::Usage("`--port` only means something to `serve`".to_string());
+            return Cli::Usage("`--port` only means something to `serve` and `health`".to_string());
         }
         if open {
             return Cli::Usage("`--open` only means something to `serve`".to_string());
@@ -326,6 +329,12 @@ fn version_output(json: bool) -> String {
 }
 
 fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
+    // Before any directory is opened: the probe asks a RUNNING console, and
+    // opening its directory from a second process is the one thing the data
+    // directory does not support.
+    if let Cmd::Health { port } = cmd {
+        return health(port, json);
+    }
     let mut db = match &dir {
         Some(d) => match Db::open(d, db_opts()) {
             Ok(db) => db,
@@ -346,6 +355,7 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             print_catalog(&db, json);
             EXIT_OK
         }
+        Cmd::Health { .. } => unreachable!("answered before the database was opened"),
     };
     // Every path that opened a directory saves before it leaves, including the
     // ones that failed: the statements that ran before the failing one are
@@ -406,6 +416,24 @@ fn failure_report(json: bool, msg: &str) -> (bool, String) {
 // --------------------------------------------------------------------------
 // serve
 // --------------------------------------------------------------------------
+
+/// `health`: exit 0 when a console on `--port` answers that it is serving,
+/// 1 otherwise. A container's liveness and readiness probe, since the image
+/// has no shell and the console binds loopback.
+fn health(port: u16, json: bool) -> i32 {
+    match celastro::serve::probe_health(port) {
+        Ok(true) => {
+            if json {
+                println!(r#"{{"ok":true,"kind":"health","port":{port}}}"#);
+            } else {
+                println!("serving on 127.0.0.1:{port}");
+            }
+            EXIT_OK
+        }
+        Ok(false) => fail(json, &format!("127.0.0.1:{port} answered, but not that it is serving")),
+        Err(e) => fail(json, &format!("no console on 127.0.0.1:{port}: {e}")),
+    }
+}
 
 fn serve(db: &mut Db, port: u16, open: bool, json: bool) -> i32 {
     let server = match Server::bind(port) {
@@ -1615,5 +1643,26 @@ mod tests {
             "TRUNCATED — text_match(body, 'a*') was cut: documents are missing\n\
              TRUNCATED — text_match(body, '-a*') was cut: documents it excludes are here\n"
         );
+    }
+    /// `health` takes `--port` like `serve` does, takes no arguments, and
+    /// needs no directory: it asks a running console rather than opening one.
+    #[test]
+    fn health_takes_a_port_and_nothing_else() {
+        match parse_args(vec!["health".to_string()]) {
+            Cli::Run { cmd: Cmd::Health { port }, dir, .. } => {
+                assert_eq!(port, DEFAULT_PORT);
+                assert!(dir.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_args(vec!["--port".into(), "9".into(), "health".into()]) {
+            Cli::Run { cmd: Cmd::Health { port }, .. } => assert_eq!(port, 9),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse_args(vec!["health".into(), "x".into()]), Cli::Usage(_)));
+        assert!(matches!(
+            parse_args(vec!["--port".into(), "9".into(), "catalog".into()]),
+            Cli::Usage(_)
+        ));
     }
 }

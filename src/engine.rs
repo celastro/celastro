@@ -517,6 +517,12 @@ impl Db {
         &self.residency
     }
 
+    /// How many collections the catalog holds. What a health probe asks,
+    /// because answering it means the catalog is there to be read.
+    pub fn collection_count(&self) -> usize {
+        self.catalog.collections.len()
+    }
+
     pub fn placement(&self) -> &Placement {
         &self.opts.placement
     }

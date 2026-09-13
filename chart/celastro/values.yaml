@@ -1,0 +1,41 @@
+image:
+  repository: celastro
+  # Empty means the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The console's port inside the pod. It binds 127.0.0.1 only, so nothing
+# routes to it: reach it with `kubectl port-forward`, which connects inside
+# the pod's network namespace. The probes run the binary itself for the same
+# reason -- the image has no shell and no curl, and a probe from outside the
+# pod could not reach a loopback bind.
+port: 8787
+
+persistence:
+  size: 10Gi
+  # Empty means the cluster's default StorageClass.
+  storageClass: ""
+
+# The `archived` tier. With no endpoint the tier is a directory inside the
+# data volume, which is what the pod gets by default. With one it is an
+# S3-compatible bucket reached over plain HTTP (the binary carries no TLS),
+# and the credentials come from a Secret with the keys AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY: name an existing one, or give the pair here and the
+# chart makes one.
+archive:
+  endpoint: ""
+  bucket: ""
+  prefix: ""
+  region: ""
+  existingSecret: ""
+  accessKeyId: ""
+  secretAccessKey: ""
+
+probes:
+  periodSeconds: 10
+  failureThreshold: 3
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

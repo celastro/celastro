@@ -143,6 +143,7 @@ what `demo` needs and what makes `exec` usable with nothing on disk.
 | `repl` | interactive session on stdin |
 | `demo` | build a small hybrid corpus and show it working |
 | `catalog` | list collections and their indexes |
+| `health [--port N]` | exit 0 if a console is serving on that port; a container's probe |
 | `version` | print the version |
 
 | global flag | |
@@ -181,6 +182,25 @@ check against DNS rebinding, and a per-run token — and every request needs the
 token. `POST /api/shutdown` with the token stops the server after a clean
 save. The console, like the CLI, saves after every statement that changed
 something.
+
+## Kubernetes
+
+`chart/celastro` is a Helm chart for one instance: a `StatefulSet` of one
+pod with the data directory on a `PersistentVolumeClaim`, because celastro is
+a single process and there is no cluster to scale. Its probes run the binary
+itself, `celastro-cli health`, which asks the console inside the pod whether
+it is serving and has its catalog. The console binds loopback, so it is
+reached with `kubectl port-forward` and the URL printed in the pod's log. The
+`archived` tier can be pointed at a bucket through the chart's `archive`
+values, with the credentials in a `Secret`.
+
+```
+helm install celastro chart/celastro
+kubectl logs celastro-0 | grep '^http'
+kubectl port-forward celastro-0 8787:8787
+```
+
+The chart's README says what was verified and how.
 
 ## The archived tier and an object store
 
