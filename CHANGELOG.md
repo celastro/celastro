@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**An unranked scan holds one page, not the collection.** `SELECT * FROM docs
+LIMIT 1` used to decode and buffer every matching document before taking one
+of them, so memory for a scan was bounded by the collection rather than by
+`LIMIT` and `OFFSET`. A scan now retains at most `offset + k` rows as it goes,
+and a key-ordered scan does not decode a document until it is known to be on
+the page. `ORDER BY` on a field still reads every survivor to place it, but
+holds one page of them. `COLLAPSE BY` and cursors answer exactly as before.
+
 ## 0.6.0 — 2026-09-13
 
 A behaviour change on every query surface, hence a minor: rows carry what

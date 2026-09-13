@@ -406,6 +406,8 @@ impl<'a> Searchable<'a> {
     }
 
     pub fn document(&self, ord: u32) -> Result<Value> {
+        #[cfg(test)]
+        DOCUMENTS_DECODED.fetch_add(1, AtomicOrdering::Relaxed);
         match self {
             Searchable::Mem(m) => m
                 .docs
@@ -416,6 +418,13 @@ impl<'a> Searchable<'a> {
         }
     }
 }
+
+/// How many documents `Searchable::document` has produced, for the tests
+/// that pin what a scan does NOT decode. Counted here because this is the
+/// one door a query's payloads come through; a scan that reached a segment's
+/// decoder by another path would not be counted, which is the residual.
+#[cfg(test)]
+pub(crate) static DOCUMENTS_DECODED: AtomicU64 = AtomicU64::new(0);
 
 /// A borrowed or reference-counted full-text index.
 pub enum TextHandle<'a> {

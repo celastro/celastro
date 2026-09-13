@@ -1096,21 +1096,52 @@ fn scan(
 ) -> Result<(Vec<Row>, Vec<String>)> {
     let t0 = Instant::now();
     let sel = input.select;
-    let mut out: Vec<(String, Value)> = Vec::new();
+    // Rows past `offset + k` are thrown away at the end, so they are never
+    // held: `SELECT * FROM docs LIMIT 1` used to decode and buffer every
+    // matching document in the collection before taking one of them, which
+    // is the out-of-memory-from-one-statement failure the ranked path's
+    // candidate cap exists to prevent, reached by the other door.
+    let keep = sel.offset.saturating_add(k);
+    let fields: Vec<(String, bool)> = match &sel.order {
+        Some(OrderBy::Fields(f)) => f.clone(),
+        _ => Vec::new(),
+    };
+    // A key-ordered scan resumes on the primary key. A full cursor token
+    // from a ranked query still works: its last field is that key.
+    let after: Option<String> = sel.cursor.as_ref().map(|c| decode_cursor(c).2);
+    // A row can be placed by its key alone unless the order or the collapse
+    // reads the document. When neither does, the document is not decoded
+    // until the row is known to be on the page.
+    let needs_doc = !fields.is_empty() || sel.collapse.is_some();
+    let mut retained = Retained::new(keep, fields.iter().map(|(_, asc)| *asc).collect());
     let mut missing = Vec::new();
+    // Snapshots first and sources second, both outliving the scan: a source
+    // borrows its snapshot, and a deferred decode needs the source that holds
+    // the row.
+    let snaps: Vec<Option<crate::shard::Snapshot<'_>>> = input
+        .shards
+        .iter()
+        .map(|shard| match prefix {
+            Some(p) if !shard_may_hold(shard, p) => None,
+            _ => Some(shard.snapshot_at(input.ts)),
+        })
+        .collect();
+    let sources: Vec<Vec<Searchable<'_>>> = snaps
+        .iter()
+        .enumerate()
+        .map(|(si, snap)| snap.as_ref().map(|s| input.shards[si].sources(s)).unwrap_or_default())
+        .collect();
     for (si, shard) in input.shards.iter().enumerate() {
         let mut sx = ShardExplain {
             index: si,
             manifest_version: shard.manifest_version,
             ..Default::default()
         };
-        if let Some(p) = prefix {
-            if !shard_may_hold(shard, p) {
-                sx.pruned = true;
-                sx.prune_reason = Some("out of key range".into());
-                ex.shards.push(sx);
-                continue;
-            }
+        if snaps[si].is_none() {
+            sx.pruned = true;
+            sx.prune_reason = Some("out of key range".into());
+            ex.shards.push(sx);
+            continue;
         }
         if let Some(d) = deadline {
             if t0.elapsed() > d {
@@ -1127,8 +1158,7 @@ fn scan(
                 )));
             }
         }
-        let snap = shard.snapshot_at(input.ts);
-        for unit in &shard.sources(&snap) {
+        for (ui, unit) in sources[si].iter().enumerate() {
             let n = unit.num_docs();
             if n == 0 {
                 continue;
@@ -1150,7 +1180,33 @@ fn scan(
             ux.survivors = filter.popcount();
             ux.selectivity = ux.survivors as f64 / n as f64;
             for ord in filter.iter() {
-                out.push((unit.key(ord).unwrap_or("").to_string(), unit.document(ord)?));
+                let key = unit.key(ord).unwrap_or("").to_string();
+                if after.as_ref().is_some_and(|a| key.as_str() <= a.as_str()) {
+                    continue;
+                }
+                if needs_doc {
+                    let doc = unit.document(ord)?;
+                    let vals =
+                        fields.iter().map(|(p, _)| doc.path(p).cloned().unwrap_or(Value::Null));
+                    let rank = Rank::new(vals.collect(), key, &retained.asc);
+                    // `COLLAPSE BY` applies to unranked queries too. Skipping
+                    // it would silently return `k` children of one parent for
+                    // a statement that asked for `k` distinct parents. A row
+                    // whose parent path is absent or NULL belongs to no group,
+                    // so it stands alone -- collapsing them together would
+                    // fold every unrelated document into one, which is the
+                    // same rule the ranked path applies.
+                    let parent = sel
+                        .collapse
+                        .as_ref()
+                        .and_then(|p| doc.path(p))
+                        .filter(|v| !v.is_null())
+                        .map(crate::variant::encode_to_vec);
+                    retained.insert(rank, Payload::Doc(doc), parent);
+                } else {
+                    let rank = Rank::new(Vec::new(), key, &retained.asc);
+                    retained.insert(rank, Payload::Deferred(si, ui, ord), None);
+                }
             }
             if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
                 ux.loads = l1.saturating_sub(l0);
@@ -1161,67 +1217,135 @@ fn scan(
         }
         ex.shards.push(sx);
     }
-
-    match &sel.order {
-        Some(OrderBy::Fields(fields)) => {
-            out.sort_by(|a, b| {
-                for (path, asc) in fields {
-                    let av = a.1.path(path).cloned().unwrap_or(Value::Null);
-                    let bv = b.1.path(path).cloned().unwrap_or(Value::Null);
-                    let o = compare_total(&av, &bv);
-                    let o = if *asc { o } else { o.reverse() };
-                    if o != std::cmp::Ordering::Equal {
-                        return o;
-                    }
-                }
-                // Primary key is the final tie-break, always (§7.2).
-                a.0.cmp(&b.0)
-            });
-        }
-        _ => out.sort_by(|a, b| a.0.cmp(&b.0)),
-    }
-    if let Some(cur) = &sel.cursor {
-        // A key-ordered scan resumes on the primary key. A full cursor token
-        // from a ranked query still works: its last field is that key.
-        let after = decode_cursor(cur).2;
-        out.retain(|(key, _)| key.as_str() > after.as_str());
-    }
-    // `COLLAPSE BY` applies to unranked queries too. Skipping it here would
-    // silently return `k` children of one parent for a statement that asked for
-    // `k` distinct parents — a wrong answer with no error to point at.
     if let Some(parent_path) = &sel.collapse {
-        // A scan materialises every survivor before ordering, so unlike the
-        // ranked path there is nothing to over-fetch: no amplification.
+        // Every survivor is seen, so unlike the ranked path there is no
+        // candidate depth to widen: the retained set is the best row of each
+        // of the `offset + k` best parents, exactly.
         ex.collapse = Some((parent_path.clone(), 1));
-        collapse_by_parent(&mut out, parent_path);
     }
-    let rows: Vec<Row> = out
-        .into_iter()
-        .skip(sel.offset)
-        .take(k)
-        .map(|(key, doc)| Row { key, doc, score: None, distance: None })
-        .collect();
+    let mut rows: Vec<Row> = Vec::new();
+    for (rank, payload) in retained.into_sorted().into_iter().skip(sel.offset).take(k) {
+        let doc = match payload {
+            Payload::Doc(doc) => doc,
+            Payload::Deferred(si, ui, ord) => sources[si][ui].document(ord)?,
+        };
+        rows.push(Row { key: rank.key, doc, score: None, distance: None });
+    }
     ex.fetched_payloads = rows.len();
     Ok((rows, missing))
 }
 
-/// Keep the first row per distinct parent, preserving the order already
-/// established. A row whose parent path is absent or NULL belongs to no group,
-/// so it survives — collapsing them together would fold every unrelated
-/// document into one, which is the same rule the ranked path applies.
-fn collapse_by_parent(rows: &mut Vec<(String, Value)>, parent_path: &str) {
-    let mut seen: Vec<Value> = Vec::new();
-    rows.retain(|(_, doc)| match doc.path(parent_path) {
-        Some(parent) if !parent.is_null() => {
-            if seen.contains(parent) {
-                false
-            } else {
-                seen.push(parent.clone());
-                true
+/// Where a retained row's document is: decoded, because the order or the
+/// collapse had to read it, or still in its unit, to be decoded only if the
+/// row makes the page.
+enum Payload {
+    Doc(Value),
+    Deferred(usize, usize, u32),
+}
+
+/// A row's place in the scan's order: the `ORDER BY` values, then the primary
+/// key as the final tie-break, always (§7.2). Carries its directions so that
+/// it can be a map key.
+#[derive(Clone)]
+struct Rank {
+    vals: Vec<Value>,
+    key: String,
+    asc: std::sync::Arc<[bool]>,
+}
+
+impl Rank {
+    fn new(vals: Vec<Value>, key: String, asc: &std::sync::Arc<[bool]>) -> Rank {
+        Rank { vals, key, asc: asc.clone() }
+    }
+}
+
+impl PartialEq for Rank {
+    fn eq(&self, other: &Rank) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Rank {}
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Rank) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Rank {
+    fn cmp(&self, other: &Rank) -> std::cmp::Ordering {
+        for (i, (a, b)) in self.vals.iter().zip(&other.vals).enumerate() {
+            let o = compare_total(a, b);
+            let o = if self.asc.get(i).copied().unwrap_or(true) { o } else { o.reverse() };
+            if o != std::cmp::Ordering::Equal {
+                return o;
             }
         }
-        _ => true,
-    });
+        self.key.cmp(&other.key)
+    }
+}
+
+/// The rows a scan is still holding, never more than the page can show.
+///
+/// Rows arrive in no particular order and the best `cap` of them are kept;
+/// a row worse than the worst retained one is dropped on arrival, and a row
+/// that displaces one drops the worst. Under `COLLAPSE BY` a parent holds at
+/// most one row, its best, so the set is the best row of each of the `cap`
+/// best parents: a parent whose best row ranks among those is never lost,
+/// because the worst retained row only ever improves, and a parent's earlier,
+/// worse row is replaced when its best arrives. That is what the sort-then-
+/// collapse-then-page it replaces computed, at the memory of one page.
+struct Retained {
+    cap: usize,
+    asc: std::sync::Arc<[bool]>,
+    entries: BTreeMap<Rank, (Payload, Option<Vec<u8>>)>,
+    by_parent: BTreeMap<Vec<u8>, Rank>,
+}
+
+impl Retained {
+    fn new(cap: usize, asc: Vec<bool>) -> Retained {
+        Retained { cap, asc: asc.into(), entries: BTreeMap::new(), by_parent: BTreeMap::new() }
+    }
+
+    fn insert(&mut self, rank: Rank, payload: Payload, parent: Option<Vec<u8>>) {
+        if self.cap == 0 {
+            return;
+        }
+        if let Some(p) = &parent {
+            if let Some(cur) = self.by_parent.get(p) {
+                if rank < *cur {
+                    let cur = cur.clone();
+                    self.entries.remove(&cur);
+                    self.by_parent.remove(p);
+                } else {
+                    return;
+                }
+            }
+        }
+        if self.entries.len() >= self.cap {
+            if let Some((worst, _)) = self.entries.iter().next_back() {
+                if rank >= *worst {
+                    return;
+                }
+            }
+        }
+        if let Some(p) = &parent {
+            self.by_parent.insert(p.clone(), rank.clone());
+        }
+        self.entries.insert(rank, (payload, parent));
+        if self.entries.len() > self.cap {
+            if let Some((_, (_, Some(p)))) = self.entries.pop_last() {
+                self.by_parent.remove(&p);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn into_sorted(self) -> Vec<(Rank, Payload)> {
+        self.entries.into_iter().map(|(r, (p, _))| (r, p)).collect()
+    }
 }
 
 /// Whether a shard's key range can hold anything under `prefix`.
@@ -1557,35 +1681,94 @@ mod tests {
     /// happily returned five chunks of the same parent.
     #[test]
     fn collapse_by_on_an_unranked_scan_is_honoured_rather_than_ignored() {
-        let mut rows = vec![
+        let rows = vec![
             doc("c1", r#"{"parent_id": "p1"}"#),
             doc("c2", r#"{"parent_id": "p1"}"#),
             doc("c3", r#"{"parent_id": "p2"}"#),
             doc("c4", r#"{"parent_id": "p1"}"#),
             doc("c5", r#"{"parent_id": "p3"}"#),
         ];
-        collapse_by_parent(&mut rows, "parent_id");
-        assert_eq!(
-            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["c1", "c3", "c5"]
-        );
+        assert_eq!(retain_keys(rows, 10, "parent_id"), vec!["c1", "c3", "c5"]);
     }
 
     /// Documents with no parent are not one giant group; collapsing them
     /// together would delete unrelated rows from the answer.
     #[test]
     fn a_missing_or_null_parent_does_not_collapse_unrelated_rows_together() {
-        let mut rows = vec![
+        let rows = vec![
             doc("a", r#"{"other": 1}"#),
             doc("b", r#"{"parent_id": null}"#),
             doc("c", r#"{"other": 2}"#),
             doc("d", r#"{"parent_id": "p"}"#),
             doc("e", r#"{"parent_id": "p"}"#),
         ];
-        collapse_by_parent(&mut rows, "parent_id");
-        assert_eq!(
-            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b", "c", "d"]
-        );
+        assert_eq!(retain_keys(rows, 10, "parent_id"), vec!["a", "b", "c", "d"]);
+    }
+
+    /// Feed `rows` to a `Retained` of capacity `cap` in the order given, key
+    /// order as the rank, and return the keys it kept, in order.
+    fn retain_keys(rows: Vec<(String, Value)>, cap: usize, parent: &str) -> Vec<String> {
+        let mut r = Retained::new(cap, Vec::new());
+        for (key, doc) in rows {
+            let p = doc.path(parent).filter(|v| !v.is_null()).map(crate::variant::encode_to_vec);
+            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(doc), p);
+        }
+        r.into_sorted().into_iter().map(|(rank, _)| rank.key).collect()
+    }
+
+    /// The retained set is never larger than the page, whatever arrives and in
+    /// whatever order, and what it ends up holding is exactly what sorting
+    /// everything, collapsing and taking the page would have held. 40 parents
+    /// over 4000 rows in a scrambled order, with a fifth of the rows belonging
+    /// to no parent, and every prefix of the arrival checked for the bound --
+    /// a collector that only trimmed at the end would pass the final
+    /// comparison and fail every intermediate one.
+    #[test]
+    fn a_scan_retains_no_more_rows_than_the_page_and_the_same_rows_as_a_full_sort() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut rows: Vec<(String, Value)> = (0..4000)
+            .map(|i| {
+                let parent = match next() % 5 {
+                    0 => "null".to_string(),
+                    _ => format!("\"p{:02}\"", next() % 40),
+                };
+                doc(&format!("k{:04}", i), &format!(r#"{{"parent_id": {parent}}}"#))
+            })
+            .collect();
+        for i in (1..rows.len()).rev() {
+            rows.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let expected: Vec<String> = {
+            let mut all = rows.clone();
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            all.retain(|(_, d)| match d.path("parent_id") {
+                Some(p) if !p.is_null() => {
+                    let b = crate::variant::encode_to_vec(p);
+                    if seen.contains(&b) {
+                        false
+                    } else {
+                        seen.push(b);
+                        true
+                    }
+                }
+                _ => true,
+            });
+            all.into_iter().take(7).map(|(k, _)| k).collect()
+        };
+        let mut r = Retained::new(7, Vec::new());
+        for (key, d) in rows {
+            let p = d.path("parent_id").filter(|v| !v.is_null()).map(crate::variant::encode_to_vec);
+            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(d), p);
+            assert!(r.len() <= 7, "the collector held {} rows for a page of 7", r.len());
+        }
+        let got: Vec<String> = r.into_sorted().into_iter().map(|(rank, _)| rank.key).collect();
+        assert_eq!(got, expected);
     }
 }

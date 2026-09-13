@@ -4945,6 +4945,84 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A scan under a small `LIMIT` decodes the page and not the collection.
+    /// It used to decode and buffer every matching document before taking
+    /// `offset + k` of them. Three shapes against the same 600 documents,
+    /// half sealed and half in memtables, each compared with the answer of a
+    /// scan that sees everything: key order decodes exactly the rows it
+    /// returns, even past an offset and a cursor; an `ORDER BY` on a field
+    /// has to decode every survivor to place it, and still answers the same;
+    /// and `COLLAPSE BY` returns the best row of each of the first parents,
+    /// not `k` children of the first one.
+    #[test]
+    fn a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one() {
+        use crate::shard::DOCUMENTS_DECODED;
+        use std::sync::atomic::Ordering;
+        let dir = tmp("bounded-scan");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute(
+            "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL) \
+             PARTITION BY (tenant_id) WITH (splits = ['t1', 't2'])",
+        )
+        .unwrap();
+        for i in 0..600 {
+            let d = crate::json::parse(&format!(
+                r#"{{"id":"d{i:04}","tenant_id":"t{}","n":{},"parent":"p{:02}"}}"#,
+                i % 3,
+                (i * 7919) % 600,
+                i % 50
+            ))
+            .unwrap();
+            db.insert("items", d).unwrap();
+            if i == 299 {
+                db.execute("FLUSH items").unwrap();
+            }
+        }
+        let keys = |r: &QueryResult| r.rows.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        let full = db.query("SELECT id FROM items LIMIT 100000").unwrap();
+        assert_eq!(full.rows.len(), 600);
+
+        // Key order: decodes exactly the page, wherever the page is.
+        let decoded = |db: &mut Db, sql: &str| {
+            let before = DOCUMENTS_DECODED.load(Ordering::Relaxed);
+            let r = db.query(sql).unwrap();
+            (r, DOCUMENTS_DECODED.load(Ordering::Relaxed) - before)
+        };
+        let (page, n) = decoded(&mut db, "SELECT * FROM items LIMIT 5");
+        assert_eq!(keys(&page), keys(&full)[..5].to_vec());
+        assert_eq!(n, 5, "a LIMIT 5 scan decoded {n} documents");
+        let (page, n) = decoded(&mut db, "SELECT * FROM items LIMIT 5 OFFSET 200");
+        assert_eq!(keys(&page), keys(&full)[200..205].to_vec());
+        assert_eq!(n, 5, "an OFFSET 200 scan decoded {n} documents");
+        let cursor = page.next_cursor.clone();
+        assert!(cursor.is_none(), "an unranked scan hands out no cursor");
+        let (page, n) =
+            decoded(&mut db, &format!("SELECT * FROM items LIMIT 3 AFTER '{}'", keys(&full)[100]));
+        assert_eq!(keys(&page), keys(&full)[101..104].to_vec(), "the cursor resumed elsewhere");
+        assert_eq!(n, 3, "a cursor scan decoded {n} documents");
+
+        // A field order has to read every survivor, and answers the same.
+        let all = db.query("SELECT id, n FROM items ORDER BY n DESC LIMIT 100000").unwrap();
+        let (page, n) =
+            decoded(&mut db, "SELECT id, n FROM items ORDER BY n DESC LIMIT 4 OFFSET 7");
+        assert_eq!(keys(&page), keys(&all)[7..11].to_vec());
+        assert_eq!(n, 600, "an ORDER BY scan decoded {n} documents where the order needs all 600");
+
+        // COLLAPSE BY: the best row of each of the first parents.
+        let all = db.query("SELECT id, parent FROM items LIMIT 100000 COLLAPSE BY parent").unwrap();
+        assert_eq!(all.rows.len(), 50);
+        let page =
+            db.query("SELECT id, parent FROM items LIMIT 6 OFFSET 2 COLLAPSE BY parent").unwrap();
+        assert_eq!(keys(&page), keys(&all)[2..8].to_vec());
+        let parents: std::collections::BTreeSet<String> = page
+            .rows
+            .iter()
+            .map(|r| r.doc.get("parent").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(parents.len(), 6, "collapsed rows share a parent: {parents:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The SELECT list narrows what comes back. It used to be parsed and read
     /// nowhere, so `SELECT id FROM notes` returned the whole document on
     /// every surface and the shells printed every field. Each claim below is
