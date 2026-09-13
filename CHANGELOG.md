@@ -6,6 +6,18 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The `archived` tier can live in an S3-compatible object store.** Set
+`DbOpts::archive` -- from the CLI, `CELASTRO_ARCHIVE_ENDPOINT` and
+`CELASTRO_ARCHIVE_BUCKET` -- with `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` in the environment, and a segment moved to the tier
+is `PUT` there as one object, read by ranged `GET`s as it faults in, and
+deleted when a compaction retires it. Plain HTTP only: the crate carries no
+TLS, so the endpoint is a MinIO on the same host or a TLS-terminating proxy.
+Nothing changes for a database with no endpoint configured, which keeps the
+local directory.
+
 ## 0.11.0 — 2026-09-13
 
 A new capability and a behaviour change, hence a minor. No public signature

@@ -82,6 +82,7 @@ pub mod json;
 pub mod lifecycle;
 pub mod memtable;
 pub mod mvcc;
+pub mod objstore;
 pub mod plan;
 pub mod residency;
 pub mod segment;

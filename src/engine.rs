@@ -117,6 +117,10 @@ pub struct DbOpts {
     /// statement. Checked inside the expensive loops, not only between
     /// shards; see the `deadline` module.
     pub statement_deadline_ms: Option<u64>,
+    /// Where the `archived` tier lives: an S3-compatible endpoint, or with no
+    /// endpoint the local `archive/` directory that stands in for one. The
+    /// credentials are read from the environment at open, never stored.
+    pub archive: crate::objstore::ArchiveOpts,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -135,6 +139,7 @@ impl Default for DbOpts {
             lifecycle_interval_writes: 0,
             placement: Placement::default(),
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
+            archive: crate::objstore::ArchiveOpts::default(),
         }
     }
 }
@@ -347,6 +352,10 @@ pub struct Db {
     /// statement, and almost no statement changes the catalog.
     published_catalog: Option<Vec<u8>>,
     writes: u64,
+    /// The object store behind the `archived` tier, built at open from
+    /// `DbOpts::archive` and the environment; `None` for an in-memory
+    /// database and for one whose archive is the local directory.
+    archive: Option<crate::objstore::ArchiveHandle>,
     /// Writes per collection, for the statistics cache: its refresh gate and
     /// its anchor compare against the collection whose statistics they guard,
     /// so traffic on an unrelated collection neither ages an entry nor
@@ -394,6 +403,7 @@ impl Db {
             stats_baseline: BTreeMap::new(),
             published_catalog: None,
             writes: 0,
+            archive: None,
             collection_writes: BTreeMap::new(),
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
@@ -407,7 +417,15 @@ impl Db {
     /// shard's manifest, then replaying each WAL.
     pub fn open(dir: &Path, opts: DbOpts) -> Result<Db> {
         opts.placement.validate()?;
+        let archive = match opts.archive.endpoint {
+            Some(_) => Some(crate::objstore::ArchiveHandle {
+                store: Arc::new(crate::objstore::S3Store::from_env(&opts.archive)?),
+                prefix: opts.archive.prefix.clone(),
+            }),
+            None => None,
+        };
         let mut db = Db::with_opts(opts);
+        db.archive = archive;
         fs::create_dir_all(dir)?;
         db.dir = Some(dir.to_path_buf());
         // Absent is a fresh database. Unreadable is not: read as absent it
@@ -489,6 +507,7 @@ impl Db {
             gc_horizon: 0,
             residency: Some(self.residency.clone()),
             placement: self.opts.placement.clone(),
+            archive: self.archive.clone(),
         }
     }
 

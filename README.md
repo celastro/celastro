@@ -182,6 +182,27 @@ token. `POST /api/shutdown` with the token stops the server after a clean
 save. The console, like the CLI, saves after every statement that changed
 something.
 
+## The archived tier and an object store
+
+An index moved to the `archived` tier leaves local storage. By default that
+means a directory beside the segments that stands in for object storage. Point
+it at an S3-compatible store instead and the segment is `PUT` there as one
+object, read back by ranged `GET`s when a query needs it, and deleted when a
+compaction retires it:
+
+```
+export CELASTRO_ARCHIVE_ENDPOINT=127.0.0.1:9000   # host:port, plain HTTP
+export CELASTRO_ARCHIVE_BUCKET=celastro
+export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
+celastro-cli --dir ./data serve
+```
+
+Any server that speaks S3's `PUT`, `GET`, `HEAD` and `DELETE` with Signature
+Version 4 will do; MinIO is the one this was written against. The endpoint is
+plain HTTP because the crate carries no TLS: run MinIO on the same host, or a
+TLS-terminating proxy in front of a real bucket. The credentials are read from
+the environment at open and never written anywhere.
+
 ## Running in a container
 
 The `Dockerfile` builds a statically linked `celastro-cli` into an image

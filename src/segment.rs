@@ -106,6 +106,10 @@ pub enum SegmentSource {
     /// The local copy has been released; reads go to the archive store and
     /// cost a round trip.
     Archive(PathBuf),
+    /// The object store is the segment's only copy. Every read is a ranged
+    /// `GET`: the footer at open, then each component as it faults in --
+    /// the chain of dependent round trips the design budgets for.
+    Remote { store: Arc<dyn crate::objstore::ObjectStore>, key: String, size: u64 },
 }
 
 impl SegmentSource {
@@ -132,11 +136,17 @@ impl SegmentSource {
                 f.read_exact(&mut buf)?;
                 Ok(buf)
             }
+            SegmentSource::Remote { store, key, size } => {
+                if off.checked_add(len).map(|e| e > *size).unwrap_or(true) {
+                    return Err(Error::Storage("segment: region lies outside the object".into()));
+                }
+                store.get_range(key, off, len)
+            }
         }
     }
 
     pub fn is_archive(&self) -> bool {
-        matches!(self, SegmentSource::Archive(_))
+        matches!(self, SegmentSource::Archive(_) | SegmentSource::Remote { .. })
     }
 }
 
@@ -830,12 +840,13 @@ impl SegmentSource {
         Ok(match self {
             SegmentSource::Bytes(b) => b.len() as u64,
             SegmentSource::File(p) | SegmentSource::Archive(p) => std::fs::metadata(p)?.len(),
+            SegmentSource::Remote { size, .. } => *size,
         })
     }
 
     pub fn path(&self) -> Option<&Path> {
         match self {
-            SegmentSource::Bytes(_) => None,
+            SegmentSource::Bytes(_) | SegmentSource::Remote { .. } => None,
             SegmentSource::File(p) | SegmentSource::Archive(p) => Some(p),
         }
     }

@@ -1284,6 +1284,9 @@ pub struct ShardOpts {
     pub residency: Option<Arc<ResidencyManager>>,
     /// Who this node is, for resolving the `minimal` tier.
     pub placement: Placement,
+    /// The object store the `archived` tier lives in, and the key prefix.
+    /// `None` keeps the local `archive/` directory as the stand-in.
+    pub archive: Option<crate::objstore::ArchiveHandle>,
 }
 
 /// What a seal wrote. The ids are ascending, so the last is the segment
@@ -1819,8 +1822,23 @@ impl Shard {
     /// invariant (§4.2) that makes hybrid retrieval a bitmap intersection.
     ///
     /// Returns the number of files relocated.
+    /// The object a segment of this shard is stored under when the archive
+    /// is an object store: the prefix, the collection, the shard directory
+    /// and the segment's file name, so that one bucket holds many databases
+    /// and a key reads like the path it stands in for.
+    fn object_key(&self, id: u64) -> Option<String> {
+        let dir = self.dir.as_ref()?;
+        let h = self.opts.archive.as_ref()?;
+        let shard = dir.file_name()?.to_str()?;
+        let coll = dir.parent()?.file_name()?.to_str()?;
+        Some(format!("{}{coll}/{shard}/{id:016x}.seg", h.prefix))
+    }
+
     pub(crate) fn sync_archive(&mut self) -> Result<usize> {
         let Some(dir) = self.dir.clone() else { return Ok(0) };
+        if let Some(h) = self.opts.archive.clone() {
+            return self.sync_object_store(&dir, &h);
+        }
         let want_archive = self.coll.all_indexes_archived();
         let mut moved = 0;
         for h in &self.segments {
@@ -1870,6 +1888,68 @@ impl Shard {
                 if want_archive { ("segments", "archive") } else { ("archive", "segments") };
             sync_dir(&dir.join(to_dir))?;
             sync_dir(&dir.join(from_dir))?;
+        }
+        Ok(moved)
+    }
+
+    /// The tier move against an object store. To the archive: the local file
+    /// is `PUT` whole, and only once the store has acknowledged it is the
+    /// local copy unlinked, so a failure between the two leaves both and the
+    /// next move re-puts. Back: the object is fetched whole and published
+    /// into `segments/` like any other file, and only then deleted from the
+    /// store; a failure between the two leaves both, and the open prefers
+    /// the local copy. A segment sitting in the legacy local `archive/`
+    /// directory from before the store was configured is migrated by the
+    /// first move that wants it archived.
+    fn sync_object_store(
+        &mut self,
+        dir: &Path,
+        h: &crate::objstore::ArchiveHandle,
+    ) -> Result<usize> {
+        let want_archive = self.coll.all_indexes_archived();
+        let mut moved = 0;
+        for handle in &self.segments {
+            let Some(key) = self.object_key(handle.id()) else { continue };
+            let name = format!("{:016x}.seg", handle.id());
+            let local = dir.join("segments").join(&name);
+            let legacy = dir.join("archive").join(&name);
+            let is_remote = matches!(handle.segment.source(), SegmentSource::Remote { .. });
+            if want_archive {
+                let from = if local.exists() {
+                    local.clone()
+                } else if legacy.exists() {
+                    legacy.clone()
+                } else {
+                    continue;
+                };
+                if is_remote {
+                    continue;
+                }
+                handle.segment.unload_all();
+                let bytes = fs::read(&from)?;
+                h.store.put(&key, &bytes)?;
+                let size = bytes.len() as u64;
+                handle.segment.set_source(SegmentSource::Remote {
+                    store: h.store.clone(),
+                    key: key.clone(),
+                    size,
+                });
+                handle.set_path(None);
+                fs::remove_file(&from)?;
+                #[cfg(test)]
+                durability_probe::note_rename(&from);
+                sync_dir(from.parent().unwrap_or(dir))?;
+                moved += 1;
+            } else if is_remote {
+                handle.segment.unload_all();
+                let bytes = h.store.get(&key)?;
+                publish(&local, &bytes)?;
+                sync_dir(&dir.join("segments"))?;
+                handle.segment.set_source(SegmentSource::File(local.clone()));
+                handle.set_path(Some(local.clone()));
+                h.store.delete(&key)?;
+                moved += 1;
+            }
         }
         Ok(moved)
     }
@@ -2299,15 +2379,27 @@ impl Shard {
                 // postings and vectors into RAM just to answer "what exists".
                 let local = dir.join("segments").join(format!("{:016x}.seg", meta.id));
                 let archived = dir.join("archive").join(format!("{:016x}.seg", meta.id));
-                let (p, src) = if local.exists() {
-                    (local.clone(), SegmentSource::File(local))
-                } else if archived.exists() {
-                    (archived.clone(), SegmentSource::Archive(archived))
-                } else {
-                    return Err(Error::Storage(format!(
+                let missing = || {
+                    Error::Storage(format!(
                         "segment {:016x} named by the manifest is missing",
                         meta.id
-                    )));
+                    ))
+                };
+                let (p, src) = if local.exists() {
+                    (Some(local.clone()), SegmentSource::File(local))
+                } else if archived.exists() {
+                    (Some(archived.clone()), SegmentSource::Archive(archived))
+                } else if let Some(h) = s.opts.archive.clone() {
+                    // Neither local copy: the object store is the only one.
+                    // Its size is asked for once, here, and the footer and
+                    // every component are ranged reads against it.
+                    let key = s.object_key(meta.id).ok_or_else(missing)?;
+                    match h.store.size(&key)? {
+                        Some(size) => (None, SegmentSource::Remote { store: h.store, key, size }),
+                        None => return Err(missing()),
+                    }
+                } else {
+                    return Err(missing());
                 };
                 let seg = Segment::open(src)?;
                 s.adopt_segment(&seg);
@@ -2323,7 +2415,7 @@ impl Shard {
                     })?,
                     None => DeleteLog::new(),
                 };
-                s.segments.push(SegmentHandle::new(seg, dl, Some(p)));
+                s.segments.push(SegmentHandle::new(seg, dl, p));
             }
             // Inside the branch on purpose: the live set is only known where a
             // manifest was read. See [`reclaim_orphans`].
@@ -2473,6 +2565,12 @@ impl Shard {
             }
             if let Some(p) = h.path() {
                 let _ = fs::remove_file(&p);
+            }
+            // A retired segment that lived in the object store is deleted
+            // there; nothing else ever will, since orphans are reclaimed
+            // only where a directory can be listed.
+            if let SegmentSource::Remote { store, key, .. } = h.segment.source() {
+                let _ = store.delete(&key);
             }
             let _ = fs::remove_file(dir.join("deletes").join(format!("{:016x}.dlog", h.id())));
             false

@@ -212,6 +212,17 @@ decides whose name ends up on the files.
 Nothing in celastro resolves a UID to a name, and the image has no `passwd`
 file to resolve it in, so `--user` may name any pair of numbers.
 
+## The archived tier can live in an object store
+
+`CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP) and
+`CELASTRO_ARCHIVE_BUCKET`, with `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, make the `archived` tier an S3-compatible bucket
+rather than a directory in the volume. `CELASTRO_ARCHIVE_PREFIX` and
+`CELASTRO_ARCHIVE_REGION` are optional. Pass them with `-e`; the credentials
+reach the process through its environment and are never written to the data
+directory. The endpoint must be reachable from the container's network
+namespace, which under `--network host` is the host's.
+
 ## The console binds loopback, and `-p` therefore cannot reach it
 
 `celastro-cli serve` puts a browser console on `127.0.0.1` and on nothing else.

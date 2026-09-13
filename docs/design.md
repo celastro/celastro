@@ -241,9 +241,9 @@ one, and it is not done.
 Everything that needs more than one process: consensus and replication, follower
 reads and closed timestamps, hedged requests, two-phase commit for multi-shard
 writes, stateless compaction workers, dynamic shard split and merge, and a
-deterministic simulator. The `archived` tier writes to a local directory that
-stands in for object storage — the residency and lifecycle machinery around it
-is real, the S3 client is not.
+deterministic simulator. The `archived` tier is an S3-compatible object store
+when one is configured and a local directory that stands in for one when not;
+the client is in-tree and plain HTTP, since the crate carries no TLS.
 
 The *boundaries* those attach to are real, and that is the point of having built
 them first:
@@ -504,6 +504,26 @@ For `<#>` the presented value is the negated inner product, so a threshold on
 it reads the other way.
 Under `NOT` a document with no vector has no distance and is on neither side.
 
+**The `archived` tier is an object store, reached the way the design budgets
+for.** One S3-compatible surface: a bucket, a key that reads like the path it
+stands in for, `PUT`, ranged `GET`, `HEAD` and `DELETE`, path-style and signed
+with Signature Version 4, over plain HTTP because the crate carries no TLS.
+SHA-256, HMAC, the signer and a small HTTP/1.1 client are in-tree and pinned
+against the published vectors, AWS's own worked example included. A remote
+segment is opened by reading its footer with two ranged reads and each
+component faults in with one more -- the chain of dependent round trips the
+design already charges an archived read for, reported by `EXPLAIN` like any
+fault-in; nothing is cached locally, so the object is the segment's only copy
+while it is archived. Moving to the store `PUT`s the local file and unlinks it
+only once the store has acknowledged; moving back fetches the object, publishes
+it into `segments/` like any other file, and only then deletes it, so a failure
+between the two steps of either move leaves both copies and the open prefers
+the local one. A retired segment's object is deleted by the sweep that
+retires it, because nothing lists the store: an object a failed publication
+left behind is not reclaimed, which is the one thing the local directory does
+that the store does not. Credentials come from the environment at open and
+are never written anywhere.
+
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
 running `serve` could only be stopped by the ten-second SIGKILL or by
@@ -650,6 +670,7 @@ guarantee:
 | a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
+| the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

@@ -79,6 +79,10 @@ the whole answer: a failure that ends the command is written there too, as
 {\"ok\":false,\"error\":...}, so a pipeline never has to read stderr to find out
 what went wrong.
 
+The `archived` tier is a local directory unless CELASTRO_ARCHIVE_ENDPOINT
+(`host:port`, plain HTTP) and CELASTRO_ARCHIVE_BUCKET name an S3-compatible
+store, with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for it.
+
 Statements end with `;` or a blank line. Everything after a bare `--` is an
 argument rather than a flag, which is how a statement that opens with a SQL
 comment gets through.
@@ -323,7 +327,7 @@ fn version_output(json: bool) -> String {
 
 fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     let mut db = match &dir {
-        Some(d) => match Db::open(d, DbOpts::default()) {
+        Some(d) => match Db::open(d, db_opts()) {
             Ok(db) => db,
             Err(e) => return fail(json, &format!("could not open {}: {e}", d.display())),
         },
@@ -1032,6 +1036,24 @@ const DEMO_TOPICS: &[(&str, &str)] = &[
 /// low flat-tier threshold so that a few hundred documents actually reach the
 /// HNSW tier, and every vector query logged so that the recall harness replays
 /// real queries rather than synthesising friendlier ones.
+/// The options a persistent database opens with. The `archived` tier's
+/// object store is configured from the environment, because a container
+/// has nowhere else to say it: `CELASTRO_ARCHIVE_ENDPOINT` (`host:port`,
+/// plain HTTP), `CELASTRO_ARCHIVE_BUCKET`, and optionally
+/// `CELASTRO_ARCHIVE_PREFIX` and `CELASTRO_ARCHIVE_REGION`. The credentials
+/// are `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, read by the library.
+fn db_opts() -> DbOpts {
+    let mut o = DbOpts::default();
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(endpoint) = var("CELASTRO_ARCHIVE_ENDPOINT") {
+        o.archive.endpoint = Some(endpoint);
+        o.archive.bucket = var("CELASTRO_ARCHIVE_BUCKET").unwrap_or_default();
+        o.archive.prefix = var("CELASTRO_ARCHIVE_PREFIX").unwrap_or_default();
+        o.archive.region = var("CELASTRO_ARCHIVE_REGION").unwrap_or_default();
+    }
+    o
+}
+
 fn demo_opts() -> DbOpts {
     let mut opts = DbOpts::default();
     opts.build.flat_tier_max = 64;
