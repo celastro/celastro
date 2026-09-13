@@ -44,22 +44,28 @@ pub struct SearchOpts {
     pub rerank_multiplier: usize,
     /// `WITH exact`: brute force over every vector, no approximation (§14).
     pub exact: bool,
-    /// Upper bound on the `1/s` amplification of `k`, so a very selective
-    /// filter cannot widen one query's traversal without limit.
-    ///
-    /// It bounds `ef`, not visits, and only on the [`Strategy::PostFilter`]
-    /// arm — the two places that read it both clamp `1/s` before computing
-    /// `ef`. [`Strategy::FilterAware`] traversal is bounded by `ef_search` and
-    /// by the graph: at a selectivity low enough that the result heap never
-    /// fills, it does walk the whole segment. `Hnsw::search_budgeted` can cap
-    /// that, but a bound budget changes which documents come back, so nothing
-    /// here passes one.
+    /// Upper bound on the `1/s` amplification of `k` on the
+    /// [`Strategy::PostFilter`] arm, so a very selective filter cannot widen
+    /// one query's traversal without limit. It bounds `ef`, not visits.
     pub max_amplification: usize,
+    /// A ceiling on the nodes a graph traversal may visit at level 0, for a
+    /// caller that would rather have a short answer than a long wait. A
+    /// budget that binds returns fewer or worse documents, which is why it is
+    /// `None` by default and reported beside the visit count when set:
+    /// `WITH (max_visits = N)` from SQL. The cost model prices a filter-aware
+    /// traversal by the visits it will make, budget included.
+    pub max_visits: Option<usize>,
 }
 
 impl Default for SearchOpts {
     fn default() -> Self {
-        SearchOpts { ef_search: 128, rerank_multiplier: 3, exact: false, max_amplification: 64 }
+        SearchOpts {
+            ef_search: 128,
+            rerank_multiplier: 3,
+            exact: false,
+            max_amplification: 64,
+            max_visits: None,
+        }
     }
 }
 
@@ -97,6 +103,12 @@ pub struct VectorReport {
     pub selectivity: f64,
     pub survivors: usize,
     pub ef_used: usize,
+    /// Level-0 nodes the graph traversal visited, summed over re-probes;
+    /// zero on the brute-force arm. The number the cost model estimates.
+    pub visits: usize,
+    /// The visit budget in force, if any, so a plan can show whether it
+    /// bound.
+    pub budget: Option<usize>,
     pub amplification: f64,
     pub reranked: usize,
     pub reprobes: usize,
@@ -328,10 +340,26 @@ impl VectorStore {
         }
     }
 
-    /// The cost model. Brute force is `survivors × dim`; a post-filtered ANN is
-    /// roughly `ANN(k/s)`, which is `ef` traversal steps each touching `m0`
-    /// neighbours. Codes are bytes rather than floats, so a traversal step is
-    /// cheaper per dimension than an exact one — hence `CODE_COST`.
+    /// The cost model. Brute force is `survivors × dim`. A graph traversal is
+    /// `visits × m0 × dim × CODE_COST` -- codes are bytes rather than floats,
+    /// so a step is cheaper per dimension than an exact distance -- and the
+    /// number of visits depends on WHICH traversal runs, so the model prices
+    /// the arm it would choose and compares that against the scan:
+    ///
+    /// - post-filter, above [`POST_FILTER_FLOOR`]: `ef` visits, with `ef`
+    ///   amplified by `1/s` up to `max_amplification`;
+    /// - filter-aware, below it: the heap fills only with admitted nodes, so
+    ///   about `ef / s` visits, never more than the segment, and never more
+    ///   than a visit budget.
+    ///
+    /// The model used to price both arms as `ef` visits, which under-counted
+    /// the filter-aware arm by `1/s`: at one percent selectivity it chose a
+    /// traversal of the whole segment over a scan of the one percent, twenty
+    /// times the work it had costed and neither exact nor bounded. The
+    /// corrected arithmetic is also why filter-aware traversal earns its
+    /// place only where a small fraction is still a large count, order
+    /// `10^5` documents per segment: below that, the fraction is cheaper to
+    /// scan.
     fn choose(&self, survivors: usize, s: f64, k: usize, opts: &SearchOpts) -> Strategy {
         if opts.exact {
             return Strategy::Exact;
@@ -342,22 +370,28 @@ impl VectorStore {
         const CODE_COST: f64 = 0.35;
         let dims = self.dims as f64;
         let cost_brute = survivors as f64 * dims;
-        let amp = (1.0 / s.max(1e-9)).min(opts.max_amplification as f64);
-        let ef = ((k as f64 * amp).ceil()).max(opts.ef_search as f64);
-        let cost_ann = ef * g.params.m0 as f64 * dims * CODE_COST;
-        if cost_brute <= cost_ann {
+        let per_visit = g.params.m0 as f64 * dims * CODE_COST;
+        // Above this selectivity, amplified post-filtering keeps recall; below
+        // it, a post-filter is mostly discarding what it just spent work to
+        // find, and filter-aware traversal is the graph's answer.
+        const POST_FILTER_FLOOR: f64 = 0.15;
+        let (arm, visits) = if s >= POST_FILTER_FLOOR {
+            let amp = (1.0 / s.max(1e-9)).min(opts.max_amplification as f64);
+            let ef = ((k as f64 * amp).ceil()).max(opts.ef_search as f64);
+            (Strategy::PostFilter, ef)
+        } else {
+            let ef = opts.ef_search.max(k * 4) as f64;
+            let mut visits = (ef / s.max(1e-9)).min(self.len() as f64);
+            if let Some(b) = opts.max_visits {
+                visits = visits.min(b as f64);
+            }
+            (Strategy::FilterAware, visits)
+        };
+        if cost_brute <= visits * per_visit {
             // Few enough survive that scanning them is cheaper — and exact.
             return Strategy::BruteForce;
         }
-        // Above this selectivity, amplified post-filtering keeps recall; below
-        // it, a post-filter is mostly discarding what it just spent work to
-        // find, and filter-aware traversal wins.
-        const POST_FILTER_FLOOR: f64 = 0.15;
-        if s >= POST_FILTER_FLOOR {
-            Strategy::PostFilter
-        } else {
-            Strategy::FilterAware
-        }
+        arm
     }
 
     fn brute_force(&self, query: &[f32], k: usize, admit: &Bitmap) -> Vec<(u32, f32)> {
@@ -420,7 +454,10 @@ impl VectorStore {
         // out. Capping here is what made post-filtered queries return six rows
         // when ten were available.
         let take = if admit_during.is_some() { want.min(ef) } else { want.max(ef) };
-        let raw = g.search(ef, take, admit_during, &d_to);
+        let (raw, visits) =
+            g.search_budgeted(ef, take, admit_during, opts.max_visits.unwrap_or(usize::MAX), &d_to);
+        report.visits += visits;
+        report.budget = opts.max_visits;
 
         let mut reranked: Vec<(u32, f32)> = raw
             .into_iter()
@@ -589,23 +626,61 @@ mod tests {
         assert!(hits >= 9, "recall {hits}/10");
     }
 
+    /// Ten percent of 20,000 is 2,000 survivors, and this fixture used to be
+    /// the one that "picked filter-aware" -- because the model priced that
+    /// arm at `ef` visits when its real cost is about `ef / s`: 1,280 visits
+    /// of 32 code distances each against a scan of 2,000 exact ones, seven
+    /// times the work. Priced honestly, the scan wins, and it is exact.
     #[test]
-    fn middling_selectivity_picks_filter_aware() {
+    fn a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed() {
         let vs = store(20000, 24, true);
-        // 10%: 2000 survivors is too many to scan exactly, but a post-filtered
-        // traversal would throw away nine of every ten candidates it found.
         let mut f = Bitmap::new(20000);
         for i in (0..20000).step_by(10) {
             f.set(i);
         }
         let q = vs.vector(3).to_vec();
         let (got, rep) = vs.search(&q, 10, &f, &SearchOpts::default());
+        assert_eq!(rep.strategy, Some(Strategy::BruteForce));
+        assert_eq!(rep.visits, 0);
+        assert_eq!(got.iter().map(|(d, _)| *d).collect::<Vec<_>>(), truth(&vs, &q, 10, &f));
+    }
+
+    /// Where the traversal is cheaper than the scan it is chosen, its visits
+    /// are counted rather than assumed, and a budget bounds them. One in
+    /// eight of 20,000 admitted with `ef = 16`: the model expects about 128
+    /// visits at 32 code distances each, under the 2,500 exact distances a
+    /// scan would cost, so filter-aware runs; the count is asserted against
+    /// the model's own bound rather than only the recall. With a budget of
+    /// 64 the traversal stops there, says so, and still returns only
+    /// admitted documents.
+    #[test]
+    fn filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them() {
+        let vs = store(20000, 24, true);
+        let mut f = Bitmap::new(20000);
+        for i in (0..20000).step_by(8) {
+            f.set(i);
+        }
+        let q = vs.vector(5).to_vec();
+        let opts = SearchOpts { ef_search: 16, ..Default::default() };
+        let (got, rep) = vs.search(&q, 4, &f, &opts);
         assert_eq!(rep.strategy, Some(Strategy::FilterAware));
-        assert_eq!(got.len(), 10);
+        assert_eq!(rep.budget, None);
         assert!(got.iter().all(|(d, _)| f.get(*d as usize)));
-        let t = truth(&vs, &q, 10, &f);
-        let hits = got.iter().filter(|(d, _)| t.contains(d)).count();
-        assert!(hits >= 8, "filter-aware recall {hits}/10");
+        assert!(!got.is_empty());
+        // The heap holds 16 admitted nodes and one in eight is admitted, so
+        // the walk is well past `ef` and nowhere near the segment.
+        assert!(rep.visits >= 16, "visits={}", rep.visits);
+        assert!(rep.visits < 20000 / 4, "visits={}: the traversal walked the segment", rep.visits);
+        let unbounded = rep.visits;
+
+        let budgeted = SearchOpts { ef_search: 16, max_visits: Some(64), ..Default::default() };
+        let (got, rep) = vs.search(&q, 4, &f, &budgeted);
+        assert_eq!(rep.strategy, Some(Strategy::FilterAware));
+        assert_eq!(rep.budget, Some(64));
+        assert!(rep.visits <= 64, "visits={} over a budget of 64", rep.visits);
+        assert!(rep.visits < unbounded, "the budget did not bind");
+        assert!(got.iter().all(|(d, _)| f.get(*d as usize)));
+        assert!(got.len() <= 4);
     }
 
     #[test]

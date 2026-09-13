@@ -185,7 +185,7 @@ impl Explain {
                 }
                 for (name, v) in &u.vector {
                     o.push_str(&format!(
-                        "      vector[{}]: strategy={} tier={} s={:.4} survivors={} ef={} amp={:.1}x reranked={} reprobes={}\n",
+                        "      vector[{}]: strategy={} tier={} s={:.4} survivors={} ef={} amp={:.1}x visits={}{} reranked={} reprobes={}\n",
                         name,
                         v.strategy.map(|s| s.name()).unwrap_or("none"),
                         v.tier.map(|t| format!("{t:?}")).unwrap_or_else(|| "-".into()),
@@ -193,6 +193,8 @@ impl Explain {
                         v.survivors,
                         v.ef_used,
                         v.amplification,
+                        v.visits,
+                        v.budget.map(|b| format!(" budget={b}")).unwrap_or_default(),
                         v.reranked,
                         v.reprobes
                     ));

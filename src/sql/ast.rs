@@ -258,6 +258,10 @@ pub struct WithOpts {
     /// opts in, and the response carries the list of missing units (§8.4).
     pub partial_results: bool,
     pub ef_search: Option<usize>,
+    /// `WITH (max_visits = N)`: a ceiling on the nodes a graph traversal may
+    /// visit, for a caller that would rather have a short answer. It binds
+    /// knowingly: the plan shows the count beside it.
+    pub max_visits: Option<usize>,
     /// Query deadline in milliseconds. Zero is exceeded at once.
     pub deadline_ms: Option<u64>,
     /// `WITH (no_deadline)`: run without a budget, whatever the `Db`'s

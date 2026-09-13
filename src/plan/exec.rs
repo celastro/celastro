@@ -1167,6 +1167,7 @@ fn run_source(
             if let Some(ef) = sel.with.ef_search {
                 opts.ef_search = ef;
             }
+            opts.max_visits = sel.with.max_visits;
             let (hits, mut report) = vs.search(query, k_prime, filter, &opts);
             if sel.with.exact {
                 report.strategy = Some(Strategy::Exact);

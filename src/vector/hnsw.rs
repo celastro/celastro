@@ -427,7 +427,7 @@ impl Hnsw {
         admit: Option<&Bitmap>,
         d_to: &dyn Fn(u32) -> f32,
     ) -> Vec<(u32, f32)> {
-        self.search_budgeted(ef, k, admit, usize::MAX, d_to)
+        self.search_budgeted(ef, k, admit, usize::MAX, d_to).0
     }
 
     /// [`Hnsw::search`] with a hard ceiling on how many nodes level 0 may
@@ -439,12 +439,10 @@ impl Hnsw {
     /// budget caps that, and when it binds the answer degrades to the best the
     /// budget found.
     ///
-    /// Nothing on the query path passes one: `VectorStore::graph_search` calls
-    /// [`Hnsw::search`], and `SearchOpts::max_amplification` bounds `ef` on the
-    /// post-filter arm rather than bounding visits here. Wiring this in would
-    /// change which documents a filtered search returns, so it is a decision
-    /// for a caller that would rather have a short answer than an unbounded
-    /// scan, not a silent default.
+    /// `SearchOpts::max_visits` is how a caller passes one, knowingly: a
+    /// budget that binds returns fewer or worse documents, so it is never a
+    /// silent default, and the number of nodes visited is reported beside
+    /// it so a plan shows whether it bound. Returns the hits and that count.
     pub fn search_budgeted(
         &self,
         ef: usize,
@@ -452,9 +450,9 @@ impl Hnsw {
         admit: Option<&Bitmap>,
         max_visits: usize,
         d_to: &dyn Fn(u32) -> f32,
-    ) -> Vec<(u32, f32)> {
+    ) -> (Vec<(u32, f32)>, usize) {
         if self.count == 0 || self.entry == u32::MAX {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let mut ep = self.entry;
         let mut l = self.max_level;
@@ -514,7 +512,7 @@ impl Hnsw {
         let mut v: Vec<Cand> = results.into_vec();
         v.sort();
         v.truncate(k);
-        v.into_iter().map(|c| (c.id, c.d)).collect()
+        (v.into_iter().map(|c| (c.id, c.d)).collect(), visits)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -923,7 +921,7 @@ mod tests {
         let full = g.search(64, 10, Some(&admit), &d_to);
         let unbudgeted = seen.get();
         seen.set(0);
-        let capped = g.search_budgeted(64, 10, Some(&admit), 32, &d_to);
+        let capped = g.search_budgeted(64, 10, Some(&admit), 32, &d_to).0;
         let budgeted = seen.get();
         assert!(unbudgeted > n / 2, "unbudgeted traversal should scan the segment: {unbudgeted}");
         assert!(budgeted < n / 4, "the budget should have cut the traversal short: {budgeted}");

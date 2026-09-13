@@ -21,6 +21,17 @@ that ran out listed as missing. `EXPLAIN ANALYZE` shows the budget. A
 statement that used to finish slowly may now be refused; name a budget if
 thirty seconds is not enough.
 
+**Filtered vector search prices the traversal that would run.** The cost
+model charged a filter-aware traversal `ef` visits when its real cost is
+about `ef / s`, so at low selectivity it chose a traversal of most of the
+segment over an exact scan of the few survivors, twenty times the work it had
+costed. It now prices the arm it would run, which picks the scan far more
+often on segments under a hundred thousand documents; a scan is exact, so
+where the choice changes the answer can only improve. `WITH (max_visits = N)`
+bounds a traversal for a caller that would rather have a short answer, and
+`EXPLAIN ANALYZE` reports `visits` beside the budget so it shows whether it
+bound.
+
 **The console says when a query was cut.** A wide prefix that hit the
 expansion cap was reported by the shells and both JSON wires and not by the
 browser console, which showed the short table and said nothing. It now shows

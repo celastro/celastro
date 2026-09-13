@@ -641,6 +641,12 @@ impl<'a> Parser<'a> {
                         .map_err(|_| Error::Sql("`ef_search` is too large".into()))?;
                     w.ef_search = Some(n);
                 }
+                "max_visits" => {
+                    let n = count_option(&key, val)?;
+                    let n = usize::try_from(n)
+                        .map_err(|_| Error::Sql("`max_visits` is too large".into()))?;
+                    w.max_visits = Some(n);
+                }
                 "deadline_ms" => w.deadline_ms = Some(count_option(&key, val)?),
                 "no_deadline" => w.no_deadline = bool_option(&key, val)?,
                 other => return Err(Error::Sql(format!("unknown WITH option `{other}`"))),
@@ -1210,6 +1216,8 @@ mod tests {
             assert!(parse(&sql, &[]).is_err(), "accepted {bad}");
         }
         // Zero is a meaningful `ef_search`: the search floors it at one.
+        let s = sel("SELECT * FROM c WITH (max_visits = 64)", &[]);
+        assert_eq!(s.with.max_visits, Some(64));
         let s = sel("SELECT * FROM c WITH (no_deadline)", &[]);
         assert!(s.with.no_deadline && s.with.deadline_ms.is_none());
         let s = sel("SELECT * FROM c WITH (ef_search = 0, deadline_ms = 50)", &[]);

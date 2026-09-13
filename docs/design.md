@@ -428,13 +428,20 @@ not cost. A text source genuinely can resume from a score threshold; the two
 cases are worth keeping separate in one's head.
 
 **The cost model picks brute force far more often than a static planner would.**
-With `m0 = 32`, an ANN traversal touches roughly `ef × 32` code distances, so
-exact scan wins until survivors exceed about `11 × ef` — around 1,400 documents
-at `ef = 128`. Filter-aware traversal earns its place only when a small
-*fraction* is still a large *count*, order 10⁵ documents per segment. The
-regimes are separated by absolute counts that depend on `m0`, dimensionality and
-the filter, which is the argument for choosing at runtime from measured
-selectivity rather than estimating.
+With `m0 = 32`, a traversal costs about `11 × dims` per node visited, so an
+exact scan wins until survivors exceed about `11 × visits`. A post-filtered
+traversal visits about `ef` nodes — around 1,400 survivors at `ef = 128`. A
+filter-aware traversal visits about `ef / s`, because its heap fills only with
+admitted nodes, so it earns its place only when a small *fraction* is still a
+large *count*: the scan wins until `n > 11 × ef / s²`, which at ten percent and
+`ef = 128` is a segment of 140,000 documents. The model used to price both arms
+at `ef` visits, which chose a full traversal over a one-percent scan; it now
+prices the arm that would run. A caller can bound the traversal with
+`WITH (max_visits = N)`, knowingly — a budget that binds returns fewer or worse
+documents — and the plan reports `visits` beside `budget` so it shows whether
+it bound. The regimes are separated by absolute counts that depend on `m0`,
+dimensionality and the filter, which is the argument for choosing at runtime
+from measured selectivity rather than estimating.
 
 **1-bit quantization needs a much deeper rerank set than SQ8.** Measured on
 isotropic Gaussians — the worst case for sign quantization — 5× rerank gives
@@ -579,7 +586,7 @@ guarantee:
 | approximate mode within tolerance | `approximate_mode_across_shard_counts_stays_within_recall_tolerance` |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |
-| filtered-search strategy selection | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, middling_selectivity_picks_filter_aware}` |
+| filtered-search strategy selection prices the traversal that would run, and a visit budget binds knowingly | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed, filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them}` (the last asserts the visit count against the model's bound, and that a budget of 64 stops the walk at 64 and says so) |
 | visibility under deletes and updates | `mvcc::tests::*`, `shard::tests::*` |
 | segments survive a reopen | `a_database_survives_reopen` |
 | an acknowledged write is on the disk, and every step is in the order the guarantee needs | `shard::tests::the_three_fsyncs_are_syscalls_and_not_bookkeeping` (the floor under the rest: each fsync helper is handed a descriptor the kernel refuses to sync and has to report it, so none of them can be satisfied by bookkeeping), `shard::tests::an_insert_appends_its_wal_record_and_then_makes_it_durable`, `shard::tests::an_insert_that_supersedes_a_document_syncs_the_record_that_supersedes_it`, `shard::tests::a_delete_makes_its_wal_record_durable_before_it_returns`, `shard::tests::a_publication_syncs_the_bytes_then_renames_then_syncs_the_name` (a directory synced BEFORE its rename is a directory synced for nothing), `shard::tests::a_seal_publishes_the_delete_logs_durably_and_before_the_manifest`, `shard::tests::a_seal_publishes_the_manifest_before_it_empties_the_wal`, `engine::tests::creating_a_collection_makes_the_directories_that_hold_it_durable` (the directory entries: an fsynced file whose directory was never synced is a file nothing names), `engine::tests::the_tablet_map_is_published_durably_and_a_damaged_one_is_refused` (and that an empty line in it is an unbounded end, not the bound `""`, which is a shard owning no keys), `engine::tests::every_publication_fsyncs_the_directory_it_renamed_into` (the same claim stated once over the whole event log rather than once per file, so the call site written next is covered without a test of its own) |
