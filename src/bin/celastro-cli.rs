@@ -58,6 +58,8 @@ COMMANDS:
   demo                       build a small hybrid corpus and show it working
   catalog                    list collections and their indexes
   health [--port N]          exit 0 if a console is serving on 127.0.0.1:N
+  export <COLLECTION> <DIR>  copy a collection, as of now, into a new database directory
+  import <DIR>               adopt a collection an export wrote into this database
   help                       this
   version                    print the version
 
@@ -128,6 +130,8 @@ enum Cmd {
     Demo,
     Catalog,
     Health { port: u16 },
+    Export { collection: String, to: PathBuf },
+    Import { from: PathBuf },
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
@@ -227,6 +231,18 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
         "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT) },
+        "export" => match rest.len() {
+            2 => Cmd::Export { collection: rest[0].clone(), to: PathBuf::from(&rest[1]) },
+            _ => {
+                return Cli::Usage(
+                    "`export` takes a collection and a directory to write".to_string(),
+                )
+            }
+        },
+        "import" => match rest.len() {
+            1 => Cmd::Import { from: PathBuf::from(&rest[0]) },
+            _ => return Cli::Usage("`import` takes the directory an export wrote".to_string()),
+        },
         "help" => return Cli::Help { json },
         "version" => return Cli::Version { json },
         other => return Cli::Usage(format!("unknown command `{other}`")),
@@ -356,6 +372,30 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             EXIT_OK
         }
         Cmd::Health { .. } => unreachable!("answered before the database was opened"),
+        Cmd::Export { collection, to } => match db.export_collection(&collection) {
+            Ok(export) => match export.write_to(&to) {
+                Ok(()) => {
+                    ack(
+                        json,
+                        &format!(
+                            "exported `{collection}` at ts {} to {}",
+                            export.timestamp(),
+                            to.display()
+                        ),
+                    );
+                    EXIT_OK
+                }
+                Err(e) => fail(json, &format!("could not write {}: {e}", to.display())),
+            },
+            Err(e) => fail(json, &format!("could not export `{collection}`: {e}")),
+        },
+        Cmd::Import { from } => match db.import_collection(&from) {
+            Ok(name) => {
+                ack(json, &format!("imported `{name}` from {}", from.display()));
+                EXIT_OK
+            }
+            Err(e) => fail(json, &format!("could not import {}: {e}", from.display())),
+        },
     };
     // Every path that opened a directory saves before it leaves, including the
     // ones that failed: the statements that ran before the failing one are
@@ -416,6 +456,20 @@ fn failure_report(json: bool, msg: &str) -> (bool, String) {
 // --------------------------------------------------------------------------
 // serve
 // --------------------------------------------------------------------------
+
+/// One acknowledgement line, in whichever shape the run asked for.
+fn ack(json: bool, message: &str) {
+    if json {
+        let out = Value::obj(vec![
+            ("ok".to_string(), Value::Bool(true)),
+            ("kind".to_string(), Value::Str("ack".into())),
+            ("message".to_string(), Value::Str(message.into())),
+        ]);
+        println!("{}", json::to_string(&out));
+    } else {
+        println!("{message}");
+    }
+}
 
 /// `health`: exit 0 when a console on `--port` answers that it is serving,
 /// 1 otherwise. A container's liveness and readiness probe, since the image
@@ -1664,5 +1718,31 @@ mod tests {
             parse_args(vec!["--port".into(), "9".into(), "catalog".into()]),
             Cli::Usage(_)
         ));
+    }
+
+    /// `export` takes a collection and a directory, `import` a directory,
+    /// and neither takes more.
+    #[test]
+    fn export_and_import_take_their_arguments_and_no_more() {
+        match parse_args(vec![
+            "--dir".into(),
+            "d".into(),
+            "export".into(),
+            "notes".into(),
+            "out".into(),
+        ]) {
+            Cli::Run { cmd: Cmd::Export { collection, to }, .. } => {
+                assert_eq!(collection, "notes");
+                assert_eq!(to, PathBuf::from("out"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_args(vec!["--dir".into(), "d".into(), "import".into(), "out".into()]) {
+            Cli::Run { cmd: Cmd::Import { from }, .. } => assert_eq!(from, PathBuf::from("out")),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse_args(vec!["export".into(), "notes".into()]), Cli::Usage(_)));
+        assert!(matches!(parse_args(vec!["import".into()]), Cli::Usage(_)));
+        assert!(matches!(parse_args(vec!["import".into(), "a".into(), "b".into()]), Cli::Usage(_)));
     }
 }

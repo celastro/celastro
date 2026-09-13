@@ -504,6 +504,19 @@ For `<#>` the presented value is the negated inner product, so a threshold on
 it reads the other way.
 Under `NOT` a document with no vector has no distance and is on neither side.
 
+**A copy of a collection is the source at one instant, taken without
+stopping it.** `Db::export_collection` pins a snapshot: the sealed segments
+the manifest names, held by their `Arc`s so no compaction can unlink one
+before it is copied; each delete log as it stands at the pin;
+and the memtable's visible rows sealed into one fresh segment of the copy's
+own, built from the snapshot and touching nothing in the source. Between the
+pin and `write_to` the source keeps taking writes and none reach the copy.
+`write_to` publishes every file under a temporary directory and renames it
+into place at the end, so the destination is absent or complete; `import`
+adopts one into another instance the same way. No `gc_horizon` is pinned:
+the entry that planned this expected to need one, but a handle's `Arc` is
+what keeps a file, and the files are what is copied.
+
 **A deployment is one pod, and its probes ask the database.** The Helm chart
 is a `StatefulSet` of one, with `replicas: 1` as a fact and not a value,
 because there is no cluster: two pods would be two unrelated databases. The
@@ -682,6 +695,7 @@ guarantee:
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
 | the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |
 | a health probe measures the database, needs no token, and stays behind the Host check | `serve::tests::the_health_probe_needs_no_token_and_reports_the_database`, `serve::tests::the_probe_tells_serving_from_unwell_from_absent` (the client half: serving, unwell and absent are three answers), `celastro-cli::tests::health_takes_a_port_and_nothing_else`; the chart itself is verified by hand against a `kind` cluster, as its README records |
+| a copy is the source at its pinned instant, absent or complete, and adoptable elsewhere | `engine::tests::a_copy_is_the_source_at_its_pinned_instant_whatever_happens_after` (three shards, sealed and memtable rows, deletes on both; inserts, deletes, updates, a flush and a compaction between the pin and the write; the copy answers the source's pinned rows byte for byte and the source no longer does), `engine::tests::an_interrupted_copy_leaves_no_destination_to_open_by_mistake`, `engine::tests::an_import_adds_the_collection_to_another_instance`, `celastro-cli::tests::export_and_import_take_their_arguments_and_no_more` |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

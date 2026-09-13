@@ -2206,7 +2206,7 @@ impl Shard {
     /// happens BEFORE the shard is moved to the state it publishes: see
     /// [`Shard::publish_segments`]. The shard's own fields are one caller of
     /// this, not its definition.
-    fn manifest_of(
+    pub(crate) fn manifest_of(
         segments: &[Arc<SegmentHandle>],
         version: u64,
         next_segment_id: u64,

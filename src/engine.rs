@@ -20,14 +20,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally};
+use crate::codec::{crc32, put_u32};
 use crate::compaction::{self, CompactionOpts};
 use crate::error::{Error, Result};
 use crate::lifecycle::{self, IndexActivity, LifecyclePolicy};
 use crate::memtable::{FlushThresholds, MemtableBudget};
+use crate::mvcc::DeleteLog;
 use crate::plan::exec::{self, ExecInput, QueryResult};
 use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
 use crate::segment::BuildOpts;
-use crate::shard::{sort_key, Shard, ShardOpts};
+use crate::segment::{PendingDoc, SegmentBuilder, SegmentSource};
+use crate::shard::{sort_key, Searchable, SegmentHandle, Shard, ShardOpts};
 use crate::sql::{self, ast::*};
 use crate::text::scorer::{Expansion, GlobalStats, PREFIX_EXPANSION_LIMIT};
 use crate::time::{Hlc, Timestamp};
@@ -142,6 +145,120 @@ impl Default for DbOpts {
             archive: crate::objstore::ArchiveOpts::default(),
         }
     }
+}
+
+/// A collection pinned at one instant by [`Db::export_collection`], ready to
+/// be written as a database directory of its own by [`write_to`](Self::write_to).
+/// Holding it holds the source's segment files: drop it when done.
+pub struct CollectionExport {
+    name: String,
+    ts: Timestamp,
+    catalog: Catalog,
+    shards: Vec<ExportShard>,
+}
+
+struct ExportShard {
+    range: (Option<String>, Option<String>),
+    sealed: Vec<Arc<SegmentHandle>>,
+    deletes: Vec<(u64, Option<Vec<u8>>)>,
+    fresh: Option<(u64, Vec<u8>)>,
+    manifest: Vec<u8>,
+}
+
+impl CollectionExport {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The instant the copy is pinned at.
+    pub fn timestamp(&self) -> Timestamp {
+        self.ts
+    }
+
+    /// Write the copy as a complete database directory at `dir`, which must
+    /// not exist. Everything is written under a sibling temporary directory
+    /// and renamed into place at the end, so `dir` is either absent or
+    /// complete: a copy that fails partway, or a crash during one, leaves
+    /// no half-populated destination to open by mistake.
+    pub fn write_to(&self, dir: &Path) -> Result<()> {
+        if dir.exists() {
+            return Err(Error::Storage(format!("{} already exists", dir.display())));
+        }
+        let tmp = dir.with_extension("tmp");
+        let _ = fs::remove_dir_all(&tmp);
+        match self.write_tree(&tmp) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        }
+        fs::rename(&tmp, dir)?;
+        #[cfg(test)]
+        crate::shard::durability_probe::note_rename(dir);
+        let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        crate::shard::sync_dir(parent)?;
+        Ok(())
+    }
+
+    fn write_tree(&self, root: &Path) -> Result<()> {
+        fs::create_dir_all(root)?;
+        crate::shard::atomic_write(&root.join("CATALOG"), &self.catalog.encode())?;
+        let cdir = root.join("collections").join(&self.name);
+        for (i, sh) in self.shards.iter().enumerate() {
+            let sdir = cdir.join(format!("shard-{i:04}"));
+            fs::create_dir_all(sdir.join("segments"))?;
+            fs::create_dir_all(sdir.join("deletes"))?;
+            fs::create_dir_all(sdir.join("archive"))?;
+            let (lo, hi) = &sh.range;
+            crate::shard::atomic_write(
+                &sdir.join("RANGE"),
+                format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default())
+                    .as_bytes(),
+            )?;
+            for h in &sh.sealed {
+                let bytes = match h.segment.source() {
+                    SegmentSource::File(p) | SegmentSource::Archive(p) => fs::read(&p)?,
+                    SegmentSource::Bytes(b) => b.as_ref().clone(),
+                    SegmentSource::Remote { store, key, .. } => store.get(&key)?,
+                };
+                let name = format!("{:016x}.seg", h.id());
+                crate::shard::atomic_write(&sdir.join("segments").join(name), &bytes)?;
+            }
+            for (id, log) in &sh.deletes {
+                if let Some(bytes) = log {
+                    let name = format!("{id:016x}.dlog");
+                    crate::shard::atomic_write(&sdir.join("deletes").join(name), bytes)?;
+                }
+            }
+            if let Some((id, bytes)) = &sh.fresh {
+                let name = format!("{id:016x}.seg");
+                crate::shard::atomic_write(&sdir.join("segments").join(name), bytes)?;
+            }
+            crate::shard::atomic_write(&sdir.join("MANIFEST"), &sh.manifest)?;
+            crate::shard::sync_dir(&sdir)?;
+        }
+        crate::shard::sync_dir(&cdir)?;
+        crate::shard::sync_dir(&root.join("collections"))?;
+        crate::shard::sync_dir(root)?;
+        Ok(())
+    }
+}
+
+/// Copy a directory tree, every file published durably.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            crate::shard::atomic_write(&dest, &fs::read(entry.path())?)?;
+        }
+    }
+    crate::shard::sync_dir(to)?;
+    Ok(())
 }
 
 /// Thirty seconds: long enough that no statement the quick start or the demo
@@ -436,17 +553,36 @@ impl Db {
         }
         let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
         for name in names {
-            let mut coll = db.catalog.get(&name)?.clone();
+            db.attach_collection(dir, &name)?;
+        }
+        // The catalog as decoded describes sealed documents. Until the
+        // replayed ones are folded in, `SHOW CATALOG` and the `catalog` verb
+        // would report a database with an unflushed WAL as smaller than it
+        // is, and a statement is not required before the first question.
+        let names: Vec<String> = db.shards.keys().cloned().collect();
+        for name in names {
+            db.absorb_shard_catalogs(&name)?;
+        }
+        Ok(db)
+    }
+
+    /// Open the shards of one collection from its directory under `dir`,
+    /// replaying each WAL. The catalog entry is already in place; what this
+    /// adds is the shards, with the statistics baseline they start from.
+    fn attach_collection(&mut self, dir: &Path, name: &str) -> Result<()> {
+        let db = self;
+        {
+            let mut coll = db.catalog.get(name)?.clone();
             // What is already counted stays in the baseline; the shards start
             // from zero and count only what they see from here -- which
             // includes the WAL they are about to replay, and which the
             // baseline therefore must not.
             db.stats_baseline.insert(
-                name.clone(),
+                name.to_string(),
                 PathTally { docs: coll.doc_count, paths: std::mem::take(&mut coll.paths) },
             );
             coll.doc_count = 0;
-            let cdir = dir.join("collections").join(&name);
+            let cdir = dir.join("collections").join(name);
             let mut shards = Vec::new();
             let mut i = 0usize;
             loop {
@@ -485,18 +621,10 @@ impl Db {
                 i += 1;
             }
             if !shards.is_empty() {
-                db.shards.insert(name, shards);
+                db.shards.insert(name.to_string(), shards);
             }
         }
-        // The catalog as decoded describes sealed documents. Until the
-        // replayed ones are folded in, `SHOW CATALOG` and the `catalog` verb
-        // would report a database with an unflushed WAL as smaller than it
-        // is, and a statement is not required before the first question.
-        let names: Vec<String> = db.shards.keys().cloned().collect();
-        for name in names {
-            db.absorb_shard_catalogs(&name)?;
-        }
-        Ok(db)
+        Ok(())
     }
 
     fn shard_opts(&self) -> ShardOpts {
@@ -515,6 +643,125 @@ impl Db {
     /// often a read had to fault a component back in.
     pub fn residency(&self) -> &Arc<ResidencyManager> {
         &self.residency
+    }
+
+    /// Pin a collection at this instant and hand back everything a copy of
+    /// it needs, without stopping writes.
+    ///
+    /// The copy is the collection as a reader at this instant sees it: the
+    /// sealed segments the manifest names now, held by their `Arc`s so that
+    /// no compaction can unlink a file before it is copied; each segment's
+    /// delete log as it stands now, so a later delete does not reach the
+    /// copy; and the memtable's visible rows sealed into one
+    /// fresh segment of the copy's own, built here from the snapshot and
+    /// touching nothing in the source. The source keeps taking writes
+    /// between this call and `CollectionExport::write_to`, and none of them
+    /// reach the copy -- the test that pins this interleaves inserts,
+    /// deletes, a flush and a compaction between the two.
+    ///
+    /// No `gc_horizon` is pinned. The entry that planned this expected to
+    /// need one, but the files are what the copy reads and an `Arc` on the
+    /// handle is what keeps a file; version retention inside compaction
+    /// outputs is beside the point when the outputs are not what is copied.
+    pub fn export_collection(&mut self, name: &str) -> Result<CollectionExport> {
+        self.absorb_shard_catalogs(name)?;
+        let ts = self.clock.peek().max(self.last_commit);
+        let coll = self.catalog.get(name)?.clone();
+        let mut catalog = Catalog::default();
+        catalog.collections.insert(name.to_string(), coll.clone());
+        let mut shards = Vec::new();
+        for s in self.shards(name)? {
+            let snap = s.snapshot_at(ts);
+            let sealed = snap.segments.clone();
+            // Captured now, at the pin: a delete landed after this point
+            // goes into the source's log and not into these bytes. The test
+            // that pins this deletes sealed rows between the pin and the
+            // write and finds them in the copy.
+            let deletes: Vec<(u64, Option<Vec<u8>>)> =
+                sealed.iter().map(|h| (h.id(), h.encode_deletes())).collect();
+            // The memtable and any frozen memtable, visible at `ts`, in key
+            // order: one version per key is visible, so one segment holds
+            // them all.
+            let mut pending: Vec<PendingDoc> = Vec::new();
+            let mut units: Vec<Searchable<'_>> = vec![Searchable::Mem(snap.memtable)];
+            units.extend(snap.frozen.iter().map(|f| Searchable::Mem(f)));
+            for unit in &units {
+                let Searchable::Mem(m) = unit else { continue };
+                let vis = unit.visibility(ts);
+                for ord in vis.iter() {
+                    let d = &m.docs[ord as usize];
+                    pending.push(PendingDoc {
+                        sort_key: d.sort_key.clone(),
+                        commit_ts: d.commit_ts,
+                        doc: d.doc.clone(),
+                    });
+                }
+            }
+            pending.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+            let next_id = sealed.iter().map(|h| h.id()).max().unwrap_or(0) + 1;
+            let mut handles: Vec<Arc<SegmentHandle>> = sealed.clone();
+            let mut fresh = None;
+            if !pending.is_empty() {
+                let mut b = SegmentBuilder::new(self.opts.build);
+                for d in pending {
+                    b.add(d);
+                }
+                let seg = b.build(next_id, 0, &coll)?;
+                let bytes = seg.encode()?;
+                let handle = SegmentHandle::new(seg, DeleteLog::new(), None);
+                handles.push(handle);
+                fresh = Some((next_id, bytes));
+            }
+            let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1).encode();
+            let crc = crc32(&manifest);
+            put_u32(&mut manifest, crc);
+            shards.push(ExportShard {
+                range: s.key_range.clone().unwrap_or((None, None)),
+                sealed,
+                deletes,
+                fresh,
+                manifest,
+            });
+        }
+        Ok(CollectionExport { name: name.to_string(), ts, catalog, shards })
+    }
+
+    /// Adopt a collection written by [`CollectionExport::write_to`] into
+    /// this database: its files are copied under `collections/`, its catalog
+    /// entry added, its shards opened, and the catalog persisted. Refused
+    /// if a collection of that name exists, and on an in-memory database.
+    /// Returns the collection's name.
+    pub fn import_collection(&mut self, from: &Path) -> Result<String> {
+        let Some(dir) = self.dir.clone() else {
+            return Err(Error::Plan("import needs a persistent database (--dir)".into()));
+        };
+        let bytes = fs::read(from.join("CATALOG"))
+            .map_err(|e| Error::Storage(format!("{}: CATALOG: {e}", from.display())))?;
+        let exported = Catalog::decode(&bytes)?;
+        let (name, coll) = match exported.collections.iter().next() {
+            Some((n, c)) if exported.collections.len() == 1 => (n.clone(), c.clone()),
+            _ => return Err(Error::Storage("an export holds exactly one collection".into())),
+        };
+        if self.catalog.collections.contains_key(&name) {
+            return Err(Error::Plan(format!("collection `{name}` already exists here")));
+        }
+        let src = from.join("collections").join(&name);
+        let dest = dir.join("collections").join(&name);
+        let tmp = dir.join("collections").join(format!("{name}.import.tmp"));
+        let _ = fs::remove_dir_all(&tmp);
+        if let Err(e) = copy_tree(&src, &tmp) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, &dest)?;
+        #[cfg(test)]
+        crate::shard::durability_probe::note_rename(&dest);
+        crate::shard::sync_dir(&dir.join("collections"))?;
+        self.catalog.collections.insert(name.clone(), coll);
+        self.attach_collection(&dir, &name)?;
+        self.absorb_shard_catalogs(&name)?;
+        self.persist_catalog()?;
+        Ok(name)
     }
 
     /// How many collections the catalog holds. What a health probe asks,
@@ -5072,6 +5319,164 @@ mod tests {
         db.gather_stats("notes", &want(&["segments"]), ts, false).unwrap();
         let c = db.stats.get(&cache_key("notes", "body")).unwrap();
         assert!(c.refreshed_at_writes > before.0, "writes to `notes` did not end its epoch");
+    }
+
+    /// A copy is the source at the instant it was pinned, whatever the source
+    /// does afterwards. Three shards, sealed rows and memtable rows, deletes
+    /// on both; then, between the pin and the write, inserts, deletes of rows
+    /// the copy holds, updates, a flush and a compaction. The copy opens as a
+    /// database of its own and answers exactly what the source answered at
+    /// the pin, document by document and byte for byte -- and the source no
+    /// longer does, which is what proves the interleaving reached it and not
+    /// the copy.
+    #[test]
+    fn a_copy_is_the_source_at_its_pinned_instant_whatever_happens_after() {
+        let dir = tmp("export-src");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute(
+            "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, n INT) \
+             PARTITION BY (tenant_id) WITH (splits = ['t1', 't2'])",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        let doc = |i: usize, v: usize| {
+            crate::json::parse(&format!(
+                r#"{{"id":"d{i:04}","tenant_id":"t{}","n":{v},"body":"item {i} version {v}"}}"#,
+                i % 3
+            ))
+            .unwrap()
+        };
+        let key = |i: usize| format!("t{}\u{1}d{i:04}", i % 3);
+        for i in 0..200 {
+            db.insert("items", doc(i, 0)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        for i in 200..300 {
+            db.insert("items", doc(i, 0)).unwrap();
+        }
+        for i in (0..300).step_by(10) {
+            assert!(db.delete_key("items", &key(i)).unwrap(), "{}", key(i));
+        }
+        let rows = |db: &mut Db| -> Vec<(String, Vec<u8>)> {
+            let mut r: Vec<(String, Vec<u8>)> = db
+                .query("SELECT * FROM items LIMIT 100000")
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|x| (x.key, crate::variant::encode_to_vec(&x.doc)))
+                .collect();
+            r.sort();
+            r
+        };
+        let expected = rows(&mut db);
+        assert_eq!(expected.len(), 270);
+
+        let export = db.export_collection("items").unwrap();
+
+        // Everything a source does while a copy is in flight.
+        for i in 300..350 {
+            db.insert("items", doc(i, 0)).unwrap();
+        }
+        for i in (5..300).step_by(10) {
+            assert!(db.delete_key("items", &key(i)).unwrap());
+        }
+        for i in (1..300).step_by(7) {
+            db.insert("items", doc(i, 1)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        db.execute("COMPACT items").unwrap();
+        assert_ne!(rows(&mut db), expected, "the interleaved writes changed nothing");
+
+        let dest = tmp("export-dst");
+        export.write_to(&dest).unwrap();
+        drop(export);
+        assert!(!dest.with_extension("tmp").exists(), "the temporary directory was left behind");
+        let mut copy = Db::open(&dest, DbOpts::default()).unwrap();
+        assert_eq!(rows(&mut copy), expected, "the copy is not the source at the pinned instant");
+        assert_eq!(copy.shards("items").unwrap().len(), 3);
+        // And it is a database, not a snapshot: it takes writes of its own.
+        copy.insert("items", doc(900, 0)).unwrap();
+        assert_eq!(rows(&mut copy).len(), 271);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A copy that fails partway leaves the destination absent or complete,
+    /// never in between. Two failures, either side of the one rename: the
+    /// fsync of the temporary tree, after every file has been written under
+    /// it, which is the moment a half-populated destination would look most
+    /// complete -- and the destination is absent; and the fsync of the parent
+    /// after the rename -- and the destination is there, whole, and opens.
+    #[test]
+    fn an_interrupted_copy_leaves_no_destination_to_open_by_mistake() {
+        let dir = tmp("export-fail-src");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for id in ["a", "b", "c"] {
+            db.insert("notes", note(id)).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db.insert("notes", note("d")).unwrap();
+        let export = db.export_collection("notes").unwrap();
+        let dest = tmp("export-fail-dst");
+        durability_probe::fail_next(Op::DirSync, &dest.with_extension("tmp"));
+        let e = export.write_to(&dest).expect_err("the injected failure was not reported");
+        assert!(matches!(e, Error::Io(_)), "{e}");
+        assert!(!dest.exists(), "a failed copy left a destination");
+        assert!(!dest.with_extension("tmp").exists(), "a failed copy left its temporary tree");
+        // After the rename only the parent's fsync is left; a failure there
+        // is reported, and what it leaves is complete.
+        durability_probe::fail_next(Op::DirSync, dest.parent().unwrap());
+        let e = export.write_to(&dest).expect_err("the injected failure was not reported");
+        assert!(matches!(e, Error::Io(_)), "{e}");
+        let mut copy = Db::open(&dest, DbOpts::default()).unwrap();
+        assert_eq!(copy.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 4);
+        drop(copy);
+        let _ = fs::remove_dir_all(&dest);
+        // And with nothing armed, the same export writes fine.
+        export.write_to(&dest).unwrap();
+        let mut copy = Db::open(&dest, DbOpts::default()).unwrap();
+        assert_eq!(copy.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 4);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A copy is adopted by another instance beside what it already holds,
+    /// refused where the name is taken, and still there after a reopen.
+    #[test]
+    fn an_import_adds_the_collection_to_another_instance() {
+        let src_dir = tmp("import-src");
+        let mut src = Db::open(&src_dir, DbOpts::default()).unwrap();
+        src.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for id in ["a", "b", "c"] {
+            src.insert("notes", note(id)).unwrap();
+        }
+        src.execute("FLUSH notes").unwrap();
+        src.insert("notes", note("d")).unwrap();
+        let export = src.export_collection("notes").unwrap();
+        let exported = tmp("import-exported");
+        export.write_to(&exported).unwrap();
+
+        let dst_dir = tmp("import-dst");
+        let mut dst = Db::open(&dst_dir, DbOpts::default()).unwrap();
+        dst.execute("CREATE COLLECTION other (id TEXT PRIMARY KEY)").unwrap();
+        dst.insert("other", note("x")).unwrap();
+        assert_eq!(dst.import_collection(&exported).unwrap(), "notes");
+        assert_eq!(dst.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 4);
+        assert_eq!(dst.query("SELECT id FROM other LIMIT 10").unwrap().rows.len(), 1);
+        assert!(matches!(dst.import_collection(&exported), Err(Error::Plan(_))));
+        drop(dst);
+        let mut dst = Db::open(&dst_dir, DbOpts::default()).unwrap();
+        assert_eq!(dst.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 4);
+        assert_eq!(dst.collection_count(), 2);
+        let mut mem = Db::in_memory();
+        assert!(matches!(mem.import_collection(&exported), Err(Error::Plan(_))));
+        for d in [src_dir, exported, dst_dir] {
+            let _ = fs::remove_dir_all(&d);
+        }
     }
 
     /// A tier move is a publication. `sync_archive` relocates a segment

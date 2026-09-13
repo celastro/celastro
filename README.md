@@ -183,6 +183,22 @@ token. `POST /api/shutdown` with the token stops the server after a clean
 save. The console, like the CLI, saves after every statement that changed
 something.
 
+## Copying a collection
+
+A collection is copied as of an instant, without stopping the source:
+
+```
+celastro-cli --dir ./data export notes ./notes-copy       # a database directory of its own
+celastro-cli --dir ./elsewhere import ./notes-copy         # adopted beside what is there
+```
+
+The export pins a snapshot, copies the segment files it names, copies each
+delete log as it stands, and seals the rows still in
+memory into one segment of the copy's own; writes that land on the source
+meanwhile do not reach it. The destination is written under a temporary name
+and renamed into place at the end, so it is either absent or complete. The
+copy opens as a database on its own, or `import` adopts it into another one.
+
 ## Kubernetes
 
 `chart/celastro` is a Helm chart for one instance: a `StatefulSet` of one

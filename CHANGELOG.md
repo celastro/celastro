@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A collection can be copied between instances, as of an instant, without
+stopping the source.** `celastro-cli export <collection> <dir>` writes a
+database directory holding the collection as a reader saw it at the pin,
+and `import <dir>` adopts it into another database. Writes that land on the
+source while the copy is in flight do not reach it; the destination is
+absent or complete, never half-populated. In the library:
+`Db::export_collection`, `CollectionExport::write_to`, `Db::import_collection`.
+
 ## 0.13.0 — 2026-09-13
 
 A new verb and a chart, hence a minor. `/api/health` no longer requires the
