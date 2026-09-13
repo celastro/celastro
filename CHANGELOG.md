@@ -6,7 +6,11 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.10.0 — 2026-09-13
+
+A behaviour change for a query with more tied documents than its candidate
+depth in an unflushed memtable, hence a minor. No public signature changed
+and the on-disk format is unchanged.
 
 **A score tie inside a memtable no longer depends on insertion order.** A
 unit hands the coordinator its best `k'` candidates, and inside a memtable a
