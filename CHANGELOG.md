@@ -6,7 +6,11 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.5.0 — 2026-09-13
+
+The delete log gained a frame, so this is a format change with a compatible
+read path: a 0.4.0 directory opens as it is, and its delete logs are rewritten
+in the new shape as they are next published. No public signature changed.
 
 **An unreadable file fails the open instead of opening empty.** CATALOG,
 MANIFEST and every delete log used to be read as absent when the read failed
