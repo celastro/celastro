@@ -97,9 +97,9 @@ Exit 0, no error, nothing wrong — but not what anyone meant to run.
 | `docker run -it celastro` | the interactive session |
 
 `-t` without `-i` is the trap. It does not exit; it waits on a terminal that
-will never send anything, and because nothing in the image handles signals
-(see below) `docker stop` waits out the full ten-second grace period and then
-kills it: exit 137.
+will never send anything, and because the REPL handles no signals (only
+`serve` does -- see below) `docker stop` waits out the full ten-second grace
+period and then kills it: exit 137.
 
 With a volume, the entrypoint is bare so global flags precede the verb. `-i` is
 what lets the statements below arrive on stdin; `-it` is the same session typed
@@ -271,7 +271,7 @@ and the container's the same interface:
 
 ```
 $ docker run --rm --network host -v celastro-data:/data celastro --dir /data serve
-celastro-cli serving on 127.0.0.1:8787 — Ctrl-C to stop
+celastro-cli serving on 127.0.0.1:8787 — Ctrl-C, SIGTERM or POST /api/shutdown to stop
 The token in that URL is the only thing protecting this database. Anyone who can
 read this terminal, this process's environment or its command line can use it, and
 the server answers every request that carries it. Treat the URL as a password, and
@@ -285,11 +285,10 @@ the four-line warning are diagnostics on stderr. Docker copies the two streams
 to a terminal independently, so their order relative to each other is not
 fixed: the URL lands last here and first about as often.
 
-That URL, token included, is what to `curl` or open. It is also how to stop the
-server: the command above holds the terminal, and Ctrl-C does not end it —
-nothing in the image handles signals (see below), so the interrupt reaches a
-PID 1 that ignores it and the container keeps serving, banner line
-notwithstanding. From a second terminal:
+That URL, token included, is what to `curl` or open. Ctrl-C in the terminal
+holding the command ends the server, saved and exit 0: `serve` handles SIGINT
+and SIGTERM itself, as the banner says. It can also be stopped from a second
+terminal, which is how a browser session ends it:
 
 ```
 $ curl -s -X POST 'http://127.0.0.1:8787/api/shutdown?t=fdd2b8856f798668b6f29478e4f1fd5b'
@@ -317,17 +316,24 @@ that is a process that was running and then was not. What would be a caught
 exception elsewhere is a container exit here, so the restart policy is the
 error handling.
 
-Nothing in the image handles signals either, and PID 1 with a default
-disposition does not receive the ones a supervisor sends:
+`serve` handles SIGTERM and SIGINT itself -- an in-tree binding to
+`signal(2)`, the route being recorded in `src/signal.rs` -- so as PID 1 it
+receives the signal a supervisor sends and ends the accept loop; the caller
+then saves and exits 0. The other verbs install no handler: the REPL because a
+handled Ctrl-C would be swallowed by a restarted read at a terminal, and the
+one-shot verbs because a job that is killed is a job that stops. PID 1 with a
+default disposition does not receive the signal at all, which is what the
+ten seconds below are:
 
 | stopping it | observed |
 |---|---|
-| `docker stop` | ten seconds of waiting, then SIGKILL: exit 137 |
-| `docker stop`, container started with `--init` | under a second, exit 143 |
+| `docker stop`, `serve` | prompt, exit 0, closed cleanly |
+| `docker stop`, `repl` | ten seconds of waiting, then SIGKILL: exit 137 |
+| `docker stop`, `repl`, container started with `--init` | under a second, exit 143 |
 | `POST /api/shutdown` (`serve` only) | immediate, exit 0, closed cleanly |
 
-So run `serve` with `--init` — Docker's init takes PID 1 and forwards the
-signal to a child that is killable — or expect every stop to take ten seconds.
+So `serve` needs nothing; an interactive `repl` left running as PID 1 wants
+`--init`, or expect its stop to take ten seconds.
 
 Being killed abruptly is survivable. `serve` persists after every statement that
 changed something: two statements through the console, then

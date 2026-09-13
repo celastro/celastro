@@ -504,6 +504,16 @@ For `<#>` the presented value is the negated inner product, so a threshold on
 it reads the other way.
 Under `NOT` a document with no vector has no distance and is on neither side.
 
+**`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
+kernel does not deliver a default-disposition signal to PID 1, so a container
+running `serve` could only be stopped by the ten-second SIGKILL or by
+`--init`. `std` has no signal API and the crate takes no dependencies, so the
+handler is one `extern "C"` declaration and one atomic store, and the accept
+loop polls the listener rather than blocking on it, because a blocking accept
+is restarted after the handler runs. Only `serve` installs it: at a REPL a
+handled Ctrl-C would be swallowed by the restarted read. The route is
+recorded in `src/signal.rs`.
+
 **Durability is unix-shaped, and every mover is inside it.** The guarantee
 rests on fsyncing the directory a rename landed in, which is a POSIX
 operation; off unix `sync_dir` is a no-op and the guarantee weakens to what
@@ -639,6 +649,7 @@ guarantee:
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |
 | a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
+| `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |

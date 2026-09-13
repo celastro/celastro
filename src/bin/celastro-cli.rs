@@ -417,7 +417,16 @@ fn serve(db: &mut Db, port: u16, open: bool, json: bool) -> i32 {
         println!("{url}");
     }
     let _ = io::stdout().flush();
-    eprintln!("celastro-cli serving on {} — Ctrl-C to stop", server.local_addr());
+    // Installed here and not for the REPL: see `celastro::signal`. The banner
+    // says what actually stops the server, which used to be false in a
+    // container, where PID 1 with a default disposition never receives the
+    // interrupt the banner promised.
+    let stops = if celastro::signal::install_shutdown_handlers() {
+        "Ctrl-C, SIGTERM or POST /api/shutdown to stop"
+    } else {
+        "POST /api/shutdown to stop"
+    };
+    eprintln!("celastro-cli serving on {} — {stops}", server.local_addr());
     eprintln!(
         "The token in that URL is the only thing protecting this database. Anyone who can\n\
          read this terminal, this process's environment or its command line can use it, and\n\

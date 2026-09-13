@@ -8,6 +8,13 @@ repository.
 
 ## Unreleased
 
+**`serve` handles SIGTERM and SIGINT.** As PID 1 in a container it received
+neither, so `docker stop` waited ten seconds and killed it; it now ends the
+accept loop, saves and exits 0, and the banner says so. The route is an
+in-tree `signal(2)` binding, recorded in `src/signal.rs`, because `std` has
+no signal API and the crate takes no dependencies. Only `serve` installs it.
+`--init` is no longer needed for `serve`.
+
 **The statistics cache ages by its own collection's writes.** The refresh
 gate compared against an engine-wide write count, so a burst on an
 unrelated collection ended this one's epoch and unanchored its globals. It

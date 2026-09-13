@@ -134,18 +134,33 @@ impl Server {
     /// hangs up mid-request, sends garbage, or trips a deadline is not a reason
     /// to take the user's database console down. A `POST /api/shutdown` is, and
     /// returning is what lets the caller persist and exit.
+    ///
+    /// A SIGTERM or SIGINT ends it the same way, once the caller has installed
+    /// the handlers (`signal::install_shutdown_handlers`). The listener is
+    /// polled rather than blocked on: a blocking `accept` is restarted after a
+    /// handler runs, so the flag would be read only when the next connection
+    /// happened to arrive, which for a `docker stop` is never.
     pub fn run(self, db: &mut Db) -> Result<()> {
+        const POLL: Duration = Duration::from_millis(25);
+        self.listener.set_nonblocking(true)?;
         let mut failures = 0u32;
-        for stream in self.listener.incoming() {
-            match stream {
-                Ok(s) => {
+        loop {
+            if crate::signal::shutdown_requested() {
+                return Ok(());
+            }
+            match self.listener.accept() {
+                Ok((s, _)) => {
                     failures = 0;
+                    // The listener's flag is not inherited on every platform
+                    // and must not be here: a connection is served blocking.
+                    s.set_nonblocking(false)?;
                     match self.serve_one(s, db) {
                         Ok(Next::Serve) => {}
                         Ok(Next::Stop) => return Ok(()),
                         Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
                     }
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) => {
                     eprintln!("celastro-cli: accept failed: {e}");
                     match accept_backoff(e.kind(), failures + 1) {
@@ -165,7 +180,6 @@ impl Server {
                 }
             }
         }
-        Ok(())
     }
 
     fn serve_one(&self, stream: TcpStream, db: &mut Db) -> std::io::Result<Next> {

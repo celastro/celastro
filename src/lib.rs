@@ -87,6 +87,7 @@ pub mod residency;
 pub mod segment;
 pub mod serve;
 pub mod shard;
+pub mod signal;
 pub mod sql;
 pub mod text;
 pub mod time;

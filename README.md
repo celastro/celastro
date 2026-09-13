@@ -161,7 +161,7 @@ is in use: `celastro --dir ./data`, `celastro --file setup.sql`,
 
 ```
 $ celastro-cli --dir ./data serve
-celastro-cli serving on 127.0.0.1:8787 — Ctrl-C to stop
+celastro-cli serving on 127.0.0.1:8787 — Ctrl-C, SIGTERM or POST /api/shutdown to stop
 The token in that URL is the only thing protecting this database. Anyone who can
 read this terminal, this process's environment or its command line can use it, and
 the server answers every request that carries it. Treat the URL as a password, and
@@ -192,13 +192,14 @@ docker build -t celastro .
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
-docker run --rm --init --network host -v celastro-data:/data celastro --dir /data serve
+docker run --rm --network host -v celastro-data:/data celastro --dir /data serve
 ```
 
 `serve` needs `--network host`, because a published port cannot reach a
-loopback bind, and `--init`, because nothing in the image handles signals. Bind
-mounts, ownership, the REPL's stdin behaviour and what each of those flags
-costs are in [docs/container.md](https://github.com/celastro/celastro/blob/main/docs/container.md).
+loopback bind. It handles SIGTERM and SIGINT itself, so `docker stop` ends it
+promptly with the database saved. Bind mounts, ownership, the REPL's stdin
+behaviour and what each of those flags costs are in
+[docs/container.md](https://github.com/celastro/celastro/blob/main/docs/container.md).
 
 ---
 
