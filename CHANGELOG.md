@@ -6,7 +6,13 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.8.0 — 2026-09-13
+
+Two behaviour changes on a published crate, hence a minor: every statement
+now has a deadline, and a filtered vector search may choose a different
+strategy than before. No public signature was removed; `DbOpts`,
+`SearchOpts` and `VectorReport` each gained a field, and `WithOpts` gained
+two. The on-disk format is unchanged.
 
 **Every statement has a deadline, and it is enforced inside the work.** A
 query's CPU used to be bounded only by an opt-in: `WITH (deadline_ms)`
