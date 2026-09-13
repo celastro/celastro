@@ -1060,6 +1060,9 @@ pub fn collect_top_k(
     let mut heap: Vec<Hit> = Vec::with_capacity(k.min(4096) + 1);
     let mut d = scorer.advance(0);
     while d != EXHAUSTED {
+        if crate::deadline::expired() {
+            break;
+        }
         let admitted =
             filter.get(d as usize) && !excluded.map(|e| e.get(d as usize)).unwrap_or(false);
         if !admitted {
@@ -1133,6 +1136,9 @@ pub fn evaluate_to_bitmap(c: Compiled<'_>, len: usize) -> Bitmap {
     if let Some(mut s) = scorer {
         let mut d = s.advance(0);
         while d != EXHAUSTED {
+            if crate::deadline::expired() {
+                break;
+            }
             if (d as usize) < len {
                 out.set(d as usize);
             }
@@ -1280,6 +1286,42 @@ mod tests {
             got.iter().map(|h| h.ord).collect::<Vec<_>>(),
             want.iter().map(|h| h.ord).collect::<Vec<_>>()
         );
+    }
+
+    /// Scoring and filtering both stop when the statement's deadline has
+    /// passed: the top-k loop returns nothing and the filter walk sets no
+    /// bit, so the executor above refuses the statement rather than the loop
+    /// answering with a fraction. With the deadline lifted the same query is
+    /// complete.
+    #[test]
+    fn scoring_stops_when_the_deadline_has_passed() {
+        let mut b = InvertedBuilder::new();
+        for i in 0..40u32 {
+            let mut toks = Vec::new();
+            Analyzer::English.analyze(&format!("small world {i}"), 0, &mut toks);
+            b.add_doc(i, &toks);
+        }
+        let (dict, post, _) = b.finish();
+        let dict = crate::text::postings::DictParts::parse(&dict).unwrap();
+        let lens = b.doc_lens.clone();
+        let src = TextSource::sealed(&dict, &post, &lens);
+        let st = stats(&src);
+        let q = TextQuery::parse("small world", Analyzer::English).unwrap();
+        {
+            let _expired = crate::deadline::arm(Some(0));
+            let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+            let got = collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10);
+            assert!(got.is_empty(), "scoring ran past the deadline: {} hits", got.len());
+            let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+            assert_eq!(evaluate_to_bitmap(c, 40).popcount(), 0, "the filter ran past the deadline");
+        }
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+        assert_eq!(
+            collect_top_k(c.scorer.unwrap(), &Bitmap::all(40), c.excluded.as_ref(), 10).len(),
+            10
+        );
+        let c = compile(&q, &src, &all_live(&src), &st, Bm25Params::default()).unwrap();
+        assert_eq!(evaluate_to_bitmap(c, 40).popcount(), 40);
     }
 
     #[test]

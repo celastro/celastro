@@ -481,6 +481,9 @@ impl Hnsw {
         // heap held, and that is the honest answer.
         let ef = ef.max(1);
         'traverse: while let Some(RevCand(c)) = cands.pop() {
+            if crate::deadline::expired() {
+                break;
+            }
             let worst = results.peek().map(|w| ord_d(w.d)).unwrap_or(f32::INFINITY);
             if results.len() >= ef && ord_d(c.d) > worst {
                 break;

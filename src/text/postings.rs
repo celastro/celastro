@@ -346,6 +346,9 @@ impl<'a> TermDict<'a> {
         let start = self.block_for(prefix).unwrap_or(0);
         let index = self.index();
         for bi in start..index.len() {
+            if crate::deadline::expired() {
+                break;
+            }
             if out.len() >= limit {
                 break;
             }

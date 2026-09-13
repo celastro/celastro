@@ -107,6 +107,15 @@ pub struct DbOpts {
     /// it, leaving `RUN LIFECYCLE` as the only trigger — which is what the
     /// tests want, and what an operator who prefers a cron job wants.
     pub lifecycle_interval_writes: u64,
+    /// How long a statement may run before it is refused, in milliseconds,
+    /// unless it says otherwise with `WITH (deadline_ms = N)`; `None` for no
+    /// limit. On by default, because a statement's cost is otherwise bounded
+    /// by nothing a caller did not opt into: a wide prefix, a filter-aware
+    /// graph traversal at low selectivity or a scan of a large collection
+    /// each run as long as they run. `WITH (no_deadline)` lifts it for one
+    /// statement. Checked inside the expensive loops, not only between
+    /// shards; see the `deadline` module.
+    pub statement_deadline_ms: Option<u64>,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -124,9 +133,14 @@ impl Default for DbOpts {
             residency: ResidencyOpts::default(),
             lifecycle_interval_writes: 0,
             placement: Placement::default(),
+            statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
         }
     }
 }
+
+/// Thirty seconds: long enough that no statement the quick start or the demo
+/// runs comes near it, short enough that a hostile one is a bounded cost.
+pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 
 /// The periodically refreshed global statistics of §8.2. All three numbers —
 /// `num_docs`, `total_doc_len` and `doc_freq` — are masked sums at one
@@ -1957,6 +1971,14 @@ impl Db {
     }
 
     pub fn run_select(&mut self, sel: &Select, sql: &str, analyze: bool) -> Result<QueryResult> {
+        // The statement's budget: none if it said `no_deadline`, its own if
+        // it named one, else the `Db`'s.
+        let budget = if sel.with.no_deadline {
+            None
+        } else {
+            sel.with.deadline_ms.or(self.opts.statement_deadline_ms)
+        };
+        let _deadline = crate::deadline::arm(budget);
         self.absorb_shard_catalogs(&sel.collection)?;
         // Before the query, not after: an index the query is about to fault in
         // from cold storage counts as used even if the query then fails.
@@ -4943,6 +4965,84 @@ mod tests {
             "a missing tablet map was read as a shard that owns every key"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A statement that cannot finish within its deadline is refused with the
+    /// budget named and the two ways to change it, on every query shape, and
+    /// by DEFAULT: this `Db` was given a budget of nothing and the statements
+    /// say nothing. `WITH (partial_results)` turns the refusal into an answer
+    /// that says which shards are missing, and `WITH (no_deadline)` lifts
+    /// the budget for one statement. Writes, DDL and maintenance carry no
+    /// budget: the same `Db` creates, inserts and flushes without complaint.
+    #[test]
+    fn a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named() {
+        let dir = tmp("deadline");
+        let opts = DbOpts { statement_deadline_ms: Some(0), ..Default::default() };
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (embedding) \
+             WITH (dims = 4, metric = 'cosine')",
+        )
+        .unwrap();
+        for i in 0..50 {
+            let d = crate::json::parse(&format!(
+                r#"{{"id":"n{i:02}","topic":"t","body":"segments and postings {i}","embedding":[{},1.0,0.5,0.25]}}"#,
+                i as f32 / 50.0
+            ))
+            .unwrap();
+            db.insert("notes", d).unwrap();
+        }
+        let shapes = [
+            "SELECT id FROM notes LIMIT 5",
+            "SELECT id FROM notes WHERE text_match(body, 'segments') LIMIT 5",
+            "SELECT id FROM notes ORDER BY embedding <=> [1,0,0,0] LIMIT 5",
+            "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'segments'), \
+             embedding <=> [1,0,0,0]) LIMIT 5",
+            "SELECT id FROM notes WHERE embedding <=> [1,0,0,0] < 0.5 LIMIT 5",
+        ];
+        for sql in shapes {
+            match db.query(sql) {
+                Err(Error::Deadline(m)) => {
+                    assert!(m.contains("0 ms") && m.contains("deadline_ms"), "{sql}: {m}")
+                }
+                other => panic!("{sql}: {other:?}"),
+            }
+            let r = db.query(&format!("{sql} WITH (partial_results)")).unwrap();
+            assert!(!r.missing.is_empty(), "{sql}: nothing was reported missing");
+            let r = db.query(&format!("{sql} WITH (no_deadline)")).unwrap();
+            assert_eq!(r.rows.len(), 5, "{sql}: lifting the deadline");
+            assert!(r.missing.is_empty());
+        }
+        db.execute("FLUSH notes").unwrap();
+        assert_eq!(
+            db.query("SELECT id FROM notes LIMIT 5 WITH (deadline_ms = 60000)").unwrap().rows.len(),
+            5
+        );
+        drop(db);
+
+        // And the default IS a budget: a `Db` given no opinion shows one in
+        // the plan, and only `no_deadline` takes it away.
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let plan = |db: &mut Db, with: &str| match db
+            .execute(&format!("EXPLAIN ANALYZE SELECT id FROM notes LIMIT 5{with}"))
+            .unwrap()
+        {
+            Outcome::Explain(t) => t,
+            _ => panic!("expected a plan"),
+        };
+        let text = plan(&mut db, "");
+        assert!(
+            text.contains(&format!("deadline={DEFAULT_STATEMENT_DEADLINE_MS} ms")),
+            "a default Db has no budget: {text}"
+        );
+        assert!(plan(&mut db, " WITH (deadline_ms = 7)").contains("deadline=7 ms"));
+        assert!(plan(&mut db, " WITH (no_deadline)").contains("deadline=none"));
         let _ = fs::remove_dir_all(&dir);
     }
 

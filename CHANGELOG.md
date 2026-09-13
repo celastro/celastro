@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Every statement has a deadline, and it is enforced inside the work.** A
+query's CPU used to be bounded only by an opt-in: `WITH (deadline_ms)`
+existed, was off by default, and was checked between shards, so one shard's
+work ran as long as it ran. A `Db` now gives every query 30 seconds
+(`DbOpts::statement_deadline_ms`), a statement may raise it with
+`WITH (deadline_ms = N)` or lift it with `WITH (no_deadline)`, and the
+graph traversal, the brute-force pass, the WAND loop, the prefix walk and the
+scan each stop when it passes. A statement that ran out is refused with the
+budget named, or, under `WITH (partial_results)`, answered with the shards
+that ran out listed as missing. `EXPLAIN ANALYZE` shows the budget. A
+statement that used to finish slowly may now be refused; name a budget if
+thirty seconds is not enough.
+
 ## 0.7.0 — 2026-09-13
 
 A new predicate shape, hence a minor. No public signature changed and the

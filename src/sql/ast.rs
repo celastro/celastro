@@ -258,8 +258,11 @@ pub struct WithOpts {
     /// opts in, and the response carries the list of missing units (§8.4).
     pub partial_results: bool,
     pub ef_search: Option<usize>,
-    /// Query deadline in milliseconds.
+    /// Query deadline in milliseconds. Zero is exceeded at once.
     pub deadline_ms: Option<u64>,
+    /// `WITH (no_deadline)`: run without a budget, whatever the `Db`'s
+    /// default. The one way to lift the default from SQL.
+    pub no_deadline: bool,
 }
 
 #[derive(Debug, Clone)]

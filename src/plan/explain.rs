@@ -90,6 +90,10 @@ pub struct Explain {
     pub limit: usize,
     pub offset: usize,
     pub exact_mode: bool,
+    /// The statement's budget, or `None` under `WITH (no_deadline)` or a
+    /// `Db` with none. In the plan because a refusal for running out is
+    /// otherwise the first a reader hears of it.
+    pub deadline_ms: Option<u64>,
     pub stats_exact: bool,
     pub shards: Vec<ShardExplain>,
     pub fusion: Option<FusionExplain>,
@@ -106,10 +110,14 @@ impl Explain {
         let mut o = String::new();
         let shards_scanned = self.shards.iter().filter(|s| !s.pruned).count();
         o.push_str(&format!(
-            "Query plan  (snapshot ts={}, limit={}, k'={}{})\n",
+            "Query plan  (snapshot ts={}, limit={}, k'={}, deadline={}{})\n",
             self.snapshot_ts,
             self.limit,
             self.k_prime,
+            match self.deadline_ms {
+                Some(ms) => format!("{ms} ms"),
+                None => "none".to_string(),
+            },
             if self.exact_mode { ", EXACT MODE" } else { "" }
         ));
         o.push_str(&format!(

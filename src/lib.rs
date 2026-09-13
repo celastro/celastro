@@ -27,6 +27,7 @@ pub mod catalog;
 pub mod codec;
 pub mod column;
 pub mod compaction;
+pub mod deadline;
 pub mod engine;
 pub mod error;
 pub mod harness;

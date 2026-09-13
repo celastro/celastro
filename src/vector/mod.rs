@@ -244,6 +244,9 @@ impl VectorStore {
         };
         let mut out = Bitmap::new(n);
         for v in admit.iter() {
+            if crate::deadline::expired() {
+                break;
+            }
             let d = distance::distance(self.metric, query, self.vector(v as usize));
             if keep(d) {
                 out.set(self.vec_to_doc[v as usize] as usize);
@@ -361,6 +364,9 @@ impl VectorStore {
         let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
         let mut worst = f32::INFINITY;
         for v in admit.iter() {
+            if crate::deadline::expired() {
+                break;
+            }
             let d = distance::distance(self.metric, query, self.vector(v as usize));
             if best.len() < k {
                 best.push((self.vec_to_doc[v as usize], d));
@@ -525,6 +531,36 @@ mod tests {
             .collect();
         all.sort_by(cmp_dist);
         all.into_iter().take(k).map(|(d, _)| d).collect()
+    }
+
+    /// A search stops when the statement's deadline has passed, on every arm:
+    /// a brute-force pass, a graph traversal and a threshold pass each return
+    /// at once with what they had -- nothing, or the entry point -- so that
+    /// the executor's check above them refuses the statement instead of
+    /// letting it run to the end of the segment. With the deadline lifted the
+    /// same search is complete and exact.
+    #[test]
+    fn a_search_stops_when_the_deadline_has_passed() {
+        let vs = store(6000, 32, true);
+        let q = vs.vector(0).to_vec();
+        let all = Bitmap::all(6000);
+        let mut sparse = Bitmap::new(6000);
+        for i in (0..6000).step_by(97) {
+            sparse.set(i);
+        }
+        {
+            let _expired = crate::deadline::arm(Some(0));
+            let (got, rep) = vs.search(&q, 10, &sparse, &SearchOpts::default());
+            assert_eq!(rep.strategy, Some(Strategy::BruteForce));
+            assert!(got.is_empty(), "brute force ran past the deadline: {} hits", got.len());
+            let (got, rep) = vs.search(&q, 10, &all, &SearchOpts::default());
+            assert_eq!(rep.strategy, Some(Strategy::PostFilter));
+            assert!(got.len() < 10, "the traversal ran past the deadline: {} hits", got.len());
+            let (bm, _) = vs.within(&q, &all, 6000, |_| true);
+            assert_eq!(bm.popcount(), 0, "the threshold pass ran past the deadline");
+        }
+        let (got, _) = vs.search(&q, 10, &sparse, &SearchOpts::default());
+        assert_eq!(got.iter().map(|(d, _)| *d).collect::<Vec<_>>(), truth(&vs, &q, 10, &sparse));
     }
 
     #[test]

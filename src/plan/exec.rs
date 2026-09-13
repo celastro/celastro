@@ -34,6 +34,7 @@ use std::time::Instant;
 use crate::bitmap::Bitmap;
 use crate::catalog::{Collection, Metric};
 use crate::column::CmpOp;
+use crate::deadline;
 use crate::error::{Error, Result};
 use crate::plan::explain::{Explain, ShardExplain, TextExplain, TextStrategy, UnitExplain};
 use crate::plan::fusion::{fuse, Candidate, Direction, Fused, SourceList};
@@ -423,7 +424,6 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     let t0 = Instant::now();
     let sel = input.select;
     let k = sel.limit.unwrap_or(10);
-    let deadline = sel.with.deadline_ms.map(std::time::Duration::from_millis);
 
     let mut ex = Explain {
         statement: input.statement.clone(),
@@ -431,6 +431,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         limit: k,
         offset: sel.offset,
         exact_mode: sel.with.exact,
+        deadline_ms: deadline::limit_ms(),
         stats_exact: input.stats.values().next().map(|s| s.exact).unwrap_or(sel.with.exact_scoring),
         ..Default::default()
     };
@@ -482,12 +483,15 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
 
     // --- Non-ranked queries: no candidate generation, just a filtered scan.
     if sources.is_empty() {
-        let out = scan(&input, &prefix, k, &mut ex, deadline)?;
+        let out = scan(&input, &prefix, k, &mut ex)?;
         ex.total_micros = t0.elapsed().as_micros();
         let cut = truncated_prefixes(input.stats);
         ex.notes.extend(cut.iter().cloned());
         let mut rows = out.0;
         project(&input.select.projections, &mut rows);
+        if !sel.with.partial_results {
+            deadline::check()?;
+        }
         return Ok(QueryResult {
             rows,
             explain: if input.analyze { Some(ex) } else { None },
@@ -516,26 +520,24 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
                 continue;
             }
         }
-        if let Some(d) = deadline {
-            if t0.elapsed() > d {
-                sx.timed_out = true;
-                ex.shards.push(sx);
-                missing.push(format!("shard {si}"));
-                if sel.with.partial_results {
-                    continue;
-                }
-                return Err(Error::Deadline(format!(
-                    "shard {si} not reached within {} ms; use WITH partial_results to opt in to \
-                     incomplete answers",
-                    d.as_millis()
-                )));
+        if let Some(ms) = deadline::passed() {
+            sx.timed_out = true;
+            ex.shards.push(sx);
+            missing.push(format!("shard {si}"));
+            if sel.with.partial_results {
+                continue;
             }
+            return Err(shard_deadline(si, ms));
         }
 
         let snap = shard.snapshot_at(input.ts);
         let units = shard.sources(&snap);
         // Per-source heaps, merged across every unit of this shard (step 3).
         let mut shard_heaps: Vec<Vec<Candidate>> = vec![Vec::new(); sources.len()];
+        // Set when the deadline passes inside this shard. A loop that stops
+        // on the deadline returns less than it was asked for, so nothing a
+        // timed-out shard produced may reach the merge below.
+        let mut timed_out = false;
 
         for unit in &units {
             let ut = Instant::now();
@@ -579,6 +581,19 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             }
             ux.micros = ut.elapsed().as_micros();
             sx.units.push(ux);
+            if let Some(ms) = deadline::passed() {
+                if !sel.with.partial_results {
+                    return Err(shard_deadline(si, ms));
+                }
+                timed_out = true;
+                break;
+            }
+        }
+        if timed_out {
+            sx.timed_out = true;
+            ex.shards.push(sx);
+            missing.push(format!("shard {si}"));
+            continue;
         }
 
         // Merge this shard's per-source heaps and truncate to k'. Identifiers
@@ -699,6 +714,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     let cut = truncated_prefixes(input.stats);
     ex.notes.extend(cut.iter().cloned());
     project(&input.select.projections, &mut rows);
+    // Strict at the end: a deadline that passed during the last unit's work
+    // is a statement that did not finish in time, whatever the loop managed
+    // to return. Under `partial_results` the shards that ran out are already
+    // in `missing`, which is the contract that option buys.
+    if !sel.with.partial_results {
+        deadline::check()?;
+    }
     Ok(QueryResult {
         rows,
         explain: if input.analyze { Some(ex) } else { None },
@@ -1161,9 +1183,7 @@ fn scan(
     prefix: &Option<String>,
     k: usize,
     ex: &mut Explain,
-    deadline: Option<std::time::Duration>,
 ) -> Result<(Vec<Row>, Vec<String>)> {
-    let t0 = Instant::now();
     let sel = input.select;
     // Rows past `offset + k` are thrown away at the end, so they are never
     // held: `SELECT * FROM docs LIMIT 1` used to decode and buffer every
@@ -1212,21 +1232,16 @@ fn scan(
             ex.shards.push(sx);
             continue;
         }
-        if let Some(d) = deadline {
-            if t0.elapsed() > d {
-                sx.timed_out = true;
-                ex.shards.push(sx);
-                missing.push(format!("shard {si}"));
-                if sel.with.partial_results {
-                    continue;
-                }
-                return Err(Error::Deadline(format!(
-                    "shard {si} not reached within {} ms; use WITH partial_results to opt in to \
-                     incomplete answers",
-                    d.as_millis()
-                )));
+        if let Some(ms) = deadline::passed() {
+            sx.timed_out = true;
+            ex.shards.push(sx);
+            missing.push(format!("shard {si}"));
+            if sel.with.partial_results {
+                continue;
             }
+            return Err(shard_deadline(si, ms));
         }
+        let mut timed_out = false;
         for (ui, unit) in sources[si].iter().enumerate() {
             let n = unit.num_docs();
             if n == 0 {
@@ -1249,6 +1264,9 @@ fn scan(
             ux.survivors = filter.popcount();
             ux.selectivity = ux.survivors as f64 / n as f64;
             for ord in filter.iter() {
+                if deadline::expired() {
+                    break;
+                }
                 let key = unit.key(ord).unwrap_or("").to_string();
                 if after.as_ref().is_some_and(|a| key.as_str() <= a.as_str()) {
                     continue;
@@ -1283,6 +1301,21 @@ fn scan(
             }
             ux.micros = ut.elapsed().as_micros();
             sx.units.push(ux);
+            if let Some(ms) = deadline::passed() {
+                if !sel.with.partial_results {
+                    return Err(shard_deadline(si, ms));
+                }
+                timed_out = true;
+                break;
+            }
+        }
+        if timed_out {
+            // Rows this shard retained before the cut are not withdrawn:
+            // they are correct rows, and under `partial_results` the shard
+            // is reported missing, which is the contract -- some of its rows
+            // may be absent.
+            sx.timed_out = true;
+            missing.push(format!("shard {si}"));
         }
         ex.shards.push(sx);
     }
@@ -1302,6 +1335,14 @@ fn scan(
     }
     ex.fetched_payloads = rows.len();
     Ok((rows, missing))
+}
+
+/// The refusal at a shard boundary: which shard, and the budget.
+fn shard_deadline(si: usize, ms: u64) -> Error {
+    Error::Deadline(format!(
+        "shard {si} not finished within {ms} ms; raise it with WITH (deadline_ms = N), lift it \
+         with WITH (no_deadline), or use WITH (partial_results) to opt in to incomplete answers"
+    ))
 }
 
 /// Where a retained row's document is: decoded, because the order or the

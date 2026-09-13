@@ -483,6 +483,19 @@ For `<#>` the presented value is the negated inner product, so a threshold on
 it reads the other way.
 Under `NOT` a document with no vector has no distance and is on neither side.
 
+**A statement's cost is bounded by a deadline that is on by default and
+checked inside the loops.** Thirty seconds unless the `Db` or the statement
+says otherwise; `WITH (deadline_ms = N)` raises it, `WITH (no_deadline)` lifts
+it. The check is not only between shards: the graph traversal, the brute-force
+distance pass, the WAND loop, the prefix walk and the unranked scan each ask a
+thread-local clock every 128 steps and stop when it has passed. A loop that
+stops returns less than it was asked for, which is the silent partial answer
+this engine refuses to give -- so the loop never reports the cut; the executor
+asks after every unit and at the end of the statement, and turns a passed
+deadline into a refusal naming the budget, or, under `partial_results`, into
+the shard listed as missing. Nothing a timed-out shard produced reaches the
+merge. Writes, DDL and maintenance carry no budget.
+
 **Three query shapes are refused rather than mis-answered.** `AFTER` with
 `COLLAPSE BY`, `AFTER` with `ORDER BY <field>`, and a negation as one side of an
 explicit `OR`. Each has a defensible semantics that is not implemented; refusing
@@ -577,6 +590,7 @@ guarantee:
 | an unranked scan holds one page, and answers like one that held everything | `plan::exec::tests::a_scan_retains_no_more_rows_than_the_page_and_the_same_rows_as_a_full_sort` (the collector: never more than the page at any point of a scrambled arrival, under `COLLAPSE BY`, and the same rows a full sort-collapse-page yields), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (a key-ordered scan decodes exactly the rows it returns, past an `OFFSET` and a cursor; a field order decodes every survivor and still answers the same; a collapse returns one row per parent) |
 | a distance threshold in `WHERE` agrees with the `distance` column, composes, and is three-valued | `engine::tests::a_distance_threshold_in_where_agrees_with_the_distance_column` (both metrics, five thresholds each way, an AND with a structured predicate, `NOT` leaving the vectorless document on neither side, exact match at `<= 0`, the plan naming brute force, and the three refusals), `a_distance_threshold_returns_the_same_rows_at_every_shard_count` (equality, not a tolerance: there is no candidate depth in a predicate), `sql::parser::tests::a_distance_threshold_parses_as_a_predicate_and_not_as_an_order` |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
+| a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | a record the crash tore is discarded, every record before it kept, and no record after it applied | `shard::tests::replay_stops_at_a_record_whose_crc_does_not_match` (three records with the damage in the middle: a log whose last record is the damaged one cannot tell stopping from skipping) |
 | every version above the retain floor survives writes interleaved with collection | `compaction::tests::interleaved_writes_and_collection_keep_every_version_above_the_retain_floor` (6 seeds × 120 interleaved steps against a pinned horizon) |
 | an unpinned seal collects nothing and moves no score | `shard::tests::an_unpinned_flush_does_not_move_the_scoring_statistics`, `shard::tests::an_unpinned_flush_keeps_a_snapshot_below_it_readable` |
