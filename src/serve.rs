@@ -796,7 +796,12 @@ fn asset(content_type: &'static str, body: &'static str) -> Action {
 }
 
 fn page(token: &str) -> Action {
-    Action::Reply(Response::new(200, "OK", CT_HTML, with_tokenised_assets(INDEX_HTML, token)))
+    Action::Reply(Response::new(
+        200,
+        "OK",
+        CT_HTML,
+        with_tokenised_assets(&with_source_offer(INDEX_HTML), token),
+    ))
 }
 
 /// Stitch the token into the page's own asset URLs.
@@ -1104,7 +1109,29 @@ fn error_json(message: &str) -> String {
 
 fn health_json() -> String {
     let version = jstr(env!("CARGO_PKG_VERSION"));
-    format!(r#"{{"ok":true,"name":"celastro","version":{version}}}"#)
+    let source = jstr(&source_url());
+    let license = jstr(env!("CARGO_PKG_LICENSE"));
+    format!(
+        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license}}}"#
+    )
+}
+
+/// Where the source of this build is offered, as AGPL §13 requires of a
+/// program its users interact with over a network: the repository the crate
+/// declares, at the tag of the version that is running. Absolute, so it means
+/// the same thing from a browser on the host and from inside a container.
+///
+/// A modified fork that serves this console is offering someone else's source
+/// unless it points `repository` in Cargo.toml at its own; that field is the
+/// only input here, on purpose, so the fix is one line in the manifest.
+fn source_url() -> String {
+    format!("{}/tree/v{}", env!("CARGO_PKG_REPOSITORY"), env!("CARGO_PKG_VERSION"))
+}
+
+/// The console page with its source offer filled in. See [`source_url`].
+fn with_source_offer(html: &str) -> String {
+    html.replace("__CELASTRO_SOURCE__", &source_url())
+        .replace("__CELASTRO_VERSION__", concat!("v", env!("CARGO_PKG_VERSION")))
 }
 
 fn index_kind_name(kind: &IndexKind) -> &'static str {
@@ -1696,6 +1723,32 @@ mod tests {
         assert_eq!(parsed.get("name").and_then(|v| v.as_str()), Some("celastro"));
         let version = parsed.get("version").and_then(|v| v.as_str());
         assert_eq!(version, Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// The console executes SQL for whoever holds the token, over HTTP, which
+    /// is the interaction AGPL §13 attaches a source offer to. The offer is
+    /// on the page a user sees, names THIS version, and is an absolute URL --
+    /// a relative one would resolve to the loopback address it was served
+    /// from, which from inside a container is nowhere. The same URL is on the
+    /// health endpoint for a client that never renders the page.
+    #[test]
+    fn the_console_offers_the_source_of_the_running_version() {
+        let expected = format!(
+            "{}/tree/v{}",
+            env!("CARGO_PKG_REPOSITORY"),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(expected.starts_with("https://"), "{expected}");
+        let page = answer_to("GET /?t=tok HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
+        assert_eq!(status_line(&page), "HTTP/1.1 200 OK");
+        let body = body_of(&page);
+        assert!(body.contains(&format!("href=\"{expected}\"")), "no source link on the page");
+        assert!(body.contains("AGPL"), "the licence is not named on the page");
+        assert!(!body.contains("__CELASTRO_"), "a placeholder reached the browser: {body}");
+        let health = answer_to("GET /api/health?t=tok HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
+        let parsed = json::parse(body_of(&health)).unwrap();
+        assert_eq!(parsed.get("source").and_then(|v| v.as_str()), Some(expected.as_str()));
+        assert_eq!(parsed.get("license").and_then(|v| v.as_str()), Some("AGPL-3.0-only"));
     }
 
     #[test]
