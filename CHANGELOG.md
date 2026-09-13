@@ -6,7 +6,11 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.9.0 — 2026-09-13
+
+Breaking for library callers who built an options or report struct
+literally, or called into a shard's storage; the SQL surface and the
+on-disk format are unchanged. The version after this one is 0.10.0.
 
 **The public surface is deliberate.** Every options struct (`DbOpts`,
 `SearchOpts`, `ResidencyOpts`, `Placement`, `FlushThresholds`,
