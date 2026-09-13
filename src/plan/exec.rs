@@ -245,11 +245,10 @@ pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<S
         // rather than reporting an unindexed path, so any string a caller puts
         // in a `text_match` parses and enters this map; `Db::gather_stats` then
         // creates a `CachedStats` entry keyed on it, in a map nothing evicts
-        // from, before `eval_expr` reaches the leaf and returns `no full-text
-        // index on ...`. One 1 MiB statement naming a thousand fresh paths
-        // retains a thousand entries and returns one error. Refusing here would
-        // move the error off `eval_expr`, which words it better; declining to
-        // NAME the path leaves the message exactly where it was.
+        // from. One 1 MiB statement naming a thousand fresh paths retained a
+        // thousand entries and returned one error. `Db::run_select` refuses an
+        // undeclared path before it gets here, through [`undeclared_text_path`];
+        // this guard stays so that the map never names one whatever the caller.
         if coll.fulltext_index(path).is_none() {
             return;
         }
@@ -278,6 +277,35 @@ pub fn required_terms(coll: &Collection, sel: &Select) -> BTreeMap<String, Vec<S
         v.dedup();
     }
     out
+}
+
+/// The first path a `text_match` in this statement names that the CATALOG
+/// declares no full-text index on, in either site.
+///
+/// The catalog, not the units: a sealed segment keeps the region of an index
+/// that was since dropped until compaction rewrites it, and a memtable rebuilt
+/// after the drop has none, so a unit-by-unit check answered a query from the
+/// old segments and refused it from the memtable -- the answer depended on
+/// which units happened to exist. A declaration withdrawn is withdrawn for the
+/// whole statement.
+pub fn undeclared_text_path(coll: &Collection, sel: &Select) -> Option<String> {
+    let mut found = None;
+    let mut see = |path: &str| {
+        if found.is_none() && coll.fulltext_index(path).is_none() {
+            found = Some(path.to_string());
+        }
+    };
+    if let Some(e) = &sel.predicate {
+        walk_text_match(e, false, &mut |p, _, _| see(p));
+    }
+    if let Some(OrderBy::Hybrid(h)) = &sel.order {
+        for s in &h.sources {
+            if let HybridSource::Text { path, .. } = s {
+                see(path);
+            }
+        }
+    }
+    found
 }
 
 /// Prefixes this statement needs the coordinator to expand, per path.

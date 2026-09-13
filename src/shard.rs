@@ -2550,6 +2550,16 @@ impl Shard {
         Ok(())
     }
 
+    /// Retire every segment at once: what a dropped collection's shard does
+    /// before it is dropped, so its files and any objects it put in the store
+    /// are removed by the same sweep a compaction uses rather than by a
+    /// second deleter that would have to know the same things.
+    pub(crate) fn retire_all(&mut self) {
+        let all = std::mem::take(&mut self.segments);
+        self.retiring.extend(all);
+        self.sweep_retired();
+    }
+
     /// Unlink the files of retired segments no reader still holds.
     ///
     /// `Arc::strong_count == 1` means this list is the last owner. A segment

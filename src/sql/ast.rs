@@ -48,6 +48,17 @@ pub enum Statement {
     DropLifecyclePolicy {
         name: String,
     },
+    /// `DROP COLLECTION <name>` — the collection, its files, its objects in
+    /// the store, and everything recorded against it. Irreversible.
+    DropCollection {
+        name: String,
+    },
+    /// `DROP INDEX <name> ON <collection>` — withdraw the declaration; the
+    /// regions already sealed stay until compaction rewrites them.
+    DropIndex {
+        collection: String,
+        index: String,
+    },
     /// Evaluate the policies and carry out whatever they call for. Like
     /// compaction, tiering is scheduled and visible rather than an invisible
     /// background process (§12.1).

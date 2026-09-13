@@ -95,6 +95,11 @@ the query produced; the rest of the columns are the SELECT list. A distance in
 column shows: for cosine an identical vector lands within floating-point
 rounding of zero, so exact match is a small threshold; for L2 it is `<= 0`.
 
+`DROP INDEX notes_body ON notes` withdraws an index and `DROP COLLECTION
+notes` removes a collection with its files and, if it had an archived tier,
+its objects in the store. Both are refused while a lifecycle policy names
+what they would drop, and neither can be undone.
+
 Every write is on the disk before it is acknowledged, so the collection is
 there in the next process:
 

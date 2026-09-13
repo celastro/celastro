@@ -585,9 +585,28 @@ impl Db {
         if let Some(b) = crate::shard::read_optional(&dir.join("CATALOG"))? {
             db.catalog = Catalog::decode(&b)?;
         }
+        // A drop is complete once the collection's directory has been renamed
+        // aside; the catalog catches up here if the process ended between
+        // that rename and the catalog's publication. See `drop_collection`.
+        let interrupted: Vec<String> = db
+            .catalog
+            .collections
+            .keys()
+            .filter(|n| {
+                !dir.join("collections").join(n.as_str()).exists() && dropping_dir(dir, n).exists()
+            })
+            .cloned()
+            .collect();
+        for name in &interrupted {
+            db.forget_collection(name);
+        }
+        Db::sweep_dropping(dir)?;
         let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
         for name in names {
             db.attach_collection(dir, &name)?;
+        }
+        if !interrupted.is_empty() {
+            db.persist_catalog()?;
         }
         // The catalog as decoded describes sealed documents. Until the
         // replayed ones are folded in, `SHOW CATALOG` and the `catalog` verb
@@ -799,6 +818,141 @@ impl Db {
         self.absorb_shard_catalogs(&name)?;
         self.persist_catalog()?;
         Ok(name)
+    }
+
+    /// Drop a collection: its catalog entry, every shard, every file, every
+    /// object it put in the store, and every statistic and access clock
+    /// recorded against it. Irreversible. Refused while a lifecycle policy
+    /// names the collection, so the policy is dropped knowingly rather than
+    /// left naming nothing.
+    ///
+    /// The order is what makes a crash anywhere in the middle safe to open
+    /// after. The directory is renamed aside first -- one atomic step, the
+    /// drop's point of no return -- then the catalog is published without the
+    /// entry, then the renamed directory is removed. `Db::open` completes a
+    /// drop that stopped after the rename (a catalog naming a collection
+    /// whose directory is aside) and removes any directory left aside. The
+    /// objects an archived tier put in the store are deleted before the
+    /// shards are dropped, while they can still be named; a crash between the
+    /// rename and that deletion leaves them in the store under the
+    /// collection's prefix, which is the one thing a later open cannot find
+    /// from a directory.
+    ///
+    /// The statistics cache and the access clocks go with the entry, so a
+    /// collection recreated under the same name starts from nothing: the
+    /// cache key carries no catalog identity, and without this a recreated
+    /// collection would be answered from its predecessor's frequencies.
+    pub fn drop_collection(&mut self, name: &str) -> Result<()> {
+        self.catalog.get(name)?;
+        if let Some(p) = self.catalog.policies.values().find(|p| p.collection == name) {
+            return Err(Error::Plan(format!(
+                "collection `{name}` is named by lifecycle policy `{}`; drop the policy first",
+                p.name
+            )));
+        }
+        let aside = match &self.dir {
+            Some(dir) => {
+                let live = dir.join("collections").join(name);
+                let aside = dropping_dir(dir, name);
+                if aside.exists() {
+                    fs::remove_dir_all(&aside)?;
+                }
+                if live.exists() {
+                    fs::rename(&live, &aside)?;
+                    crate::shard::sync_dir(&dir.join("collections"))?;
+                }
+                Some((dir.join("collections"), aside))
+            }
+            None => None,
+        };
+        // Past the point of no return. The store's objects go first, while
+        // the shards are still open to name them.
+        if let Some(mut shards) = self.shards.remove(name) {
+            for s in shards.iter_mut() {
+                s.retire_all();
+            }
+        }
+        self.forget_collection(name);
+        self.persist_catalog()?;
+        if let Some((parent, aside)) = aside {
+            if aside.exists() {
+                fs::remove_dir_all(&aside)?;
+                crate::shard::sync_dir(&parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything the engine records against a collection by name, gone.
+    fn forget_collection(&mut self, name: &str) {
+        self.catalog.collections.remove(name);
+        self.catalog.activity.retain(|(c, _), _| c != name);
+        let prefix = cache_key(name, "");
+        self.stats.retain(|k, _| !k.starts_with(&prefix));
+        self.stats_baseline.remove(name);
+        self.collection_writes.remove(name);
+        self.query_log.retain(|q| q.collection != name);
+    }
+
+    /// Remove every directory a drop renamed aside and did not get to remove.
+    fn sweep_dropping(dir: &Path) -> Result<()> {
+        let parent = dir.join("collections");
+        let Ok(entries) = fs::read_dir(&parent) else { return Ok(()) };
+        let mut swept = false;
+        for e in entries {
+            let e = e?;
+            if e.file_name().to_string_lossy().ends_with(DROPPING_SUFFIX) {
+                fs::remove_dir_all(e.path())?;
+                swept = true;
+            }
+        }
+        if swept {
+            crate::shard::sync_dir(&parent)?;
+        }
+        Ok(())
+    }
+
+    /// Drop an index: the catalog no longer declares it, so the planner stops
+    /// using it; its decoded component is released from every segment, its
+    /// access clock and its statistics go, the memtables are rebuilt without
+    /// it, and the segments' tiers are re-resolved over the indexes that
+    /// remain. The regions already written into sealed segments stay until
+    /// compaction rewrites those segments, which mirrors CREATE INDEX never
+    /// having backfilled: an index is a declaration the next seal honours,
+    /// and a drop is its withdrawal. Refused while a lifecycle policy names
+    /// the index by name; a policy covering every index of the collection
+    /// simply covers one fewer.
+    pub fn drop_index(&mut self, collection: &str, index: &str) -> Result<()> {
+        if let Some(p) = self
+            .catalog
+            .policies
+            .values()
+            .find(|p| p.collection == collection && p.indexes.iter().any(|i| i == index))
+        {
+            return Err(Error::Plan(format!(
+                "index `{index}` is named by lifecycle policy `{}`; drop the policy first",
+                p.name
+            )));
+        }
+        let c = self.catalog.get_mut(collection)?;
+        let Some(pos) = c.indexes.iter().position(|i| i.name == index) else {
+            return Err(Error::Plan(format!("no index `{index}` on collection `{collection}`")));
+        };
+        let def = c.indexes.remove(pos);
+        let component = Collection::index_component(&def);
+        let coll = c.clone();
+        self.catalog.activity.remove(&(collection.to_string(), index.to_string()));
+        self.stats.remove(&cache_key(collection, &def.path));
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                s.adopt_catalog(coll.clone())?;
+                for h in &s.segments {
+                    h.segment.unload_component(&component);
+                }
+            }
+        }
+        self.apply_tiers(collection)?;
+        self.persist_catalog()
     }
 
     /// How many collections the catalog holds. What a health probe asks,
@@ -1818,6 +1972,14 @@ impl Db {
                 self.drop_policy(&name)?;
                 Ok(Outcome::Ack(format!("lifecycle policy `{name}` dropped")))
             }
+            Statement::DropCollection { name } => {
+                self.drop_collection(&name)?;
+                Ok(Outcome::Ack(format!("collection `{name}` dropped")))
+            }
+            Statement::DropIndex { collection, index } => {
+                self.drop_index(&collection, &index)?;
+                Ok(Outcome::Ack(format!("index `{index}` dropped from `{collection}`")))
+            }
             Statement::RunLifecycle { collection } => {
                 let run = self.run_lifecycle(collection.as_deref())?;
                 let mut out = String::new();
@@ -2370,6 +2532,11 @@ impl Db {
         // observed (§6).
         let ts = self.clock.peek().max(self.last_commit);
         let coll = self.catalog.get(&sel.collection)?.clone();
+        if let Some(path) = exec::undeclared_text_path(&coll, sel) {
+            return Err(Error::Plan(format!(
+                "no full-text index on `{path}`; CREATE INDEX ... USING fulltext ({path})"
+            )));
+        }
         let mut want = exec::required_terms(&coll, sel);
         // Resolve every prefix in the statement HERE, once, before the gather.
         //
@@ -2650,6 +2817,13 @@ fn term_set(terms: &[String]) -> Cow<'_, [String]> {
 
 fn cache_key(collection: &str, path: &str) -> String {
     format!("{collection}/{path}")
+}
+
+/// What a collection's directory is renamed to at the start of a drop.
+const DROPPING_SUFFIX: &str = ".dropping";
+
+fn dropping_dir(dir: &Path, name: &str) -> PathBuf {
+    dir.join("collections").join(format!("{name}{DROPPING_SUFFIX}"))
 }
 
 /// Human-readable byte counts for the residency reports. Operators reason
@@ -4391,6 +4565,213 @@ mod tests {
         for d in [&dir, &exported, &dst_dir, &over_dir, &tmp("prefix-cap-import-over")] {
             let _ = fs::remove_dir_all(d);
         }
+    }
+
+    /// DROP COLLECTION takes the entry, the shards, the files and everything
+    /// recorded against the name -- and the last of those is the point: the
+    /// statistics cache is keyed by name alone, so a collection recreated
+    /// under the same name was answered from its predecessor's frequencies.
+    /// Each leg names the mutation that fails it: the files left behind; the
+    /// cache not pruned (the recreated collection gathers 10 documents where
+    /// it has 3); the policy refusal skipped; the interrupted drop not
+    /// completed at open, and the directory left aside not swept.
+    #[test]
+    fn dropping_a_collection_removes_it_and_everything_recorded_against_its_name() {
+        fn ack(db: &mut Db, sql: &str) -> String {
+            match db.execute(sql).unwrap() {
+                Outcome::Ack(m) => m,
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+        let dir = tmp("drop-collection");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..10 {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i}"))),
+                    ("body".into(), Value::Str("graph search".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        // Warm the cache with the ten-document corpus.
+        db.query("SELECT id FROM notes WHERE text_match(body, 'graph') LIMIT 5").unwrap();
+        assert!(db.stats.contains_key(&cache_key("notes", "body")), "the fixture warmed nothing");
+        db.execute(
+            "CREATE LIFECYCLE POLICY cool ON notes FOR (notes_body) \
+             MOVE TO cached AFTER 1 hour OF INACTIVITY",
+        )
+        .unwrap();
+        let e = db.execute("DROP COLLECTION notes").unwrap_err().to_string();
+        assert!(e.contains("policy `cool`"), "refused while a policy names it: {e}");
+        assert!(db.execute("SHOW CATALOG notes").is_ok(), "and nothing was dropped");
+        db.execute("DROP LIFECYCLE POLICY cool").unwrap();
+
+        assert_eq!(ack(&mut db, "DROP COLLECTION notes"), "collection `notes` dropped");
+        assert!(db.execute("SHOW CATALOG notes").is_err());
+        assert!(!dir.join("collections").join("notes").exists(), "the files were left behind");
+        assert!(!dropping_dir(&dir, "notes").exists(), "the directory was left aside");
+        assert!(db.stats.keys().all(|k| !k.starts_with("notes/")), "the statistics were kept");
+        assert!(db.catalog.activity.keys().all(|(c, _)| c != "notes"), "the clocks were kept");
+        let e = db.execute("DROP COLLECTION notes").unwrap_err().to_string();
+        assert!(e.contains("no such collection"), "{e}");
+
+        // Recreated under the same name, with a corpus of three: the gather
+        // must measure three, not answer ten out of the old cache.
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        for i in 0..3 {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("m{i}"))),
+                    ("body".into(), Value::Str("graph search".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        let ts = db.last_commit;
+        let want = BTreeMap::from([("body".to_string(), vec!["graph".to_string()])]);
+        let st = db.gather_stats("notes", &want, ts, false).unwrap();
+        assert_eq!(st["body"].num_docs, 3, "answered from the dropped collection's cache");
+        assert_eq!(st["body"].doc_freq["graph"], 3);
+        assert_eq!(
+            db.query("SELECT id FROM notes WHERE text_match(body, 'graph') LIMIT 10")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+
+        // Persisted: a reopen finds the recreated collection and no trace of
+        // the dropped one.
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 3);
+
+        // An interrupted drop: the directory is aside and the catalog still
+        // names the collection, which is exactly the state a crash between the
+        // rename and the catalog's publication leaves. The open completes it.
+        db.persist().unwrap();
+        drop(db);
+        fs::rename(dir.join("collections").join("notes"), dropping_dir(&dir, "notes")).unwrap();
+        fs::create_dir_all(dropping_dir(&dir, "orphan")).unwrap();
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert!(
+            db.execute("SHOW CATALOG notes").is_err(),
+            "the interrupted drop was not completed"
+        );
+        assert!(!dropping_dir(&dir, "notes").exists(), "the directory aside was not removed");
+        assert!(!dropping_dir(&dir, "orphan").exists(), "a directory aside with no entry was kept");
+        assert_eq!(db.collection_count(), 0);
+        drop(db);
+        let db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.collection_count(), 0, "and the completed drop was published");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// DROP INDEX withdraws the declaration: the planner refuses the path,
+    /// the clock and the statistics go, a reopen agrees, and the index can be
+    /// declared again. The sealed regions are left for compaction, as CREATE
+    /// INDEX leaves them for the next seal. The policy refusal covers only a
+    /// policy that names the index; one covering the collection covers one
+    /// fewer.
+    #[test]
+    fn dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it() {
+        let dir = tmp("drop-index");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (embedding) \
+             WITH (dims = 2, metric = 'cosine')",
+        )
+        .unwrap();
+        for i in 0..4 {
+            db.insert(
+                "notes",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("n{i}"))),
+                    ("body".into(), Value::Str("graph search".into())),
+                    (
+                        "embedding".into(),
+                        Value::Array(vec![Value::Float(i as f64), Value::Float(1.0)]),
+                    ),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        let text = "SELECT id FROM notes WHERE text_match(body, 'graph') LIMIT 10";
+        assert_eq!(db.query(text).unwrap().rows.len(), 4);
+        assert!(db.stats.contains_key(&cache_key("notes", "body")));
+        db.execute(
+            "CREATE LIFECYCLE POLICY cool ON notes FOR (notes_body) \
+             MOVE TO cached AFTER 1 hour OF INACTIVITY",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE LIFECYCLE POLICY all_of_it ON notes MOVE TO cached AFTER 1 hour OF INACTIVITY",
+        )
+        .unwrap();
+        let e = db.execute("DROP INDEX notes_body ON notes").unwrap_err().to_string();
+        assert!(e.contains("policy `cool`"), "{e}");
+        db.execute("DROP LIFECYCLE POLICY cool").unwrap();
+        let e = db.execute("DROP INDEX nope ON notes").unwrap_err().to_string();
+        assert!(e.contains("no index `nope`"), "{e}");
+
+        match db.execute("DROP INDEX notes_body ON notes").unwrap() {
+            Outcome::Ack(m) => assert_eq!(m, "index `notes_body` dropped from `notes`"),
+            other => panic!("{other:?}"),
+        }
+        let e = db.query(text).unwrap_err().to_string();
+        assert!(e.contains("no full-text index on"), "the planner still used it: {e}");
+        assert!(!db.stats.contains_key(&cache_key("notes", "body")), "the statistics were kept");
+        assert!(!db.catalog.activity.contains_key(&("notes".into(), "notes_body".into())));
+        assert!(db.catalog.get("notes").unwrap().index_by_name("notes_body").is_none());
+        let emb = "SELECT id FROM notes ORDER BY embedding <=> [1.0, 1.0] LIMIT 2";
+        assert_eq!(db.query(emb).unwrap().rows.len(), 2, "the other index is untouched");
+        // A write after the drop lands in a memtable rebuilt without the index.
+        db.insert(
+            "notes",
+            Value::obj(vec![
+                ("id".into(), Value::Str("n9".into())),
+                ("body".into(), Value::Str("graph".into())),
+                ("embedding".into(), Value::Array(vec![Value::Float(9.0), Value::Float(1.0)])),
+            ]),
+        )
+        .unwrap();
+
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert!(
+            db.catalog.get("notes").unwrap().index_by_name("notes_body").is_none(),
+            "reopened with it"
+        );
+        assert!(db.query(text).is_err());
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        // The sealed regions are still there for the declaration to find, and
+        // the write after the drop was sealed by the re-declaration itself.
+        assert_eq!(db.query(text).unwrap().rows.len(), 5, "declared again");
+        db.execute("DROP LIFECYCLE POLICY all_of_it").unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

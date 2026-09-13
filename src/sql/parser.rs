@@ -217,7 +217,20 @@ impl<'a> Parser<'a> {
             return Ok(Statement::AlterIndexTier { collection, index, tier });
         }
         if self.eat_kw("DROP") {
-            self.expect_kw("LIFECYCLE")?;
+            if self.eat_kw("COLLECTION") {
+                return Ok(Statement::DropCollection { name: self.ident()? });
+            }
+            if self.eat_kw("INDEX") {
+                let index = self.ident()?;
+                self.expect_kw("ON")?;
+                let collection = self.ident()?;
+                return Ok(Statement::DropIndex { collection, index });
+            }
+            if !self.eat_kw("LIFECYCLE") {
+                return Err(Error::Sql(
+                    "expected COLLECTION, INDEX or LIFECYCLE POLICY after DROP".into(),
+                ));
+            }
             self.expect_kw("POLICY")?;
             return Ok(Statement::DropLifecyclePolicy { name: self.ident()? });
         }
@@ -1604,5 +1617,29 @@ mod tests {
             let e = parse(sql, &[]).unwrap_err().to_string();
             assert!(e.contains(why), "{sql}: {e}");
         }
+    }
+
+    /// The two DROP statements that used to be missing -- the DELETE refusal
+    /// has said "or drop the collection" since before either existed.
+    #[test]
+    fn drop_collection_and_drop_index_parse_and_name_what_they_drop() {
+        match parse("DROP COLLECTION notes", &[]).unwrap() {
+            Statement::DropCollection { name } => assert_eq!(name, "notes"),
+            other => panic!("{other:?}"),
+        }
+        match parse("drop index notes_body on notes", &[]).unwrap() {
+            Statement::DropIndex { collection, index } => {
+                assert_eq!((collection.as_str(), index.as_str()), ("notes", "notes_body"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse("DROP LIFECYCLE POLICY p", &[]).unwrap(),
+            Statement::DropLifecyclePolicy { .. }
+        ));
+        let e = parse("DROP TABLE notes", &[]).unwrap_err().to_string();
+        assert!(e.contains("COLLECTION, INDEX or LIFECYCLE POLICY"), "{e}");
+        let e = parse("DROP INDEX notes_body", &[]).unwrap_err().to_string();
+        assert!(e.contains("ON"), "an index is named with its collection: {e}");
     }
 }

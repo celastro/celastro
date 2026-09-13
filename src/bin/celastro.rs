@@ -138,6 +138,8 @@ fn print_help() {
            CREATE COLLECTION articles (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL) PARTITION BY (tenant_id);\n  \
            CREATE INDEX a_body ON articles USING fulltext (body) WITH (analyzer = 'english');\n  \
            CREATE INDEX a_emb ON articles USING vector (embedding) WITH (dims = 8, metric = 'cosine');\n  \
+           DROP INDEX a_emb ON articles;\n  \
+           DROP COLLECTION articles;\n  \
            SHOW SEGMENTS articles;\n  \
            EXPLAIN ANALYZE SELECT id FROM articles ORDER BY hybrid(text_match(body, 'x'), embedding <=> [..]) LIMIT 5;\n"
     );

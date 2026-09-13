@@ -8,6 +8,16 @@ repository.
 
 ## Unreleased
 
+**`DROP COLLECTION` and `DROP INDEX` exist.** A dropped collection takes its
+files, its objects in an archived-tier store, its statistics and its access
+clocks with it, and a collection recreated under the same name is measured
+afresh; the drop is ordered so that a crash in the middle is completed at
+the next open. A dropped index is withdrawn from the planner, the residency
+ledger, the clocks and the statistics; the regions already sealed stay until
+compaction rewrites them. Both refuse while a lifecycle policy names what
+they would drop. The library gains `Db::drop_collection`, `Db::drop_index`,
+`Statement::DropCollection` and `Statement::DropIndex`.
+
 **A seal under a pinned `gc_horizon` emits at most `max_versions` segments.**
 `FlushThresholds` gains `max_versions` (default 8): while a horizon is pinned
 the memtable seals once its longest version chain reaches it, so a hot key's

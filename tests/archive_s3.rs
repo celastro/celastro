@@ -330,6 +330,23 @@ fn a_retired_archived_segment_is_deleted_from_the_store() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Dropping a collection deletes the objects its archived segments put in
+/// the store, and deletes them while the shards can still name them: a
+/// store is the one place a later open cannot sweep from a directory.
+#[test]
+fn dropping_a_collection_deletes_its_objects_from_the_store() {
+    let fake = FakeS3::start();
+    let d = dir("drop");
+    let mut db = open(&d, opts(&fake)).unwrap();
+    setup(&mut db, 120);
+    archive_all(&mut db);
+    assert_eq!(fake.keys().len(), 1, "{:?}", fake.keys());
+    db.execute("DROP COLLECTION items").unwrap();
+    assert!(fake.keys().is_empty(), "the object was left behind: {:?}", fake.keys());
+    assert!(!d.join("collections").join("items").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The credentials come from the environment and from nowhere else: with
 /// an endpoint configured and no key in the environment, the open is
 /// refused naming the variable, and nothing about the store is in the

@@ -85,6 +85,8 @@ UNLOAD IDLE;              -- release idle components, then evict to budget
 SHOW CATALOG items;       -- every index and the tier it is on
 SHOW RESIDENCY;           -- what is decoded right now, and what it cost
 SHOW LIFECYCLE;           -- every policy, with each index's idle time and age
+DROP INDEX items_emb ON items;   -- withdraw the declaration; sealed regions wait for compaction
+DROP COLLECTION items;           -- files, store objects, statistics, clocks: all of it
 ```
 
 Durations take `minutes`, `hours` or `days`, singular or plural, and the
@@ -250,6 +252,25 @@ is an on-disk format change plus a redesign of the MVCC ordinal layout, and it
 is deliberately not taken until something needs it. Unpinned, depth is not a
 reason to seal: that seal keeps one version per key and emits one segment
 however deep the chains ran.
+
+**`DROP` is ordered so that a crash anywhere in it opens cleanly.** A
+collection's directory is renamed aside first — one atomic step, the point of
+no return — then the catalog is published without the entry, then the
+directory is removed. `Db::open` completes a drop that stopped after the
+rename, which it recognises as a catalog naming a collection whose directory
+is aside, and removes any directory left aside. The objects an archived tier
+put in the store are deleted before the shards are dropped, while they can
+still be named; a crash between the rename and that deletion is the one case
+that leaves something behind, under the collection's prefix in the store.
+Everything recorded against the name goes with the entry — the statistics
+cache above all, whose key carries no catalog identity, so that a collection
+recreated under the same name is measured afresh rather than answered from its
+predecessor's frequencies. `DROP INDEX` withdraws a declaration: the planner
+refuses the path, the decoded component is released, the clock and the
+statistics go, and the memtables are rebuilt without it. The regions already
+sealed stay until compaction rewrites their segments, which mirrors
+`CREATE INDEX` never having backfilled. Both refuse while a lifecycle policy
+names what they would drop, so the policy is dropped knowingly.
 
 ## Two limits a document can meet
 
@@ -752,6 +773,8 @@ guarantee:
 | a distance threshold in `WHERE` agrees with the `distance` column, composes, and is three-valued | `engine::tests::a_distance_threshold_in_where_agrees_with_the_distance_column` (both metrics, five thresholds each way, an AND with a structured predicate, `NOT` leaving the vectorless document on neither side, exact match at `<= 0`, the plan naming brute force, and the three refusals), `a_distance_threshold_returns_the_same_rows_at_every_shard_count` (equality, not a tolerance: there is no candidate depth in a predicate), `sql::parser::tests::a_distance_threshold_parses_as_a_predicate_and_not_as_an_order` |
 | a collection's prefix expansion cap is a setting, its leaf budget is derived from it, and the cache is the ceiling | `engine::tests::a_collection_can_raise_its_prefix_expansion_and_pays_with_its_leaf_budget` (the union cut, the budget, the ceiling, the persisted setting, the export, the DELETE refusal and the CREATE option, each the mutation that fails it), `text::scorer::tests::an_expansion_reports_truncation_only_when_a_term_was_actually_dropped` (the no-coordinator arm reads the cap off the statistics), `catalog::tests::a_version_2_catalog_is_read_with_every_collection_at_the_default_cap` (the format step: 2 reads at the default, 1 and 4 are refused), `sql::parser::tests::a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later` |
 | a pinned seal emits at most `max_versions` segments, and an unpinned one does not seal on depth | `shard::tests::a_pinned_seal_fans_out_to_at_most_max_versions_segments` (twelve versions at a threshold of four: three seals of four pinned, one seal of one unpinned) |
+| a dropped collection leaves nothing behind under its name, and an interrupted drop completes at the next open | `engine::tests::dropping_a_collection_removes_it_and_everything_recorded_against_its_name` (files, statistics and clocks gone; a recreated collection measured afresh; the policy refusal; the interrupted state completed and swept at open), `archive_s3::dropping_a_collection_deletes_its_objects_from_the_store` |
+| a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |
