@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::plan::exec::{self, SourcePlan};
 use crate::plan::explain::ShardExplain;
 use crate::plan::fusion::Candidate;
-use crate::plan::walk::{self, ExpandRequest};
+use crate::plan::walk::{self, ExpandRequest, HopExpansion};
 use crate::shard::Shard;
 use crate::sql::ast::Select;
 use crate::text::scorer::GlobalStats;
@@ -161,8 +161,9 @@ pub trait ShardService {
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>>;
     /// One hop of a walk over this shard of an edge collection: the live
     /// edges leaving the frontier that the filter admits, as `(from, to)`
-    /// pairs, sorted and distinct, at most `limit` per `from`.
-    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>>;
+    /// pairs, sorted and distinct, at most `limit` per `from`, and how many
+    /// units had to be scanned for want of an adjacency region.
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion>;
     /// Which of `keys` are primary keys of documents visible at `ts` on
     /// this shard, sorted and distinct. How a walk tells a node from a
     /// dangling edge.
@@ -227,7 +228,7 @@ impl ShardService for Local<'_> {
         self.shard.get(key, ts)
     }
 
-    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
         walk::expand_on(self.shard, req)
     }
 

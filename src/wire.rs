@@ -57,7 +57,7 @@ use crate::plan::service::{
     CandidatesRequest, Local, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
     TermStats,
 };
-use crate::plan::walk::{self, ExpandRequest};
+use crate::plan::walk::{self, ExpandRequest, HopExpansion};
 use crate::sql::ast::{Expr, Select, Statement};
 use crate::text::scorer::{Expansion, GlobalStats, PrefixUse};
 use crate::time::Timestamp;
@@ -807,7 +807,7 @@ impl ShardService for Remote {
         }
     }
 
-    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
         // The filter travels as the statement it came from: the holder
         // parses the same text with the same crate and takes the `walk`-th
         // walk's filter, as it takes the statement's predicate for a scan.
@@ -826,7 +826,10 @@ impl ShardService for Remote {
         put_bool(&mut body, req.reverse);
         put_uvarint(&mut body, req.walk as u64);
         let b = self.call(Call::Expand, &body)?;
-        get_pairs(&b, &mut 0)
+        let mut i = 0;
+        let pairs = get_pairs(&b, &mut i)?;
+        let scanned = get_count(&b, &mut i)?;
+        Ok(HopExpansion { pairs, scanned })
     }
 
     fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>> {
@@ -1166,7 +1169,9 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                         params: &params,
                         walk: wi,
                     };
-                    put_pairs(&mut out, &local.expand(&req)?);
+                    let x = local.expand(&req)?;
+                    put_pairs(&mut out, &x.pairs);
+                    put_uvarint(&mut out, x.scanned as u64);
                 }
                 Call::Present => {
                     let keys = get_strs(body, &mut j)?;

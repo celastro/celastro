@@ -942,9 +942,10 @@ impl Db {
     /// access clock and its statistics go, the memtables are rebuilt without
     /// it, and the segments' tiers are re-resolved over the indexes that
     /// remain. The regions already written into sealed segments stay until
-    /// compaction rewrites those segments, which mirrors CREATE INDEX never
-    /// having backfilled: an index is a declaration the next seal honours,
-    /// and a drop is its withdrawal. Refused while a lifecycle policy names
+    /// compaction rewrites those segments, which mirrors CREATE INDEX
+    /// writing nothing into them: an index is a declaration the next seal
+    /// honours -- and, since the backfill trigger, the next compaction
+    /// pass -- and a drop is its withdrawal. Refused while a lifecycle policy names
     /// the index by name; a policy covering every index of the collection
     /// simply covers one fewer.
     pub fn drop_index(&mut self, collection: &str, index: &str) -> Result<()> {
@@ -7707,7 +7708,88 @@ mod tests {
             ))
             .unwrap();
         }
+        // Sealed, so a walk probes the adjacency region; the memtable path
+        // is exercised by what each test inserts afterwards and by
+        // `a_hop_probes_the_region_and_scans_only_units_sealed_before_it`.
+        db.execute("FLUSH papers").unwrap();
+        db.execute("FLUSH cites").unwrap();
         db
+    }
+
+    /// A segment sealed with the adjacency index is probed; a memtable, and
+    /// a segment sealed before the index was declared, is scanned -- the
+    /// plan counts those units per hop -- and a compaction rewrites the old
+    /// segment with the region. The answer is the same on every path.
+    #[test]
+    fn a_hop_probes_the_region_and_scans_only_units_sealed_before_it() {
+        let dir = tmp("hops-probe");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION papers (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'papers')",
+        )
+        .unwrap();
+        for p in ["p1", "p2", "p3", "p4", "p5"] {
+            db.execute(&format!(r#"INSERT INTO papers VALUES ('{{"id":"{p}"}}')"#)).unwrap();
+        }
+        // Sealed before the index exists: no region, scanned.
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e1","src":"p1","dst":"p2"}')"#).unwrap();
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e2","src":"p1","dst":"p3"}')"#).unwrap();
+        db.execute("FLUSH cites").unwrap();
+        db.execute("CREATE INDEX cites_adj ON cites USING adjacency (src, dst)").unwrap();
+        // Sealed after: probed.
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e3","src":"p2","dst":"p4"}')"#).unwrap();
+        db.execute("FLUSH cites").unwrap();
+        // Still in the memtable: scanned.
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e4","src":"p3","dst":"p5"}')"#).unwrap();
+        let sql = "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites LIMIT 100";
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p4", "p5"]);
+        let plan = plan_of(&mut db, sql);
+        assert!(
+            plan.contains(
+                "hop 1: 1 key(s) expanded over 2 edge(s): 2 new, 0 dangling, frontier 2 (expand"
+            ),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("2 unit(s) scanned: no adjacency region"),
+            "the old segment and the memtable:\n{plan}"
+        );
+        assert_eq!(plan.matches("unit(s) scanned").count(), 2, "at both hops:\n{plan}");
+        // A reverse walk probes the other column's map of the same region.
+        assert_eq!(key_set(&db.query("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p4' VIA cites REVERSE LIMIT 10").unwrap()), ["p2"]);
+        // An edge deleted after its segment was sealed is hidden from the
+        // probe by the same visibility the scan applies.
+        assert!(db.delete_key("cites", "e3").unwrap());
+        assert_eq!(
+            key_set(&db.query(sql).unwrap()),
+            ["p2", "p3", "p5"],
+            "p4 was reached only through e3"
+        );
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e5","src":"p2","dst":"p4"}')"#).unwrap();
+        // Sealing the memtable leaves the old segment as the only scan;
+        // compacting -- four level-0 segments, the tier fan-out -- rewrites
+        // it with the region, and nothing is scanned.
+        db.execute("FLUSH cites").unwrap();
+        db.execute(r#"INSERT INTO cites VALUES ('{"id":"e6","src":"p5","dst":"p1"}')"#).unwrap();
+        db.execute("FLUSH cites").unwrap();
+        let plan = plan_of(&mut db, sql);
+        assert!(plan.contains("1 unit(s) scanned: no adjacency region"), "{plan}");
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p4", "p5"]);
+        db.execute("COMPACT cites").unwrap();
+        let plan = plan_of(&mut db, sql);
+        assert!(
+            !plan.contains("unit(s) scanned"),
+            "every unit has the region after the rewrite:\n{plan}"
+        );
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p4", "p5"]);
+        // The edge filter still applies on the probed path.
+        assert_eq!(
+            key_set(&db.query("SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites WHERE id <> 'e2' LIMIT 100").unwrap()),
+            ["p2", "p4"]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn key_set(r: &QueryResult) -> Vec<String> {

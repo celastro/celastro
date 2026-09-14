@@ -6,6 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.21.0 — 2026-09-14
+
+A walk got cheaper and compaction does one more thing, hence a minor.
+
+**An adjacency index probes.** `USING adjacency (src, dst)` now writes a
+region per column into every segment sealed after it — a sorted
+value-to-ordinals map — and a hop probes it per frontier key instead of
+scanning the column of every unit against the frontier; the liveness check
+of an unpartitioned node collection is a key lookup per key instead of a
+scan of the key column. `EXPLAIN ANALYZE` says per hop how many units had
+no region and were scanned: the memtable, and any segment sealed before the
+index was declared. The region is its own component (`adj:<column>`) under
+the index's tier, so `SHOW RESIDENCY` lists it and a policy moves it.
+
+**Compaction backfills an index.** A segment lacking a region for an index
+the collection declares — sealed before `CREATE INDEX`, of any kind — is now
+a rewrite job of its own, oldest first, one per pass. `COMPACT` after
+`CREATE INDEX` rebuilds such segments; before this only a size-tier merge
+that happened to include one did, which two large segments never had. A
+text index on a loaded collection therefore starts answering from every
+segment after a `COMPACT`, which it did not before.
+
 ## 0.20.0 — 2026-09-14
 
 A new retrieval mode, hence a minor.

@@ -296,8 +296,11 @@ the coordinator's `ts` is the maximum of the holders' clocks, so a statement
 reads at least what every node had committed when it began; and a unit sealed
 before an index was declared holds no region for it and answers no rows for
 that path until compaction rewrites it, which the plan says -- `CREATE INDEX`
-never backfilled, and a `DROP INDEX` that seals a memtable makes such a unit
-on purpose.
+writes nothing into a sealed segment, and a `DROP INDEX` that seals a
+memtable makes such a unit on purpose. Compaction does the backfill: a
+segment lacking a region for a declared index is a rewrite job of its own
+(`Reason::IndexBackfill`), oldest first, one per pass, so `COMPACT` after
+`CREATE INDEX` is the rolling rebuild and no size-tier accident is needed.
 
 The catalog format is version 4 for the node list and the placement, and 5
 for the edge-collection fields of the section after this one; a 3 is read
@@ -349,7 +352,8 @@ predecessor's frequencies. `DROP INDEX` withdraws a declaration: the planner
 refuses the path, the decoded component is released, the clock and the
 statistics go, and the memtables are rebuilt without it. The regions already
 sealed stay until compaction rewrites their segments, which mirrors
-`CREATE INDEX` never having backfilled. Both refuse while a lifecycle policy
+`CREATE INDEX` writing nothing into them -- with the difference that a
+missing region is a compaction trigger and a stale one is not. Both refuse while a lifecycle policy
 names what they would drop, so the policy is dropped knowingly.
 
 ## Two limits a document can meet
@@ -612,16 +616,52 @@ the keys as literals.
 
 So the slice did what it was for — nothing crosses the client, the answer is
 the same, and the two round trips of up to 44,000 keys are gone — and the
-number it has to beat next is its own: a hub walk is six to seventeen times
-the statement without the walk, and the plan says where. Expand is a column
-scan per unit, not a probe, and materialises a `(from, to)` pair per edge;
-the check builds the key set once per unit rather than once per call. An
-adjacency index that probes — a sorted value-to-ordinals map per unit, which
-is what "secondary index" ought to mean here too — takes the scan out of
-every hop and is the next item; the cap semantics, the plan and the tests
-do not change under it.
+number it had to beat next was its own: a hub walk was six to seventeen
+times the statement without the walk, and the plan said where. Expand was a
+column scan per unit, not a probe; the check built the key set once per
+unit rather than once per call.
+
+### What it costs with the region, measured
+
+Measured on 2026-09-14 on 0.21.0, same box, same corpus, same twenty
+statements, after `COMPACT cites` had rewritten both segments with the
+adjacency region (2.4 s for 249,950 edges). Every statement returned the
+same rows as both earlier runs, identical across ten runs.
+
+Outgoing walks: 26 to 31 ms fused, which is the statement without the walk
+(26 to 33 ms); the walk itself is 0.9 to 2.0 ms — two probes and two
+lookups, nothing scanned. Incoming walks from the hubs: 127 to 392 ms
+fused, against 165 to 463 with the scan and 278 to 862 as three
+statements. The largest, 43,861 keys: hop 1 expands one key in 4 ms and
+checks 7,180 keys in 21 ms; hop 2 expands 7,180 keys over 77,767 edges in
+52 ms and checks 36,681 keys in 148 ms; the coordinator's own set handling
+— sorting 77,767 pairs, the seen and answer sets — is the 94 ms between
+the hops' sum and the walk's 320 ms; the fused statement over the key set
+is 32 ms, as before.
+
+So the probe did what it was for: an outgoing walk now costs what the
+statement without it costs, and a hub walk is bounded by the edges it
+follows and the keys it checks, not by the corpus. What is left is
+proportional to the neighbourhood, and the plan says where: the liveness
+check is one lookup per key — a memtable map probe and a binary search per
+segment over pointer-chased strings, about 4 µs a key — and the coordinator
+keeps its frontiers as ordered sets of owned strings. A merge of the sorted
+frontier against each segment's sorted keys, and sorted vectors in place of
+the sets, would take both down; neither changes an answer, a plan line or a
+test, and neither is taken until a walk of this shape is somebody's.
 
 ### Shipped
+
+The second slice, in 0.21.0: the adjacency region — one sorted
+value-to-ordinals map per column the index names, in every segment sealed
+after it, its own component under the index's tier — probed per frontier
+key by `expand`; the liveness check as a key lookup on an unpartitioned node
+collection; the units a hop had to scan counted in the plan; and compaction
+backfilling any index a segment was sealed before, which `COMPACT` after
+`CREATE INDEX` now does for every index kind. The tests:
+`segment::tests::an_adjacency_region_probes_both_columns_and_round_trips`,
+`engine::tests::a_hop_probes_the_region_and_scans_only_units_sealed_before_it`,
+and every test of the first slice unchanged.
 
 The first slice, in 0.20.0: an edge collection with `WITH (nodes_of = ...)`
 — or `ALTER COLLECTION ... SET (nodes_of = ...)` for one loaded before —

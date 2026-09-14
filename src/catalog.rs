@@ -399,9 +399,10 @@ impl Collection {
         match idx.kind {
             IndexKind::FullText { .. } => crate::segment::text_component(&idx.path),
             IndexKind::Vector { .. } => crate::segment::vector_component(&idx.path),
-            IndexKind::Secondary | IndexKind::Adjacency { .. } => {
-                crate::segment::column_component(&idx.path)
-            }
+            IndexKind::Secondary => crate::segment::column_component(&idx.path),
+            // The probed column's map; the read column's map is tiered with
+            // it, in `index_tiers`.
+            IndexKind::Adjacency { .. } => crate::segment::adjacency_component(&idx.path),
         }
     }
 
@@ -418,6 +419,12 @@ impl Collection {
         for i in &self.indexes {
             let c = Collection::index_component(i);
             out.entry(c).and_modify(|t| *t = (*t).min(i.tier)).or_insert(i.tier);
+            // An adjacency index owns two maps, one per column, so that a
+            // walk can follow its edges either way; both follow its tier.
+            if let IndexKind::Adjacency { to } = &i.kind {
+                let c = crate::segment::adjacency_component(to);
+                out.entry(c).and_modify(|t| *t = (*t).min(i.tier)).or_insert(i.tier);
+            }
         }
         out
     }
@@ -1004,7 +1011,14 @@ mod tests {
         );
         assert_eq!(
             Collection::index_component(e.adjacency_index().unwrap()),
-            crate::segment::column_component("src")
+            crate::segment::adjacency_component("src")
+        );
+        let tiers = e.index_tiers();
+        assert_eq!(tiers.get("adj:src"), Some(&crate::residency::Tier::Cached));
+        assert_eq!(
+            tiers.get("adj:dst"),
+            Some(&crate::residency::Tier::Cached),
+            "both maps tier together"
         );
         let four = Catalog::decode(&cat.encode_as(4)).unwrap();
         let e4 = four.get("cites").unwrap();

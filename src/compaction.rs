@@ -62,6 +62,25 @@ pub enum Job {
 pub enum Reason {
     DeadRatio,
     FormatUpgrade,
+    /// The segment was sealed before an index the collection now declares,
+    /// so it has no region for it; the rewrite builds one.
+    IndexBackfill,
+}
+
+/// Whether a segment holds a region for every index the collection
+/// declares. A secondary index is a declaration over a column and owns no
+/// region, so it is always covered.
+pub fn covers_indexes(seg: &crate::segment::Segment, coll: &crate::catalog::Collection) -> bool {
+    use crate::catalog::IndexKind;
+    coll.indexes.iter().all(|i| match &i.kind {
+        IndexKind::FullText { .. } => seg.text_paths().contains(&i.path),
+        IndexKind::Vector { .. } => seg.vector_paths().contains(&i.path),
+        IndexKind::Adjacency { to } => {
+            let a = seg.adjacency_paths();
+            a.contains(&i.path) && a.contains(to)
+        }
+        IndexKind::Secondary => true,
+    })
 }
 
 /// A segment at the cap is retired from merging. Its dead documents are still
@@ -103,6 +122,22 @@ pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
         {
             return Some(Job::Rewrite { input: h.id(), reason: Reason::FormatUpgrade });
         }
+    }
+
+    // 2b. Index backfill. `CREATE INDEX` writes no region into segments
+    // already sealed -- a walk scans such a segment and a text match answers
+    // nothing from it -- and until this trigger existed only a size-tier
+    // merge that happened to include the segment rebuilt it, which a
+    // collection of two large segments never has. Oldest first, one per
+    // pass, so the backfill of a wide collection is a rolling rebuild like a
+    // format upgrade and not a stall.
+    if let Some(h) = shard
+        .segments
+        .iter()
+        .filter(|h| !covers_indexes(&h.segment, &shard.coll))
+        .min_by_key(|h| h.id())
+    {
+        return Some(Job::Rewrite { input: h.id(), reason: Reason::IndexBackfill });
     }
 
     // 3. Size tiers.

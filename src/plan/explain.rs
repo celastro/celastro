@@ -151,6 +151,9 @@ pub struct HopExplain {
     pub expand_micros: u128,
     /// Time in the node shards' `present` calls.
     pub check_micros: u128,
+    /// Units that had no adjacency region -- a memtable, or a segment sealed
+    /// before the index was declared -- and were scanned instead of probed.
+    pub scanned: usize,
 }
 
 impl Explain {
@@ -183,7 +186,7 @@ impl Explain {
             for h in &w.hops {
                 o.push_str(&format!(
                     "    hop {}: {} key(s) expanded over {} edge(s): {} new, {} dangling, \
-                     frontier {}{} (expand {:.2} ms, check {:.2} ms)\n",
+                     frontier {}{} (expand {:.2} ms, check {:.2} ms{})\n",
                     h.hop,
                     h.expanded,
                     h.edges,
@@ -197,6 +200,11 @@ impl Explain {
                     },
                     h.expand_micros as f64 / 1000.0,
                     h.check_micros as f64 / 1000.0,
+                    if h.scanned > 0 {
+                        format!("; {} unit(s) scanned: no adjacency region", h.scanned)
+                    } else {
+                        String::new()
+                    }
                 ));
             }
             o.push_str(&format!(

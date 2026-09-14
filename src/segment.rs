@@ -183,6 +183,7 @@ pub struct Segment {
     columns: BTreeMap<String, Lazy<Column>>,
     text: BTreeMap<String, Lazy<SealedText>>,
     vectors: BTreeMap<String, Lazy<VectorStore>>,
+    adjacency: BTreeMap<String, Lazy<AdjIndex>>,
 }
 
 /// A segment that goes away takes its ledger entries with it.
@@ -235,6 +236,98 @@ pub fn text_component(path: &str) -> String {
 pub fn vector_component(path: &str) -> String {
     format!("vec:{path}")
 }
+pub fn adjacency_component(path: &str) -> String {
+    format!("adj:{path}")
+}
+
+/// One column's value-to-ordinals map: the region an adjacency index owns,
+/// one per column it names, so that a hop probes a key instead of scanning
+/// the column. Keys sorted, each with the run of ordinals -- ascending --
+/// whose document holds that string at the path. A document whose value
+/// there is not a string is in no run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdjIndex {
+    keys: Vec<String>,
+    /// `keys.len() + 1` offsets into `ords`.
+    starts: Vec<u32>,
+    ords: Vec<u32>,
+}
+
+impl AdjIndex {
+    /// From `(value, ordinal)` pairs in any order.
+    pub fn build(mut pairs: Vec<(String, u32)>) -> AdjIndex {
+        pairs.sort();
+        pairs.dedup();
+        let mut out = AdjIndex::default();
+        out.starts.push(0);
+        for (k, ord) in pairs {
+            if out.keys.last() != Some(&k) {
+                out.keys.push(k);
+                out.starts.push(out.ords.len() as u32);
+            }
+            out.ords.push(ord);
+            *out.starts.last_mut().expect("pushed above") = out.ords.len() as u32;
+        }
+        out
+    }
+
+    /// The ordinals holding `key`, ascending; empty for a key no document
+    /// holds.
+    pub fn probe(&self, key: &str) -> &[u32] {
+        match self.keys.binary_search_by(|k| k.as_str().cmp(key)) {
+            Ok(i) => &self.ords[self.starts[i] as usize..self.starts[i + 1] as usize],
+            Err(_) => &[],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uvarint(&mut out, self.keys.len() as u64);
+        for (i, k) in self.keys.iter().enumerate() {
+            put_str(&mut out, k);
+            let run = &self.ords[self.starts[i] as usize..self.starts[i + 1] as usize];
+            put_uvarint(&mut out, run.len() as u64);
+            let mut prev = 0u32;
+            for &o in run {
+                put_uvarint(&mut out, (o - prev) as u64);
+                prev = o;
+            }
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<AdjIndex> {
+        let bad = || Error::Storage("segment: adjacency region is malformed".into());
+        let mut i = 0usize;
+        let n = bounded_len(get_uvarint(b, &mut i).ok_or_else(bad)?, 2, b.len()).ok_or_else(bad)?;
+        let mut out = AdjIndex { keys: Vec::with_capacity(n), starts: vec![0], ords: Vec::new() };
+        for _ in 0..n {
+            let k = get_str(b, &mut i).ok_or_else(bad)?;
+            if out.keys.last().is_some_and(|last| last >= &k) {
+                return Err(bad());
+            }
+            let run = bounded_len(get_uvarint(b, &mut i).ok_or_else(bad)?, 1, b.len() - i)
+                .ok_or_else(bad)?;
+            let mut prev = 0u32;
+            for _ in 0..run {
+                let d = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                prev = u32::try_from(d).ok().and_then(|d| prev.checked_add(d)).ok_or_else(bad)?;
+                out.ords.push(prev);
+            }
+            out.keys.push(k);
+            out.starts.push(out.ords.len() as u32);
+        }
+        Ok(out)
+    }
+}
 
 impl Segment {
     pub fn num_docs(&self) -> usize {
@@ -266,6 +359,11 @@ impl Segment {
 
     pub fn column_paths(&self) -> Vec<String> {
         self.columns.keys().cloned().collect()
+    }
+
+    /// The columns this segment holds an adjacency map for.
+    pub fn adjacency_paths(&self) -> Vec<String> {
+        self.adjacency.keys().cloned().collect()
     }
 
     /// This segment's identity in the node's residency ledger.
@@ -422,6 +520,24 @@ impl Segment {
         })
     }
 
+    /// The adjacency map over `path`, if this segment was sealed with one:
+    /// the collection declared `USING adjacency` naming the column before
+    /// the seal. `None` otherwise, and the caller scans.
+    pub fn adjacency(&self, path: &str) -> Result<Option<Arc<AdjIndex>>> {
+        let Some(cell) = self.adjacency.get(path) else { return Ok(None) };
+        let name = format!("adj/{path}.idx");
+        let comp = adjacency_component(path);
+        let tier = self.tier_of(&comp);
+        let x = self.acquire(cell, comp, tier, || {
+            let b = self
+                .read_region(&name)?
+                .ok_or_else(|| Error::Storage(format!("segment: missing region {name}")))?;
+            let n = b.len();
+            Ok((AdjIndex::decode(&b)?, n))
+        })?;
+        Ok(Some(x))
+    }
+
     pub fn column(&self, path: &str) -> Result<Option<Arc<Column>>> {
         let Some(cell) = self.columns.get(path) else { return Ok(None) };
         let name = format!("cols/{path}.col");
@@ -555,6 +671,13 @@ impl Segment {
                 out.push((n, t, c.last_access(), c.bytes()));
             }
         }
+        for (p, c) in &self.adjacency {
+            if c.is_loaded() {
+                let n = adjacency_component(p);
+                let t = self.tier_of(&n);
+                out.push((n, t, c.last_access(), c.bytes()));
+            }
+        }
         out
     }
 
@@ -584,6 +707,8 @@ impl Segment {
             self.text.get(p).and_then(|c| c.unload_with(note))
         } else if let Some(p) = component.strip_prefix("vec:") {
             self.vectors.get(p).and_then(|c| c.unload_with(note))
+        } else if let Some(p) = component.strip_prefix("adj:") {
+            self.adjacency.get(p).and_then(|c| c.unload_with(note))
         } else {
             None
         };
@@ -780,9 +905,13 @@ impl Segment {
         let mut columns = BTreeMap::new();
         let mut text = BTreeMap::new();
         let mut vectors = BTreeMap::new();
+        let mut adjacency = BTreeMap::new();
         let mut vec_meta = BTreeMap::new();
         for name in dir.keys() {
-            if let Some(rest) = name.strip_prefix("cols/") {
+            if let Some(rest) = name.strip_prefix("adj/") {
+                let path = rest.strip_suffix(".idx").unwrap_or(rest).to_string();
+                adjacency.insert(path, Lazy::default());
+            } else if let Some(rest) = name.strip_prefix("cols/") {
                 // `strip_suffix`, not `trim_end_matches`: the latter strips
                 // every trailing repetition, so a path that itself ends in
                 // `.col` decodes to the wrong name and two columns can collapse
@@ -827,6 +956,7 @@ impl Segment {
             columns,
             text,
             vectors,
+            adjacency,
         })
     }
 
@@ -1014,6 +1144,9 @@ impl SegmentBuilder {
 
         let mut text_builders: BTreeMap<String, (InvertedBuilder, Analyzer)> = BTreeMap::new();
         let mut vec_stores: BTreeMap<String, VectorStore> = BTreeMap::new();
+        // One value-to-ordinals map per column an adjacency index names,
+        // both of them: a walk follows the index either way.
+        let mut adj_pairs: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
         for idx in &coll.indexes {
             match &idx.kind {
                 IndexKind::FullText { analyzer } => {
@@ -1025,7 +1158,11 @@ impl SegmentBuilder {
                 IndexKind::Vector { dims, metric } => {
                     vec_stores.insert(idx.path.clone(), VectorStore::new(*dims, *metric));
                 }
-                IndexKind::Secondary | IndexKind::Adjacency { .. } => {}
+                IndexKind::Adjacency { to } => {
+                    adj_pairs.entry(idx.path.clone()).or_default();
+                    adj_pairs.entry(to.clone()).or_default();
+                }
+                IndexKind::Secondary => {}
             }
         }
 
@@ -1055,6 +1192,11 @@ impl SegmentBuilder {
                     analyze_field(v, *an, &mut toks);
                 }
                 ib.add_doc(ord, &toks);
+            }
+            for (path, pairs) in adj_pairs.iter_mut() {
+                if let Some(Value::Str(k)) = pd.doc.path(path) {
+                    pairs.push((k.clone(), ord));
+                }
             }
             for (path, vs) in vec_stores.iter_mut() {
                 if let Some(v) = pd.doc.path(path) {
@@ -1087,6 +1229,9 @@ impl SegmentBuilder {
 
         for (b, (path, _)) in col_builders.into_iter().zip(shred.iter()) {
             regions.push((format!("cols/{path}.col"), b.finish(n).encode()));
+        }
+        for (path, pairs) in adj_pairs {
+            regions.push((format!("adj/{path}.idx"), AdjIndex::build(pairs).encode()));
         }
         for (path, (ib, an)) in text_builders {
             let (dict, postings, lens) = ib.finish();
@@ -1213,6 +1358,80 @@ mod tests {
             });
         }
         (b.build(1, 0, &c).unwrap(), c)
+    }
+
+    /// The adjacency region is one sorted value-to-ordinals map per column
+    /// the index names, built at seal for both columns: a probe answers the
+    /// ordinals holding a key, ascending, or nothing for a key no document
+    /// holds, and a document whose value there is not a string is in no
+    /// run. It survives the bytes, is listed as its own component under the
+    /// index's tier, and a segment sealed without the index has none.
+    #[test]
+    fn an_adjacency_region_probes_both_columns_and_round_trips() {
+        let mut c = Collection::new("cites", "id", None);
+        c.nodes_of = Some("papers".into());
+        c.declared.push(ColumnDef { path: "src".into(), ty: ValueType::Str, not_null: true });
+        c.declared.push(ColumnDef { path: "dst".into(), ty: ValueType::Str, not_null: true });
+        c.indexes.push(IndexDef::new(
+            "cites_adj",
+            "src",
+            IndexKind::Adjacency { to: "dst".into() },
+            Tier::Cached,
+        ));
+        let edges = [("e1", "a", "b"), ("e2", "a", "c"), ("e3", "b", "c"), ("e4", "c", "a")];
+        let mut b = SegmentBuilder::new(BuildOpts::default());
+        for (i, (id, src, dst)) in edges.iter().enumerate() {
+            let doc =
+                json::parse(&format!(r#"{{"id":"{id}","src":"{src}","dst":"{dst}"}}"#)).unwrap();
+            b.add(PendingDoc { sort_key: id.to_string(), commit_ts: 10 + i as u64, doc });
+        }
+        // A fifth edge whose `src` is a number: in no run of the `src` map.
+        let doc = json::parse(r#"{"id":"e5","src":7,"dst":"a"}"#).unwrap();
+        b.add(PendingDoc { sort_key: "e5".into(), commit_ts: 20, doc });
+        let s = b.build(1, 0, &c).unwrap();
+        let back = Segment::decode(&s.encode().unwrap()).unwrap();
+        for seg in [&s, &back] {
+            let by_src = seg.adjacency("src").unwrap().expect("the probed column's map");
+            let by_dst = seg.adjacency("dst").unwrap().expect("the read column's map too");
+            // Ordinals are by sort key: e1=0, e2=1, e3=2, e4=3, e5=4.
+            assert_eq!(by_src.probe("a"), &[0, 1]);
+            assert_eq!(by_src.probe("b"), &[2]);
+            assert_eq!(by_src.probe("c"), &[3]);
+            assert_eq!(by_src.probe("nobody"), &[] as &[u32]);
+            assert_eq!(by_src.len(), 3, "the numeric src is in no run");
+            assert_eq!(by_dst.probe("a"), &[3, 4]);
+            assert_eq!(by_dst.probe("c"), &[1, 2]);
+            assert!(
+                seg.adjacency("id").unwrap().is_none(),
+                "no map for a column the index does not name"
+            );
+        }
+        assert_eq!(*s.adjacency("src").unwrap().unwrap(), *back.adjacency("src").unwrap().unwrap());
+        let listed: Vec<String> = back.loaded_components().into_iter().map(|(n, ..)| n).collect();
+        assert!(
+            listed.contains(&"adj:src".to_string()) && listed.contains(&"adj:dst".to_string()),
+            "{listed:?}"
+        );
+        assert!(back.unload_component("adj:src") > 0);
+        assert!(!back.loaded_components().iter().any(|(n, ..)| n == "adj:src"));
+
+        // Without the index, no region: the walk scans such a segment.
+        c.indexes.clear();
+        let mut b = SegmentBuilder::new(BuildOpts::default());
+        let doc = json::parse(r#"{"id":"e1","src":"a","dst":"b"}"#).unwrap();
+        b.add(PendingDoc { sort_key: "e1".into(), commit_ts: 10, doc });
+        let plain = b.build(2, 0, &c).unwrap();
+        assert!(plain.adjacency("src").unwrap().is_none());
+
+        // The codec refuses what it cannot have written: keys out of order.
+        let mut bytes = Vec::new();
+        put_uvarint(&mut bytes, 2);
+        for k in ["b", "a"] {
+            put_str(&mut bytes, k);
+            put_uvarint(&mut bytes, 1);
+            put_uvarint(&mut bytes, 0);
+        }
+        assert!(AdjIndex::decode(&bytes).is_err());
     }
 
     #[test]

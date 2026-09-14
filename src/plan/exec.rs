@@ -1020,8 +1020,10 @@ fn eval_expr(
             // The catalog declares the index -- `Db::run_select` refused the
             // statement otherwise -- but a unit sealed before it was declared
             // holds no region for it, and the index does not cover those
-            // documents until compaction rewrites them (CREATE INDEX never
-            // backfilled). No rows from this unit, and the plan says so.
+            // documents until compaction rewrites them (CREATE INDEX writes
+            // nothing into a sealed segment; the missing region is a
+            // compaction trigger). No rows from this unit, and the plan says
+            // so.
             let no_region = |ux: &mut UnitExplain| {
                 ux.access_paths.push(format!(
                     "text_match({path}) [no index region in this unit: sealed before the index]"

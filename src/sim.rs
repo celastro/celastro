@@ -42,7 +42,7 @@ use crate::error::{Error, Result};
 use crate::plan::service::{
     CandidatesRequest, Local, ScanRequest, ShardCandidates, ShardScan, ShardService, TermStats,
 };
-use crate::plan::walk::ExpandRequest;
+use crate::plan::walk::{ExpandRequest, HopExpansion};
 use crate::shard::Shard;
 use crate::time::Timestamp;
 use crate::value::Value;
@@ -291,7 +291,7 @@ impl ShardService for SimShard<'_> {
         self.deliver("get", |s| s.get(key, ts))
     }
 
-    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
         self.deliver("expand", |s| s.expand(req))
     }
 

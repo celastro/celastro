@@ -197,9 +197,12 @@ keeps at most `N` of the keys a hop found. Either cut keeps the
 lexicographically first and says so, on the response as a `CUT` line and in
 `EXPLAIN ANALYZE`, which shows every hop: keys expanded, edges followed, new
 keys, dangling edges (a `dst` that names no live document is skipped and
-counted) and the frontier that goes on. An adjacency index is tiered like any
-index; a walk that finds it below `cached` is refused naming the tier, since
-a walk reads it at every hop.
+counted) and the frontier that goes on. An adjacency index is a
+value-to-ordinals map per column in every segment sealed after it, probed
+per key at each hop; a segment sealed before it is scanned until compaction
+rewrites it, which `COMPACT` does, and the plan counts such units. It is
+tiered like any index; a walk that finds it below `cached` is refused naming
+the tier, since a walk reads it at every hop.
 
 This is not a graph database: no pattern language, no unbounded paths, no
 shortest path, no centrality. It is the neighbourhood as a filter, fused with
@@ -360,7 +363,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.20.0 && docker tag ghcr.io/celastro/celastro:0.20.0 celastro
+docker pull ghcr.io/celastro/celastro:0.21.0 && docker tag ghcr.io/celastro/celastro:0.21.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

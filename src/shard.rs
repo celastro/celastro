@@ -1582,6 +1582,13 @@ impl Shard {
     }
 
     /// Where a version lives.
+    /// Whether a document with this sort key is visible at `t`: the locate
+    /// without the decode, for a walk's liveness check, which asks it once
+    /// per key over thousands of keys.
+    pub fn contains(&self, key: &str, t: Timestamp) -> bool {
+        self.locate(key, t).is_some()
+    }
+
     fn locate(&self, key: &str, t: Timestamp) -> Option<Loc> {
         if let Some(ord) = self.memtable.find_at(key, t) {
             return Some(Loc::Mem(ord));

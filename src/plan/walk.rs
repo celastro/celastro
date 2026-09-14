@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::plan::exec;
 use crate::plan::explain::{HopExplain, UnitExplain, WalkExplain};
 use crate::plan::service::ShardService;
-use crate::shard::Shard;
+use crate::shard::{Searchable, Shard};
 use crate::sql::ast::{Expr, Select};
 use crate::time::Timestamp;
 use crate::value::Value;
@@ -56,11 +56,28 @@ pub struct ExpandRequest<'a> {
     pub walk: usize,
 }
 
+/// A shard's answer to one hop.
+pub struct HopExpansion {
+    /// `(from, to)` pairs, sorted and distinct.
+    pub pairs: Vec<(String, String)>,
+    /// Units scanned for want of an adjacency region: the memtable, and any
+    /// segment sealed before the index was declared.
+    pub scanned: usize,
+}
+
 /// The shard's half of a hop: every live edge whose probed column is in the
 /// frontier and which the filter admits, as `(from, to)` pairs, sorted and
 /// distinct, at most `limit` per `from`. An undirected collection yields
 /// both orders.
-pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+///
+/// A segment with an adjacency region is probed once per frontier key --
+/// a binary search and a run of ordinals -- and nothing else in it is
+/// read but the ordinals' `to` strings and, when there is an edge filter,
+/// the filter's own columns. A unit without one (the memtable; a segment
+/// sealed before `CREATE INDEX`, until compaction rewrites it) is scanned
+/// against the frontier as a set, as every unit was before the region
+/// existed, and counted so the plan can say so.
+pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
     let idx = req
         .coll
         .adjacency_index()
@@ -78,6 +95,7 @@ pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<Vec<(S
     let snap = shard.snapshot_at(req.ts);
     let units = shard.sources(&snap);
     let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut scanned = 0usize;
     let mut ux = UnitExplain::default();
     for unit in &units {
         if unit.num_docs() == 0 {
@@ -85,6 +103,33 @@ pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<Vec<(S
         }
         let vis = unit.visibility(req.ts);
         for (probe, read) in &orders {
+            let region = match unit {
+                Searchable::Seg(h) => h.segment.adjacency(probe)?,
+                Searchable::Mem(_) => None,
+            };
+            if let Some(adj) = region {
+                // The filter once per unit, over the visible set, only when
+                // there is one: its columns are the only scan left here.
+                let admitted = match req.filter {
+                    Some(f) => Some(exec::eval_structured(unit, f, &vis, &vis, &mut ux)?),
+                    None => None,
+                };
+                let tos = unit.strings(read)?;
+                for key in req.frontier {
+                    for &ord in adj.probe(key) {
+                        let ok = vis.get(ord as usize)
+                            && admitted.as_ref().map_or(true, |a| a.get(ord as usize));
+                        if !ok {
+                            continue;
+                        }
+                        if let Some(b) = tos.at(ord)? {
+                            pairs.push((key.clone(), b));
+                        }
+                    }
+                }
+                continue;
+            }
+            scanned += 1;
             let mut bm = unit.filter(probe, CmpOp::In, &lit, &vis)?.0;
             bm.and_inplace(&vis);
             if let Some(f) = req.filter {
@@ -107,17 +152,29 @@ pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<Vec<(S
     if let Some(n) = req.limit {
         pairs = cut_fanout(pairs, n).0;
     }
-    Ok(pairs)
+    Ok(HopExpansion { pairs, scanned })
 }
 
 /// The shard's half of the liveness check: which of `keys` are primary
 /// keys of a document visible at `ts`, sorted and distinct.
+///
+/// An unpartitioned collection's sort key is its primary key, so each key
+/// is one lookup in the memtable's map and one binary search per segment,
+/// which is the shard's own `get` without the decode. A partitioned
+/// collection sorts by `(partition, key)` and a walk carries bare keys, so
+/// it is a scan of the key column against the set.
 pub(crate) fn present_on(
     shard: &Shard,
     coll: &Collection,
     keys: &[String],
     ts: Timestamp,
 ) -> Result<Vec<String>> {
+    if coll.partition_key.is_none() {
+        let mut out: Vec<String> = keys.iter().filter(|k| shard.contains(k, ts)).cloned().collect();
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
     let lit = Value::Array(keys.iter().map(|k| Value::Str(k.clone())).collect());
     let snap = shard.snapshot_at(ts);
     let units = shard.sources(&snap);
@@ -248,12 +305,16 @@ pub fn walk(
             params: spec.params,
             walk: spec.walk,
         };
+        let mut scanned = 0usize;
         for s in edge_services {
             if edge_unreachable.contains(&s.index()) {
                 continue;
             }
             match s.expand(&req) {
-                Ok(p) => pairs.extend(p),
+                Ok(x) => {
+                    pairs.extend(x.pairs);
+                    scanned += x.scanned;
+                }
                 Err(Error::Deadline(e)) => {
                     if !partial {
                         return Err(Error::Deadline(e));
@@ -342,6 +403,7 @@ pub fn walk(
             cut,
             expand_micros,
             check_micros: t_check.elapsed().as_micros(),
+            scanned,
         });
     }
     let keys: Vec<String> = answer.into_iter().collect();
