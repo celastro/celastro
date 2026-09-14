@@ -368,8 +368,9 @@ without a dot.
 
 Consensus and replication, follower reads and closed timestamps, hedged
 requests, two-phase commit for multi-shard writes and for multi-node DDL,
-stateless compaction workers, dynamic shard split and merge, and moving a
-shard between nodes. A collection's shards can be spread over nodes and any
+stateless compaction workers, dynamic shard split and merge, moving a shard
+between nodes, and edges — the last designed and measured in the section
+after this one, and not built. A collection's shards can be spread over nodes and any
 holder can coordinate, but each shard has exactly one holder and a statement
 that changes the catalog reaches the holders one by one, reporting the ones it
 did not reach. The
@@ -408,6 +409,161 @@ does the same for the global statistics themselves, under a workload that
 leaves dead rows behind for each shard to collect on its own schedule.
 
 ---
+
+## Graph-constrained hybrid search
+
+celastro has no notion of an edge. This section is the design for one, made
+before any code, so that the questions it raises are answered where they
+constrain each other and not one at a time in the tree. It is the result of a
+design pass on 2026-09-14; the backlog item it belongs to is `ready` on the
+strength of it.
+
+**The query.** *Documents within `k` hops of node `x`, matching text `t`,
+nearest to vector `v`, under structured predicate `p`* — the shape retrieval
+over a citation graph takes, and the one every engine that offers it evaluates
+as separate index lookups joined afterwards. celastro's load-bearing idea is
+that every index produces sets in the segment's ordinal space and hybrid
+candidate generation is bitmap intersection. If a `k`-hop neighbourhood can be
+made an ordinal set, it intersects with the other three for free, and the
+claim "one plan, one process, bit-identical across shard counts" extends to
+it.
+
+**What this is not.** Not a graph database: no pattern language, no unbounded
+paths, no shortest path, no centrality or community detection (batch
+analytics, not a query plan), no index-free adjacency. Immutable segments
+cannot chase pointers; adjacency is an index rebuilt at compaction, and a deep
+walk pays a probe per hop. The win is the fused query and the bounded
+behaviour, not the hop, and the README will say so the day this ships.
+
+### Decisions
+
+1. **An edge is a document in its own collection**, with `src` and `dst`
+   columns declared and typed, and a `kind` and whatever properties it
+   carries as ordinary fields. MVCC, tiers, lifecycle, `DROP`, the WAL,
+   export and placement come free; an edge predicate is a structured bitmap
+   on that collection. The alternative — adjacency as an array on the node
+   document — makes every edge write a node rewrite and was rejected.
+
+2. **An edge collection points into exactly one node collection**, named at
+   creation: `CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT
+   NULL, dst TEXT NOT NULL) WITH (nodes_of = 'papers')`. Every `dst` and
+   `src` is a primary key of that collection. The two collections may be
+   placed differently across nodes, because of the next decision.
+
+3. **The frontier is a set of primary keys until the last hop.** A hop is a
+   secondary-index probe on `src` (or `dst`) over the edge collection; the
+   keys it yields are the next frontier. Only the *final* frontier is turned
+   into an ordinal bitmap, per segment of the node collection, exactly as
+   `id IN (...)` is today. The invariant "no identifier translation" holds:
+   there is no second identifier space and no per-segment map, and the
+   hybrid intersection is untouched. The cost is `k` index probes plus one
+   key-set-to-bitmap pass per segment. The per-hop lookup through
+   `ShardService::get` (a chain of dependent reads) and a global node-id
+   space (the second identifier space the invariant forbids) were rejected.
+
+4. **A filter first, a source later.** `WHERE id WITHIN 2 HOPS OF 'p1' VIA
+   cites` is one more `Expr` variant beside `text_match` and a distance
+   threshold: it selects and contributes no rank. Hop distance as a
+   `SourceList` into fusion, so that nearer nodes rank higher, is a
+   separable later decision. A pattern surface, if the filter ever grows
+   into one, is SQL/PGQ, which is SQL and stays inside the front end's
+   shape.
+
+5. **Bounded, and a cut says so.** `k` is required; there is no unbounded
+   walk. `WITH (max_frontier = N)` caps the key set after any hop and
+   `WITH (max_fanout = N)` caps one node's expansion, which is what a hub
+   costs. Hitting either is reported the way a truncated prefix is: on the
+   response, in the plan, per hop. The statement deadline applies per hop.
+   `EXPLAIN ANALYZE` shows the frontier after each hop and which cap bound.
+
+6. **Shards.** A shard never sees another shard's candidates, so a frontier
+   crossing shards is expanded through the coordinator each round: one more
+   call on `plan::service::ShardService`, `expand(frontier, edge index,
+   filter, ts) -> keys`, which the simulator covers for free and the wire
+   carries. The exit test is the existing one extended: a `k`-hop statement
+   is bit-identical at 1, 3 and 6 shards, and a shard that stops answering
+   mid-walk shortens the answer only by saying so.
+
+7. **Residency.** `USING adjacency (src, dst)` takes a tier like any index
+   and a policy may demote it. A walk that finds it below `cached` is
+   refused naming the tier and the index, rather than paying a chain of
+   archive fault-ins per hop; the operator raises the tier or narrows the
+   walk.
+
+8. **Direction and kinds.** Outgoing edges by default; a collection created
+   `UNDIRECTED` indexes both orders and its walks follow both. `VIA cites
+   WHERE kind = 'cites' AND weight > 0.5` is a structured bitmap on the edge
+   collection applied at every hop; one filter for the whole walk, per-hop
+   filters a later extension.
+
+9. **Dangling edges.** An edge whose `dst` is deleted at the statement's
+   instant, or never existed, is followed and resolves to nothing: skipped
+   in the answer, counted in the plan per hop. MVCC already hides the node;
+   the count is how an operator sees rot accumulating.
+
+10. **The hop set** is every node reachable in `1..k` hops, the start node
+    excluded: the neighbourhood, which is what a retrieval filter wants.
+    `OR id = 'x'` puts the start back.
+
+### What it costs today, measured
+
+Measured on 2026-09-14, on this crate as it is, with the graph step done the
+only way it can be done today — as client round trips — so that the number
+the first slice has to beat is written down before the slice exists. The
+corpus: 50,000 documents of 20 words each from a 2,000-word vocabulary drawn
+Zipf-like, a 128-dimensional embedding per document in 64 clusters, and
+249,950 citation edges, every document citing five earlier ones by
+preferential attachment, so the graph has hubs: the most-cited document has
+7,717 citers. Two collections, `papers` with a full-text and a cosine vector
+index and `cites` with secondary indexes on `src` and `dst`. Twenty
+statements, each *within 2 hops of x, matching one common word, nearest to
+v, top 10*, run as three statements: the first hop by secondary index, the
+second hop as `WHERE src IN (...)` over the first hop's keys, and the fused
+statement as `WHERE id IN (...frontier...) AND text_match(...) ORDER BY
+embedding <=> [...] LIMIT 10`. Every timing is the best of five over the
+console's HTTP API in one process; every fused statement was run ten times
+and returned identical rows every time.
+
+Outgoing walks — what `x` cites and what those cite — reach 17 to 27
+documents. The three statements cost 83 to 86 ms together, 28 to 30 ms for
+the fused one, against 26 to 32 ms for the same text-and-vector statement
+without the graph filter: the walk costs two extra round trips of a
+statement's fixed overhead and nothing else. Incoming walks from the ten
+most-cited documents — what cites `x` and what cites those — reach 18,147 to
+43,861 documents, up to 88% of the corpus. There the three statements cost
+5.0 to 17.8 seconds: the second hop carries 2,533 to 7,717 keys as SQL
+literals and takes 3.0 to 12.4 s, and the fused statement carries the whole
+frontier and takes 1.9 to 5.3 s, against 26 to 30 ms for the same statement
+without the graph filter. That is a factor of 200 to 600, and all of it is
+the key set travelling as a list of literals and being matched per document.
+
+Three things follow. The fused evaluation is not where the cost is: text,
+vector and structured predicates over 50,000 documents answer in under
+30 ms with or without a neighbourhood, so decision 3 — the frontier as keys
+until the last hop, then one key-set-to-bitmap pass per segment — is aimed at
+the whole of the measured cost, and the number the slice has to show is a
+hub walk answering in the low hundreds of milliseconds, not seconds. Second,
+a two-hop neighbourhood of a hub is most of the corpus: `max_frontier` will
+bind on real graphs at small `k`, which is why a cut that says so is part of
+the design and not an option on it. Third, `IN` with thousands of literals is
+slow in its own right, walk or no walk — it is evaluated per document against
+the list — and deserves a hash set per statement whether or not this section
+is ever built; that is filed on its own.
+
+### Done when
+
+An edge collection with `WITH (nodes_of = ...)` and `CREATE INDEX ... USING
+adjacency (src, dst)`; `WITHIN k HOPS OF` fused with `text_match` and `<=>`
+in one plan; `exact` mode bit-identical across shard counts for hop
+statements; a cut walk says so on the response and in the plan; `EXPLAIN
+ANALYZE` shows the frontier per hop; the measurement above re-run against the
+fused plan and the numbers replaced; and the README says what this is and is
+not. A minor release. The tests it will name: `engine::tests::a_hop_filter_
+selects_the_neighbourhood_and_nothing_else`, `a_hop_statement_is_bit_
+identical_across_shard_counts`, `a_cut_walk_says_which_cap_bound_it`,
+`a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `a_dangling_
+edge_is_skipped_and_counted`, and the simulator's fault property over
+`expand`.
 
 ## Design notes
 
