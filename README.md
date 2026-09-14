@@ -272,11 +272,12 @@ the environment at open and never written anywhere.
 
 ## Running in a container
 
-The `Dockerfile` builds a statically linked `celastro-cli` into an image
-`FROM scratch`: no shell, no libc, nothing running as root.
+Each release publishes `ghcr.io/celastro/celastro:<version>`: a statically
+linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
+running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker build -t celastro .
+docker pull ghcr.io/celastro/celastro:0.17.0 && docker tag ghcr.io/celastro/celastro:0.17.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

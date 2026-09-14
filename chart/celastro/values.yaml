@@ -1,5 +1,5 @@
 image:
-  repository: celastro
+  repository: ghcr.io/celastro/celastro
   # Empty means the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent

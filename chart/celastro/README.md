@@ -10,17 +10,23 @@ database that happened to share a name.
 
 ## Install
 
-The chart pulls `celastro:<appVersion>`. No public image is published yet, so
-build one from the repository's `Dockerfile` and put it where your cluster can
-pull it, or load it into a local cluster:
+The chart pulls `ghcr.io/celastro/celastro:<appVersion>`, the image each
+release publishes from the tagged tree (see the repository's `Dockerfile`).
 
 ```
-docker build -t celastro:0.13.0 .
-kind load docker-image celastro:0.13.0        # for a kind cluster
 helm install celastro chart/celastro
 ```
 
-Set `image.repository` and `image.tag` for a registry of your own.
+To run an image of your own instead, build one and put it where the cluster
+can pull it, or load it into a local cluster, then point the chart at it:
+
+```
+docker build -t celastro:0.17.0 .
+kind load docker-image celastro:0.17.0        # for a kind cluster
+helm install celastro chart/celastro --set image.repository=celastro
+```
+
+`image.repository` and `image.tag` take a registry of your own the same way.
 
 ## Reaching the console
 
@@ -56,7 +62,7 @@ probe cannot know one, and it executes nothing.
 
 | value | default | what it is |
 |---|---|---|
-| `image.repository`, `image.tag` | `celastro`, the chart's `appVersion` | the image; `pullPolicy` is `IfNotPresent` |
+| `image.repository`, `image.tag` | `ghcr.io/celastro/celastro`, the chart's `appVersion` | the image; `pullPolicy` is `IfNotPresent` |
 | `port` | `8787` | the console's port inside the pod |
 | `persistence.size`, `persistence.storageClass` | `10Gi`, the cluster default | the data volume |
 | `archive.endpoint` | empty | `host:port` of an S3-compatible store, plain HTTP; empty keeps the `archived` tier in the data volume |
@@ -87,6 +93,13 @@ image built from the tree at the commit that added this chart:
   rolled the pod, and the row was still there.
 - The pod's events show both probes as configured and no warnings.
 
-Not verified: a real registry, a real `StorageClass` other than kind's, and
-the `archive` values against a bucket in the cluster. The client behind them
-is tested against an in-process S3 in the crate's own tests.
+And again on 2026-09-14 with the chart at appVersion 0.17.0 and nothing
+loaded into the cluster by hand: `helm install --wait` pulled
+`ghcr.io/celastro/celastro:0.17.0` from the registry anonymously (the pod's
+events show the pull, 1 MB, in under three seconds), the pod reached
+`READY 1/1`, and `/api/health` over the forwarded port reported version
+0.17.0.
+
+Not verified: a real `StorageClass` other than kind's, and the `archive`
+values against a bucket in the cluster. The client behind them is tested
+against an in-process S3 in the crate's own tests.

@@ -6,6 +6,13 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The image is published.** Each release pushes `ghcr.io/celastro/celastro`
+tagged with the version and with `latest`, built from the tagged tree by the
+repository's `Dockerfile`; 0.17.0 is the first. The chart pulls it by
+default and moves to appVersion 0.17.0.
+
 ## 0.17.0 — 2026-09-14
 
 A new module and a library type that changed shape, hence a minor. The
