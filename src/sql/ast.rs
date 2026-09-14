@@ -59,6 +59,19 @@ pub enum Statement {
         collection: String,
         index: String,
     },
+    /// `LOCAL <statement>` — run it on this node only, without forwarding
+    /// it to the other nodes holding the collection. What a coordinator
+    /// sends the other holders, and what an operator runs to repair a node
+    /// a forwarded statement did not reach.
+    Local(Box<Statement>),
+    /// `ATTACH NODE 'tcp://host:port'` — a node this one may place shards
+    /// on. `DETACH NODE` refuses while a placement still names it.
+    AttachNode {
+        url: String,
+    },
+    DetachNode {
+        url: String,
+    },
     /// Evaluate the policies and carry out whatever they call for. Like
     /// compaction, tiering is scheduled and visible rather than an invisible
     /// background process (§12.1).
@@ -106,6 +119,9 @@ pub struct CreateCollection {
     /// `WITH (prefix_expansion = N)`: how many dictionary terms a prefix on
     /// the collection expands to, or `None` for the engine's default.
     pub prefix_expansion: Option<usize>,
+    /// `WITH (nodes = [...])`: the nodes to place the shards on, round-robin
+    /// by shard index. Empty means every attached node and this one.
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

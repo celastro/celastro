@@ -30,13 +30,34 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 3;
+const CATALOG_VERSION: u8 = 4;
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
-/// and nothing else moves. Version 1 is refused: its tier bytes name different
+/// and nothing else moves. Version 4 appends the node list and the placement
+/// map after the activity clocks; a 3 is read as a 4 with no nodes and no
+/// placement, and `Db::open` derives the placement of every collection from
+/// its shard directories. Version 1 is refused: its tier bytes name different
 /// tiers.
 const CATALOG_VERSION_OLDEST: u8 = 2;
+
+/// Where one shard of a collection lives: the node that holds it and the
+/// key range it owns. The node is its advertised address, or empty for a
+/// shard on whichever node holds this catalog — what a single-node database
+/// has, and what a database created before it had an address keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tablet {
+    pub node: String,
+    pub lo: Option<String>,
+    pub hi: Option<String>,
+}
+
+impl Tablet {
+    pub fn owns(&self, key: &str) -> bool {
+        self.lo.as_ref().map(|l| key >= l.as_str()).unwrap_or(true)
+            && self.hi.as_ref().map(|h| key < h.as_str()).unwrap_or(true)
+    }
+}
 
 /// How a path behaves across the collection. Drives shredding eligibility and
 /// predicate semantics, not storage layout directly — shredding is a physical,
@@ -238,7 +259,7 @@ impl IndexDef {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub path: String,
     pub ty: ValueType,
@@ -498,6 +519,14 @@ pub struct Catalog {
     /// the policies are evaluated against. Persisted, because "idle for seven
     /// days" must not be reset by a restart.
     pub activity: BTreeMap<(String, String), crate::lifecycle::IndexActivity>,
+    /// The other nodes this one may place shards on, in the order they were
+    /// attached, which is the order a default placement walks. Control
+    /// plane, so it is here and not in a flag; membership is declared.
+    pub nodes: Vec<String>,
+    /// Per collection, one entry per shard index: which node holds it and
+    /// the key range it owns. Every node holding a shard carries the same
+    /// map, so any of them can coordinate.
+    pub placement: BTreeMap<String, Vec<Tablet>>,
     /// Data-plane readers observe catalog versions and never block on DDL
     /// (§10).
     pub version: u64,
@@ -669,6 +698,22 @@ impl Catalog {
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
         crate::lifecycle::encode_activity(&self.activity, &mut out);
+        if format >= 4 {
+            put_uvarint(&mut out, self.nodes.len() as u64);
+            for n in &self.nodes {
+                put_str(&mut out, n);
+            }
+            put_uvarint(&mut out, self.placement.len() as u64);
+            for (name, tablets) in &self.placement {
+                put_str(&mut out, name);
+                put_uvarint(&mut out, tablets.len() as u64);
+                for t in tablets {
+                    put_str(&mut out, &t.node);
+                    put_opt_str(&mut out, t.lo.as_deref());
+                    put_opt_str(&mut out, t.hi.as_deref());
+                }
+            }
+        }
         out
     }
 
@@ -762,7 +807,29 @@ impl Catalog {
         }
         let policies = crate::lifecycle::decode_policies(b, &mut i)?;
         let activity = crate::lifecycle::decode_activity(b, &mut i)?;
-        Ok(Catalog { collections, policies, activity, version })
+        let mut nodes = Vec::new();
+        let mut placement = BTreeMap::new();
+        if format >= 4 {
+            let nn = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+            for _ in 0..nn {
+                nodes.push(get_str(b, &mut i).ok_or_else(bad)?);
+            }
+            let np = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+            for _ in 0..np {
+                let name = get_str(b, &mut i).ok_or_else(bad)?;
+                let nt = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                let mut tablets = Vec::with_capacity(nt);
+                for _ in 0..nt {
+                    tablets.push(Tablet {
+                        node: get_str(b, &mut i).ok_or_else(bad)?,
+                        lo: get_opt_str(b, &mut i).ok_or_else(bad)?,
+                        hi: get_opt_str(b, &mut i).ok_or_else(bad)?,
+                    });
+                }
+                placement.insert(name, tablets);
+            }
+        }
+        Ok(Catalog { collections, policies, activity, nodes, placement, version })
     }
 }
 
@@ -857,6 +924,20 @@ mod tests {
         assert_eq!(a.vector_dims("embedding"), Some(8));
         assert_eq!(a.doc_count, 1);
         assert_eq!(a.prefix_expansion, Some(2048), "the prefix cap survives a reopen");
+
+        cat.nodes.push("tcp://b:9000".into());
+        cat.placement.insert(
+            "articles".into(),
+            vec![
+                Tablet { node: String::new(), lo: None, hi: Some("m".into()) },
+                Tablet { node: "tcp://b:9000".into(), lo: Some("m".into()), hi: None },
+            ],
+        );
+        let back = Catalog::decode(&cat.encode()).unwrap();
+        assert_eq!(back.nodes, cat.nodes, "the node list survives a reopen");
+        assert_eq!(back.placement, cat.placement, "and so does the placement");
+        let three = Catalog::decode(&cat.encode_as(3)).unwrap();
+        assert!(three.nodes.is_empty() && three.placement.is_empty(), "a 3 has neither");
     }
 
     /// A catalog written by a 0.14 build has no cap field: it is read at the
@@ -906,7 +987,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 3"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 4"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

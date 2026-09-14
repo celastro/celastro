@@ -6,12 +6,40 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.18.0 — 2026-09-14
+
+A cluster, hence a minor. The catalog format moves to version 4 with the
+previous one still readable.
 
 **The image is published.** Each release pushes `ghcr.io/celastro/celastro`
 tagged with the version and with `latest`, built from the tagged tree by the
 repository's `Dockerfile`; 0.17.0 is the first. The chart pulls it by
 default and moves to appVersion 0.17.0.
+
+**A collection's shards can be spread over nodes.** Every node is started
+with an address (`CELASTRO_NODE`) and the shared `CELASTRO_WIRE_TOKEN`, and
+`celastro-cli serve --shard-bind ADDR:PORT` serves its shards to the others.
+`ATTACH NODE 'tcp://host:port'` declares a peer; `CREATE COLLECTION ... WITH
+(nodes = [...])` places shard `i` on the `i`-th node named, or on this node
+and the attached ones in turn; every holder carries the definition and the
+placement, so any of them takes any statement: writes route to the owner,
+queries fan out and fuse where they arrived, DDL and `FLUSH` run on every
+holder, and `LOCAL <statement>` runs on one node only. A node that does not
+answer is a deadline at the coordinator and `partial_results` names its
+shard. `DETACH NODE` refuses while the node holds a shard; an export needs
+every shard local. The library gains `DbOpts::node`, `Db::attach_node`,
+`Db::detach_node`, `Db::adopt_collection`, `Db::insert_here`,
+`Db::delete_key_here`, the `wire` module and `Shard::index`; `Db::run_select`
+takes the statement's parameters; `Statement` gains `Local`, `AttachNode` and
+`DetachNode`, and `CreateCollection` a `nodes` list. Moving a shard between
+nodes is not built yet.
+
+**The catalog format is version 4**, for the node list and the placement. A
+version-3 catalog is read with every collection placed on this node.
+
+**A unit sealed before an index was declared answers no rows for that
+path** instead of refusing the statement, and the plan says which unit and
+why; the catalog still refuses a path no index declares.
 
 ## 0.17.0 — 2026-09-14
 

@@ -69,6 +69,15 @@ impl Drop for Armed {
 }
 
 /// The budget the current statement was given, if any.
+/// What is left of the statement's budget, in milliseconds, or `None` under
+/// no deadline. Zero once it has passed. What a call across the wire hands
+/// the other node, which arms it for its half of the work.
+pub fn remaining_ms() -> Option<u64> {
+    ARMED
+        .with(|a| a.get())
+        .map(|(until, _)| until.saturating_duration_since(Instant::now()).as_millis() as u64)
+}
+
 pub fn limit_ms() -> Option<u64> {
     ARMED.with(|a| a.get()).map(|(_, ms)| ms)
 }

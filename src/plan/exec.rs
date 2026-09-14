@@ -237,6 +237,9 @@ pub struct ExecInput<'a> {
     /// in `missing`, so one statement names a missing shard once.
     pub unreachable: &'a [usize],
     pub coll: &'a Collection,
+    /// The statement's parameters, carried to shards on other nodes with
+    /// its text.
+    pub params: &'a [Value],
     pub select: &'a Select,
     pub ts: Timestamp,
     /// Global term statistics for this query's terms, per text path (§8.2).
@@ -586,6 +589,8 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             k_prime,
             stats: input.stats,
             analyze: input.analyze,
+            statement: &input.statement,
+            params: input.params,
         };
         match shard.candidates(&req) {
             Ok(a) => {
@@ -782,15 +787,15 @@ fn show_key(k: &str) -> String {
 
 /// What `plan_sources` decides: the per-source access paths, how their
 /// candidate lists will be fused, and how deep each source has to go.
-struct SourcePlanning {
-    sources: Vec<SourcePlan>,
+pub(crate) struct SourcePlanning {
+    pub(crate) sources: Vec<SourcePlan>,
     method: FusionMethod,
     weights: Vec<f32>,
     rrf_c: f32,
     k_prime: usize,
 }
 
-fn plan_sources(coll: &Collection, sel: &Select, k: usize) -> Result<SourcePlanning> {
+pub(crate) fn plan_sources(coll: &Collection, sel: &Select, k: usize) -> Result<SourcePlanning> {
     let mut sources = Vec::new();
     let mut method = FusionMethod::Rrf;
     let mut weights = Vec::new();
@@ -968,12 +973,19 @@ fn eval_expr(
         }
         Expr::TextMatch { path, query } => {
             // A **must**: it filters and contributes no rank (§2.4).
-            let Some(handle) = unit.text_handle(path)? else {
-                return Err(Error::Plan(format!("no full-text index on `{path}`")));
+            // The catalog declares the index -- `Db::run_select` refused the
+            // statement otherwise -- but a unit sealed before it was declared
+            // holds no region for it, and the index does not cover those
+            // documents until compaction rewrites them (CREATE INDEX never
+            // backfilled). No rows from this unit, and the plan says so.
+            let no_region = |ux: &mut UnitExplain| {
+                ux.access_paths.push(format!(
+                    "text_match({path}) [no index region in this unit: sealed before the index]"
+                ));
+                Bitmap::new(unit.num_docs())
             };
-            let Some(src) = handle.source(path) else {
-                return Err(Error::Plan(format!("no full-text index on `{path}`")));
-            };
+            let Some(handle) = unit.text_handle(path)? else { return Ok(no_region(ux)) };
+            let Some(src) = handle.source(path) else { return Ok(no_region(ux)) };
             let an = unit.analyzer(path)?.unwrap_or(Analyzer::Standard);
             let tq = TextQuery::parse(query, an)?;
             let empty = GlobalStats::default();
@@ -1274,6 +1286,8 @@ fn scan(
             keep,
             after: after.as_deref(),
             fields: &fields,
+            statement: &input.statement,
+            params: input.params,
         };
         match shard.scan(&req) {
             Ok(a) => {
@@ -1702,7 +1716,13 @@ impl Retained {
 
 /// Whether a shard's key range can hold anything under `prefix`.
 pub(crate) fn shard_may_hold(shard: &Shard, prefix: &str) -> bool {
-    if let Some(r) = &shard.key_range {
+    range_may_hold(shard.key_range.as_ref(), prefix)
+}
+
+/// Whether a key range can hold anything under `prefix`; `None` is a shard
+/// with no bounds, which holds everything.
+pub(crate) fn range_may_hold(r: Option<&(Option<String>, Option<String>)>, prefix: &str) -> bool {
+    if let Some(r) = r {
         // A prefix overlaps the range if it is not entirely below `lo` and
         // not at or above `hi`. `lo.starts_with(prefix)` covers the case where
         // the prefix is a strict prefix of the boundary itself.
@@ -1712,6 +1732,23 @@ pub(crate) fn shard_may_hold(shard: &Shard, prefix: &str) -> bool {
         return lo_ok && hi_ok;
     }
     true
+}
+
+/// The SELECT a DELETE runs to find its keys: every row the predicate
+/// selects, no order, no page. One function so that a coordinator and a
+/// holder on another node build the same statement from the same text.
+pub fn select_for_delete(collection: &str, predicate: &Expr) -> Select {
+    Select {
+        projections: vec![Projection::All],
+        collection: collection.to_string(),
+        predicate: Some(predicate.clone()),
+        order: None,
+        limit: Some(usize::MAX),
+        offset: 0,
+        cursor: None,
+        collapse: None,
+        with: WithOpts::default(),
+    }
 }
 
 /// A payload by primary key, from the shards whose range can hold it. A

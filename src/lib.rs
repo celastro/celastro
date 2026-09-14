@@ -96,6 +96,7 @@ pub mod time;
 pub mod value;
 pub mod variant;
 pub mod vector;
+pub mod wire;
 
 pub use engine::{Db, DbOpts, Outcome};
 pub use error::{Error, Result};

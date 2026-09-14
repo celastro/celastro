@@ -26,6 +26,9 @@ use celastro::json;
 use celastro::plan::exec::{QueryResult, Row};
 use celastro::serve::Server;
 use celastro::value::Value;
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The command did what it was asked.
 const EXIT_OK: i32 = 0;
@@ -52,6 +55,7 @@ USAGE:
 
 COMMANDS:
   serve [--port N] [--open]  serve the browser UI on 127.0.0.1
+        [--shard-bind ADDR:PORT] and this node's shards to other nodes
   exec <SQL>                 run one statement and print the result
   run <FILE>                 run a script of statements
   repl                       interactive session on stdin
@@ -76,6 +80,12 @@ and `--port 0` asks the operating system for a free one.
 A running server saves after every statement that changed something, and saves
 again when it is asked to stop through `POST /api/shutdown`, so a closed
 terminal does not cost committed writes.
+
+A node in a cluster is started with CELASTRO_NODE=tcp://host:port, its address
+in every placement map, and CELASTRO_WIRE_TOKEN, the secret every node shares;
+`serve --shard-bind ADDR:PORT` then serves its shards to the others. ATTACH NODE,
+CREATE COLLECTION ... WITH (nodes = [...]) and LOCAL are the statements that
+go with it; docs/design.md has the rest.
 
 `--json` covers every command, `help` and `version` included, and stdout carries
 the whole answer: a failure that ends the command is written there too, as
@@ -123,7 +133,7 @@ enum Cli {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
-    Serve { port: u16, open: bool },
+    Serve { port: u16, open: bool, shard_bind: Option<String> },
     Exec(String),
     Script(PathBuf),
     Repl,
@@ -140,6 +150,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut json = false;
     let mut port: Option<u16> = None;
     let mut open = false;
+    let mut shard_bind: Option<String> = None;
     let mut verb: Option<String> = None;
     // `-h` and `-V` are answered after the whole line is read rather than at
     // the moment they are seen, so that `celastro-cli -h --json` honours the
@@ -194,6 +205,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 }
                 open = true;
             }
+            "--shard-bind" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => shard_bind = Some(v),
+                None => return Cli::Usage(missing_value(&name)),
+            },
             "-h" | "--help" => want_help = true,
             "-V" | "--version" => want_version = true,
             other => return Cli::Usage(format!("unknown flag `{other}`")),
@@ -216,7 +231,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "serve" | "repl" | "demo" | "catalog" | "health" if !rest.is_empty() => {
             return Cli::Usage(format!("`{verb}` takes no arguments"));
         }
-        "serve" => Cmd::Serve { port: port.unwrap_or(DEFAULT_PORT), open },
+        "serve" => {
+            Cmd::Serve { port: port.unwrap_or(DEFAULT_PORT), open, shard_bind: shard_bind.clone() }
+        }
         "exec" => match rest.len() {
             1 => Cmd::Exec(rest[0].clone()),
             0 => return Cli::Usage("`exec` needs a statement to run".to_string()),
@@ -256,6 +273,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         }
         if open {
             return Cli::Usage("`--open` only means something to `serve`".to_string());
+        }
+        if shard_bind.is_some() {
+            return Cli::Usage("`--shard-bind` only means something to `serve`".to_string());
         }
     }
     // The demo builds its own database, with build options no persistent
@@ -362,7 +382,7 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
         None => Db::in_memory(),
     };
     let code = match cmd {
-        Cmd::Serve { port, open } => serve(&mut db, port, open, json),
+        Cmd::Serve { port, open, shard_bind } => serve(&mut db, port, open, shard_bind, json),
         Cmd::Exec(sql) => statement(&mut db, &sql, json),
         Cmd::Script(file) => run_script(&mut db, &file, json),
         Cmd::Repl => repl(&mut db, json),
@@ -489,7 +509,7 @@ fn health(port: u16, json: bool) -> i32 {
     }
 }
 
-fn serve(db: &mut Db, port: u16, open: bool, json: bool) -> i32 {
+fn serve(db: &mut Db, port: u16, open: bool, shard_bind: Option<String>, json: bool) -> i32 {
     let server = match Server::bind(port) {
         Ok(s) => s,
         Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
@@ -529,7 +549,41 @@ fn serve(db: &mut Db, port: u16, open: bool, json: bool) -> i32 {
     // `run` returns when the console asks the server to shut down. The caller
     // saves after it returns, which is what makes a browser session's writes
     // outlive the process.
-    match server.run(db) {
+    // The console and the wire share the database under one lock; the wire
+    // is served from its own thread, stopped when the console stops.
+    let shared = Arc::new(Mutex::new(std::mem::replace(db, Db::in_memory())));
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Some(bind) = shard_bind {
+        let Some(token) = celastro::wire::token_from_env() else {
+            return fail(
+                json,
+                &format!("--shard-bind needs {} in the environment", celastro::wire::TOKEN_ENV),
+            );
+        };
+        let listener = match TcpListener::bind(&bind) {
+            Ok(l) => l,
+            Err(e) => return fail(json, &format!("could not bind {bind} for the wire: {e}")),
+        };
+        eprintln!(
+            "celastro-cli serving shards on {} to any node presenting the wire token; this is \
+             plain TCP, for a network you trust",
+            listener.local_addr().map(|a| a.to_string()).unwrap_or(bind)
+        );
+        let (db, stop) = (shared.clone(), stop.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = celastro::wire::serve(listener, db, token, stop) {
+                eprintln!("celastro-cli: the wire stopped: {e}");
+            }
+        });
+    }
+    let outcome = server.run(&shared);
+    stop.store(true, Ordering::Relaxed);
+    // Whatever stopped the console, the last writes are on the disk before
+    // the process ends.
+    if let Err(e) = shared.lock().unwrap_or_else(|p| p.into_inner()).persist() {
+        eprintln!("celastro-cli: could not save at exit: {e}");
+    }
+    match outcome {
         Ok(()) => EXIT_OK,
         Err(e) => fail(json, &format!("serving stopped: {e}")),
     }
@@ -1127,6 +1181,7 @@ const DEMO_TOPICS: &[(&str, &str)] = &[
 fn db_opts() -> DbOpts {
     let mut o = DbOpts::default();
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    o.node = var("CELASTRO_NODE");
     if let Some(endpoint) = var("CELASTRO_ARCHIVE_ENDPOINT") {
         o.archive.endpoint = Some(endpoint);
         o.archive.bucket = var("CELASTRO_ARCHIVE_BUCKET").unwrap_or_default();

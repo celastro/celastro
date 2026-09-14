@@ -589,7 +589,7 @@ fn a_catalog_from_an_older_format_version_is_refused() {
     }
     let p = d.join("CATALOG");
     let mut b = std::fs::read(&p).unwrap();
-    assert_eq!(b[4], 3, "this build writes version 3");
+    assert_eq!(b[4], 4, "this build writes version 4");
     b[4] = 1;
     // Re-frame so the checksum is valid: the version check must be what
     // refuses it, not the checksum.

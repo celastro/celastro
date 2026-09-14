@@ -149,6 +149,30 @@ impl<'a> Parser<'a> {
     // ---------------------------------------------------------------- stmts
 
     fn statement(&mut self) -> Result<Statement> {
+        if self.eat_kw("LOCAL") {
+            self.enter()?;
+            let inner = self.statement();
+            self.leave();
+            return Ok(Statement::Local(Box::new(inner?)));
+        }
+        let attach = self.eat_kw("ATTACH");
+        if attach || self.eat_kw("DETACH") {
+            self.expect_kw("NODE")?;
+            let url = match self.literal()? {
+                Value::Str(s) => s,
+                other => {
+                    return Err(Error::Sql(format!(
+                        "a node address is a string like 'tcp://host:port', not {}",
+                        crate::json::to_string(&other)
+                    )))
+                }
+            };
+            return Ok(if attach {
+                Statement::AttachNode { url }
+            } else {
+                Statement::DetachNode { url }
+            });
+        }
         if self.eat_kw("EXPLAIN") {
             let analyze = self.eat_kw("ANALYZE");
             // A prefix that recurses into `statement` is recursive descent like
@@ -372,6 +396,7 @@ impl<'a> Parser<'a> {
         }
         let mut splits = Vec::new();
         let mut prefix_expansion = None;
+        let mut nodes = Vec::new();
         if self.eat_kw("WITH") {
             for (key, v) in self.option_list()? {
                 match key.as_str() {
@@ -387,6 +412,22 @@ impl<'a> Parser<'a> {
                             .collect()
                     }
                     "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
+                    "nodes" => {
+                        nodes = v
+                            .as_array()
+                            .ok_or_else(|| {
+                                Error::Sql("nodes must be an array of 'tcp://host:port'".into())
+                            })?
+                            .iter()
+                            .map(|x| match x {
+                                Value::Str(s) => Ok(s.clone()),
+                                other => Err(Error::Sql(format!(
+                                    "nodes must be an array of 'tcp://host:port', not {}",
+                                    crate::json::to_string(other)
+                                ))),
+                            })
+                            .collect::<Result<Vec<String>>>()?
+                    }
                     other => {
                         return Err(Error::Sql(format!("unknown collection option `{other}`")))
                     }
@@ -399,6 +440,7 @@ impl<'a> Parser<'a> {
             partition_by,
             splits,
             prefix_expansion,
+            nodes,
         }))
     }
 
@@ -1641,5 +1683,45 @@ mod tests {
         assert!(e.contains("COLLECTION, INDEX or LIFECYCLE POLICY"), "{e}");
         let e = parse("DROP INDEX notes_body", &[]).unwrap_err().to_string();
         assert!(e.contains("ON"), "an index is named with its collection: {e}");
+    }
+
+    /// The three spellings the cluster adds: a `LOCAL` prefix on any
+    /// statement, `ATTACH NODE` / `DETACH NODE` with a string address, and a
+    /// `nodes` option on CREATE COLLECTION.
+    #[test]
+    fn cluster_statements_parse_and_name_their_nodes() {
+        match parse("LOCAL CREATE INDEX i ON c USING fulltext (body)", &[]).unwrap() {
+            Statement::Local(inner) => assert!(matches!(*inner, Statement::CreateIndex(_))),
+            other => panic!("{other:?}"),
+        }
+        match parse("ATTACH NODE 'tcp://b:9000'", &[]).unwrap() {
+            Statement::AttachNode { url } => assert_eq!(url, "tcp://b:9000"),
+            other => panic!("{other:?}"),
+        }
+        match parse("detach node 'tcp://b:9000'", &[]).unwrap() {
+            Statement::DetachNode { url } => assert_eq!(url, "tcp://b:9000"),
+            other => panic!("{other:?}"),
+        }
+        match parse(
+            "CREATE COLLECTION c (id TEXT PRIMARY KEY) WITH (splits = ['m'], nodes = \
+             ['tcp://a:1', 'tcp://b:1'])",
+            &[],
+        )
+        .unwrap()
+        {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.nodes, vec!["tcp://a:1".to_string(), "tcp://b:1".to_string()]);
+                assert_eq!(c.splits, vec!["m".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        for (sql, why) in [
+            ("ATTACH NODE 9000", "string"),
+            ("ATTACH SHARD 'x'", "NODE"),
+            ("CREATE COLLECTION c (id TEXT PRIMARY KEY) WITH (nodes = 'tcp://a:1')", "array"),
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
     }
 }

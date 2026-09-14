@@ -90,6 +90,27 @@ pub fn get_str(b: &[u8], i: &mut usize) -> Option<String> {
     String::from_utf8(s.to_vec()).ok()
 }
 
+/// An optional string: a presence byte, then the string.
+pub fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            out.push(1);
+            put_str(out, s);
+        }
+        None => out.push(0),
+    }
+}
+
+pub fn get_opt_str(b: &[u8], i: &mut usize) -> Option<Option<String>> {
+    let present = *b.get(*i)?;
+    *i += 1;
+    if present == 0 {
+        Some(None)
+    } else {
+        get_str(b, i).map(Some)
+    }
+}
+
 pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_uvarint(out, b.len() as u64);
     out.extend_from_slice(b);

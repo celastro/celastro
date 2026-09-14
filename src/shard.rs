@@ -1342,6 +1342,9 @@ pub struct Shard {
     /// hash partitioning cannot, because a large tenant would pin to one shard
     /// forever.
     pub key_range: Option<(Option<String>, Option<String>)>,
+    /// The shard's position in its collection's placement map, which is its
+    /// name in every answer; the shards a node holds need not be contiguous.
+    pub index: usize,
     pub(crate) memtable: Memtable,
     pub(crate) frozen: Vec<Arc<Memtable>>,
     pub segments: Vec<Arc<SegmentHandle>>,
@@ -1395,6 +1398,7 @@ impl Shard {
             sealed: PathTally::default(),
             unsealed: PathTally::default(),
             key_range: None,
+            index: 0,
             memtable,
             frozen: Vec::new(),
             segments: Vec::new(),

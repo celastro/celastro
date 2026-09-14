@@ -54,6 +54,10 @@ pub struct CandidatesRequest<'a> {
     pub k_prime: usize,
     pub stats: &'a BTreeMap<String, GlobalStats>,
     pub analyze: bool,
+    /// The statement's text and parameters, for a shard on another node,
+    /// which parses them with the same crate into the same `select`.
+    pub statement: &'a str,
+    pub params: &'a [Value],
 }
 
 /// A shard's answer to a ranked statement: per source, at most `k_prime`
@@ -80,6 +84,8 @@ pub struct ScanRequest<'a> {
     pub after: Option<&'a str>,
     /// The `ORDER BY` fields and their directions; empty for key order.
     pub fields: &'a [(String, bool)],
+    pub statement: &'a str,
+    pub params: &'a [Value],
 }
 
 /// One row a shard retained. `doc` is present when the shard had to decode

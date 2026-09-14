@@ -83,6 +83,10 @@ pub struct ShardExplain {
     pub units: Vec<UnitExplain>,
     pub micros: u128,
     pub timed_out: bool,
+    /// The block as the holder rendered it, for a shard on another node:
+    /// the same text `render_shard` produces here, carried across the wire
+    /// instead of the units behind it.
+    pub rendered: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,75 +139,7 @@ impl Explain {
             if self.stats_exact { "exact (two-phase)" } else { "cached approximate" }
         ));
         for s in &self.shards {
-            if s.pruned {
-                o.push_str(&format!(
-                    "  shard {}: PRUNED ({})\n",
-                    s.index,
-                    s.prune_reason.as_deref().unwrap_or("out of key range")
-                ));
-                continue;
-            }
-            o.push_str(&format!(
-                "  shard {} (manifest v{}, {:.2} ms{}):\n",
-                s.index,
-                s.manifest_version,
-                s.micros as f64 / 1000.0,
-                if s.timed_out { ", DEADLINE EXCEEDED" } else { "" }
-            ));
-            for u in &s.units {
-                o.push_str(&format!(
-                    "    {:<14} docs={:<7} visible={:<7} survivors={:<7} s={:.4}  {:.2} ms\n",
-                    u.label,
-                    u.docs,
-                    u.visible,
-                    u.survivors,
-                    u.selectivity,
-                    u.micros as f64 / 1000.0
-                ));
-                if !u.access_paths.is_empty() {
-                    o.push_str(&format!("      filter: {}\n", u.access_paths.join(" -> ")));
-                }
-                if u.loads > 0 {
-                    o.push_str(&format!(
-                        "      residency: {} component(s) decoded on demand{}\n",
-                        u.loads,
-                        if u.faults > 0 {
-                            format!(", {} faulted in from the archive", u.faults)
-                        } else {
-                            String::new()
-                        }
-                    ));
-                }
-                for t in &u.text {
-                    let cut = if t.prefix_truncated { ", PREFIX EXPANSION TRUNCATED" } else { "" };
-                    o.push_str(&match t.strategy {
-                        TextStrategy::Wand => format!(
-                            "      text[{}]: block-max WAND, terms={:?}, candidates={}{}\n",
-                            t.source, t.terms, t.matched, cut
-                        ),
-                        TextStrategy::Filter => format!(
-                            "      text[{}]: bitmap evaluation, survivors={}{}\n",
-                            t.source, t.matched, cut
-                        ),
-                    });
-                }
-                for (name, v) in &u.vector {
-                    o.push_str(&format!(
-                        "      vector[{}]: strategy={} tier={} s={:.4} survivors={} ef={} amp={:.1}x visits={}{} reranked={} reprobes={}\n",
-                        name,
-                        v.strategy.map(|s| s.name()).unwrap_or("none"),
-                        v.tier.map(|t| format!("{t:?}")).unwrap_or_else(|| "-".into()),
-                        v.selectivity,
-                        v.survivors,
-                        v.ef_used,
-                        v.amplification,
-                        v.visits,
-                        v.budget.map(|b| format!(" budget={b}")).unwrap_or_default(),
-                        v.reranked,
-                        v.reprobes
-                    ));
-                }
-            }
+            o.push_str(&render_shard(s));
         }
         if let Some(f) = &self.fusion {
             o.push_str(&format!(
@@ -241,4 +177,84 @@ impl Explain {
         o.push_str(&format!("  total: {:.2} ms\n", self.total_micros as f64 / 1000.0));
         o
     }
+}
+
+/// One shard's block of the plan. Public because a holder renders its own
+/// shard's block with it and sends the text: the coordinator then prints
+/// what it would have printed had the shard been local.
+pub fn render_shard(s: &ShardExplain) -> String {
+    if let Some(text) = &s.rendered {
+        return text.clone();
+    }
+    let mut o = String::new();
+    if s.pruned {
+        o.push_str(&format!(
+            "  shard {}: PRUNED ({})\n",
+            s.index,
+            s.prune_reason.as_deref().unwrap_or("out of key range")
+        ));
+        return o;
+    }
+    o.push_str(&format!(
+        "  shard {} (manifest v{}, {:.2} ms{}):\n",
+        s.index,
+        s.manifest_version,
+        s.micros as f64 / 1000.0,
+        if s.timed_out { ", DEADLINE EXCEEDED" } else { "" }
+    ));
+    for u in &s.units {
+        o.push_str(&format!(
+            "    {:<14} docs={:<7} visible={:<7} survivors={:<7} s={:.4}  {:.2} ms\n",
+            u.label,
+            u.docs,
+            u.visible,
+            u.survivors,
+            u.selectivity,
+            u.micros as f64 / 1000.0
+        ));
+        if !u.access_paths.is_empty() {
+            o.push_str(&format!("      filter: {}\n", u.access_paths.join(" -> ")));
+        }
+        if u.loads > 0 {
+            o.push_str(&format!(
+                "      residency: {} component(s) decoded on demand{}\n",
+                u.loads,
+                if u.faults > 0 {
+                    format!(", {} faulted in from the archive", u.faults)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        for t in &u.text {
+            let cut = if t.prefix_truncated { ", PREFIX EXPANSION TRUNCATED" } else { "" };
+            o.push_str(&match t.strategy {
+                TextStrategy::Wand => format!(
+                    "      text[{}]: block-max WAND, terms={:?}, candidates={}{}\n",
+                    t.source, t.terms, t.matched, cut
+                ),
+                TextStrategy::Filter => format!(
+                    "      text[{}]: bitmap evaluation, survivors={}{}\n",
+                    t.source, t.matched, cut
+                ),
+            });
+        }
+        for (name, v) in &u.vector {
+            o.push_str(&format!(
+                    "      vector[{}]: strategy={} tier={} s={:.4} survivors={} ef={} amp={:.1}x visits={}{} reranked={} reprobes={}\n",
+                    name,
+                    v.strategy.map(|s| s.name()).unwrap_or("none"),
+                    v.tier.map(|t| format!("{t:?}")).unwrap_or_else(|| "-".into()),
+                    v.selectivity,
+                    v.survivors,
+                    v.ef_used,
+                    v.amplification,
+                    v.visits,
+                    v.budget.map(|b| format!(" budget={b}")).unwrap_or_default(),
+                    v.reranked,
+                    v.reprobes
+                ));
+        }
+    }
+    o
 }

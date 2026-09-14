@@ -87,6 +87,8 @@ SHOW RESIDENCY;           -- what is decoded right now, and what it cost
 SHOW LIFECYCLE;           -- every policy, with each index's idle time and age
 DROP INDEX items_emb ON items;   -- withdraw the declaration; sealed regions wait for compaction
 DROP COLLECTION items;           -- files, store objects, statistics, clocks: all of it
+ATTACH NODE 'tcp://db-b:9000';   -- a node this one may place shards on
+LOCAL FLUSH items;               -- this node's shards only, never forwarded
 ```
 
 Durations take `minutes`, `hours` or `days`, singular or plural, and the
@@ -253,6 +255,52 @@ is deliberately not taken until something needs it. Unpinned, depth is not a
 reason to seal: that seal keeps one version per key and emits one segment
 however deep the chains ran.
 
+**The wire: a collection spread over nodes, any holder coordinating.** A
+cluster is a set of nodes, each with its own directory, its own console and
+one advertised address (`CELASTRO_NODE`, `DbOpts::node`). Membership is
+declared -- `ATTACH NODE` is DDL and lives in the catalog -- and a collection's
+placement is one entry per shard index naming the holder and the key range,
+carried by every holder, so any of them can coordinate a statement. `CREATE
+COLLECTION` computes the placement (shard `i` on the `i`-th node named, or on
+this node and the attached ones in turn) and has every other holder adopt the
+same definition and map, building the shards placed on it; a holder that did
+not take it is named and the statement is idempotent there. A write routes by
+key to the owner's node and is acknowledged after that node did, so the
+durability guarantee is kept by the disk the row lands on; a query fans out
+per shard through `ShardService`, local shards by direct call and the rest
+through `wire::Remote`, and the answer is fused where the statement arrived.
+DDL and the operational statements run here and are then re-run on every
+other holder with a `LOCAL` prefix, which is also the operator's tool for a
+node a statement did not reach: there is no two-phase commit, and the refusal
+names the nodes that did and did not take it.
+
+What crosses the wire is length-prefixed frames of the crate's own codec,
+carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
+in constant time), the call, and what is left of the statement's deadline,
+which the holder arms for its half. A node that does not answer -- slow,
+partitioned, or gone -- is `Error::Deadline` at the coordinator, exactly what a
+slow shard in this process produces, so `partial_results` names its shard and
+nothing else changes. That is the rule the simulator pinned before the wire
+existed, and the reason the wire's tests are the simulator's property run
+across three real nodes: written through any of them, every node answers what
+the same corpus answers in one process, bit for bit. The statistics cache
+ages by the sum of every holder's write counter, fetched with the snapshot
+instant in one call per remote node per statement, so a write that landed
+elsewhere is read and ages the cache here. Two consequences worth knowing:
+the coordinator's `ts` is the maximum of the holders' clocks, so a statement
+reads at least what every node had committed when it began; and a unit sealed
+before an index was declared holds no region for it and answers no rows for
+that path until compaction rewrites it, which the plan says -- `CREATE INDEX`
+never backfilled, and a `DROP INDEX` that seals a memtable makes such a unit
+on purpose.
+
+The catalog format is version 4 for the node list and the placement; a 3 is
+read with every collection placed wholly on this node, derived from its shard
+directories at open. Not built yet, by decision: moving a shard between nodes
+(`MOVE SHARD`, and rebalancing when nodes come and go), which the placement by
+index is shaped for; replication, so a node that is down is a shard that is
+down; and a chart for more than one pod.
+
 **The deterministic simulator states what a transport has to keep, before
 there is one.** `celastro::sim` puts a seeded fault schedule on the
 coordinator-to-shard boundary: per call, a shard's answer can be dropped (a
@@ -318,9 +366,13 @@ without a dot.
 
 ## What is deliberately not here
 
-Everything that needs more than one process: consensus and replication, follower
-reads and closed timestamps, hedged requests, two-phase commit for multi-shard
-writes, stateless compaction workers, and dynamic shard split and merge. The
+Consensus and replication, follower reads and closed timestamps, hedged
+requests, two-phase commit for multi-shard writes and for multi-node DDL,
+stateless compaction workers, dynamic shard split and merge, and moving a
+shard between nodes. A collection's shards can be spread over nodes and any
+holder can coordinate, but each shard has exactly one holder and a statement
+that changes the catalog reaches the holders one by one, reporting the ones it
+did not reach. The
 `archived` tier is an S3-compatible object store when one is configured and a
 local directory that stands in for one when not; the client is in-tree and
 plain HTTP, since the crate carries no TLS.
@@ -344,9 +396,9 @@ them first:
   coordination round.
 - **A query reaches a shard through one boundary**, `plan::service::ShardService`:
   statistics, prefix expansion, candidates, an unranked scan, payload fetches,
-  and nothing else. Today it is answered by direct call; a transport is
-  another implementation of it, and the simulator below already puts a seeded
-  fault schedule there.
+  and nothing else. A shard on this node answers by direct call, a shard on
+  another node through `wire::Remote`, and the simulator puts a seeded fault
+  schedule on the same seam.
 
 That combination makes the distributed exit criterion testable now:
 `exact_mode_is_bit_identical_across_shard_counts` runs the same corpus at 1, 3
@@ -807,6 +859,8 @@ guarantee:
 | a dropped collection leaves nothing behind under its name, and an interrupted drop completes at the next open | `engine::tests::dropping_a_collection_removes_it_and_everything_recorded_against_its_name` (files, statistics and clocks gone; a recreated collection measured afresh; the policy refusal; the interrupted state completed and swept at open), `archive_s3::dropping_a_collection_deletes_its_objects_from_the_store` |
 | a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
 | a fault on the coordinator-to-shard boundary can shorten an answer only by saying so, and a seeded run reproduces exactly | `sim::tests::a_fault_cannot_change_an_answer_without_saying_so` (twenty seeds of drops and restarts, every query shape: refused or bit-identical, never different), `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (`missing` is exactly the dropped shards, no second call to a shard given up on, real rows only, and the cache holds no partial sum afterwards), `sim::tests::a_shard_that_restarted_answers_exactly_what_it_did_before` (every call answered by a replacement opened from the directory), `sim::tests::the_order_shards_answer_in_does_not_change_the_answer` (and the plan lists shards by index), `sim::tests::a_seeded_run_reproduces_its_trace_and_its_answers` |
+| a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
+| a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |

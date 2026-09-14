@@ -27,6 +27,7 @@
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -140,7 +141,7 @@ impl Server {
     /// polled rather than blocked on: a blocking `accept` is restarted after a
     /// handler runs, so the flag would be read only when the next connection
     /// happened to arrive, which for a `docker stop` is never.
-    pub fn run(self, db: &mut Db) -> Result<()> {
+    pub fn run(self, db: &Mutex<Db>) -> Result<()> {
         const POLL: Duration = Duration::from_millis(25);
         self.listener.set_nonblocking(true)?;
         let mut failures = 0u32;
@@ -182,12 +183,16 @@ impl Server {
         }
     }
 
-    fn serve_one(&self, stream: TcpStream, db: &mut Db) -> std::io::Result<Next> {
+    fn serve_one(&self, stream: TcpStream, db: &Mutex<Db>) -> std::io::Result<Next> {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         // The read side is armed per read, from the deadline, by `Wire::arm`.
         let deadlines = Deadlines::from_now();
         let mut io = BufReader::new(stream);
-        let served = answer(&mut io, &self.token, self.addr.port(), db, deadlines);
+        // Under the lock for the whole request, as the wire's calls are: the
+        // engine is single-threaded and the lock is what serialises the two.
+        let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
+        let served = answer(&mut io, &self.token, self.addr.port(), &mut guard, deadlines);
+        drop(guard);
         let socket = io.get_mut();
         served.response.write_to(socket)?;
         socket.flush()?;

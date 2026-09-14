@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally};
+use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally, Tablet};
 use crate::codec::{crc32, put_u32};
 use crate::compaction::{self, CompactionOpts};
 use crate::error::{Error, Result};
@@ -163,6 +163,11 @@ pub struct DbOpts {
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
     pub placement: Placement,
+    /// This node's advertised wire address, `tcp://host:port`: its name in
+    /// every placement map, and what other nodes connect to. `None` is a
+    /// single node that places every shard on itself and can attach nobody.
+    /// `celastro-cli` reads it from `CELASTRO_NODE`.
+    pub node: Option<String>,
 }
 
 impl Default for DbOpts {
@@ -178,6 +183,7 @@ impl Default for DbOpts {
             placement: Placement::default(),
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
             archive: crate::objstore::ArchiveOpts::default(),
+            node: None,
         }
     }
 }
@@ -521,6 +527,11 @@ pub struct Db {
     /// The fault schedule every query's shard calls go through, when one is
     /// installed. See `crate::sim`.
     sim: Option<Arc<crate::sim::Sim>>,
+    /// The token every request on the wire carries, from the environment at
+    /// construction; `None` means this node can reach no other.
+    wire_token: Option<String>,
+    /// One connection per other node, opened on demand. See `crate::wire`.
+    nodes: BTreeMap<String, Arc<crate::wire::Node>>,
     /// The client's read-your-writes token: the last commit timestamp it
     /// observed (§6). Subsequent reads pin at least this.
     pub last_commit: Timestamp,
@@ -564,6 +575,8 @@ impl Db {
             activity_persisted_micros: 0,
             query_log: Vec::new(),
             sim: None,
+            wire_token: crate::wire::token_from_env(),
+            nodes: BTreeMap::new(),
             queries_seen: 0,
             last_commit: 0,
         }
@@ -607,10 +620,11 @@ impl Db {
         }
         Db::sweep_dropping(dir)?;
         let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
+        let mut derived = false;
         for name in names {
-            db.attach_collection(dir, &name)?;
+            derived |= db.attach_collection(dir, &name)?;
         }
-        if !interrupted.is_empty() {
+        if !interrupted.is_empty() || derived {
             db.persist_catalog()?;
         }
         // The catalog as decoded describes sealed documents. Until the
@@ -627,62 +641,59 @@ impl Db {
     /// Open the shards of one collection from its directory under `dir`,
     /// replaying each WAL. The catalog entry is already in place; what this
     /// adds is the shards, with the statistics baseline they start from.
-    fn attach_collection(&mut self, dir: &Path, name: &str) -> Result<()> {
+    fn attach_collection(&mut self, dir: &Path, name: &str) -> Result<bool> {
         let db = self;
-        {
-            let mut coll = db.catalog.get(name)?.clone();
-            // What is already counted stays in the baseline; the shards start
-            // from zero and count only what they see from here -- which
-            // includes the WAL they are about to replay, and which the
-            // baseline therefore must not.
-            db.stats_baseline.insert(
-                name.to_string(),
-                PathTally { docs: coll.doc_count, paths: std::mem::take(&mut coll.paths) },
-            );
-            coll.doc_count = 0;
-            let cdir = dir.join("collections").join(name);
-            let mut shards = Vec::new();
-            let mut i = 0usize;
-            loop {
-                let sdir = cdir.join(format!("shard-{i:04}"));
-                if !sdir.exists() {
-                    break;
+        let mut coll = db.catalog.get(name)?.clone();
+        // What is already counted stays in the baseline; the shards start
+        // from zero and count only what they see from here -- which
+        // includes the WAL they are about to replay, and which the
+        // baseline therefore must not.
+        db.stats_baseline.insert(
+            name.to_string(),
+            PathTally { docs: coll.doc_count, paths: std::mem::take(&mut coll.paths) },
+        );
+        coll.doc_count = 0;
+        let cdir = dir.join("collections").join(name);
+        // A catalog from before placement existed names no tablets: every
+        // shard directory is one, on this node, its range from RANGE. That
+        // is exactly what a single-node database has always been.
+        let mut derived = false;
+        let tablets = match db.catalog.placement.get(name) {
+            Some(t) => t.clone(),
+            None => {
+                let mut t = Vec::new();
+                let mut i = 0usize;
+                while cdir.join(format!("shard-{i:04}")).exists() {
+                    let (lo, hi) = read_range(&cdir.join(format!("shard-{i:04}")), i, name)?;
+                    t.push(Tablet { node: db.opts.node.clone().unwrap_or_default(), lo, hi });
+                    i += 1;
                 }
-                // Two lines, a low bound and a high one, and neither the
-                // file nor either line is optional. `create_collection`
-                // refuses a split key that could write a third line, so a
-                // third is a damaged tablet map -- and a tablet map read wrong
-                // is a shard that silently owns the wrong keys, which no later
-                // check catches because every shard agrees with itself.
-                //
-                // A missing or empty RANGE is the same defect wearing the
-                // opposite disguise, and it used to be read as success: an
-                // `unwrap_or_default()` turned it into `""`, which splits into
-                // ONE empty part, and a shard with no bounds owns every key.
-                // Every shard in the collection then answers `true` to `owns`,
-                // writes land wherever the router looked first and reads find
-                // the same key in two places. It has to fail here instead.
-                let ranges = fs::read_to_string(sdir.join("RANGE"))
-                    .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?;
-                let parts: Vec<&str> = ranges.split('\n').collect();
-                if parts.len() != 2 {
-                    return Err(Error::Storage(format!(
-                        "shard-{i:04} of `{name}`: RANGE holds {} lines, expected 2",
-                        parts.len()
-                    )));
-                }
-                let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
-                let lo = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
-                let hi = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
-                sh.key_range = Some((lo, hi));
-                shards.push(sh);
-                i += 1;
+                derived = true;
+                db.catalog.placement.insert(name.to_string(), t.clone());
+                t
             }
-            if !shards.is_empty() {
-                db.shards.insert(name.to_string(), shards);
+        };
+        let mut shards = Vec::new();
+        for (i, t) in tablets.iter().enumerate() {
+            if !db.is_self(&t.node) {
+                continue;
             }
+            let sdir = cdir.join(format!("shard-{i:04}"));
+            if !sdir.exists() {
+                return Err(Error::Storage(format!(
+                    "shard-{i:04} of `{name}` is placed on this node but its directory is missing"
+                )));
+            }
+            let (lo, hi) = read_range(&sdir, i, name)?;
+            let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
+            sh.key_range = Some((lo, hi));
+            sh.index = i;
+            shards.push(sh);
         }
-        Ok(())
+        if !shards.is_empty() {
+            db.shards.insert(name.to_string(), shards);
+        }
+        Ok(derived)
     }
 
     fn shard_opts(&self) -> ShardOpts {
@@ -722,6 +733,13 @@ impl Db {
     /// handle is what keeps a file; version retention inside compaction
     /// outputs is beside the point when the outputs are not what is copied.
     pub fn export_collection(&mut self, name: &str) -> Result<CollectionExport> {
+        let elsewhere = self.holders(name);
+        if !elsewhere.is_empty() {
+            return Err(Error::Plan(format!(
+                "collection `{name}` has shards on {}; an export needs every shard on this node",
+                elsewhere.join(", ")
+            )));
+        }
         self.absorb_shard_catalogs(name)?;
         let ts = self.clock.peek().max(self.last_commit);
         let coll = self.catalog.get(name)?.clone();
@@ -891,6 +909,7 @@ impl Db {
     /// Everything the engine records against a collection by name, gone.
     fn forget_collection(&mut self, name: &str) {
         self.catalog.collections.remove(name);
+        self.catalog.placement.remove(name);
         self.catalog.activity.retain(|(c, _), _| c != name);
         let prefix = cache_key(name, "");
         self.stats.retain(|k, _| !k.starts_with(&prefix));
@@ -960,6 +979,27 @@ impl Db {
         self.persist_catalog()
     }
 
+    /// This node's advertised address, if it has one.
+    pub fn node(&self) -> Option<&str> {
+        self.opts.node.as_deref()
+    }
+
+    /// The instant a statement started now would read at.
+    pub fn now_ts(&self) -> Timestamp {
+        self.clock.peek().max(self.last_commit)
+    }
+
+    /// A collection's definition.
+    pub fn collection(&self, name: &str) -> Result<&Collection> {
+        self.catalog.get(name)
+    }
+
+    /// Fold the shards' inferred statistics into the definition before a
+    /// read plans against it; what `run_select` does for its own shards.
+    pub(crate) fn absorb_for_read(&mut self, name: &str) -> Result<()> {
+        self.absorb_shard_catalogs(name)
+    }
+
     /// Put a fault schedule between every query and the shards. See
     /// `crate::sim`; `None` takes it out again.
     pub fn install_sim(&mut self, sim: Arc<crate::sim::Sim>) {
@@ -981,10 +1021,8 @@ impl Db {
     }
 
     pub fn shards(&self, collection: &str) -> Result<&[Shard]> {
-        self.shards
-            .get(collection)
-            .map(|v| v.as_slice())
-            .ok_or_else(|| Error::Plan(format!("no such collection `{collection}`")))
+        self.catalog.get(collection)?;
+        Ok(self.shards.get(collection).map(|v| v.as_slice()).unwrap_or(&[]))
     }
 
     pub fn memtable_budget(&self) -> &MemtableBudget {
@@ -997,35 +1035,43 @@ impl Db {
     /// `n` split points make `n+1` shards, range-partitioned on the composite
     /// `(partition_key, primary_key)`.
     pub fn create_collection(&mut self, coll: Collection, splits: &[String]) -> Result<()> {
-        let name = coll.name.clone();
-        // The catalog entry has to go in first, so that a duplicate name is
-        // refused before anything is written to disk — which means every
-        // failure below has to take it back out. A collection that is in the
-        // catalog but has no shards answers `already exists` to CREATE and
-        // `no such collection` to every read and write, until a restart.
-        self.catalog.create(coll.clone())?;
-        let shards = match self.build_shards(&coll, splits) {
-            Ok(s) => s,
-            Err(e) => {
-                self.catalog.collections.remove(&name);
-                return Err(e);
-            }
-        };
-        self.shards.insert(name, shards);
-        self.persist_catalog()?;
-        Ok(())
+        let _deadline = self.arm_default_deadline();
+        let tablets = self.plan_tablets(splits, &[])?;
+        self.create_spread(coll, tablets)
     }
 
-    /// Build the shard set for a new collection: `n` split points make `n+1`
-    /// shards. Separate from [`Db::create_collection`] so that a failure part
-    /// way through has one place to unwind from.
-    fn build_shards(&self, coll: &Collection, splits: &[String]) -> Result<Vec<Shard>> {
-        // The tablet map is the only on-disk record of the split points, and
-        // it is a two-line file. A split key holding a line break writes a
-        // third line and is read back as a different key -- the shard then
-        // owns a range nobody asked for, and routing sends writes to it that
-        // reads look for elsewhere. An empty split key is the same ambiguity
-        // by another route: it is how the file spells "unbounded".
+    /// Whether a placement entry means this node.
+    fn is_self(&self, node: &str) -> bool {
+        node.is_empty() || Some(node) == self.opts.node.as_deref()
+    }
+
+    /// The other nodes holding a shard of `collection`, each once.
+    fn holders(&self, collection: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .catalog
+            .placement
+            .get(collection)
+            .map(|t| t.iter().map(|x| x.node.clone()).filter(|n| !self.is_self(n)).collect())
+            .unwrap_or_default();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn node_conn(&mut self, url: &str) -> Result<Arc<crate::wire::Node>> {
+        if let Some(n) = self.nodes.get(url) {
+            return Ok(n.clone());
+        }
+        let n = Arc::new(crate::wire::Node::new(url, self.wire_token.as_deref())?);
+        self.nodes.insert(url.to_string(), n.clone());
+        Ok(n)
+    }
+
+    /// Placement for a new collection: `splits` make `n+1` shards, shard `i`
+    /// goes to the `i`-th of `nodes`, wrapping. No nodes named means this
+    /// node and every attached one; a node with no address places every
+    /// shard on itself.
+    fn plan_tablets(&self, splits: &[String], nodes: &[String]) -> Result<Vec<Tablet>> {
         for k in splits {
             if k.is_empty() || k.contains('\n') {
                 return Err(Error::Schema(format!(
@@ -1034,24 +1080,125 @@ impl Db {
                 )));
             }
         }
-        let mut shards = Vec::with_capacity(splits.len() + 1);
-        for i in 0..=splits.len() {
-            let lo = if i == 0 { None } else { Some(splits[i - 1].clone()) };
-            let hi = splits.get(i).cloned();
+        let nodes: Vec<String> = if !nodes.is_empty() {
+            if self.opts.node.is_none() {
+                return Err(Error::Plan(
+                    "this node has no address, so it cannot place shards on other nodes; start \
+                     it with CELASTRO_NODE=tcp://host:port (DbOpts::node)"
+                        .into(),
+                ));
+            }
+            for n in nodes {
+                if !self.is_self(n) && !self.catalog.nodes.iter().any(|x| x == n) {
+                    return Err(Error::Plan(format!(
+                        "node {n} is not attached; ATTACH NODE '{n}' first"
+                    )));
+                }
+            }
+            nodes.to_vec()
+        } else {
+            match &self.opts.node {
+                Some(me) => {
+                    let mut v = vec![me.clone()];
+                    v.extend(self.catalog.nodes.iter().cloned());
+                    v
+                }
+                None => vec![String::new()],
+            }
+        };
+        Ok((0..=splits.len())
+            .map(|i| Tablet {
+                node: nodes[i % nodes.len()].clone(),
+                lo: if i == 0 { None } else { Some(splits[i - 1].clone()) },
+                hi: splits.get(i).cloned(),
+            })
+            .collect())
+    }
+
+    /// Create a collection under a placement: here, then on every other
+    /// node the placement names, each adopting the same definition and the
+    /// same map and building the shards placed on it. A node that does not
+    /// take it is reported by name; the statement is idempotent on a node
+    /// that already holds the identical collection, so it can be re-run.
+    fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<()> {
+        self.adopt_collection(coll.clone(), tablets.clone())?;
+        let mut failures = Vec::new();
+        for url in self.holders(&coll.name) {
+            if let Err(e) = self.node_conn(&url).and_then(|n| n.create_collection(&coll, &tablets))
+            {
+                failures.push(format!("{url}: {e}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Plan(format!(
+                "collection `{}` was created here but not on {}; re-run the same CREATE \
+                 COLLECTION once those nodes are reachable",
+                coll.name,
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Take a collection's definition and placement as another node planned
+    /// them, building the shards the map puts here. What the wire calls on
+    /// the other holders, and what `create_collection` does locally.
+    /// Idempotent for an identical definition and map.
+    pub fn adopt_collection(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<()> {
+        let name = coll.name.clone();
+        if let Ok(existing) = self.catalog.get(&name) {
+            let same = existing.primary_key == coll.primary_key
+                && existing.partition_key == coll.partition_key
+                && existing.declared == coll.declared
+                && existing.prefix_expansion == coll.prefix_expansion
+                && self.catalog.placement.get(&name) == Some(&tablets);
+            return if same {
+                Ok(())
+            } else {
+                Err(Error::Schema(format!(
+                    "collection `{name}` already exists here with a different definition or \
+                     placement"
+                )))
+            };
+        }
+        self.catalog.create(coll.clone())?;
+        let shards = match self.build_shards(&coll, &tablets) {
+            Ok(s) => s,
+            Err(e) => {
+                self.catalog.collections.remove(&name);
+                return Err(e);
+            }
+        };
+        self.catalog.placement.insert(name.clone(), tablets);
+        if !shards.is_empty() {
+            self.shards.insert(name, shards);
+        }
+        self.persist_catalog()?;
+        Ok(())
+    }
+
+    /// Build the shards of `tablets` placed on this node, each under its
+    /// index. Separate from [`Db::adopt_collection`] so that a failure part
+    /// way through has one place to unwind from.
+    fn build_shards(&self, coll: &Collection, tablets: &[Tablet]) -> Result<Vec<Shard>> {
+        let mut shards = Vec::new();
+        for (i, t) in tablets.iter().enumerate() {
+            if !self.is_self(&t.node) {
+                continue;
+            }
+            let (lo, hi) = (t.lo.clone(), t.hi.clone());
             let mut sh = Shard::new(coll.clone(), self.clock.clone(), self.shard_opts())
                 .with_key_range(lo.clone(), hi.clone());
+            sh.index = i;
             if let Some(dir) = &self.dir {
                 let sdir = dir.join("collections").join(&coll.name).join(format!("shard-{i:04}"));
                 fs::create_dir_all(&sdir)?;
-                // Through `atomic_write`, like every other file this database
-                // cannot afford to find half-written. RANGE decides which keys
-                // the shard owns, and the CREATE COLLECTION that writes it is
-                // acknowledged on the strength of a CATALOG that IS published
-                // durably -- so a bare `fs::write`, which syncs nothing and
-                // truncates in place, is the one file on the acknowledged path
-                // that a crash could disagree with the catalog about. What it
-                // leaves is a zero-length or half-written tablet map, which the
-                // reopen above now refuses rather than reinterprets.
+                // The tablet map is the first thing a shard directory holds,
+                // and the CREATE COLLECTION that writes it is acknowledged
+                // durably -- so an atomic, synced write, not a bare
+                // `fs::write` that a crash could disagree with the catalog
+                // about.
                 crate::shard::atomic_write(
                     &sdir.join("RANGE"),
                     format!("{}\n{}", lo.unwrap_or_default(), hi.unwrap_or_default()).as_bytes(),
@@ -1060,28 +1207,113 @@ impl Db {
             }
             shards.push(sh);
         }
-        // The shard directories now hold durable files under durable names.
-        // The names of the DIRECTORIES are a separate question: `create_dir_all`
-        // above wrote `collections/`, `collections/<name>/` and each
-        // `shard-NNNN` as dirty metadata in their parents, and fsyncing a file
-        // cannot create the directory entry that reaches it. Without this walk
-        // a crash after an acknowledged CREATE COLLECTION and an acknowledged
-        // INSERT leaves a durable CATALOG naming a collection whose directory
-        // is not there -- and `Db::open`'s scan stops at the missing shard
-        // directory, leaving a collection that answers `already exists` to
-        // CREATE and `no such collection` to everything else.
-        //
-        // Once per collection, not once per shard: every `shard-NNNN` entry
-        // lives in `collections/<name>`, so one fsync of it covers all of them,
-        // and this is creation-time work that no write path pays for. Top down,
-        // because a prefix of the chain being durable is a state the reopen
-        // handles and a directory whose parent does not name it is not.
         if let Some(dir) = &self.dir {
+            // The shard directories now hold durable files under durable
+            // names. The names of the DIRECTORIES are a separate question:
+            // `create_dir_all` leaves them as dirty metadata in their parents,
+            // and fsyncing a file cannot create the directory entry that
+            // reaches it. Without this walk an INSERT leaves a durable CATALOG
+            // naming a collection whose directory a crash can lose.
             crate::shard::sync_dir(dir)?;
             crate::shard::sync_dir(&dir.join("collections"))?;
             crate::shard::sync_dir(&dir.join("collections").join(&coll.name))?;
         }
         Ok(shards)
+    }
+
+    /// Declare a node this one may place shards on. The node is asked who it
+    /// is, so a typo is refused now rather than at the first CREATE.
+    pub fn attach_node(&mut self, url: &str) -> Result<()> {
+        let _deadline = self.arm_default_deadline();
+        let me = self.opts.node.clone().ok_or_else(|| {
+            Error::Plan(
+                "this node has no address; start it with CELASTRO_NODE=tcp://host:port \
+                 (DbOpts::node) before attaching others"
+                    .into(),
+            )
+        })?;
+        crate::wire::parse_url(url)?;
+        if url == me {
+            return Err(Error::Plan("a node cannot attach itself".into()));
+        }
+        let hello = self.node_conn(url)?.hello()?;
+        match hello.node.as_deref() {
+            Some(a) if a == url => {}
+            Some(a) => {
+                return Err(Error::Plan(format!(
+                    "the node at {url} calls itself {a}; attach it by that address"
+                )))
+            }
+            None => {
+                return Err(Error::Plan(format!(
+                    "the node at {url} has no address; start it with CELASTRO_NODE={url}"
+                )))
+            }
+        }
+        if hello.version != env!("CARGO_PKG_VERSION") {
+            return Err(Error::Plan(format!(
+                "the node at {url} runs celastro {}, this one {}; the wire needs the same version \
+                 on both",
+                hello.version,
+                env!("CARGO_PKG_VERSION")
+            )));
+        }
+        if !self.catalog.nodes.iter().any(|n| n == url) {
+            self.catalog.nodes.push(url.to_string());
+        }
+        self.persist_catalog()
+    }
+
+    /// Forget a node. Refused while a placement still names it: the shards
+    /// there would become unreachable with nothing saying so.
+    pub fn detach_node(&mut self, url: &str) -> Result<()> {
+        if !self.catalog.nodes.iter().any(|n| n == url) {
+            return Err(Error::Plan(format!("node {url} is not attached")));
+        }
+        let held: Vec<&String> = self
+            .catalog
+            .placement
+            .iter()
+            .filter(|(_, t)| t.iter().any(|x| x.node == url))
+            .map(|(n, _)| n)
+            .collect();
+        if !held.is_empty() {
+            return Err(Error::Plan(format!(
+                "node {url} holds shards of {}; move or drop them first",
+                held.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        self.catalog.nodes.retain(|n| n != url);
+        self.nodes.remove(url);
+        self.persist_catalog()
+    }
+
+    /// Run `LOCAL <sql>` on every other holder of a collection, after it
+    /// ran here. A holder that did not take it is named, with what to run
+    /// there by hand.
+    fn propagate(
+        &mut self,
+        holders: &[String],
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<String>> {
+        let local = format!("LOCAL {sql}");
+        let mut done = Vec::new();
+        let mut failures = Vec::new();
+        for url in holders {
+            match self.node_conn(url).and_then(|n| n.statement(&local, params)) {
+                Ok(_) => done.push(url.clone()),
+                Err(e) => failures.push(format!("{url}: {e}")),
+            }
+        }
+        if failures.is_empty() {
+            return Ok(done);
+        }
+        Err(Error::Plan(format!(
+            "applied here{}, but not on {}. Run `{local}` on those nodes once they are reachable",
+            if done.is_empty() { String::new() } else { format!(" and on {}", done.join(", ")) },
+            failures.join("; ")
+        )))
     }
 
     pub fn add_index(&mut self, collection: &str, idx: IndexDef) -> Result<()> {
@@ -1187,27 +1419,75 @@ impl Db {
     // ------------------------------------------------------------- writes
 
     pub fn insert(&mut self, collection: &str, doc: Value) -> Result<Timestamp> {
+        let _deadline = self.arm_default_deadline();
         let coll = self.catalog.get(collection)?;
         let key = sort_key(coll, &doc)?;
+        let owner = self.owner_of(collection, &key)?;
+        let ts = match owner {
+            None => self.insert_here(collection, doc)?,
+            Some(url) => {
+                // Counted where it lands, so that the sum of every holder's
+                // counter is the collection's write count exactly once --
+                // which is what the statistics epoch compares against, on
+                // every node alike.
+                let ts = self.node_conn(&url)?.insert(collection, &doc)?;
+                self.writes += 1;
+                self.last_commit = self.last_commit.max(ts);
+                ts
+            }
+        };
+        self.maybe_run_lifecycle()?;
+        Ok(ts)
+    }
+
+    /// The node holding the shard that owns `key`: `None` for this one.
+    fn owner_of(&self, collection: &str, key: &str) -> Result<Option<String>> {
+        let Some(tablets) = self.catalog.placement.get(collection) else {
+            // No placement is a collection wholly here.
+            return Ok(None);
+        };
+        let t = tablets
+            .iter()
+            .find(|t| t.owns(key))
+            .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
+        Ok(if self.is_self(&t.node) { None } else { Some(t.node.clone()) })
+    }
+
+    fn note_write(&mut self, collection: &str, ts: Timestamp) {
+        self.writes += 1;
+        *self.collection_writes.entry(collection.to_string()).or_insert(0) += 1;
+        self.last_commit = self.last_commit.max(ts);
+    }
+
+    /// Insert into the shard on THIS node that owns the key. What the wire
+    /// calls on the owner; refused if the placement says the key is
+    /// elsewhere, because a forwarded write that is forwarded again is a
+    /// placement map that disagrees between nodes.
+    pub fn insert_here(&mut self, collection: &str, doc: Value) -> Result<Timestamp> {
+        let coll = self.catalog.get(collection)?;
+        let key = sort_key(coll, &doc)?;
+        if let Some(url) = self.owner_of(collection, &key)? {
+            return Err(Error::Plan(format!(
+                "key `{key}` of `{collection}` belongs to the shard on {url}, not to this node; \
+                 the placement maps disagree"
+            )));
+        }
         let shards = self
             .shards
             .get_mut(collection)
-            .ok_or_else(|| Error::Plan(format!("no such collection `{collection}`")))?;
+            .ok_or_else(|| Error::Plan(format!("no shard of `{collection}` is on this node")))?;
         let idx = shards
             .iter()
             .position(|s| s.owns(&key))
             .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
         let ts = shards[idx].insert(doc)?;
-        self.writes += 1;
-        *self.collection_writes.entry(collection.to_string()).or_insert(0) += 1;
-        self.last_commit = self.last_commit.max(ts);
-        self.maybe_run_lifecycle()?;
+        self.note_write(collection, ts);
         Ok(ts)
     }
 
-    /// Writes this collection has taken: what the statistics cache measures
-    /// staleness in.
-    fn writes_to(&self, collection: &str) -> u64 {
+    /// Inserts and deletes this node has applied or forwarded for a
+    /// collection: what ages its statistics cache.
+    pub fn writes_to(&self, collection: &str) -> u64 {
         self.collection_writes.get(collection).copied().unwrap_or(0)
     }
 
@@ -1226,16 +1506,38 @@ impl Db {
     }
 
     pub fn delete_key(&mut self, collection: &str, key: &str) -> Result<bool> {
+        let _deadline = self.arm_default_deadline();
+        self.catalog.get(collection)?;
+        match self.owner_of(collection, key)? {
+            None => self.delete_key_here(collection, key),
+            Some(url) => {
+                let deleted = self.node_conn(&url)?.delete(collection, key)?;
+                if deleted {
+                    self.writes += 1;
+                }
+                Ok(deleted)
+            }
+        }
+    }
+
+    /// Delete from the shard on THIS node that owns the key; see
+    /// [`Db::insert_here`].
+    pub fn delete_key_here(&mut self, collection: &str, key: &str) -> Result<bool> {
+        self.catalog.get(collection)?;
+        if let Some(url) = self.owner_of(collection, key)? {
+            return Err(Error::Plan(format!(
+                "key `{key}` of `{collection}` belongs to the shard on {url}, not to this node; \
+                 the placement maps disagree"
+            )));
+        }
         let shards = self
             .shards
             .get_mut(collection)
-            .ok_or_else(|| Error::Plan(format!("no such collection `{collection}`")))?;
+            .ok_or_else(|| Error::Plan(format!("no shard of `{collection}` is on this node")))?;
         for s in shards.iter_mut() {
             if s.owns(key) {
                 if let Some(ts) = s.delete(key)? {
-                    self.writes += 1;
-                    *self.collection_writes.entry(collection.to_string()).or_insert(0) += 1;
-                    self.last_commit = self.last_commit.max(ts);
+                    self.note_write(collection, ts);
                     return Ok(true);
                 }
             }
@@ -1347,11 +1649,14 @@ impl Db {
         ts: Timestamp,
         exact: bool,
     ) -> Result<BTreeMap<String, GlobalStats>> {
+        let coll = self.catalog.get(collection)?.clone();
+        let writes = self.writes_to(collection);
+        let tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
         let taken = Taken::take(self, collection)?;
         let sim = taken.db.sim.clone();
-        let services = services_for(&taken.shards, sim);
+        let services = services_for(&taken.shards, &tablets, &BTreeMap::new(), collection, sim);
         let db: &mut Db = taken.db;
-        db.gather_stats_over(&services, collection, want, ts, exact, false, &mut Vec::new())
+        db.gather_stats_over(&services, &coll, want, ts, exact, false, &mut Vec::new(), writes)
     }
 
     /// [`gather_stats`](Self::gather_stats) over an explicit set of shard
@@ -1363,15 +1668,17 @@ impl Db {
     fn gather_stats_over(
         &mut self,
         services: &[Box<dyn ShardService + '_>],
-        collection: &str,
+        coll: &Collection,
         want: &BTreeMap<String, Vec<String>>,
         ts: Timestamp,
         exact: bool,
         partial: bool,
         unreachable: &mut Vec<usize>,
+        writes: u64,
     ) -> Result<BTreeMap<String, GlobalStats>> {
         let mut out = BTreeMap::new();
-        let prefix_cap = self.catalog.get(collection)?.prefix_cap();
+        let collection = coll.name.as_str();
+        let prefix_cap = coll.prefix_cap();
         for (path, terms) in want {
             // Once, here, for both arms: the shard gather walks a posting list
             // per element of the slice it is handed, so a term named twice is
@@ -1426,7 +1733,7 @@ impl Db {
                 // by emptying the entry, and filling into an entry that is
                 // about to be emptied would pay for a masked walk and discard
                 // it.
-                self.reset_stats_if_stale(collection, path);
+                self.reset_stats_if_stale(collection, path, writes);
                 let fresh = self.fill_term_stats(
                     services,
                     collection,
@@ -1435,6 +1742,7 @@ impl Db {
                     ts,
                     partial,
                     unreachable,
+                    writes,
                 )?;
                 // The answer comes from the fill whenever the fill gathered
                 // anything, and NOT from reading the cache back. Those are
@@ -1519,9 +1827,8 @@ impl Db {
     /// which was the one caller this pass was ever live for, now takes its
     /// globals from the fill's empty-slice gather, in one pass rather than
     /// two.
-    fn reset_stats_if_stale(&mut self, collection: &str, path: &str) {
+    fn reset_stats_if_stale(&mut self, collection: &str, path: &str, writes: u64) {
         let key = cache_key(collection, path);
-        let writes = self.writes_to(collection);
         let stale = match self.stats.get(&key) {
             None => true,
             Some(c) => writes.saturating_sub(c.refreshed_at_writes) >= STATS_REFRESH_WRITES,
@@ -1607,9 +1914,9 @@ impl Db {
         ts: Timestamp,
         partial: bool,
         unreachable: &mut Vec<usize>,
+        writes: u64,
     ) -> Result<Option<StatsTriple>> {
         let key = cache_key(collection, path);
-        let writes = self.writes_to(collection);
         let (missing, anchored, same_instant) = match self.stats.get(&key) {
             Some(c) => (
                 terms.iter().filter(|t| !c.doc_freq.contains_key(*t)).cloned().collect::<Vec<_>>(),
@@ -1715,7 +2022,71 @@ impl Db {
 
     pub fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
         let stmt = sql::parse(sql, params)?;
-        self.run(stmt, sql, false)
+        // Every statement runs under the default deadline, not only a SELECT
+        // (which re-arms with its own WITH). A forwarded write or a DDL that
+        // reaches other nodes waits on them, and a wait with no bound is a
+        // cluster that cannot be told from a hung one: two nodes each holding
+        // their lock while waiting for the other would wait forever.
+        let _deadline = self.arm_default_deadline();
+        self.run(stmt, sql, params, false, false)
+    }
+
+    /// The default statement budget, for the entry points a caller reaches
+    /// without SQL; a SELECT's `WITH (deadline_ms)` nests inside it.
+    fn arm_default_deadline(&self) -> crate::deadline::Armed {
+        crate::deadline::arm(self.opts.statement_deadline_ms)
+    }
+
+    /// The other holders a statement has to reach after it ran here, or
+    /// none: DDL and the operational statements are per collection and
+    /// every holder carries the collection's control-plane state; a query,
+    /// a write and the node-local statements fan out through other means or
+    /// not at all.
+    fn fan_out_of(&self, stmt: &Statement) -> Vec<String> {
+        let collection = match stmt {
+            Statement::CreateIndex(c) => Some(c.collection.clone()),
+            Statement::AlterIndexTier { collection, .. }
+            | Statement::AlterCollection { collection, .. }
+            | Statement::DropIndex { collection, .. }
+            | Statement::Flush { collection }
+            | Statement::Compact { collection } => Some(collection.clone()),
+            Statement::DropCollection { name } => Some(name.clone()),
+            Statement::CreateLifecyclePolicy(d) => Some(d.collection.clone()),
+            Statement::DropLifecyclePolicy { name } => {
+                self.catalog.policies.get(name).map(|p| p.collection.clone())
+            }
+            Statement::RunLifecycle { collection: Some(c) } => Some(c.clone()),
+            _ => None,
+        };
+        collection.map(|c| self.holders(&c)).unwrap_or_default()
+    }
+
+    fn run(
+        &mut self,
+        stmt: Statement,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+        local: bool,
+    ) -> Result<Outcome> {
+        if let Statement::Local(inner) = stmt {
+            return self.run(*inner, sql, params, analyze, true);
+        }
+        // A statement that arrived over the wire never fans out again,
+        // whatever its text says: the holder that forwarded it is waiting
+        // for this one under its own lock, and a fan-out from here that
+        // reached it back would wait for that lock forever.
+        let local = local || crate::wire::serving();
+        let holders = if local { Vec::new() } else { self.fan_out_of(&stmt) };
+        let out = self.run_one(stmt, sql, params, analyze)?;
+        if holders.is_empty() {
+            return Ok(out);
+        }
+        let done = self.propagate(&holders, sql, params)?;
+        Ok(match out {
+            Outcome::Ack(m) => Outcome::Ack(format!("{m}; and on {}", done.join(", "))),
+            other => other,
+        })
     }
 
     /// Convenience: run a SELECT and return its rows.
@@ -1727,13 +2098,19 @@ impl Db {
         self.execute_with(sql, params)?.rows()
     }
 
-    fn run(&mut self, stmt: Statement, sql: &str, analyze: bool) -> Result<Outcome> {
+    fn run_one(
+        &mut self,
+        stmt: Statement,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+    ) -> Result<Outcome> {
         match stmt {
             Statement::Explain { analyze, inner } => {
                 let inner_sql = sql.to_string();
                 match *inner {
                     Statement::Select(sel) => {
-                        let r = self.run_select(&sel, &inner_sql, true)?;
+                        let r = self.run_select(&sel, &inner_sql, params, true)?;
                         let text = r
                             .explain
                             .as_ref()
@@ -1751,7 +2128,7 @@ impl Db {
                         }
                         Ok(Outcome::Explain(text))
                     }
-                    other => self.run(other, sql, true),
+                    other => self.run_one(other, sql, params, true),
                 }
             }
             Statement::CreateCollection(c) => {
@@ -1773,10 +2150,21 @@ impl Db {
                         not_null: col.not_null,
                     });
                 }
-                let splits = c.splits.clone();
-                let n = splits.len() + 1;
-                self.create_collection(coll, &splits)?;
-                Ok(Outcome::Ack(format!("collection `{}` created with {} shard(s)", c.name, n)))
+                let tablets = self.plan_tablets(&c.splits, &c.nodes)?;
+                let n = tablets.len();
+                let mut nodes: Vec<&str> = tablets.iter().map(|t| t.node.as_str()).collect();
+                nodes.sort();
+                nodes.dedup();
+                let where_ = if nodes.len() == 1 && self.is_self(nodes[0]) {
+                    String::new()
+                } else {
+                    format!(" on {}", nodes.join(", "))
+                };
+                self.create_spread(coll, tablets)?;
+                Ok(Outcome::Ack(format!(
+                    "collection `{}` created with {n} shard(s){where_}",
+                    c.name
+                )))
             }
             Statement::CreateIndex(c) => {
                 let kind = match c.spec {
@@ -1808,23 +2196,13 @@ impl Db {
                         ))
                     }
                     Some(p) => {
-                        let sel = Select {
-                            projections: vec![Projection::All],
-                            collection: d.collection.clone(),
-                            predicate: Some(p.clone()),
-                            order: None,
-                            limit: Some(usize::MAX),
-                            offset: 0,
-                            cursor: None,
-                            collapse: None,
-                            with: WithOpts::default(),
-                        };
+                        let sel = exec::select_for_delete(&d.collection, p);
                         // The whole result, not just its rows. A DELETE runs
                         // the same `Select` every query does, so its predicate
                         // can be CUT the same way — and this is the one
                         // statement shape where a short answer does write
                         // work.
-                        let r = self.run_select(&sel, "", false)?;
+                        let r = self.run_select(&sel, sql, params, false)?;
                         (
                             r.rows.iter().map(|x| x.key.clone()).collect(),
                             r.truncated_prefixes.clone(),
@@ -1890,7 +2268,9 @@ impl Db {
                 }
                 Ok(Outcome::Ack(format!("{n} document(s) deleted")))
             }
-            Statement::Select(sel) => Ok(Outcome::Rows(self.run_select(&sel, sql, analyze)?)),
+            Statement::Select(sel) => {
+                Ok(Outcome::Rows(self.run_select(&sel, sql, params, analyze)?))
+            }
             Statement::Flush { collection } => {
                 let n = self.flush(&collection)?;
                 Ok(Outcome::Ack(format!("{n} shard(s) flushed")))
@@ -1935,6 +2315,16 @@ impl Db {
                         c.doc_count,
                         c.prefix_cap()
                     ));
+                    if let Some(tablets) = self.catalog.placement.get(&n) {
+                        for (i, t) in tablets.iter().enumerate() {
+                            out.push_str(&format!(
+                                "  shard {i} on {} [{}, {})\n",
+                                if self.is_self(&t.node) { "this node" } else { t.node.as_str() },
+                                t.lo.as_deref().unwrap_or(""),
+                                t.hi.as_deref().unwrap_or("")
+                            ));
+                        }
+                    }
                     for i in &c.indexes {
                         // The tier belongs here, not only in `SHOW RESIDENCY`:
                         // residency reports what is decoded right now, so an
@@ -2017,6 +2407,15 @@ impl Db {
                 self.drop_collection(&name)?;
                 Ok(Outcome::Ack(format!("collection `{name}` dropped")))
             }
+            Statement::AttachNode { url } => {
+                self.attach_node(&url)?;
+                Ok(Outcome::Ack(format!("node {url} attached")))
+            }
+            Statement::DetachNode { url } => {
+                self.detach_node(&url)?;
+                Ok(Outcome::Ack(format!("node {url} detached")))
+            }
+            Statement::Local(inner) => self.run_one(*inner, sql, params, analyze),
             Statement::DropIndex { collection, index } => {
                 self.drop_index(&collection, &index)?;
                 Ok(Outcome::Ack(format!("index `{index}` dropped from `{collection}`")))
@@ -2556,7 +2955,13 @@ impl Db {
         out
     }
 
-    pub fn run_select(&mut self, sel: &Select, sql: &str, analyze: bool) -> Result<QueryResult> {
+    pub fn run_select(
+        &mut self,
+        sel: &Select,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+    ) -> Result<QueryResult> {
         // The statement's budget: none if it said `no_deadline`, its own if
         // it named one, else the `Db`'s.
         let budget = if sel.with.no_deadline {
@@ -2579,16 +2984,59 @@ impl Db {
             )));
         }
         self.log_vector_queries(sel);
-        // The shards leave the map for the length of the statement, so that
-        // the services built over them and the statistics cache can be
-        // borrowed at once; `Taken` puts them back however this returns.
+        let partial = sel.with.partial_results;
+        // The snapshot and the epoch: this node's clock and write count,
+        // raised by every other holder's, so that a write that landed on
+        // another node is read and ages the statistics here.
+        let tablets = self.catalog.placement.get(&sel.collection).cloned().unwrap_or_default();
+        let mut ts = ts;
+        let mut writes = self.writes_to(&sel.collection);
+        let mut unreachable: Vec<usize> = Vec::new();
+        let mut remotes: BTreeMap<String, Arc<crate::wire::Node>> = BTreeMap::new();
+        for url in self.holders(&sel.collection) {
+            let node = self.node_conn(&url)?;
+            match node.counters(&sel.collection) {
+                Ok((t, w)) => {
+                    ts = ts.max(t);
+                    writes += w;
+                }
+                Err(Error::Deadline(e)) => {
+                    if !partial {
+                        return Err(Error::Deadline(e));
+                    }
+                    unreachable.extend(
+                        tablets.iter().enumerate().filter(|(_, t)| t.node == url).map(|(i, _)| i),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+            remotes.insert(url, node);
+        }
         let taken = Taken::take(self, &sel.collection)?;
         let sim = taken.db.sim.clone();
-        let services = services_for(&taken.shards, sim);
+        let services = services_for(&taken.shards, &tablets, &remotes, &sel.collection, sim);
         let db: &mut Db = taken.db;
-        let partial = sel.with.partial_results;
-        let mut unreachable: Vec<usize> = Vec::new();
-        let mut want = exec::required_terms(&coll, sel);
+        db.run_over(&coll, &services, sel, sql, params, analyze, ts, writes, partial, unreachable)
+    }
+
+    /// The statement over an explicit set of shard services: prefix
+    /// expansion, the statistics, then the executor. What `run_select` calls
+    /// after choosing the services and the instant.
+    #[allow(clippy::too_many_arguments)]
+    fn run_over(
+        &mut self,
+        coll: &Collection,
+        services: &[Box<dyn ShardService + '_>],
+        sel: &Select,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+        ts: Timestamp,
+        writes: u64,
+        partial: bool,
+        mut unreachable: Vec<usize>,
+    ) -> Result<QueryResult> {
+        let mut want = exec::required_terms(coll, sel);
         // Resolve every prefix in the statement HERE, once, before the gather.
         //
         // The cap is applied to the union over every unit of every shard, not
@@ -2625,7 +3073,7 @@ impl Db {
         // front of it — and it is read once per statement. Buying a
         // microsecond with a second thing that has to stay in step with
         // liveness forever is not a trade worth making.
-        let prefixes_by_path = exec::required_prefixes(&coll, sel);
+        let prefixes_by_path = exec::required_prefixes(coll, sel);
         // One statement, one budget. Each DISTINCT prefix costs a dictionary
         // walk in every unit of every shard plus up to the collection's
         // `prefix_expansion` gathered frequencies, and nothing in the grammar bounds how many of
@@ -2682,7 +3130,7 @@ impl Db {
         // `run_select` already ANDs the same `key_prefix` into the filter of
         // every unit. A term no document in the partition holds could only have
         // displaced one that is.
-        let part = exec::partition_constraint(&coll, sel.predicate.as_ref());
+        let part = exec::partition_constraint(coll, sel.predicate.as_ref());
         let mut expansions: BTreeMap<String, BTreeMap<String, Expansion>> = BTreeMap::new();
         for (path, prefixes) in prefixes_by_path {
             for (p, used) in prefixes {
@@ -2703,7 +3151,7 @@ impl Db {
                 // matching vocabulary, whose cost is exactly what the cap
                 // exists to refuse.
                 let mut union: BTreeSet<String> = BTreeSet::new();
-                for s in &services {
+                for s in services {
                     if unreachable.contains(&s.index()) {
                         continue;
                     }
@@ -2771,14 +3219,15 @@ impl Db {
                 v.dedup();
             }
         }
-        let mut stats = db.gather_stats_over(
-            &services,
-            &sel.collection,
+        let mut stats = self.gather_stats_over(
+            services,
+            coll,
             &want,
             ts,
             sel.with.exact_scoring || sel.with.exact,
             partial,
             &mut unreachable,
+            writes,
         )?;
         // Every path named here is a path `want` carries, so `gather_stats`
         // produced an entry for it.
@@ -2788,9 +3237,10 @@ impl Db {
             }
         }
         exec::run_select(ExecInput {
-            shards: &services,
+            shards: services,
             unreachable: &unreachable,
-            coll: &coll,
+            coll,
+            params,
             select: sel,
             ts,
             stats: &stats,
@@ -2884,28 +3334,66 @@ fn cache_key(collection: &str, path: &str) -> String {
     format!("{collection}/{path}")
 }
 
+/// A shard's tablet map from its RANGE file. Two lines, a low bound and a
+/// high one, and neither the file nor either line is optional.
+/// `create_collection` refuses a split key that could write a third line, so
+/// a third is a damaged tablet map -- and a tablet map read wrong is a shard
+/// that silently owns the wrong keys, which no later check catches because
+/// every shard agrees with itself. A missing or empty RANGE is the same
+/// defect wearing the opposite disguise, and it used to be read as success:
+/// an `unwrap_or_default()` turned it into `""`, which splits into ONE empty
+/// part, and a shard with no bounds owns every key. It has to fail here.
+fn read_range(sdir: &Path, i: usize, name: &str) -> Result<(Option<String>, Option<String>)> {
+    let ranges = fs::read_to_string(sdir.join("RANGE"))
+        .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?;
+    let parts: Vec<&str> = ranges.split('\n').collect();
+    if parts.len() != 2 {
+        return Err(Error::Storage(format!(
+            "shard-{i:04} of `{name}`: RANGE holds {} lines, expected 2",
+            parts.len()
+        )));
+    }
+    let lo = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let hi = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    Ok((lo, hi))
+}
+
 /// A collection's shards as the coordinator calls them: `Local` by direct
 /// call, or through the fault schedule when one is installed, in the order
 /// it chooses.
 fn services_for<'a>(
     shards: &'a [Shard],
+    tablets: &[Tablet],
+    remotes: &BTreeMap<String, Arc<crate::wire::Node>>,
+    collection: &str,
     sim: Option<Arc<crate::sim::Sim>>,
 ) -> Vec<Box<dyn ShardService + 'a>> {
-    match sim {
-        None => shards
-            .iter()
-            .enumerate()
-            .map(|(i, s)| Box::new(Local { shard: s, index: i }) as Box<dyn ShardService + 'a>)
-            .collect(),
-        Some(sim) => sim
-            .order(shards.len())
-            .into_iter()
-            .map(|i| {
-                Box::new(crate::sim::SimShard::new(sim.clone(), i, &shards[i]))
-                    as Box<dyn ShardService + 'a>
-            })
-            .collect(),
+    // This node's shards by direct call, or through the fault schedule when
+    // one is installed; every other tablet through its node. A tablet
+    // whose node did not answer the counters call is not here at all: the
+    // caller already marked it unreachable.
+    let mut out: Vec<Box<dyn ShardService + 'a>> = Vec::new();
+    for s in shards {
+        out.push(match &sim {
+            None => Box::new(Local { shard: s, index: s.index }),
+            Some(sim) => Box::new(crate::sim::SimShard::new(sim.clone(), s.index, s)),
+        });
     }
+    for (i, t) in tablets.iter().enumerate() {
+        if shards.iter().any(|s| s.index == i) {
+            continue;
+        }
+        if let Some(node) = remotes.get(&t.node) {
+            out.push(Box::new(crate::wire::Remote::new(node.clone(), collection, i, t)));
+        }
+    }
+    if let Some(sim) = &sim {
+        let order = sim.order(out.len());
+        let mut by_pos: Vec<Option<Box<dyn ShardService + 'a>>> =
+            out.into_iter().map(Some).collect();
+        out = order.into_iter().map(|p| by_pos[p].take().expect("each position once")).collect();
+    }
+    out
 }
 
 /// One path's statistics summed over every shard that answered. `complete`
@@ -2960,17 +3448,19 @@ struct Taken<'a> {
 
 impl<'a> Taken<'a> {
     fn take(db: &'a mut Db, name: &str) -> Result<Taken<'a>> {
-        let shards = db
-            .shards
-            .remove(name)
-            .ok_or_else(|| Error::Plan(format!("no such collection `{name}`")))?;
+        db.catalog.get(name)?;
+        // A collection every shard of which is on other nodes has no entry
+        // here, and that is not an error: the coordinator holds no data.
+        let shards = db.shards.remove(name).unwrap_or_default();
         Ok(Taken { db, name: name.to_string(), shards })
     }
 }
 
 impl Drop for Taken<'_> {
     fn drop(&mut self) {
-        self.db.shards.insert(std::mem::take(&mut self.name), std::mem::take(&mut self.shards));
+        if !self.shards.is_empty() {
+            self.db.shards.insert(std::mem::take(&mut self.name), std::mem::take(&mut self.shards));
+        }
     }
 }
 

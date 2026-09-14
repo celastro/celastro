@@ -249,6 +249,43 @@ kubectl port-forward celastro-0 8787:8787
 
 The chart's README says what was verified and how.
 
+## Two or more nodes
+
+A collection's shards can be spread over nodes, one shard per node at most,
+and every node holding a shard can take any statement for it. Each node is
+its own process with its own directory, started with an address and the
+secret every node shares, and serving its shards to the others:
+
+```
+CELASTRO_NODE=tcp://10.0.0.2:9000 CELASTRO_WIRE_TOKEN=... celastro-cli --dir ./data serve --shard-bind 0.0.0.0:9000
+```
+
+Then, on one node:
+
+```sql
+ATTACH NODE 'tcp://10.0.0.3:9000';
+ATTACH NODE 'tcp://10.0.0.4:9000';
+CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
+  PARTITION BY (tenant) WITH (splits = ['m', 't']);            -- three shards, one per node
+CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
+```
+
+Shard `i` goes to the `i`-th node named in `WITH (nodes = [...])`, wrapping,
+or to this node and the attached ones in turn when none are named. Every
+holder gets the same definition and the same placement map, so an `INSERT`,
+a `DELETE`, a `SELECT` or a `CREATE INDEX` issued at any of them reaches the
+right shards: writes are forwarded to the shard's owner and acknowledged
+after it acknowledged, queries fan out and are fused at the node that took
+them, and DDL and `FLUSH` run on every holder. A statement prefixed with
+`LOCAL` runs on the node it is given to and nowhere else, which is how a node
+a forwarded statement did not reach is repaired. A node that does not answer
+is a deadline at the coordinator, with `WITH (partial_results)` naming its
+shard, the same rule as for a slow shard.
+
+The wire is plain TCP with a shared token and no TLS: for a network you
+trust. Moving a shard between nodes is the next thing to come; until then a
+shard stays where it was created.
+
 ## The archived tier and an object store
 
 An index moved to the `archived` tier leaves local storage. By default that
@@ -277,7 +314,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.17.0 && docker tag ghcr.io/celastro/celastro:0.17.0 celastro
+docker pull ghcr.io/celastro/celastro:0.18.0 && docker tag ghcr.io/celastro/celastro:0.18.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
