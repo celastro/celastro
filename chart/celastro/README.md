@@ -1,12 +1,37 @@
 # celastro
 
-One instance of celastro: a `StatefulSet` of exactly one pod with its data
-directory on a `PersistentVolumeClaim`. That is the whole shape, and it is
-not a default someone should raise. celastro is a single process -- its
-shards run inside it, and there is no replication, consensus or shared
-storage between two processes -- so `replicas` is a fact written into the
-template rather than a value. A second pod would be a second, unrelated
-database that happened to share a name.
+celastro on Kubernetes: a `StatefulSet` of `replicas` pods, each with its
+data directory on its own `PersistentVolumeClaim`. One pod is a database.
+More than one is a cluster: each pod is a node with a stable address inside
+the headless service, serves its shards to the others on the wire port, and
+attaches every other pod as it comes up, so a collection created `WITH
+(splits = [...])` at any of them is spread one shard per pod, in pod order,
+and any pod takes any statement for it. There is no replication between the
+pods -- a shard has exactly one holder -- so a pod that is down is its
+shards down until it is back on its volume.
+
+## A cluster
+
+```
+helm install celastro chart/celastro --set replicas=3
+```
+
+Every pod is started with `CELASTRO_NODE=tcp://<pod>.<service>:9000`, the
+shared token from a `Secret` the chart generates once and keeps across
+upgrades (or `wire.existingSecret`), and `CELASTRO_ATTACH` naming every
+pod's address; each attaches the others, retrying until they answer, and
+logs `attached tcp://...` for each. Then, over a port-forward to any pod:
+
+```sql
+CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
+  PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per pod
+```
+
+Raising `replicas` later adds attached nodes; `REBALANCE notes` moves shards
+onto them, and `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:9000'`
+moves one by hand. Lowering `replicas` strands the shards on the removed
+pods' volumes: move them off first, then scale down. The wire is plain TCP
+with the shared token and no TLS, inside the cluster network only.
 
 ## Install
 
@@ -21,8 +46,8 @@ To run an image of your own instead, build one and put it where the cluster
 can pull it, or load it into a local cluster, then point the chart at it:
 
 ```
-docker build -t celastro:0.22.0 .
-kind load docker-image celastro:0.22.0        # for a kind cluster
+docker build -t celastro:0.23.0 .
+kind load docker-image celastro:0.23.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -63,6 +88,9 @@ probe cannot know one, and it executes nothing.
 | value | default | what it is |
 |---|---|---|
 | `image.repository`, `image.tag` | `ghcr.io/celastro/celastro`, the chart's `appVersion` | the image; `pullPolicy` is `IfNotPresent` |
+| `replicas` | `1` | pods; more than one is a cluster of nodes |
+| `wire.port` | `9000` | the port pods serve their shards on to each other |
+| `wire.token`, `wire.existingSecret` | empty | the shared token, or a `Secret` with the key `CELASTRO_WIRE_TOKEN`; both empty generates one, kept across upgrades |
 | `port` | `8787` | the console's port inside the pod |
 | `persistence.size`, `persistence.storageClass` | `10Gi`, the cluster default | the data volume |
 | `archive.endpoint` | empty | `host:port` of an S3-compatible store, plain HTTP; empty keeps the `archived` tier in the data volume |
@@ -99,6 +127,21 @@ loaded into the cluster by hand: `helm install --wait` pulled
 events show the pull, 1 MB, in under three seconds), the pod reached
 `READY 1/1`, and `/api/health` over the forwarded port reported version
 0.17.0.
+
+The cluster, on 2026-09-14 with the chart at 0.3.0 and an image built from
+the tree: `helm install --set replicas=3 --wait` had three pods `READY 1/1`
+in 11 seconds, and every pod logged `attached` for both others within 40
+seconds of the install (pod DNS resolves a few seconds after start, which
+the retry covers). Over a port-forward to pod 0: a collection created `WITH
+(splits = ['t1', 't2'])` answered "3 shard(s) on" the three pod addresses,
+two indexes reached every holder, ninety documents inserted through pod 0
+landed on their owners, a hybrid statement and a partition-scoped one
+answered across the pods and `EXPLAIN ANALYZE` listed all three shards, a
+`MOVE SHARD` between two pods and a `REBALANCE` back both completed with
+the rows intact. `kubectl delete pod celastro-1` came back ready and
+re-attached its peers in 3 seconds, and its tenant answered through pod 0.
+`helm upgrade --set replicas=4 --wait` rolled the pods in 33 seconds, kept
+the generated token, and the fourth pod was attached by the others.
 
 Not verified: a real `StorageClass` other than kind's, and the `archive`
 values against a bucket in the cluster. The client behind them is tested

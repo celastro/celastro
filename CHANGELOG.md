@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.23.0 — 2026-09-14
+
+A cluster from a chart, hence a minor.
+
+**The chart runs a cluster.** `helm install celastro chart/celastro --set
+replicas=3` starts three pods that attach each other and spread a
+collection's shards one per pod; the wire port, the shared token (a
+`Secret` generated once and kept across upgrades, or one named) and each
+pod's address are the chart's to render. Underneath, `celastro-cli serve`
+reads `CELASTRO_ATTACH=tcp://a:9000,tcp://b:9000`: the peers it attaches as
+they answer, its own address skipped, retried until they do, so every node
+of a cluster can be given the same list and a restarted pod re-attaches on
+its own.
+
 ## 0.22.0 — 2026-09-14
 
 A capability the cluster did not have, hence a minor.

@@ -5,11 +5,14 @@ metadata:
   labels:
     {{- include "celastro.labels" . | nindent 4 }}
 spec:
-  # One, and not a value: celastro is a single process. Its shards run in
-  # that process, and there is no replication, consensus or shared storage
-  # between two of them. A second replica would be a second, unrelated
-  # database that happened to share a name.
-  replicas: 1
+  # One pod is a database. More are nodes of one cluster: each with its own
+  # volume, its own address in the headless service, attaching the others
+  # at start. There is no replication between them -- a shard has one
+  # holder -- so a pod that is down is its shards down.
+  replicas: {{ .Values.replicas }}
+  # All at once: every pod attaches the others by retrying until they
+  # answer, and none has to wait for a lower ordinal to be ready.
+  podManagementPolicy: Parallel
   serviceName: {{ include "celastro.fullname" . }}
   selector:
     matchLabels:
@@ -33,9 +36,29 @@ spec:
         - name: celastro
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if gt (int .Values.replicas) 1 }}
+          args: ["--dir", "/data", "--port", {{ .Values.port | quote }}, "serve", "--shard-bind", {{ printf "0.0.0.0:%d" (int .Values.wire.port) | quote }}]
+          {{- else }}
           args: ["--dir", "/data", "--port", {{ .Values.port | quote }}, "serve"]
-          {{- if .Values.archive.endpoint }}
+          {{- end }}
           env:
+            {{- if gt (int .Values.replicas) 1 }}
+            # The pod's stable name is its address: `tcp://<pod>.<service>:<wire port>`.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CELASTRO_NODE
+              value: {{ printf "tcp://$(POD_NAME).%s:%d" (include "celastro.fullname" .) (int .Values.wire.port) | quote }}
+            - name: CELASTRO_ATTACH
+              value: {{ include "celastro.peers" . | quote }}
+            - name: CELASTRO_WIRE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "celastro.wireSecretName" . }}
+                  key: CELASTRO_WIRE_TOKEN
+            {{- end }}
+            {{- if .Values.archive.endpoint }}
             - name: CELASTRO_ARCHIVE_ENDPOINT
               value: {{ .Values.archive.endpoint | quote }}
             - name: CELASTRO_ARCHIVE_BUCKET
@@ -44,6 +67,8 @@ spec:
               value: {{ .Values.archive.prefix | quote }}
             - name: CELASTRO_ARCHIVE_REGION
               value: {{ .Values.archive.region | quote }}
+            {{- end }}
+          {{- if .Values.archive.endpoint }}
           envFrom:
             - secretRef:
                 name: {{ include "celastro.secretName" . }}
@@ -51,6 +76,10 @@ spec:
           ports:
             - name: console
               containerPort: {{ .Values.port }}
+            {{- if gt (int .Values.replicas) 1 }}
+            - name: wire
+              containerPort: {{ .Values.wire.port }}
+            {{- end }}
           # The probes ask the console itself, from inside the pod, and the
           # console answers only after it has read its catalog: a process
           # that is up with a database it cannot open is not ready.

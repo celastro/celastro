@@ -1,9 +1,9 @@
 apiVersion: v2
 name: celastro
-description: A hybrid document database. One process with its data on a persistent volume; there is no cluster to scale.
+description: A hybrid document database. One pod, or a StatefulSet of nodes that attach each other and spread a collection's shards.
 type: application
-version: 0.2.0
-appVersion: "0.22.0"
+version: 0.3.0
+appVersion: "0.23.0"
 home: https://github.com/celastro/celastro
 sources:
   - https://github.com/celastro/celastro

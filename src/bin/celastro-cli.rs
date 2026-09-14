@@ -83,9 +83,12 @@ terminal does not cost committed writes.
 
 A node in a cluster is started with CELASTRO_NODE=tcp://host:port, its address
 in every placement map, and CELASTRO_WIRE_TOKEN, the secret every node shares;
-`serve --shard-bind ADDR:PORT` then serves its shards to the others. ATTACH NODE,
-CREATE COLLECTION ... WITH (nodes = [...]) and LOCAL are the statements that
-go with it; docs/design.md has the rest.
+`serve --shard-bind ADDR:PORT` then serves its shards to the others, and
+CELASTRO_ATTACH=tcp://a:9000,tcp://b:9000 names the peers it attaches as they
+come up, its own address skipped, so every node of a cluster can be given the
+same list. ATTACH NODE, CREATE COLLECTION ... WITH (nodes = [...]), MOVE SHARD,
+REBALANCE and LOCAL are the statements that go with it; docs/design.md has the
+rest.
 
 `--json` covers every command, `help` and `version` included, and stdout carries
 the whole answer: a failure that ends the command is written there too, as
@@ -569,12 +572,29 @@ fn serve(db: &mut Db, port: u16, open: bool, shard_bind: Option<String>, json: b
              plain TCP, for a network you trust",
             listener.local_addr().map(|a| a.to_string()).unwrap_or(bind)
         );
-        let (db, stop) = (shared.clone(), stop.clone());
+        let (wire_db, wire_stop) = (shared.clone(), stop.clone());
         std::thread::spawn(move || {
-            if let Err(e) = celastro::wire::serve(listener, db, token, stop) {
+            if let Err(e) = celastro::wire::serve(listener, wire_db, token, wire_stop) {
                 eprintln!("celastro-cli: the wire stopped: {e}");
             }
         });
+        // CELASTRO_ATTACH: the peers this node attaches as they come up.
+        // What a StatefulSet's pods are given -- every pod's address, each
+        // skipping its own -- so that a cluster assembles itself and a pod
+        // that restarts re-attaches without an operator. ATTACH NODE is
+        // idempotent, and a peer that is not answering yet is retried
+        // until it does or the node stops.
+        let peers: Vec<String> = std::env::var(ATTACH_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !peers.is_empty() {
+            let (db, stop) = (shared.clone(), stop.clone());
+            std::thread::spawn(move || attach_peers(&db, &stop, &peers));
+        }
     }
     let outcome = server.run(&shared);
     stop.store(true, Ordering::Relaxed);
@@ -586,6 +606,42 @@ fn serve(db: &mut Db, port: u16, open: bool, shard_bind: Option<String>, json: b
     match outcome {
         Ok(()) => EXIT_OK,
         Err(e) => fail(json, &format!("serving stopped: {e}")),
+    }
+}
+
+/// The environment variable naming the peers `serve` attaches: a
+/// comma-separated list of `tcp://host:port`.
+const ATTACH_ENV: &str = "CELASTRO_ATTACH";
+
+/// Attach every peer, retrying each until it answers or the node stops. A
+/// peer that is this node's own address is skipped, so the same list can be
+/// handed to every member of a cluster.
+fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
+    let me = db.lock().unwrap_or_else(|p| p.into_inner()).node().map(str::to_string);
+    let mut pending: Vec<&String> = peers.iter().filter(|p| me.as_ref() != Some(*p)).collect();
+    let mut attempt = 0u32;
+    while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
+        attempt += 1;
+        let mut still = Vec::new();
+        for url in pending {
+            let r = db
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .execute(&format!("ATTACH NODE '{}'", url.replace('\'', "''")));
+            match r {
+                Ok(_) => eprintln!("celastro-cli: attached {url}"),
+                Err(e) => {
+                    if attempt == 1 || attempt % 30 == 0 {
+                        eprintln!("celastro-cli: {url} not attached yet ({e}); retrying");
+                    }
+                    still.push(url);
+                }
+            }
+        }
+        pending = still;
+        if !pending.is_empty() {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
     }
 }
 

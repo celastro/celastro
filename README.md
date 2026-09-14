@@ -281,9 +281,11 @@ copy opens as a database on its own, or `import` adopts it into another one.
 
 ## Kubernetes
 
-`chart/celastro` is a Helm chart for one instance: a `StatefulSet` of one
-pod with the data directory on a `PersistentVolumeClaim`, because celastro is
-a single process and there is no cluster to scale. Its probes run the binary
+`chart/celastro` is a Helm chart for one instance or a cluster: a
+`StatefulSet` of `replicas` pods, each with its data directory on its own
+`PersistentVolumeClaim`. With more than one, the pods attach each other as
+they come up and a collection created with splits is spread one shard per
+pod; `REBALANCE` moves shards onto pods added later. Its probes run the binary
 itself, `celastro-cli health`, which asks the console inside the pod whether
 it is serving and has its catalog. The console binds loopback, so it is
 reached with `kubectl port-forward` and the URL printed in the pod's log. The
@@ -377,7 +379,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.22.0 && docker tag ghcr.io/celastro/celastro:0.22.0 celastro
+docker pull ghcr.io/celastro/celastro:0.23.0 && docker tag ghcr.io/celastro/celastro:0.23.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

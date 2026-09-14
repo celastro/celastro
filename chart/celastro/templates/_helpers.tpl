@@ -23,6 +23,25 @@ app.kubernetes.io/name: {{ include "celastro.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{- define "celastro.wireSecretName" -}}
+{{- if .Values.wire.existingSecret -}}
+{{- .Values.wire.existingSecret -}}
+{{- else -}}
+{{- printf "%s-wire" (include "celastro.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Every pod's wire address, comma-separated: what each pod attaches. */}}
+{{- define "celastro.peers" -}}
+{{- $name := include "celastro.fullname" . -}}
+{{- $port := .Values.wire.port -}}
+{{- $peers := list -}}
+{{- range $i := until (int .Values.replicas) -}}
+{{- $peers = append $peers (printf "tcp://%s-%d.%s:%d" $name $i $name (int $port)) -}}
+{{- end -}}
+{{- join "," $peers -}}
+{{- end -}}
+
 {{- define "celastro.secretName" -}}
 {{- if .Values.archive.existingSecret -}}
 {{- .Values.archive.existingSecret -}}

@@ -1,3 +1,23 @@
+# Pods. One is a single-node database. More than one is a cluster: each pod
+# is a node with its own volume and a stable address inside the headless
+# service, serves its shards to the others on `wire.port`, and attaches
+# every other pod as it comes up, so a collection created `WITH (splits =
+# [...])` at any of them is spread one shard per pod in pod order. Raising
+# it later adds attached nodes; `REBALANCE <collection>` moves shards onto
+# them. Lowering it strands the shards on the removed pods' volumes: move
+# them off first (`MOVE SHARD`), then scale down.
+replicas: 1
+
+# The wire between nodes: plain TCP with a shared token and no TLS, for a
+# network you trust. Served only when replicas is more than one. The token
+# comes from a Secret with the key CELASTRO_WIRE_TOKEN: name an existing
+# one, give one here, or leave both empty and the chart generates one and
+# keeps it across upgrades.
+wire:
+  port: 9000
+  token: ""
+  existingSecret: ""
+
 image:
   repository: ghcr.io/celastro/celastro
   # Empty means the chart's appVersion.

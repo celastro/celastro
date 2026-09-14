@@ -1,5 +1,6 @@
 # Headless: the StatefulSet needs a service for its stable identity, and
 # nothing routes to the console anyway -- it binds 127.0.0.1 inside the pod.
+# The wire port is what the pods reach each other on, by pod name.
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,3 +15,8 @@ spec:
     - name: console
       port: {{ .Values.port }}
       targetPort: {{ .Values.port }}
+    {{- if gt (int .Values.replicas) 1 }}
+    - name: wire
+      port: {{ .Values.wire.port }}
+      targetPort: {{ .Values.wire.port }}
+    {{- end }}

@@ -1,5 +1,12 @@
+{{- if gt (int .Values.replicas) 1 }}
+celastro is starting as {{ .Values.replicas }} nodes, {{ include "celastro.fullname" . }}-0 to
+{{ include "celastro.fullname" . }}-{{ sub (int .Values.replicas) 1 }}, each with its own volume,
+attaching each other on port {{ .Values.wire.port }} as they come up. A collection
+created WITH (splits = [...]) at any of them is spread one shard per pod.
+{{- else }}
 celastro is starting as one pod, {{ include "celastro.fullname" . }}-0, with its
 data on the volume data-{{ include "celastro.fullname" . }}-0.
+{{- end }}
 
 The console binds 127.0.0.1 inside the pod and prints its URL, token included,
 on stdout as it starts. Read the URL from the log and forward the port:
