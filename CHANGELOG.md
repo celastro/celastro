@@ -6,7 +6,9 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.18.2 — 2026-09-14
+
+A fix that moves no behaviour, hence a patch.
 
 **`IN` with a long list is one scan against a set.** It was one equality
 scan per literal on a column and one comparison per literal per document
