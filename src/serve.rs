@@ -1137,13 +1137,20 @@ fn error_json(message: &str) -> String {
     format!(r#"{{"ok":false,"error":{}}}"#, jstr(message))
 }
 
+/// The copyright holder, as `COPYRIGHT` at the repository root states it.
+/// Here because the health endpoint is a machine's way of asking who granted
+/// the licence it already reports, and it is not an interactive interface,
+/// so it carries no obligation for a modifier (AGPL §5(d)).
+pub const COPYRIGHT: &str = "Copyright (C) 2026 celastro";
+
 fn health_json(db: &Db) -> String {
     let version = jstr(env!("CARGO_PKG_VERSION"));
     let source = jstr(&source_url());
     let license = jstr(env!("CARGO_PKG_LICENSE"));
+    let copyright = jstr(COPYRIGHT);
     let collections = db.collection_count();
     format!(
-        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"collections":{collections}}}"#
+        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections}}}"#
     )
 }
 
@@ -1876,6 +1883,18 @@ mod tests {
         let parsed = json::parse(body_of(&health)).unwrap();
         assert_eq!(parsed.get("source").and_then(|v| v.as_str()), Some(expected.as_str()));
         assert_eq!(parsed.get("license").and_then(|v| v.as_str()), Some("AGPL-3.0-only"));
+        assert_eq!(
+            parsed.get("copyright").and_then(|v| v.as_str()),
+            Some("Copyright (C) 2026 celastro"),
+            "the holder travels with the licence it granted"
+        );
+        let notice = include_str!("../COPYRIGHT");
+        assert!(notice
+            .starts_with("celastro — a hybrid document database\nCopyright (C) 2026 celastro\n"));
+        assert!(
+            notice.contains("version 3 of the License\nonly."),
+            "the notice says -only, as Cargo.toml does"
+        );
     }
 
     #[test]

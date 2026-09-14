@@ -65,12 +65,13 @@ ENV RUSTFLAGS="-C strip=symbols"
 # double the image for no new function.
 RUN cargo build --release --locked --offline --bin celastro-cli
 
-# The licence is staged here rather than COPYed straight into `scratch` so its
-# mode is fixed by this file instead of by the umask of whoever checked the
-# repository out — `scratch` has no shell to chmod in. After the build, so it
-# cannot invalidate it.
+# The licence and the copyright notice are staged here rather than COPYed
+# straight into `scratch` so their mode is fixed by this file instead of by
+# the umask of whoever checked the repository out — `scratch` has no shell to
+# chmod in. After the build, so they cannot invalidate it.
 COPY LICENSE /LICENSE
-RUN chmod 0644 /LICENSE
+COPY COPYRIGHT /COPYRIGHT
+RUN chmod 0644 /LICENSE /COPYRIGHT
 
 # scratch has no shell, so the mount point and its ownership have to be made
 # here, in a stage that has one. 65532 is the conventional unprivileged
@@ -95,11 +96,13 @@ LABEL org.opencontainers.image.title="celastro" \
 # and one obvious misuse.
 COPY --from=build /src/target/release/celastro-cli /celastro-cli
 
-# AGPL-3.0-only asks that the licence travel with the object code it covers,
-# and this image is that object code plus nothing — the SPDX string in the
-# LABEL above is metadata, not a copy. 34,523 bytes against about 2 MB.
-# Root-owned and world-readable, like the binary.
+# AGPL-3.0-only asks that the licence and the notices travel with the object
+# code they cover (§4), and this image is that object code plus nothing — the
+# SPDX string in the LABEL above is metadata, not a copy. 34,523 bytes of
+# licence and 660 of notice against about 2 MB. Root-owned and
+# world-readable, like the binary.
 COPY --from=build /LICENSE /LICENSE
+COPY --from=build /COPYRIGHT /COPYRIGHT
 
 # COPY of a directory copies its contents, not the directory, so /data would
 # not exist in this image at all if it were empty upstairs. The .keep file is

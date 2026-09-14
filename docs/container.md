@@ -11,7 +11,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.18.0
+docker pull ghcr.io/celastro/celastro:0.18.1
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -23,34 +23,36 @@ means creating one, listing it and throwing it away:
 ```
 $ cid=$(docker create celastro)
 $ docker export "$cid" | tar -tv
--rwxr-xr-x 0/0               0 2026-09-10 10:25 .dockerenv
--rw-r--r-- 0/0           34523 2026-09-10 10:06 LICENSE
--rwxr-xr-x 0/0         1856216 2026-09-10 21:15 celastro-cli
-drwxr-xr-x 65532/65532       0 2026-09-10 10:25 data/
--rw-r--r-- 65532/65532       0 2026-09-10 10:21 data/.keep
-drwxr-xr-x 0/0               0 2026-09-10 10:25 dev/
--rwxr-xr-x 0/0               0 2026-09-10 10:25 dev/console
-drwxr-xr-x 0/0               0 2026-09-10 10:25 dev/pts/
-drwxr-xr-x 0/0               0 2026-09-10 10:25 dev/shm/
-drwxr-xr-x 0/0               0 2026-09-10 10:25 etc/
--rwxr-xr-x 0/0               0 2026-09-10 10:25 etc/hostname
--rwxr-xr-x 0/0               0 2026-09-10 10:25 etc/hosts
-lrwxrwxrwx 0/0               0 2026-09-10 10:25 etc/mtab -> /proc/mounts
--rwxr-xr-x 0/0               0 2026-09-10 10:25 etc/resolv.conf
-drwxr-xr-x 0/0               0 2026-09-10 10:25 proc/
-drwxr-xr-x 0/0               0 2026-09-10 10:25 sys/
+-rwxr-xr-x 0/0               0 2026-09-14 12:57 .dockerenv
+-rw-r--r-- 0/0             660 2026-09-14 12:55 COPYRIGHT
+-rw-r--r-- 0/0           34523 2026-09-09 19:41 LICENSE
+-rwxr-xr-x 0/0         2474720 2026-09-14 12:56 celastro-cli
+drwxr-xr-x 65532/65532       0 2026-09-14 12:56 data/
+-rw-r--r-- 65532/65532       0 2026-09-14 12:56 data/.keep
+drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/
+-rwxr-xr-x 0/0               0 2026-09-14 12:57 dev/console
+drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/pts/
+drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/shm/
+drwxr-xr-x 0/0               0 2026-09-14 12:57 etc/
+-rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/hostname
+-rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/hosts
+lrwxrwxrwx 0/0               0 2026-09-14 12:57 etc/mtab -> /proc/mounts
+-rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/resolv.conf
+drwxr-xr-x 0/0               0 2026-09-14 12:57 proc/
+drwxr-xr-x 0/0               0 2026-09-14 12:57 sys/
 $ docker rm "$cid" >/dev/null
 ```
 
-Sixteen entries, four of them from this file: the licence, the binary, the data
-directory and the `.keep` that makes the directory exist. The other twelve —
+Seventeen entries, five of them from this file: the licence, the copyright
+notice that applies it, the binary, the data directory and the `.keep` that
+makes the directory exist. The other twelve —
 `.dockerenv` and everything under `dev/`, `etc/`, `proc/` and `sys/` — are the
 runtime's, made for every container whatever the image, and every one of them is
 zero-length here. The timestamps are the build's and the container's, so yours
 will differ.
 
-Both files are root-owned — the binary mode 0755, the licence 0644 — on
-purpose: the unprivileged user this image runs as can read and execute the
+The three files are root-owned — the binary mode 0755, the licence and the
+notice 0644 — on purpose: the unprivileged user this image runs as can read and execute the
 binary, and nothing in the container can write it. A process able to overwrite
 its own executable has a capability with no legitimate use and one obvious
 misuse, so the `COPY` that places it carries no `--chown`. UID 65532 owns what
@@ -58,23 +60,24 @@ it has to own — the data directory — and no more. No shell, no libc, no pack
 manager, nothing to patch, and nothing running as root.
 
 Size. The stable figure is the content, because the compiler is pinned and the
-binary reproduces byte for byte: 1,856,216 bytes of binary and 34,523 of
-licence, about 1.89 MB uncompressed and about 895 kB compressed. What Docker
+binary reproduces byte for byte: 2,474,720 bytes of binary on the build behind
+this paragraph, 34,523 of licence and 660 of notice, about 2.51 MB uncompressed
+and about 1.16 MB compressed. What Docker
 *prints* is neither of those unconditionally — it depends on the image store,
 which `docker info | grep driver-type` names. On Docker 29.1.3 with the
 containerd store (`io.containerd.snapshotter.v1`), `docker images` reports DISK
-USAGE 2.81 MB and CONTENT SIZE 895 kB — disk usage counts the compressed blobs
+USAGE 3.7 MB and CONTENT SIZE 1.16 MB — disk usage counts the compressed blobs
 *and* the unpacked snapshot — and `docker image inspect --format '{{.Size}}'`
-prints the compressed content size, `895262` on the build behind this
+prints the compressed content size, `1157211` on the build behind this
 paragraph. On the older non-containerd store the same field is the uncompressed
-total instead, the 1.89 MB that `docker history` breaks down as 1.86 MB + 41 kB
-+ 8.19 kB.
+total instead, the 2.51 MB that `docker history` breaks down as 2.48 MB + 41 kB
++ 8.19 kB + 8.19 kB (the binary, the licence, the notice, the data directory).
 
-Do not hold `.Size` to the byte. Two independent `--no-cache` builds of this
-source both printed 895262 here, but on the previous toolchain pin the same
-exercise produced six different values between 918581 and 918586 around an
-identical binary. Compressing image metadata is not a reproducible operation;
-compiling this source is, and the binary size is the number to quote.
+Do not hold `.Size` to the byte. On an earlier toolchain pin, independent
+`--no-cache` builds of one source produced six different values between 918581
+and 918586 around an identical binary. Compressing image metadata is not a
+reproducible operation; compiling this source is, and the binary size is the
+number to quote.
 
 `docker run --read-only` works — `demo` and a volume-backed `exec` both complete
 under it — because nothing is written outside the data directory.

@@ -314,7 +314,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.18.0 && docker tag ghcr.io/celastro/celastro:0.18.0 celastro
+docker pull ghcr.io/celastro/celastro:0.18.1 && docker tag ghcr.io/celastro/celastro:0.18.1 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
@@ -388,3 +388,7 @@ Issues are welcome and wanted; pull requests are not accepted, for reasons
 self-host and redistribute this freely. If you run a modified version as a
 network service, the AGPL requires you to offer that version's source to its
 users, which is the reason for choosing it.
+
+Copyright (C) 2026 celastro; the notice is in [COPYRIGHT](COPYRIGHT), and it
+names one holder because contributions are not accepted (see
+[CONTRIBUTING.md](CONTRIBUTING.md)).

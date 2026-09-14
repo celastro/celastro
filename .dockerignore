@@ -1,18 +1,20 @@
 # An allowlist, not a denylist. Excluding target/ and hoping is how a build
 # context silently grows: every new top-level directory would have to be
 # remembered here, and forgetting one costs a slow build rather than an error.
-# Naming the four things the build reads cannot rot that way.
+# Naming the five things the build reads cannot rot that way.
 *
 !Cargo.toml
 !Cargo.lock
 !src
 !LICENSE
+!COPYRIGHT
 
-# Every entry above is COPYed by the Dockerfile. LICENSE is there because the
-# image ships AGPL-3.0-only object code and object code should carry its
-# licence; it passes through the build stage only so this repository, rather
-# than the checkout's umask, fixes its mode. Nothing is listed here to be
-# merely present.
+# Every entry above is COPYed by the Dockerfile. LICENSE and COPYRIGHT are
+# there because the image ships AGPL-3.0-only object code and object code
+# should carry its licence and the notice that applies it (AGPL §4); they
+# pass through the build stage only so this repository, rather than the
+# checkout's umask, fixes their mode. Nothing is listed here to be merely
+# present.
 #
 # `!src` re-includes the whole subtree on purpose, non-Rust files included.
 # src/serve.rs embeds the browser console with include_str! on

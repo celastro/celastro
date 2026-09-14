@@ -6,6 +6,15 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.18.1 — 2026-09-14
+
+A notice and a field, hence a patch.
+
+**The tree now carries a copyright notice, `COPYRIGHT`, and the image ships
+it beside the licence.** The notice applies AGPL-3.0-only, version 3 only,
+to this program and names its holder; `/api/health` reports the holder as
+`copyright` beside `license`.
+
 ## 0.18.0 — 2026-09-14
 
 A cluster, hence a minor. The catalog format moves to version 4 with the
