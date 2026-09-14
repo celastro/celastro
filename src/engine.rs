@@ -27,6 +27,7 @@ use crate::lifecycle::{self, IndexActivity, LifecyclePolicy};
 use crate::memtable::{FlushThresholds, MemtableBudget};
 use crate::mvcc::DeleteLog;
 use crate::plan::exec::{self, ExecInput, QueryResult};
+use crate::plan::service::{Local, ShardService, TermStats};
 use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
 use crate::segment::BuildOpts;
 use crate::segment::{PendingDoc, SegmentBuilder, SegmentSource};
@@ -517,6 +518,9 @@ pub struct Db {
     activity_persisted_micros: u64,
     query_log: Vec<LoggedVectorQuery>,
     queries_seen: u64,
+    /// The fault schedule every query's shard calls go through, when one is
+    /// installed. See `crate::sim`.
+    sim: Option<Arc<crate::sim::Sim>>,
     /// The client's read-your-writes token: the last commit timestamp it
     /// observed (§6). Subsequent reads pin at least this.
     pub last_commit: Timestamp,
@@ -559,6 +563,7 @@ impl Db {
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
             query_log: Vec::new(),
+            sim: None,
             queries_seen: 0,
             last_commit: 0,
         }
@@ -955,6 +960,16 @@ impl Db {
         self.persist_catalog()
     }
 
+    /// Put a fault schedule between every query and the shards. See
+    /// `crate::sim`; `None` takes it out again.
+    pub fn install_sim(&mut self, sim: Arc<crate::sim::Sim>) {
+        self.sim = Some(sim);
+    }
+
+    pub fn remove_sim(&mut self) {
+        self.sim = None;
+    }
+
     /// How many collections the catalog holds. What a health probe asks,
     /// because answering it means the catalog is there to be read.
     pub fn collection_count(&self) -> usize {
@@ -1332,6 +1347,29 @@ impl Db {
         ts: Timestamp,
         exact: bool,
     ) -> Result<BTreeMap<String, GlobalStats>> {
+        let taken = Taken::take(self, collection)?;
+        let sim = taken.db.sim.clone();
+        let services = services_for(&taken.shards, sim);
+        let db: &mut Db = taken.db;
+        db.gather_stats_over(&services, collection, want, ts, exact, false, &mut Vec::new())
+    }
+
+    /// [`gather_stats`](Self::gather_stats) over an explicit set of shard
+    /// services. `unreachable` collects the shards that did not answer, under
+    /// `partial`; without it a shard that does not answer is the statement's
+    /// error. A fill that lost a shard is used for this statement and never
+    /// written to the cache, which holds only sums measured over every shard.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_stats_over(
+        &mut self,
+        services: &[Box<dyn ShardService + '_>],
+        collection: &str,
+        want: &BTreeMap<String, Vec<String>>,
+        ts: Timestamp,
+        exact: bool,
+        partial: bool,
+        unreachable: &mut Vec<usize>,
+    ) -> Result<BTreeMap<String, GlobalStats>> {
         let mut out = BTreeMap::new();
         let prefix_cap = self.catalog.get(collection)?.prefix_cap();
         for (path, terms) in want {
@@ -1341,17 +1379,8 @@ impl Db {
             let terms = term_set(terms);
             let terms: &[String] = &terms;
             if exact {
-                let mut num_docs = 0u64;
-                let mut total_len = 0u64;
-                let mut df: BTreeMap<String, u64> = BTreeMap::new();
-                for s in self.shards(collection)? {
-                    let (n, tl, d) = s.term_stats(path, terms, ts)?;
-                    num_docs += n;
-                    total_len += tl;
-                    for (t, c) in d {
-                        *df.entry(t).or_insert(0) += c;
-                    }
-                }
+                let (TermStats { num_docs, total_doc_len: total_len, doc_freq: df }, _) =
+                    sum_term_stats(services, path, terms, ts, partial, unreachable)?;
                 out.insert(
                     path.clone(),
                     GlobalStats {
@@ -1398,7 +1427,15 @@ impl Db {
                 // about to be emptied would pay for a masked walk and discard
                 // it.
                 self.reset_stats_if_stale(collection, path);
-                let fresh = self.fill_term_stats(collection, path, terms, ts)?;
+                let fresh = self.fill_term_stats(
+                    services,
+                    collection,
+                    path,
+                    terms,
+                    ts,
+                    partial,
+                    unreachable,
+                )?;
                 // The answer comes from the fill whenever the fill gathered
                 // anything, and NOT from reading the cache back. Those are
                 // different numbers: the entry cap evicts oldest first, and
@@ -1560,12 +1597,16 @@ impl Db {
     /// clock advances only on insert and delete, seals and compactions read it
     /// with `peek`, and the pin is at or above every commit issued so far — so
     /// the set it selects is "everything committed" whatever the number is.
+    #[allow(clippy::too_many_arguments)]
     fn fill_term_stats(
         &mut self,
+        services: &[Box<dyn ShardService + '_>],
         collection: &str,
         path: &str,
         terms: &[String],
         ts: Timestamp,
+        partial: bool,
+        unreachable: &mut Vec<usize>,
     ) -> Result<Option<StatsTriple>> {
         let key = cache_key(collection, path);
         let writes = self.writes_to(collection);
@@ -1590,27 +1631,27 @@ impl Db {
         // the globals about to be written over it.
         let (gather, stale_generation) =
             if same_instant { (missing, false) } else { (terms.to_vec(), true) };
-        let mut num_docs = 0u64;
-        let mut total_doc_len = 0u64;
-        let mut df: BTreeMap<String, u64> = BTreeMap::new();
-        for s in self.shards(collection)? {
-            // An empty `gather` is not a wasted call: `term_stats` then does
-            // one `visibility` and one masked length sum per unit and enters
-            // no posting cursor at all, so a statement with no terms to
-            // measure still gets real `num_docs` and `avgdl` for one cheap
-            // pass. A prefix-only query used to be the example, because
-            // `TextQuery::leaf_terms` skipped `Prefix` and left the list
-            // empty; `run_select` now merges the resolved expansion into
-            // `want` before this runs, so what reaches here empty is a prefix
-            // that matched no live term, or a path whose leaves are all
-            // negated — TERMS and prefixes alike, since a negated expansion is
-            // an exclusion set and an exclusion set is enumerated, not scored.
-            let (n, tl, d) = s.term_stats(path, &gather, ts)?;
-            num_docs += n;
-            total_doc_len += tl;
-            for (t, c) in d {
-                *df.entry(t).or_insert(0) += c;
-            }
+        // An empty `gather` is not a wasted call: `term_stats` then does
+        // one `visibility` and one masked length sum per unit and enters
+        // no posting cursor at all, so a statement with no terms to
+        // measure still gets real `num_docs` and `avgdl` for one cheap
+        // pass. A prefix-only query used to be the example, because
+        // `TextQuery::leaf_terms` skipped `Prefix` and left the list
+        // empty; `run_select` now merges the resolved expansion into
+        // `want` before this runs, so what reaches here empty is a prefix
+        // that matched no live term, or a path whose leaves are all
+        // negated — TERMS and prefixes alike, since a negated expansion is
+        // an exclusion set and an exclusion set is enumerated, not scored.
+        let (TermStats { num_docs, total_doc_len, doc_freq: df }, complete) =
+            sum_term_stats(services, path, &gather, ts, partial, unreachable)?;
+        if !complete {
+            // Measured over the shards that answered: right for this
+            // statement, which reports them missing, and wrong for the cache,
+            // which every later statement in the epoch would read as the
+            // whole collection. Answer from it and write nothing.
+            let answer: BTreeMap<String, u64> =
+                terms.iter().map(|t| (t.clone(), df.get(t).copied().unwrap_or(0))).collect();
+            return Ok(Some((num_docs, total_doc_len, answer)));
         }
         let Some(c) = self.stats.get_mut(&key) else { return Ok(None) };
         if stale_generation {
@@ -2537,6 +2578,16 @@ impl Db {
                 "no full-text index on `{path}`; CREATE INDEX ... USING fulltext ({path})"
             )));
         }
+        self.log_vector_queries(sel);
+        // The shards leave the map for the length of the statement, so that
+        // the services built over them and the statistics cache can be
+        // borrowed at once; `Taken` puts them back however this returns.
+        let taken = Taken::take(self, &sel.collection)?;
+        let sim = taken.db.sim.clone();
+        let services = services_for(&taken.shards, sim);
+        let db: &mut Db = taken.db;
+        let partial = sel.with.partial_results;
+        let mut unreachable: Vec<usize> = Vec::new();
         let mut want = exec::required_terms(&coll, sel);
         // Resolve every prefix in the statement HERE, once, before the gather.
         //
@@ -2652,8 +2703,20 @@ impl Db {
                 // matching vocabulary, whose cost is exactly what the cap
                 // exists to refuse.
                 let mut union: BTreeSet<String> = BTreeSet::new();
-                for s in self.shards(&sel.collection)? {
-                    s.prefix_terms(&path, &p, ts, cap + 1, part.as_deref(), &mut union)?;
+                for s in &services {
+                    if unreachable.contains(&s.index()) {
+                        continue;
+                    }
+                    match s.prefix_terms(&path, &p, ts, cap + 1, part.as_deref()) {
+                        Ok(terms) => union.extend(terms),
+                        Err(Error::Deadline(e)) => {
+                            if !partial {
+                                return Err(Error::Deadline(e));
+                            }
+                            unreachable.push(s.index());
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 // Over LIVE terms, so it says the honest thing: the
                 // collection really does hold more than `cap` matching terms a
@@ -2708,11 +2771,14 @@ impl Db {
                 v.dedup();
             }
         }
-        let mut stats = self.gather_stats(
+        let mut stats = db.gather_stats_over(
+            &services,
             &sel.collection,
             &want,
             ts,
             sel.with.exact_scoring || sel.with.exact,
+            partial,
+            &mut unreachable,
         )?;
         // Every path named here is a path `want` carries, so `gather_stats`
         // produced an entry for it.
@@ -2721,10 +2787,9 @@ impl Db {
                 g.expansions = e;
             }
         }
-        self.log_vector_queries(sel);
-        let shards = self.shards(&sel.collection)?;
         exec::run_select(ExecInput {
-            shards,
+            shards: &services,
+            unreachable: &unreachable,
             coll: &coll,
             select: sel,
             ts,
@@ -2817,6 +2882,96 @@ fn term_set(terms: &[String]) -> Cow<'_, [String]> {
 
 fn cache_key(collection: &str, path: &str) -> String {
     format!("{collection}/{path}")
+}
+
+/// A collection's shards as the coordinator calls them: `Local` by direct
+/// call, or through the fault schedule when one is installed, in the order
+/// it chooses.
+fn services_for<'a>(
+    shards: &'a [Shard],
+    sim: Option<Arc<crate::sim::Sim>>,
+) -> Vec<Box<dyn ShardService + 'a>> {
+    match sim {
+        None => shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Box::new(Local { shard: s, index: i }) as Box<dyn ShardService + 'a>)
+            .collect(),
+        Some(sim) => sim
+            .order(shards.len())
+            .into_iter()
+            .map(|i| {
+                Box::new(crate::sim::SimShard::new(sim.clone(), i, &shards[i]))
+                    as Box<dyn ShardService + 'a>
+            })
+            .collect(),
+    }
+}
+
+/// One path's statistics summed over every shard that answered. `complete`
+/// is false when, under `partial`, a shard did not: its index goes to
+/// `unreachable` and the sum is over the rest. Without `partial` the first
+/// shard that does not answer is the error.
+fn sum_term_stats(
+    services: &[Box<dyn ShardService + '_>],
+    path: &str,
+    terms: &[String],
+    ts: Timestamp,
+    partial: bool,
+    unreachable: &mut Vec<usize>,
+) -> Result<(TermStats, bool)> {
+    let mut sum = TermStats::default();
+    let mut complete = true;
+    for s in services {
+        if unreachable.contains(&s.index()) {
+            complete = false;
+            continue;
+        }
+        match s.term_stats(path, terms, ts) {
+            Ok(t) => {
+                sum.num_docs += t.num_docs;
+                sum.total_doc_len += t.total_doc_len;
+                for (term, c) in t.doc_freq {
+                    *sum.doc_freq.entry(term).or_insert(0) += c;
+                }
+            }
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
+                }
+                unreachable.push(s.index());
+                complete = false;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((sum, complete))
+}
+
+/// A collection's shards, out of the map for the length of a statement and
+/// back in it afterwards, whatever the statement did -- including unwinding.
+/// Exists so that services borrowing the shards and the engine's own state
+/// (the statistics cache above all) can be held at once.
+struct Taken<'a> {
+    db: &'a mut Db,
+    name: String,
+    shards: Vec<Shard>,
+}
+
+impl<'a> Taken<'a> {
+    fn take(db: &'a mut Db, name: &str) -> Result<Taken<'a>> {
+        let shards = db
+            .shards
+            .remove(name)
+            .ok_or_else(|| Error::Plan(format!("no such collection `{name}`")))?;
+        Ok(Taken { db, name: name.to_string(), shards })
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.db.shards.insert(std::mem::take(&mut self.name), std::mem::take(&mut self.shards));
+    }
 }
 
 /// What a collection's directory is renamed to at the start of a drop.

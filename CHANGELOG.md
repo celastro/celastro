@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A deterministic simulator, and the boundary it drives.** A query now
+reaches a shard through `plan::service::ShardService` — statistics, prefix
+expansion, candidates, an unranked scan, payload fetches — answered by direct
+call as before. `celastro::sim::Sim`, installed with `Db::install_sim`, puts
+a seeded schedule of drops, crash-and-restarts and reordering on that
+boundary and records a trace; its tests pin that a fault can shorten an
+answer only by saying so. Two visible consequences: an unranked scan fetches
+the documents of the rows that make the page in one call per shard, and
+`EXPLAIN ANALYZE` lists shards by index whatever order they answered in.
+`ExecInput` (a library type) now takes services rather than shards, and
+`FlushThresholds`, `ShardOpts` and the new types are `Clone`.
+
 ## 0.16.0 — 2026-09-13
 
 Two new statements, a new flush threshold and a fallible `set_path`, hence

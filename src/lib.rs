@@ -89,6 +89,7 @@ pub mod segment;
 pub mod serve;
 pub mod shard;
 pub mod signal;
+pub mod sim;
 pub mod sql;
 pub mod text;
 pub mod time;

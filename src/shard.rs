@@ -1270,7 +1270,7 @@ pub(crate) enum Loc {
     Seg(u64, u32),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[non_exhaustive]
 pub struct ShardOpts {
     pub thresholds: FlushThresholds,
@@ -1489,6 +1489,11 @@ impl Shard {
         *self.published_manifest.write().unwrap() = None;
         self.published_deletes.write().unwrap().clear();
         Ok(())
+    }
+
+    /// The directory this shard persists to, if it persists.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 
     pub fn snapshot(&self) -> Snapshot<'_> {

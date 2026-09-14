@@ -38,6 +38,9 @@ use crate::deadline;
 use crate::error::{Error, Result};
 use crate::plan::explain::{Explain, ShardExplain, TextExplain, TextStrategy, UnitExplain};
 use crate::plan::fusion::{fuse, Candidate, Direction, Fused, SourceList};
+use crate::plan::service::{
+    CandidatesRequest, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
+};
 use crate::shard::{partition_prefix, Searchable, Shard};
 use crate::sql::ast::*;
 use crate::text::analyzer::Analyzer;
@@ -205,7 +208,7 @@ fn truncated_prefixes(stats: &BTreeMap<String, GlobalStats>) -> Vec<String> {
 }
 
 /// A candidate-generating source, resolved against the catalog.
-enum SourcePlan {
+pub enum SourcePlan {
     Text { path: String, query: TextQuery, terms: Vec<String>, name: String },
     Vector { path: String, query: Vec<f32>, metric: Metric, name: String },
 }
@@ -225,7 +228,14 @@ impl SourcePlan {
 }
 
 pub struct ExecInput<'a> {
-    pub shards: &'a [Shard],
+    /// The collection's shards, through the boundary a network will one day
+    /// sit under, in any order: every merge below attributes by
+    /// `ShardService::index`, never by position.
+    pub shards: &'a [Box<dyn ShardService + 'a>],
+    /// Shards that did not answer before the executor was reached — at the
+    /// statistics stage — under `partial_results`. Skipped here and reported
+    /// in `missing`, so one statement names a missing shard once.
+    pub unreachable: &'a [usize],
     pub coll: &'a Collection,
     pub select: &'a Select,
     pub ts: Timestamp,
@@ -530,113 +540,76 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     }
 
     // --- Scatter: one round trip, every source evaluated in the same pass.
+    // Each shard answers through `ShardService::candidates` with identifiers
+    // and raw scores only -- no ranks, no documents -- in whatever order the
+    // services were handed over, since every merge below sorts. A shard that
+    // did not answer within the deadline, in this process or across the
+    // boundary, is refused or reported by one rule.
+    let partial = sel.with.partial_results;
     let mut per_source: Vec<Vec<Candidate>> = vec![Vec::new(); sources.len()];
     let mut missing: Vec<String> = Vec::new();
-
-    for (si, shard) in input.shards.iter().enumerate() {
-        let mut sx = ShardExplain {
-            index: si,
-            manifest_version: shard.manifest_version,
-            ..Default::default()
-        };
-        let ts = Instant::now();
+    for si in input.unreachable {
+        ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
+        missing.push(shard_name(*si));
+    }
+    for shard in input.shards {
+        let si = shard.index();
+        if input.unreachable.contains(&si) {
+            continue;
+        }
         if let Some(p) = &prefix {
-            if !shard_may_hold(shard, p) {
-                sx.pruned = true;
-                sx.prune_reason = Some(format!("key prefix `{}` outside range", show_key(p)));
-                ex.shards.push(sx);
+            if !shard.may_hold(p) {
+                ex.shards.push(ShardExplain {
+                    index: si,
+                    pruned: true,
+                    prune_reason: Some(format!("key prefix `{}` outside range", show_key(p))),
+                    manifest_version: shard.manifest_version(),
+                    ..Default::default()
+                });
                 continue;
             }
         }
         if let Some(ms) = deadline::passed() {
-            sx.timed_out = true;
-            ex.shards.push(sx);
-            missing.push(format!("shard {si}"));
-            if sel.with.partial_results {
+            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+            missing.push(shard_name(si));
+            if partial {
                 continue;
             }
             return Err(shard_deadline(si, ms));
         }
-
-        let snap = shard.snapshot_at(input.ts);
-        let units = shard.sources(&snap);
-        // Per-source heaps, merged across every unit of this shard (step 3).
-        let mut shard_heaps: Vec<Vec<Candidate>> = vec![Vec::new(); sources.len()];
-        // Set when the deadline passes inside this shard. A loop that stops
-        // on the deadline returns less than it was asked for, so nothing a
-        // timed-out shard produced may reach the merge below.
-        let mut timed_out = false;
-
-        for unit in &units {
-            let ut = Instant::now();
-            let n = unit.num_docs();
-            if n == 0 {
-                continue;
-            }
-            let mut ux = UnitExplain { label: unit.label(), docs: n, ..Default::default() };
-            let io0 = unit.io_counters();
-
-            let vis = unit.visibility(input.ts);
-            ux.visible = vis.popcount();
-            let mut filter = match &prefix {
-                Some(p) => {
-                    ux.access_paths.push(format!("partition range `{}`", show_key(p)));
-                    unit.key_prefix(p)
+        let req = CandidatesRequest {
+            coll: input.coll,
+            select: sel,
+            ts: input.ts,
+            prefix: prefix.as_deref(),
+            sources: &sources,
+            k_prime,
+            stats: input.stats,
+            analyze: input.analyze,
+        };
+        match shard.candidates(&req) {
+            Ok(a) => {
+                if a.timed_out {
+                    missing.push(shard_name(si));
                 }
-                None => Bitmap::all(n),
-            };
-            filter.and_inplace(&vis);
-            if let Some(e) = &sel.predicate {
-                let bm = eval_expr(unit, e, &vis, &filter, input.stats, input.analyze, &mut ux)?;
-                filter.and_inplace(&bm);
-            }
-            ux.survivors = filter.popcount();
-            ux.selectivity = ux.survivors as f64 / n as f64;
-
-            if ux.survivors > 0 {
-                for (i, sp) in sources.iter().enumerate() {
-                    let got = run_source(unit, sp, &vis, &filter, k_prime, &input, &mut ux)?;
-                    for (ord, raw) in got {
-                        if let Some(key) = unit.key(ord) {
-                            shard_heaps[i].push(Candidate { key: key.to_string(), raw_score: raw });
-                        }
+                ex.shards.push(a.explain);
+                for (i, list) in a.per_source.into_iter().enumerate() {
+                    if let Some(p) = per_source.get_mut(i) {
+                        p.extend(list);
                     }
                 }
             }
-            if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
-                ux.loads = l1.saturating_sub(l0);
-                ux.faults = f1.saturating_sub(f0);
-            }
-            ux.micros = ut.elapsed().as_micros();
-            sx.units.push(ux);
-            if let Some(ms) = deadline::passed() {
-                if !sel.with.partial_results {
-                    return Err(shard_deadline(si, ms));
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
                 }
-                timed_out = true;
-                break;
+                ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+                missing.push(shard_name(si));
             }
+            Err(e) => return Err(e),
         }
-        if timed_out {
-            sx.timed_out = true;
-            ex.shards.push(sx);
-            missing.push(format!("shard {si}"));
-            continue;
-        }
-
-        // Merge this shard's per-source heaps and truncate to k'. Identifiers
-        // and raw scores only — no ranks, no documents.
-        for (i, sp) in sources.iter().enumerate() {
-            let dir = sp.direction();
-            shard_heaps[i]
-                .sort_by(|a, b| cmp_dir(dir, a.raw_score, b.raw_score).then(a.key.cmp(&b.key)));
-            shard_heaps[i].dedup_by(|a, b| a.key == b.key);
-            shard_heaps[i].truncate(k_prime);
-            per_source[i].extend(std::mem::take(&mut shard_heaps[i]));
-        }
-        sx.micros = ts.elapsed().as_micros();
-        ex.shards.push(sx);
     }
+    ex.shards.sort_by_key(|s| s.index);
 
     // --- Gather: merge per source, rank globally, fuse (§7.2).
     let want = k.saturating_add(sel.offset);
@@ -697,7 +670,9 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             if rows.len() >= want {
                 break;
             }
-            let Some(doc) = fetch(input.shards, key, input.ts)? else { continue };
+            let Some(doc) = fetch(input.shards, key, input.ts, partial, &mut missing)? else {
+                continue;
+            };
             let parent = doc.path(parent_path).cloned().unwrap_or(Value::Null);
             if !parent.is_null() && seen.contains(&parent) {
                 continue;
@@ -714,7 +689,9 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         // Fetch payloads from the winning shards only.
         fetch_t = Instant::now();
         for (key, score, dist) in ranked.iter().take(want) {
-            let Some(doc) = fetch(input.shards, key, input.ts)? else { continue };
+            let Some(doc) = fetch(input.shards, key, input.ts, partial, &mut missing)? else {
+                continue;
+            };
             rows.push(Row {
                 key: key.clone(),
                 doc,
@@ -737,6 +714,8 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     let next_cursor = rows
         .last()
         .map(|r| encode_cursor(last_sort.unwrap_or(0.0), cursor_depth + rows.len(), &r.key));
+    missing.sort();
+    missing.dedup();
     ex.missing = missing.clone();
     ex.total_micros = t0.elapsed().as_micros();
     let cut = truncated_prefixes(input.stats);
@@ -1158,16 +1137,17 @@ fn short(v: &Value) -> String {
 /// itself is masked by the same predicate the coordinator uses — and taking
 /// `select` and `stats` from the struct that already carries both keeps the
 /// signature at a size a reader can hold.
+#[allow(clippy::too_many_arguments)]
 fn run_source(
     unit: &Searchable<'_>,
     sp: &SourcePlan,
     vis: &Bitmap,
     filter: &Bitmap,
     k_prime: usize,
-    input: &ExecInput<'_>,
+    sel: &Select,
+    stats: &BTreeMap<String, GlobalStats>,
     ux: &mut UnitExplain,
 ) -> Result<Vec<(u32, f32)>> {
-    let (sel, stats) = (input.select, input.stats);
     match sp {
         SourcePlan::Text { path, query, terms, name, .. } => {
             let Some(handle) = unit.text_handle(path)? else { return Ok(Vec::new()) };
@@ -1224,6 +1204,13 @@ fn run_source(
 }
 
 /// A non-ranked query: filter, then order by key or by explicit fields.
+///
+/// The coordinator's half. Each shard retains its own best `offset + k` rows
+/// through `ShardService::scan` and hands back their sort values and keys,
+/// with the document only where placing the row needed it; the rows are
+/// merged here under the same retention rule, and the documents of the rows
+/// that make the page are fetched from their shards afterwards, one call per
+/// shard. So a `LIMIT 5` over three shards still decodes five documents.
 fn scan(
     input: &ExecInput<'_>,
     prefix: &Option<String>,
@@ -1231,6 +1218,7 @@ fn scan(
     ex: &mut Explain,
 ) -> Result<(Vec<Row>, Vec<String>)> {
     let sel = input.select;
+    let partial = sel.with.partial_results;
     // Rows past `offset + k` are thrown away at the end, so they are never
     // held: `SELECT * FROM docs LIMIT 1` used to decode and buffer every
     // matching document in the collection before taking one of them, which
@@ -1244,147 +1232,351 @@ fn scan(
     // A key-ordered scan resumes on the primary key. A full cursor token
     // from a ranked query still works: its last field is that key.
     let after: Option<String> = sel.cursor.as_ref().map(|c| decode_cursor(c).2);
-    // A row can be placed by its key alone unless the order or the collapse
-    // reads the document. When neither does, the document is not decoded
-    // until the row is known to be on the page.
-    let needs_doc = !fields.is_empty() || sel.collapse.is_some();
     let mut retained = Retained::new(keep, fields.iter().map(|(_, asc)| *asc).collect());
-    let mut missing = Vec::new();
-    // Snapshots first and sources second, both outliving the scan: a source
-    // borrows its snapshot, and a deferred decode needs the source that holds
-    // the row.
-    let snaps: Vec<Option<crate::shard::Snapshot<'_>>> = input
-        .shards
-        .iter()
-        .map(|shard| match prefix {
-            Some(p) if !shard_may_hold(shard, p) => None,
-            _ => Some(shard.snapshot_at(input.ts)),
-        })
-        .collect();
-    let sources: Vec<Vec<Searchable<'_>>> = snaps
-        .iter()
-        .enumerate()
-        .map(|(si, snap)| snap.as_ref().map(|s| input.shards[si].sources(s)).unwrap_or_default())
-        .collect();
-    for (si, shard) in input.shards.iter().enumerate() {
-        let mut sx = ShardExplain {
-            index: si,
-            manifest_version: shard.manifest_version,
-            ..Default::default()
-        };
-        if snaps[si].is_none() {
-            sx.pruned = true;
-            sx.prune_reason = Some("out of key range".into());
-            ex.shards.push(sx);
+    let mut missing: Vec<String> = Vec::new();
+    let mut manifests: BTreeMap<usize, u64> = BTreeMap::new();
+    for si in input.unreachable {
+        ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
+        missing.push(shard_name(*si));
+    }
+    for shard in input.shards {
+        let si = shard.index();
+        if input.unreachable.contains(&si) {
             continue;
         }
+        if let Some(p) = prefix {
+            if !shard.may_hold(p) {
+                ex.shards.push(ShardExplain {
+                    index: si,
+                    pruned: true,
+                    prune_reason: Some("out of key range".into()),
+                    manifest_version: shard.manifest_version(),
+                    ..Default::default()
+                });
+                continue;
+            }
+        }
         if let Some(ms) = deadline::passed() {
-            sx.timed_out = true;
-            ex.shards.push(sx);
-            missing.push(format!("shard {si}"));
-            if sel.with.partial_results {
+            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+            missing.push(shard_name(si));
+            if partial {
                 continue;
             }
             return Err(shard_deadline(si, ms));
         }
-        let mut timed_out = false;
-        for (ui, unit) in sources[si].iter().enumerate() {
-            let n = unit.num_docs();
-            if n == 0 {
-                continue;
-            }
-            let ut = Instant::now();
-            let mut ux = UnitExplain { label: unit.label(), docs: n, ..Default::default() };
-            let io0 = unit.io_counters();
-            let vis = unit.visibility(input.ts);
-            ux.visible = vis.popcount();
-            let mut filter = match prefix {
-                Some(p) => unit.key_prefix(p),
-                None => Bitmap::all(n),
-            };
-            filter.and_inplace(&vis);
-            if let Some(e) = &sel.predicate {
-                let bm = eval_expr(unit, e, &vis, &filter, input.stats, input.analyze, &mut ux)?;
-                filter.and_inplace(&bm);
-            }
-            ux.survivors = filter.popcount();
-            ux.selectivity = ux.survivors as f64 / n as f64;
-            for ord in filter.iter() {
-                if deadline::expired() {
-                    break;
+        let req = ScanRequest {
+            coll: input.coll,
+            select: sel,
+            ts: input.ts,
+            prefix: prefix.as_deref(),
+            stats: input.stats,
+            analyze: input.analyze,
+            keep,
+            after: after.as_deref(),
+            fields: &fields,
+        };
+        match shard.scan(&req) {
+            Ok(a) => {
+                manifests.insert(si, a.explain.manifest_version);
+                if a.timed_out {
+                    missing.push(shard_name(si));
                 }
-                let key = unit.key(ord).unwrap_or("").to_string();
-                if after.as_ref().is_some_and(|a| key.as_str() <= a.as_str()) {
-                    continue;
-                }
-                if needs_doc {
-                    let doc = unit.document(ord)?;
-                    let vals =
-                        fields.iter().map(|(p, _)| doc.path(p).cloned().unwrap_or(Value::Null));
-                    let rank = Rank::new(vals.collect(), key, &retained.asc);
-                    // `COLLAPSE BY` applies to unranked queries too. Skipping
-                    // it would silently return `k` children of one parent for
-                    // a statement that asked for `k` distinct parents. A row
-                    // whose parent path is absent or NULL belongs to no group,
-                    // so it stands alone -- collapsing them together would
-                    // fold every unrelated document into one, which is the
-                    // same rule the ranked path applies.
-                    let parent = sel
-                        .collapse
-                        .as_ref()
-                        .and_then(|p| doc.path(p))
-                        .filter(|v| !v.is_null())
-                        .map(crate::variant::encode_to_vec);
-                    retained.insert(rank, Payload::Doc(doc), parent);
-                } else {
-                    let rank = Rank::new(Vec::new(), key, &retained.asc);
-                    retained.insert(rank, Payload::Deferred(si, ui, ord), None);
+                ex.shards.push(a.explain);
+                for h in a.hits {
+                    let rank = Rank::new(h.sort, h.key, &retained.asc);
+                    let payload = match h.doc {
+                        Some(d) => Payload::Doc(d),
+                        None => Payload::Deferred(si, h.handle.0, h.handle.1),
+                    };
+                    retained.insert(rank, payload, h.parent);
                 }
             }
-            if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
-                ux.loads = l1.saturating_sub(l0);
-                ux.faults = f1.saturating_sub(f0);
-            }
-            ux.micros = ut.elapsed().as_micros();
-            sx.units.push(ux);
-            if let Some(ms) = deadline::passed() {
-                if !sel.with.partial_results {
-                    return Err(shard_deadline(si, ms));
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
                 }
-                timed_out = true;
-                break;
+                ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+                missing.push(shard_name(si));
             }
+            Err(e) => return Err(e),
         }
-        if timed_out {
-            // Rows this shard retained before the cut are not withdrawn:
-            // they are correct rows, and under `partial_results` the shard
-            // is reported missing, which is the contract -- some of its rows
-            // may be absent.
-            sx.timed_out = true;
-            missing.push(format!("shard {si}"));
-        }
-        ex.shards.push(sx);
     }
+    ex.shards.sort_by_key(|s| s.index);
     if let Some(parent_path) = &sel.collapse {
         // Every survivor is seen, so unlike the ranked path there is no
         // candidate depth to widen: the retained set is the best row of each
         // of the `offset + k` best parents, exactly.
         ex.collapse = Some((parent_path.clone(), 1));
     }
+    // The page, then the documents its deferred rows need: one call per
+    // shard, so a transport pays one round trip per shard and not per row.
+    let page: Vec<(Rank, Payload)> =
+        retained.into_sorted().into_iter().skip(sel.offset).take(k).collect();
+    let mut wanted: BTreeMap<usize, Vec<(usize, u32)>> = BTreeMap::new();
+    for (_, p) in &page {
+        if let Payload::Deferred(si, ui, ord) = p {
+            wanted.entry(*si).or_default().push((*ui, *ord));
+        }
+    }
+    let mut fetched: BTreeMap<(usize, usize, u32), Value> = BTreeMap::new();
+    for (si, handles) in wanted {
+        let Some(shard) = input.shards.iter().find(|s| s.index() == si) else { continue };
+        let version = manifests.get(&si).copied().unwrap_or(0);
+        match shard.documents(version, input.ts, &handles) {
+            Ok(docs) => {
+                for (h, d) in handles.iter().zip(docs) {
+                    fetched.insert((si, h.0, h.1), d);
+                }
+            }
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
+                }
+                missing.push(shard_name(si));
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let mut rows: Vec<Row> = Vec::new();
-    for (rank, payload) in retained.into_sorted().into_iter().skip(sel.offset).take(k) {
+    for (rank, payload) in page {
         let doc = match payload {
             Payload::Doc(doc) => doc,
-            Payload::Deferred(si, ui, ord) => sources[si][ui].document(ord)?,
+            Payload::Deferred(si, ui, ord) => match fetched.remove(&(si, ui, ord)) {
+                Some(d) => d,
+                // Its shard stopped answering between the scan and the
+                // fetch, and is in `missing`.
+                None => continue,
+            },
         };
         rows.push(Row { key: rank.key, doc, score: None, distance: None });
     }
     ex.fetched_payloads = rows.len();
+    missing.sort();
+    missing.dedup();
     Ok((rows, missing))
 }
 
+/// The shard's half of an unranked scan: its best `keep` rows over every
+/// unit of its snapshot, under the same retention rule the coordinator
+/// applies to the merge. A row is decoded here only when placing it needs
+/// the document; otherwise it travels as a handle.
+pub(crate) fn scan_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result<ShardScan> {
+    let sel = req.select;
+    let needs_doc = !req.fields.is_empty() || sel.collapse.is_some();
+    let mut sx =
+        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+    let t0 = Instant::now();
+    let snap = shard.snapshot_at(req.ts);
+    let units = shard.sources(&snap);
+    let mut retained = Retained::new(req.keep, req.fields.iter().map(|(_, asc)| *asc).collect());
+    let mut timed_out = false;
+    for (ui, unit) in units.iter().enumerate() {
+        let n = unit.num_docs();
+        if n == 0 {
+            continue;
+        }
+        let ut = Instant::now();
+        let mut ux = UnitExplain { label: unit.label(), docs: n, ..Default::default() };
+        let io0 = unit.io_counters();
+        let vis = unit.visibility(req.ts);
+        ux.visible = vis.popcount();
+        let mut filter = match req.prefix {
+            Some(p) => unit.key_prefix(p),
+            None => Bitmap::all(n),
+        };
+        filter.and_inplace(&vis);
+        if let Some(e) = &sel.predicate {
+            let bm = eval_expr(unit, e, &vis, &filter, req.stats, req.analyze, &mut ux)?;
+            filter.and_inplace(&bm);
+        }
+        ux.survivors = filter.popcount();
+        ux.selectivity = ux.survivors as f64 / n as f64;
+        for ord in filter.iter() {
+            if deadline::expired() {
+                break;
+            }
+            let key = unit.key(ord).unwrap_or("").to_string();
+            if req.after.is_some_and(|a| key.as_str() <= a) {
+                continue;
+            }
+            if needs_doc {
+                let doc = unit.document(ord)?;
+                let vals =
+                    req.fields.iter().map(|(p, _)| doc.path(p).cloned().unwrap_or(Value::Null));
+                let rank = Rank::new(vals.collect(), key, &retained.asc);
+                // `COLLAPSE BY` applies to unranked queries too. Skipping
+                // it would silently return `k` children of one parent for
+                // a statement that asked for `k` distinct parents. A row
+                // whose parent path is absent or NULL belongs to no group,
+                // so it stands alone -- collapsing them together would
+                // fold every unrelated document into one, which is the
+                // same rule the ranked path applies.
+                let parent = sel
+                    .collapse
+                    .as_ref()
+                    .and_then(|p| doc.path(p))
+                    .filter(|v| !v.is_null())
+                    .map(crate::variant::encode_to_vec);
+                retained.insert(rank, Payload::Doc(doc), parent);
+            } else {
+                let rank = Rank::new(Vec::new(), key, &retained.asc);
+                retained.insert(rank, Payload::Deferred(si, ui, ord), None);
+            }
+        }
+        if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
+            ux.loads = l1.saturating_sub(l0);
+            ux.faults = f1.saturating_sub(f0);
+        }
+        ux.micros = ut.elapsed().as_micros();
+        sx.units.push(ux);
+        if let Some(ms) = deadline::passed() {
+            if !sel.with.partial_results {
+                return Err(shard_deadline(si, ms));
+            }
+            timed_out = true;
+            break;
+        }
+    }
+    // Rows this shard retained before a cut are not withdrawn: they are
+    // correct rows, and under `partial_results` the shard is reported
+    // missing, which is the contract -- some of its rows may be absent.
+    sx.timed_out = timed_out;
+    sx.micros = t0.elapsed().as_micros();
+    let hits = retained
+        .into_sorted_with_parents()
+        .into_iter()
+        .map(|(rank, payload, parent)| {
+            let (doc, handle) = match payload {
+                Payload::Doc(d) => (Some(d), (0, 0)),
+                Payload::Deferred(_, ui, ord) => (None, (ui, ord)),
+            };
+            ScanHit { sort: rank.vals, key: rank.key, doc, handle, parent }
+        })
+        .collect();
+    Ok(ShardScan { hits, explain: sx, timed_out })
+}
+
+/// The shard's half of a ranked statement: every source evaluated over every
+/// unit of its snapshot, merged per source and cut to `k_prime`. Identifiers
+/// and raw scores only.
+pub(crate) fn candidates_on(
+    shard: &Shard,
+    si: usize,
+    req: &CandidatesRequest<'_>,
+) -> Result<ShardCandidates> {
+    let sel = req.select;
+    let t0 = Instant::now();
+    let mut sx =
+        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+    let snap = shard.snapshot_at(req.ts);
+    let units = shard.sources(&snap);
+    // Per-source heaps, merged across every unit of this shard (step 3).
+    let mut heaps: Vec<Vec<Candidate>> = vec![Vec::new(); req.sources.len()];
+    for unit in &units {
+        let ut = Instant::now();
+        let n = unit.num_docs();
+        if n == 0 {
+            continue;
+        }
+        let mut ux = UnitExplain { label: unit.label(), docs: n, ..Default::default() };
+        let io0 = unit.io_counters();
+
+        let vis = unit.visibility(req.ts);
+        ux.visible = vis.popcount();
+        let mut filter = match req.prefix {
+            Some(p) => {
+                ux.access_paths.push(format!("partition range `{}`", show_key(p)));
+                unit.key_prefix(p)
+            }
+            None => Bitmap::all(n),
+        };
+        filter.and_inplace(&vis);
+        if let Some(e) = &sel.predicate {
+            let bm = eval_expr(unit, e, &vis, &filter, req.stats, req.analyze, &mut ux)?;
+            filter.and_inplace(&bm);
+        }
+        ux.survivors = filter.popcount();
+        ux.selectivity = ux.survivors as f64 / n as f64;
+
+        if ux.survivors > 0 {
+            for (i, sp) in req.sources.iter().enumerate() {
+                let got =
+                    run_source(unit, sp, &vis, &filter, req.k_prime, sel, req.stats, &mut ux)?;
+                for (ord, raw) in got {
+                    if let Some(key) = unit.key(ord) {
+                        heaps[i].push(Candidate { key: key.to_string(), raw_score: raw });
+                    }
+                }
+            }
+        }
+        if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
+            ux.loads = l1.saturating_sub(l0);
+            ux.faults = f1.saturating_sub(f0);
+        }
+        ux.micros = ut.elapsed().as_micros();
+        sx.units.push(ux);
+        if let Some(ms) = deadline::passed() {
+            if !sel.with.partial_results {
+                return Err(shard_deadline(si, ms));
+            }
+            // A loop that stops on the deadline returns less than it was
+            // asked for, so nothing a timed-out shard produced may reach
+            // the merge.
+            sx.timed_out = true;
+            sx.micros = t0.elapsed().as_micros();
+            return Ok(ShardCandidates {
+                per_source: vec![Vec::new(); req.sources.len()],
+                explain: sx,
+                timed_out: true,
+            });
+        }
+    }
+    // Merge this shard's per-source heaps and truncate to k'. Identifiers
+    // and raw scores only -- no ranks, no documents.
+    for (i, sp) in req.sources.iter().enumerate() {
+        let dir = sp.direction();
+        heaps[i].sort_by(|a, b| cmp_dir(dir, a.raw_score, b.raw_score).then(a.key.cmp(&b.key)));
+        heaps[i].dedup_by(|a, b| a.key == b.key);
+        heaps[i].truncate(req.k_prime);
+    }
+    sx.micros = t0.elapsed().as_micros();
+    Ok(ShardCandidates { per_source: heaps, explain: sx, timed_out: false })
+}
+
+/// The documents behind scan handles, under the manifest they were issued
+/// against. A moved manifest means the units are not the units the handles
+/// name, and that is `SnapshotGone`, not a different document.
+pub(crate) fn documents_on(
+    shard: &Shard,
+    manifest_version: u64,
+    ts: Timestamp,
+    handles: &[(usize, u32)],
+) -> Result<Vec<Value>> {
+    if shard.manifest_version != manifest_version {
+        return Err(Error::SnapshotGone(format!(
+            "manifest v{manifest_version} moved to v{} between the scan and the fetch",
+            shard.manifest_version
+        )));
+    }
+    let snap = shard.snapshot_at(ts);
+    let units = shard.sources(&snap);
+    handles
+        .iter()
+        .map(|(ui, ord)| {
+            units
+                .get(*ui)
+                .ok_or_else(|| Error::SnapshotGone(format!("unit {ui} is gone")))?
+                .document(*ord)
+        })
+        .collect()
+}
+
+fn shard_name(si: usize) -> String {
+    format!("shard {si}")
+}
+
 /// The refusal at a shard boundary: which shard, and the budget.
-fn shard_deadline(si: usize, ms: u64) -> Error {
+pub(crate) fn shard_deadline(si: usize, ms: u64) -> Error {
     Error::Deadline(format!(
         "shard {si} not finished within {ms} ms; raise it with WITH (deadline_ms = N), lift it \
          with WITH (no_deadline), or use WITH (partial_results) to opt in to incomplete answers"
@@ -1502,10 +1694,14 @@ impl Retained {
     fn into_sorted(self) -> Vec<(Rank, Payload)> {
         self.entries.into_iter().map(|(r, (p, _))| (r, p)).collect()
     }
+
+    fn into_sorted_with_parents(self) -> Vec<(Rank, Payload, Option<Vec<u8>>)> {
+        self.entries.into_iter().map(|(r, (p, parent))| (r, p, parent)).collect()
+    }
 }
 
 /// Whether a shard's key range can hold anything under `prefix`.
-fn shard_may_hold(shard: &Shard, prefix: &str) -> bool {
+pub(crate) fn shard_may_hold(shard: &Shard, prefix: &str) -> bool {
     if let Some(r) = &shard.key_range {
         // A prefix overlaps the range if it is not entirely below `lo` and
         // not at or above `hi`. `lo.starts_with(prefix)` covers the case where
@@ -1518,10 +1714,31 @@ fn shard_may_hold(shard: &Shard, prefix: &str) -> bool {
     true
 }
 
-fn fetch(shards: &[Shard], key: &str, ts: Timestamp) -> Result<Option<Value>> {
+/// A payload by primary key, from the shards whose range can hold it. A
+/// shard that stops answering here is treated like one that stopped
+/// anywhere else: refused, or under `partial_results` reported and skipped.
+fn fetch(
+    shards: &[Box<dyn ShardService + '_>],
+    key: &str,
+    ts: Timestamp,
+    partial: bool,
+    missing: &mut Vec<String>,
+) -> Result<Option<Value>> {
     for s in shards {
-        if let Some(d) = s.get(key, ts)? {
-            return Ok(Some(d));
+        let si = s.index();
+        if missing.contains(&shard_name(si)) || !s.may_hold(key) {
+            continue;
+        }
+        match s.get(key, ts) {
+            Ok(Some(d)) => return Ok(Some(d)),
+            Ok(None) => {}
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
+                }
+                missing.push(shard_name(si));
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(None)

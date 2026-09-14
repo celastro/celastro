@@ -311,9 +311,11 @@ lifecycle policies.
 
 What is deliberately not here: everything that needs more than one process.
 Consensus and replication, follower reads, two-phase commit across shards,
-dynamic shard split and merge, and a real object-store client for the
-`archived` tier. The boundaries those attach to are built and tested; the
-distributed pieces are not.
+and dynamic shard split and merge. The boundaries those attach to are built
+and tested — including a deterministic simulator that puts partitions,
+crashes and reordering on the coordinator-to-shard boundary and checks that a
+fault can shorten an answer only by saying so — but the distributed pieces
+are not.
 
 The whole of it — the ordinal-space invariant, where things live in the tree,
 tiers and residency, the design notes with their measurements, the worked

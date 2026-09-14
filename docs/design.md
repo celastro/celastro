@@ -253,6 +253,32 @@ is deliberately not taken until something needs it. Unpinned, depth is not a
 reason to seal: that seal keeps one version per key and emits one segment
 however deep the chains ran.
 
+**The deterministic simulator states what a transport has to keep, before
+there is one.** `celastro::sim` puts a seeded fault schedule on the
+coordinator-to-shard boundary: per call, a shard's answer can be dropped (a
+partition, seen by the coordinator as the same `Deadline` a slow shard
+produces), or the shard can crash and a replacement open its directory and
+answer instead, serving the rest of the statement; and the shards can be
+handed to the coordinator in a permuted order. Delay is not a separate fault:
+the coordinator is synchronous, so a reply inside the deadline is a reply and
+one outside it is a drop, and what arrival order could change is covered by
+reorder. The property, checked over twenty seeds and every query shape: **a
+fault can shorten an answer only by saying so.** Without `partial_results` a
+faulted statement is refused or answers bit for bit what it answers with no
+faults; with it, `missing` names exactly the shards whose calls were dropped,
+a shard given up on is not asked again by any later stage of the statement,
+every row is a real one, and a statistics fill that lost a shard serves its
+own statement and is never written to the cache. A restart is a real reopen —
+the WAL replayed, the manifest read — and its answers are bit-identical to the
+live shard's, which is the durability work made observable. "No row from a
+missing shard" is deliberately not the claim: a shard can answer the candidate
+call and then stop answering fetches, and the rows it already contributed are
+correct rows. What the boundary cost: an unranked scan now returns each
+shard's best `offset + k` rows as sort values and keys, with documents fetched
+afterwards for the rows that make the page, one call per shard, so a
+`LIMIT 5` over three shards still decodes five documents; and the plan lists
+shards by index whatever order they answered in.
+
 **`DROP` is ordered so that a crash anywhere in it opens cleanly.** A
 collection's directory is renamed aside first — one atomic step, the point of
 no return — then the catalog is published without the entry, then the
@@ -294,10 +320,10 @@ without a dot.
 
 Everything that needs more than one process: consensus and replication, follower
 reads and closed timestamps, hedged requests, two-phase commit for multi-shard
-writes, stateless compaction workers, dynamic shard split and merge, and a
-deterministic simulator. The `archived` tier is an S3-compatible object store
-when one is configured and a local directory that stands in for one when not;
-the client is in-tree and plain HTTP, since the crate carries no TLS.
+writes, stateless compaction workers, and dynamic shard split and merge. The
+`archived` tier is an S3-compatible object store when one is configured and a
+local directory that stands in for one when not; the client is in-tree and
+plain HTTP, since the crate carries no TLS.
 
 The *boundaries* those attach to are real, and that is the point of having built
 them first:
@@ -316,6 +342,11 @@ them first:
 - **Placement is derived, not assigned.** Every node computes the holder of a
   `minimal` index from the tablet map it already has, so no tier change costs a
   coordination round.
+- **A query reaches a shard through one boundary**, `plan::service::ShardService`:
+  statistics, prefix expansion, candidates, an unranked scan, payload fetches,
+  and nothing else. Today it is answered by direct call; a transport is
+  another implementation of it, and the simulator below already puts a seeded
+  fault schedule there.
 
 That combination makes the distributed exit criterion testable now:
 `exact_mode_is_bit_identical_across_shard_counts` runs the same corpus at 1, 3
@@ -775,6 +806,7 @@ guarantee:
 | a pinned seal emits at most `max_versions` segments, and an unpinned one does not seal on depth | `shard::tests::a_pinned_seal_fans_out_to_at_most_max_versions_segments` (twelve versions at a threshold of four: three seals of four pinned, one seal of one unpinned) |
 | a dropped collection leaves nothing behind under its name, and an interrupted drop completes at the next open | `engine::tests::dropping_a_collection_removes_it_and_everything_recorded_against_its_name` (files, statistics and clocks gone; a recreated collection measured afresh; the policy refusal; the interrupted state completed and swept at open), `archive_s3::dropping_a_collection_deletes_its_objects_from_the_store` |
 | a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
+| a fault on the coordinator-to-shard boundary can shorten an answer only by saying so, and a seeded run reproduces exactly | `sim::tests::a_fault_cannot_change_an_answer_without_saying_so` (twenty seeds of drops and restarts, every query shape: refused or bit-identical, never different), `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (`missing` is exactly the dropped shards, no second call to a shard given up on, real rows only, and the cache holds no partial sum afterwards), `sim::tests::a_shard_that_restarted_answers_exactly_what_it_did_before` (every call answered by a replacement opened from the directory), `sim::tests::the_order_shards_answer_in_does_not_change_the_answer` (and the plan lists shards by index), `sim::tests::a_seeded_run_reproduces_its_trace_and_its_answers` |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |

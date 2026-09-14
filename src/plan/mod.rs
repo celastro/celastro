@@ -8,6 +8,7 @@
 pub mod exec;
 pub mod explain;
 pub mod fusion;
+pub mod service;
 
 pub use exec::{run_select, ExecInput, QueryResult, Row};
 pub use explain::Explain;
