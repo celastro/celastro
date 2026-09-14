@@ -17,67 +17,20 @@ docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
 ```
 
-`docker export` takes a container, not an image, so seeing the whole filesystem
-means creating one, listing it and throwing it away:
+The image holds five things of its own: the binary, `LICENSE`, `COPYRIGHT`,
+the `/data` directory and the `.keep` that makes it exist; everything else
+`docker export` lists (`.dockerenv`, `dev/`, `etc/`, `proc/`, `sys/`) is the
+runtime's, made for every container and empty. The binary, the licence and
+the notice are root-owned and not writable by the user the image runs as, on
+purpose: a process able to overwrite its own executable has a capability with
+no legitimate use. UID 65532 owns the data directory and nothing else. No
+shell, no libc, no package manager, nothing to patch, and nothing running as
+root.
 
-```
-$ cid=$(docker create celastro)
-$ docker export "$cid" | tar -tv
--rwxr-xr-x 0/0               0 2026-09-14 12:57 .dockerenv
--rw-r--r-- 0/0             660 2026-09-14 12:55 COPYRIGHT
--rw-r--r-- 0/0           34523 2026-09-09 19:41 LICENSE
--rwxr-xr-x 0/0         2474720 2026-09-14 12:56 celastro-cli
-drwxr-xr-x 65532/65532       0 2026-09-14 12:56 data/
--rw-r--r-- 65532/65532       0 2026-09-14 12:56 data/.keep
-drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/
--rwxr-xr-x 0/0               0 2026-09-14 12:57 dev/console
-drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/pts/
-drwxr-xr-x 0/0               0 2026-09-14 12:57 dev/shm/
-drwxr-xr-x 0/0               0 2026-09-14 12:57 etc/
--rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/hostname
--rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/hosts
-lrwxrwxrwx 0/0               0 2026-09-14 12:57 etc/mtab -> /proc/mounts
--rwxr-xr-x 0/0               0 2026-09-14 12:57 etc/resolv.conf
-drwxr-xr-x 0/0               0 2026-09-14 12:57 proc/
-drwxr-xr-x 0/0               0 2026-09-14 12:57 sys/
-$ docker rm "$cid" >/dev/null
-```
-
-Seventeen entries, five of them from this file: the licence, the copyright
-notice that applies it, the binary, the data directory and the `.keep` that
-makes the directory exist. The other twelve —
-`.dockerenv` and everything under `dev/`, `etc/`, `proc/` and `sys/` — are the
-runtime's, made for every container whatever the image, and every one of them is
-zero-length here. The timestamps are the build's and the container's, so yours
-will differ.
-
-The three files are root-owned — the binary mode 0755, the licence and the
-notice 0644 — on purpose: the unprivileged user this image runs as can read and execute the
-binary, and nothing in the container can write it. A process able to overwrite
-its own executable has a capability with no legitimate use and one obvious
-misuse, so the `COPY` that places it carries no `--chown`. UID 65532 owns what
-it has to own — the data directory — and no more. No shell, no libc, no package
-manager, nothing to patch, and nothing running as root.
-
-Size. The stable figure is the content, because the compiler is pinned and the
-binary reproduces byte for byte: 2,474,720 bytes of binary on the build behind
-this paragraph, 34,523 of licence and 660 of notice, about 2.51 MB uncompressed
-and about 1.16 MB compressed. What Docker
-*prints* is neither of those unconditionally — it depends on the image store,
-which `docker info | grep driver-type` names. On Docker 29.1.3 with the
-containerd store (`io.containerd.snapshotter.v1`), `docker images` reports DISK
-USAGE 3.7 MB and CONTENT SIZE 1.16 MB — disk usage counts the compressed blobs
-*and* the unpacked snapshot — and `docker image inspect --format '{{.Size}}'`
-prints the compressed content size, `1157211` on the build behind this
-paragraph. On the older non-containerd store the same field is the uncompressed
-total instead, the 2.51 MB that `docker history` breaks down as 2.48 MB + 41 kB
-+ 8.19 kB + 8.19 kB (the binary, the licence, the notice, the data directory).
-
-Do not hold `.Size` to the byte. On an earlier toolchain pin, independent
-`--no-cache` builds of one source produced six different values between 918581
-and 918586 around an identical binary. Compressing image metadata is not a
-reproducible operation; compiling this source is, and the binary size is the
-number to quote.
+The image is a few megabytes. The compiler is pinned and the binary
+reproduces byte for byte, so the binary's size is the stable number; what
+`docker images` and `docker image inspect` print depends on the image store
+and is not reproducible to the byte, so do not hold them to one.
 
 `docker run --read-only` works — `demo` and a volume-backed `exec` both complete
 under it — because nothing is written outside the data directory.
@@ -172,19 +125,9 @@ $ ls -ldn ./data
 drwxr-xr-x 2 0 0 4096 Sep 10 10:25 ./data
 ```
 
-Exit 1, and the directory Docker made is there, owned by root. A read-only
-statement against it fails too, and the shape is worth recognising: the query
-itself answers — against an empty database, so it answers with a planner error —
-and the save on the way out is the permission failure.
-
-```
-$ docker run --rm -v "$PWD/data:/data" celastro --dir /data exec 'SELECT * FROM notes'
-error: planner error: no such collection `notes`
-could not save: io error: Permission denied (os error 13)
-```
-
-Every session saves as it closes, so a container that only read still exits 1
-on a data directory it cannot write. Both fixes below start from the state
+Exit 1, and the directory Docker made is there, owned by root. Every session
+saves as it closes, so a container that only read still exits 1 on a data
+directory it cannot write. Both fixes below start from the state
 above — a `./data` that Docker has already created as `root:root` — and both
 therefore start with `sudo`, because that directory is root's and changing a
 file's owner is privileged on Linux. Either one is enough:
@@ -205,11 +148,6 @@ $ sudo rm -rf ./data
 $ mkdir ./data
 $ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/data:/data" celastro --dir /data exec 'CREATE COLLECTION notes (id TEXT PRIMARY KEY)'
 collection `notes` created with 1 shard(s)
-(2.35 ms)
-$ ls -ln ./data
-total 8
--rw-r--r-- 1 1000 1000   32 Sep 10 10:25 CATALOG
-drwxr-xr-x 3 1000 1000 4096 Sep 10 10:25 collections
 ```
 
 `--user` alone against a directory Docker made is not a fix: your UID cannot
@@ -271,25 +209,13 @@ arrives after the handshake, when the forward finds nothing at the other end:
 ```
 $ cid=$(docker run -d -p 8787:8787 -v celastro-data:/data celastro --dir /data serve)
 $ curl -sv http://127.0.0.1:8787/
-*   Trying 127.0.0.1:8787...
 * Connected to 127.0.0.1 (127.0.0.1) port 8787
-> GET / HTTP/1.1
-> Host: 127.0.0.1:8787
-> User-Agent: curl/8.5.0
-> Accept: */*
-> 
 * Recv failure: Connection reset by peer
-* Closing connection
 ```
 
-`-d` prints a 64-character container id; capturing it keeps the transcript
-readable and leaves a handle to stop the container with.
-
-The container's log stops at the lines `serve` printed on startup, and a
-connection that had arrived and then failed would have left one more — `serve`
-prints `celastro-cli: connection dropped: …` for that. Nothing reached the
-accept loop. Do not answer this by binding `0.0.0.0`. That bind is the thing the
-design removed, and a published SQL console is a published shell.
+Nothing reached the accept loop: the container's log has no `connection
+dropped` line. Do not answer this by binding `0.0.0.0`. That bind is the thing
+the design removed, and a published SQL console is a published shell.
 
 That container is still holding host port 8787, so it has to go before anything
 else can bind it:
@@ -311,11 +237,9 @@ stop the server when you are done.
 http://127.0.0.1:8787/?t=fdd2b8856f798668b6f29478e4f1fd5b
 ```
 
-Six lines, and only the URL is on stdout — pipe the command and you get that
-line and nothing else, which is the point of printing it there. The banner and
-the four-line warning are diagnostics on stderr. Docker copies the two streams
-to a terminal independently, so their order relative to each other is not
-fixed: the URL lands last here and first about as often.
+Only the URL is on stdout — pipe the command and you get that line and
+nothing else. The banner and the warning are diagnostics on stderr, and the
+two streams' order on a terminal is not fixed.
 
 That URL, token included, is what to `curl` or open. Ctrl-C in the terminal
 holding the command ends the server, saved and exit 0: `serve` handles SIGINT
