@@ -42,15 +42,15 @@ fn setup(db: &mut Db, n: usize) {
     db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, kind TEXT)").unwrap();
     db.execute(
         "CREATE INDEX items_body ON items USING fulltext (body) \
-         WITH (analyzer = 'english', tier = 'hot')",
+         WITH (analyzer = 'english', tier = 'active')",
     )
     .unwrap();
     db.execute(
         "CREATE INDEX items_emb ON items USING vector (embedding) \
-         WITH (dims = 8, metric = 'cosine', tier = 'cold')",
+         WITH (dims = 8, metric = 'cosine', tier = 'cached')",
     )
     .unwrap();
-    db.execute("CREATE INDEX items_kind ON items USING secondary (kind) WITH (tier = 'hot')")
+    db.execute("CREATE INDEX items_kind ON items USING secondary (kind) WITH (tier = 'active')")
         .unwrap();
     for i in 0..n {
         db.insert("items", doc(i)).unwrap();
@@ -113,28 +113,21 @@ fn a_tier_is_part_of_the_index_definition_and_survives_a_reopen() {
 }
 
 #[test]
-fn every_spelling_of_a_tier_parses_and_an_unknown_one_is_refused() {
+fn a_tier_has_one_name_and_the_old_temperature_words_are_refused() {
     for (s, want) in [
         ("active", Tier::Active),
         ("ACTIVE", Tier::Active),
-        ("hot", Tier::Active),
-        ("ram", Tier::Active),
-        ("memory", Tier::Active),
-        ("resident", Tier::Active),
         ("minimal", Tier::Minimal),
-        ("warm", Tier::Minimal),
-        ("pinned", Tier::Minimal),
-        ("single", Tier::Minimal),
-        ("one_copy", Tier::Minimal),
         ("cached", Tier::Cached),
-        ("cold", Tier::Cached),
-        ("disk", Tier::Cached),
-        ("nvme", Tier::Cached),
         ("archived", Tier::Archived),
-        ("s3", Tier::Archived),
-        ("object_store", Tier::Archived),
     ] {
         assert_eq!(Tier::parse(s).unwrap(), want, "spelling `{s}`");
+    }
+    // The temperature words that used to be taken as aliases are refused
+    // like any other unknown word: a tier has one name.
+    for alias in ["hot", "ram", "warm", "cold", "disk", "s3", "object_store"] {
+        let e = Tier::parse(alias).unwrap_err().to_string();
+        assert!(e.contains(alias) && e.contains("cached"), "{alias}: {e}");
     }
     let e = Tier::parse("lukewarm").unwrap_err().to_string();
     assert!(
@@ -778,7 +771,7 @@ fn archiving_a_collection_relocates_its_segment_files() {
     assert!(count(&segs) > 0 && count(&arch) == 0);
 
     for i in ["items_body", "items_emb", "items_kind"] {
-        db.execute(&format!("ALTER INDEX {i} ON items SET TIER 's3'")).unwrap();
+        db.execute(&format!("ALTER INDEX {i} ON items SET TIER 'archived'")).unwrap();
     }
     assert_eq!(count(&segs), 0, "nothing local still wants a copy");
     assert!(count(&arch) > 0, "the file moved to the archive");
@@ -788,7 +781,7 @@ fn archiving_a_collection_relocates_its_segment_files() {
     assert_eq!(r.rows.len(), 4);
     assert!(db.residency().faults() > 0, "reading an archived segment is a fault-in");
 
-    db.execute("ALTER INDEX items_body ON items SET TIER 'hot'").unwrap();
+    db.execute("ALTER INDEX items_body ON items SET TIER 'active'").unwrap();
     assert!(count(&segs) > 0 && count(&arch) == 0, "one hot index brings the file back");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -846,7 +839,7 @@ fn a_policy_demotes_an_index_that_has_gone_unused() {
     setup(&mut db, 100);
     db.execute(
         "CREATE LIFECYCLE POLICY cool_down ON items FOR (items_body) \
-           MOVE TO cold AFTER 30 minutes OF INACTIVITY, \
+           MOVE TO cached AFTER 30 minutes OF INACTIVITY, \
            MOVE TO archived AFTER 7 days OF INACTIVITY",
     )
     .unwrap();
@@ -894,7 +887,8 @@ fn a_policy_can_key_on_creation_age_instead_of_use() {
 fn a_policy_with_no_index_list_covers_every_index_including_later_ones() {
     let mut db = Db::in_memory();
     setup(&mut db, 40);
-    db.execute("CREATE LIFECYCLE POLICY all_cold ON items MOVE TO cold AFTER 10 minutes").unwrap();
+    db.execute("CREATE LIFECYCLE POLICY all_cold ON items MOVE TO cached AFTER 10 minutes")
+        .unwrap();
     db.execute(
         "CREATE INDEX items_extra ON items USING fulltext (body) WITH (analyzer = 'standard')",
     )
@@ -918,7 +912,7 @@ fn an_access_promotes_a_demoted_index_back_to_its_declared_tier() {
     let mut db = Db::in_memory();
     setup(&mut db, 80);
     db.execute(
-        "CREATE LIFECYCLE POLICY cool ON items FOR (items_body) MOVE TO cold AFTER 5 minutes",
+        "CREATE LIFECYCLE POLICY cool ON items FOR (items_body) MOVE TO cached AFTER 5 minutes",
     )
     .unwrap();
     age("items", "items_body", &mut db, HOUR, 0);
@@ -944,13 +938,13 @@ fn a_policy_naming_an_index_that_does_not_exist_is_refused_at_creation() {
     setup(&mut db, 10);
     let e = db
         .execute(
-            "CREATE LIFECYCLE POLICY typo ON items FOR (items_embedding) MOVE TO cold AFTER 1 day",
+            "CREATE LIFECYCLE POLICY typo ON items FOR (items_embedding) MOVE TO cached AFTER 1 day",
         )
         .unwrap_err()
         .to_string();
     assert!(e.contains("items_embedding"), "{e}");
     let e = db
-        .execute("CREATE LIFECYCLE POLICY nope ON nosuch MOVE TO cold AFTER 1 day")
+        .execute("CREATE LIFECYCLE POLICY nope ON nosuch MOVE TO cached AFTER 1 day")
         .unwrap_err()
         .to_string();
     assert!(e.contains("nosuch"), "{e}");
@@ -961,24 +955,24 @@ fn durations_are_accepted_in_minutes_hours_and_days() {
     let mut db = Db::in_memory();
     setup(&mut db, 10);
     for (sql, want) in [
-        ("MOVE TO cold AFTER 90 minutes", 90 * MIN),
-        ("MOVE TO cold AFTER 1 minute", MIN),
-        ("MOVE TO cold AFTER 6 hours", 6 * HOUR),
-        ("MOVE TO cold AFTER 1 hr", HOUR),
-        ("MOVE TO cold AFTER 30 days", 30 * DAY),
-        ("MOVE TO cold AFTER 1 day", DAY),
+        ("MOVE TO cached AFTER 90 minutes", 90 * MIN),
+        ("MOVE TO cached AFTER 1 minute", MIN),
+        ("MOVE TO cached AFTER 6 hours", 6 * HOUR),
+        ("MOVE TO cached AFTER 1 hr", HOUR),
+        ("MOVE TO cached AFTER 30 days", 30 * DAY),
+        ("MOVE TO cached AFTER 1 day", DAY),
     ] {
         db.execute(&format!("CREATE LIFECYCLE POLICY p ON items {sql}")).unwrap();
         assert_eq!(db.catalog.policies["p"].rules[0].after.micros(), want, "{sql}");
         db.execute("DROP LIFECYCLE POLICY p").unwrap();
     }
     let e = db
-        .execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cold AFTER 3 fortnights")
+        .execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cached AFTER 3 fortnights")
         .unwrap_err()
         .to_string();
     assert!(e.contains("fortnight"), "{e}");
     let e = db
-        .execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cold AFTER 0 days")
+        .execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cached AFTER 0 days")
         .unwrap_err()
         .to_string();
     assert!(e.contains("positive"), "{e}");
@@ -992,7 +986,7 @@ fn policies_and_activity_survive_a_reopen() {
         setup(&mut db, 50);
         db.execute(
             "CREATE LIFECYCLE POLICY archive_old ON items FOR (items_emb, items_body) \
-               MOVE TO cold AFTER 2 hours OF INACTIVITY, \
+               MOVE TO cached AFTER 2 hours OF INACTIVITY, \
                MOVE TO archived AFTER 45 days SINCE CREATION",
         )
         .unwrap();
@@ -1018,7 +1012,7 @@ fn policies_and_activity_survive_a_reopen() {
 fn dropping_a_policy_stops_it_moving_anything() {
     let mut db = Db::in_memory();
     setup(&mut db, 30);
-    db.execute("CREATE LIFECYCLE POLICY p ON items FOR (items_body) MOVE TO cold AFTER 1 minute")
+    db.execute("CREATE LIFECYCLE POLICY p ON items FOR (items_body) MOVE TO cached AFTER 1 minute")
         .unwrap();
     ack(&mut db, "DROP LIFECYCLE POLICY p");
     age("items", "items_body", &mut db, DAY, 0);
@@ -1031,7 +1025,7 @@ fn dropping_a_policy_stops_it_moving_anything() {
 fn the_reports_say_what_is_resident_and_what_is_scheduled() {
     let mut db = Db::in_memory();
     setup(&mut db, 200);
-    db.execute("CREATE LIFECYCLE POLICY cool ON items MOVE TO cold AFTER 2 hours OF INACTIVITY")
+    db.execute("CREATE LIFECYCLE POLICY cool ON items MOVE TO cached AFTER 2 hours OF INACTIVITY")
         .unwrap();
     db.query("SELECT * FROM items WHERE text_match(body, 'postings') LIMIT 3").unwrap();
 
@@ -1259,7 +1253,7 @@ fn ordering_on_a_field_does_not_count_as_using_its_text_index() {
     let mut db = Db::in_memory();
     setup(&mut db, 40);
     db.execute(
-        "CREATE LIFECYCLE POLICY cool ON items FOR (items_body) MOVE TO cold AFTER 5 minutes",
+        "CREATE LIFECYCLE POLICY cool ON items FOR (items_body) MOVE TO cached AFTER 5 minutes",
     )
     .unwrap();
     age("items", "items_body", &mut db, HOUR, 0);
@@ -1284,7 +1278,7 @@ fn a_full_text_and_a_secondary_index_on_one_path_do_not_share_a_tier() {
     db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
     db.execute(
         "CREATE INDEX b_text ON items USING fulltext (body) \
-         WITH (analyzer='english', tier='hot')",
+         WITH (analyzer='english', tier='active')",
     )
     .unwrap();
     db.execute("CREATE INDEX b_col ON items USING secondary (body) WITH (tier='archived')")
@@ -1443,7 +1437,7 @@ fn a_damaged_catalog_is_reported_rather_than_silently_accepted() {
     {
         let mut db = Db::open(&d, DbOpts::default()).unwrap();
         setup(&mut db, 20);
-        db.execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cold AFTER 2 hours").unwrap();
+        db.execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cached AFTER 2 hours").unwrap();
         db.persist().unwrap();
     }
     let p = d.join("CATALOG");
@@ -1528,7 +1522,7 @@ fn a_rule_that_would_promote_is_refused_at_creation() {
     let mut db = Db::in_memory();
     setup(&mut db, 10);
     let e = db
-        .execute("CREATE LIFECYCLE POLICY warm ON items MOVE TO hot AFTER 1 day")
+        .execute("CREATE LIFECYCLE POLICY warm ON items MOVE TO active AFTER 1 day")
         .unwrap_err()
         .to_string();
     assert!(e.contains("never fire") && e.contains("declared tier"), "{e}");
@@ -1542,9 +1536,9 @@ fn creating_a_policy_that_already_exists_is_refused() {
     db.execute("CREATE COLLECTION other (id TEXT PRIMARY KEY)").unwrap();
     db.execute("CREATE INDEX other_b ON other USING fulltext (body) WITH (analyzer='standard')")
         .unwrap();
-    db.execute("CREATE LIFECYCLE POLICY retention ON items MOVE TO cold AFTER 1 day").unwrap();
+    db.execute("CREATE LIFECYCLE POLICY retention ON items MOVE TO cached AFTER 1 day").unwrap();
     let e = db
-        .execute("CREATE LIFECYCLE POLICY retention ON other MOVE TO cold AFTER 1 day")
+        .execute("CREATE LIFECYCLE POLICY retention ON other MOVE TO cached AFTER 1 day")
         .unwrap_err()
         .to_string();
     assert!(e.contains("already exists") && e.contains("items"), "{e}");
@@ -1556,9 +1550,9 @@ fn creating_a_policy_that_already_exists_is_refused() {
 fn since_access_is_accepted_as_a_synonym_for_of_inactivity() {
     let mut db = Db::in_memory();
     setup(&mut db, 10);
-    db.execute("CREATE LIFECYCLE POLICY a ON items MOVE TO cold AFTER 2 hours SINCE ACCESS")
+    db.execute("CREATE LIFECYCLE POLICY a ON items MOVE TO cached AFTER 2 hours SINCE ACCESS")
         .unwrap();
-    db.execute("CREATE LIFECYCLE POLICY b ON items MOVE TO cold AFTER 2 hours SINCE CREATION")
+    db.execute("CREATE LIFECYCLE POLICY b ON items MOVE TO cached AFTER 2 hours SINCE CREATION")
         .unwrap();
     assert_eq!(db.catalog.policies["a"].rules[0].trigger, Trigger::Inactivity);
     assert_eq!(db.catalog.policies["b"].rules[0].trigger, Trigger::SinceCreation);
@@ -1569,7 +1563,7 @@ fn since_access_is_accepted_as_a_synonym_for_of_inactivity() {
 fn a_zero_duration_is_refused_on_the_way_in_from_disk() {
     let mut db = Db::in_memory();
     setup(&mut db, 10);
-    db.execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cold AFTER 1 minute").unwrap();
+    db.execute("CREATE LIFECYCLE POLICY p ON items MOVE TO cached AFTER 1 minute").unwrap();
     let good = db.catalog.encode();
     assert!(celastro::catalog::Catalog::decode(&good).is_ok());
 
@@ -1653,7 +1647,7 @@ fn a_policy_built_by_hand_matches_the_one_the_parser_builds() {
     setup(&mut db, 10);
     db.execute(
         "CREATE LIFECYCLE POLICY p ON items FOR (items_body) \
-           MOVE TO cold AFTER 30 minutes OF INACTIVITY, \
+           MOVE TO cached AFTER 30 minutes OF INACTIVITY, \
            MOVE TO archived AFTER 2 days SINCE CREATION",
     )
     .unwrap();

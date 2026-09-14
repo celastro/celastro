@@ -125,16 +125,18 @@ pub enum Tier {
 
 impl Tier {
     pub fn parse(s: &str) -> Result<Tier> {
+        // One name per tier, and it is the name the reports print. There
+        // used to be temperature words beside them -- `hot`, `cold`, `ram`,
+        // `s3` and a dozen more -- and every one was a word a reader had to
+        // map back to a rung whose whole point is that it is not a
+        // temperature: `minimal` is not "a bit less hot" than `active`, it is
+        // the same speed on the node that holds it and `cached` on every
+        // other. A tier has one name.
         match s.to_ascii_lowercase().as_str() {
-            // Temperature words are accepted as aliases because they are what
-            // people type. They are not the canonical names, and the reports
-            // print the canonical ones: `minimal` is not "a bit less hot" than
-            // `active`, it is the same speed on the node that holds it and
-            // `cached` on every other.
-            "active" | "hot" | "ram" | "memory" | "resident" => Ok(Tier::Active),
-            "minimal" | "warm" | "pinned" | "single" | "one_copy" => Ok(Tier::Minimal),
-            "cached" | "cold" | "disk" | "ssd" | "nvme" => Ok(Tier::Cached),
-            "archived" | "archive" | "s3" | "object" | "object_store" => Ok(Tier::Archived),
+            "active" => Ok(Tier::Active),
+            "minimal" => Ok(Tier::Minimal),
+            "cached" => Ok(Tier::Cached),
+            "archived" => Ok(Tier::Archived),
             other => Err(Error::Schema(format!(
                 "unknown tier `{other}`; expected active, minimal, cached or archived"
             ))),
@@ -902,11 +904,31 @@ mod tests {
             assert_eq!(Tier::parse(t.name()).unwrap(), t);
             assert_eq!(Tier::from_u8(t.as_u8()), t);
         }
-        // The aliases people actually type.
-        assert_eq!(Tier::parse("RAM").unwrap(), Tier::Active);
-        assert_eq!(Tier::parse("disk").unwrap(), Tier::Cached);
-        assert_eq!(Tier::parse("s3").unwrap(), Tier::Archived);
-        assert!(Tier::parse("lukewarm").is_err());
+        // Case is not a second spelling; a temperature word is, and is
+        // refused naming the four tiers.
+        assert_eq!(Tier::parse("ACTIVE").unwrap(), Tier::Active);
+        for alias in [
+            "hot",
+            "ram",
+            "memory",
+            "resident",
+            "warm",
+            "pinned",
+            "single",
+            "one_copy",
+            "cold",
+            "disk",
+            "ssd",
+            "nvme",
+            "archive",
+            "s3",
+            "object",
+            "object_store",
+            "lukewarm",
+        ] {
+            let e = Tier::parse(alias).unwrap_err().to_string();
+            assert!(e.contains("active, minimal, cached or archived"), "{alias}: {e}");
+        }
     }
 
     #[test]

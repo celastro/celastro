@@ -184,14 +184,14 @@ fn doc(i: usize) -> Value {
 fn setup(db: &mut Db, n: usize) {
     db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, kind TEXT)").unwrap();
     db.execute(
-        "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english', tier = 'hot')",
+        "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english', tier = 'active')",
     )
     .unwrap();
     db.execute(
-        "CREATE INDEX items_emb ON items USING vector (embedding) WITH (dims = 8, metric = 'cosine', tier = 'cold')",
+        "CREATE INDEX items_emb ON items USING vector (embedding) WITH (dims = 8, metric = 'cosine', tier = 'cached')",
     )
     .unwrap();
-    db.execute("CREATE INDEX items_kind ON items USING secondary (kind) WITH (tier = 'hot')")
+    db.execute("CREATE INDEX items_kind ON items USING secondary (kind) WITH (tier = 'active')")
         .unwrap();
     for i in 0..n {
         db.insert("items", doc(i)).unwrap();
@@ -242,7 +242,7 @@ fn archiving_puts_the_segment_in_the_store_and_bringing_it_back_deletes_it() {
         "the answer came from somewhere other than the store"
     );
 
-    db.execute("ALTER INDEX items_body ON items SET TIER 'hot'").unwrap();
+    db.execute("ALTER INDEX items_body ON items SET TIER 'active'").unwrap();
     assert!(fake.keys().is_empty(), "the object outlived its local copy: {:?}", fake.keys());
     assert!(count(&segs) > 0, "the file did not come back");
     let r = db.query("SELECT id FROM items WHERE text_match(body, 'postings') LIMIT 4").unwrap();

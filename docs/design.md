@@ -97,12 +97,16 @@ default trigger; `SINCE CREATION` is the other question you might be asking.
 
 ### The ladder
 
-| tier | decoded on | bytes live | first query after idle | aliases accepted |
-|---|---|---|---|---|
-| `active` | every node holding the tablet | local NVMe | already there | `hot`, `ram`, `memory`, `resident` |
-| `minimal` | exactly one node, whatever the replica count | local NVMe | already there on that node; one segment read elsewhere | `warm`, `pinned`, `single`, `one_copy` |
-| `cached` | no node between queries | local NVMe | one segment read | `cold`, `disk`, `ssd`, `nvme` |
-| `archived` | never | archive store | one archive round trip, or refused | `archive`, `s3`, `object_store` |
+| tier | decoded on | bytes live | first query after idle |
+|---|---|---|---|
+| `active` | every node holding the tablet | local NVMe | already there |
+| `minimal` | exactly one node, whatever the replica count | local NVMe | already there on that node; one segment read elsewhere |
+| `cached` | no node between queries | local NVMe | one segment read |
+| `archived` | never | archive store | one archive round trip, or refused |
+
+A tier has one name, the one the reports print. The temperature words that
+used to be accepted beside them were a second vocabulary for a ladder whose
+point is that its rungs are not temperatures.
 
 Each name states its own guarantee rather than a temperature, because the tiers
 do not differ along one axis. `active` and `minimal` are both "decoded in RAM";

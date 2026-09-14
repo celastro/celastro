@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A tier has one name.** `active`, `minimal`, `cached` and `archived` are
+the only spellings `CREATE INDEX ... WITH (tier = ...)`, `ALTER INDEX ...
+SET TIER` and a lifecycle policy's `MOVE TO` accept; the temperature words
+that were taken as aliases — `hot`, `ram`, `memory`, `resident`, `warm`,
+`pinned`, `single`, `one_copy`, `cold`, `disk`, `ssd`, `nvme`, `archive`,
+`s3`, `object`, `object_store` — are refused naming the four. A statement
+that used one has to be rewritten, which is why this is a minor and not a
+patch.
+
 ## 0.18.2 — 2026-09-14
 
 A fix that moves no behaviour, hence a patch.
