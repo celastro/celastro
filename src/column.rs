@@ -12,7 +12,7 @@
 //! without a join (§4.2).
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::bitmap::Bitmap;
 use crate::codec::*;
@@ -383,6 +383,7 @@ impl Column {
     pub fn filter(&self, op: CmpOp, lit: &Value) -> Bitmap {
         let n = self.num_docs;
         let mut out = Bitmap::new(n);
+        let present = || self.present();
         match op {
             CmpOp::IsNull => {
                 // A mismatched ordinal holds a value — just not one this column
@@ -398,9 +399,48 @@ impl Column {
                 return self.present().clone();
             }
             CmpOp::In => {
-                if let Value::Array(items) = lit {
+                let Value::Array(items) = lit else { return out };
+                // A handful of literals: one equality scan each, with the
+                // bloom filter and the zone maps each one gets. Past that,
+                // one scan of the column against a set, because a list of
+                // thousands of keys -- the shape a client-side join produces
+                // -- was being matched per document against every literal.
+                if items.len() <= IN_SCAN_PER_LITERAL {
                     for item in items {
                         out.or_inplace(&self.filter(CmpOp::Eq, item));
+                    }
+                    return out;
+                }
+                let Some(set) = InSet::new(lit) else { return out };
+                match &self.data {
+                    ColumnData::Str { present, offsets, data } => {
+                        for i in present.iter() {
+                            let (a, b) =
+                                (offsets[i as usize] as usize, offsets[i as usize + 1] as usize);
+                            if std::str::from_utf8(&data[a..b]).is_ok_and(|s| set.has_str(s)) {
+                                out.set(i as usize);
+                            }
+                        }
+                    }
+                    ColumnData::MultiStr { present, starts, offsets, data, .. } => {
+                        for i in present.iter() {
+                            let (s, e) =
+                                (starts[i as usize] as usize, starts[i as usize + 1] as usize);
+                            let hit = (s..e).any(|j| {
+                                let (a, b) = (offsets[j] as usize, offsets[j + 1] as usize);
+                                std::str::from_utf8(&data[a..b]).is_ok_and(|v| set.has_str(v))
+                            });
+                            if hit {
+                                out.set(i as usize);
+                            }
+                        }
+                    }
+                    _ => {
+                        for i in present().iter() {
+                            if set.matches(&self.get(i)) {
+                                out.set(i as usize);
+                            }
+                        }
                     }
                 }
                 return out;
@@ -1368,6 +1408,94 @@ fn scalar_matches(v: &Value, op: CmpOp, lit: &Value) -> bool {
 /// not be indistinguishable from "this document does not match": that turns a
 /// storage fault into a quietly shorter answer, which is the worst way for a
 /// database to fail.
+/// Past this many literals an `IN` is one scan against a set rather than
+/// one equality scan per literal.
+pub const IN_SCAN_PER_LITERAL: usize = 4;
+
+/// An `IN` list prepared once for a scan: the string literals in a hash
+/// set, the rest as they were. Answers exactly what [`matches()`] and
+/// [`comparable()`] answer for `CmpOp::In` -- the linear definition stays the
+/// definition, and `in_set_means_what_the_linear_definition_means` pins the
+/// two together -- at one lookup per document instead of one comparison per
+/// literal per document. Strings are the case that matters: a key set from
+/// a client-side join is thousands of them.
+pub struct InSet<'a> {
+    strs: HashSet<&'a str>,
+    /// Non-string scalar literals, compared with a scalar value or with
+    /// each element of an array value.
+    scalars: Vec<&'a Value>,
+    /// Array literals, compared with an array value as a whole and never
+    /// with its elements -- which is what the linear definition does.
+    arrays: Vec<&'a Value>,
+}
+
+impl<'a> InSet<'a> {
+    /// `None` unless the literal is an array, which is what the grammar
+    /// produces for `IN (...)`.
+    pub fn new(lit: &'a Value) -> Option<InSet<'a>> {
+        let Value::Array(items) = lit else { return None };
+        let mut strs = HashSet::with_capacity(items.len());
+        let mut scalars = Vec::new();
+        let mut arrays = Vec::new();
+        for x in items {
+            match x {
+                Value::Str(s) => {
+                    strs.insert(s.as_str());
+                }
+                Value::Array(_) => arrays.push(x),
+                other => scalars.push(other),
+            }
+        }
+        Some(InSet { strs, scalars, arrays })
+    }
+
+    pub fn has_str(&self, s: &str) -> bool {
+        self.strs.contains(s)
+    }
+
+    fn element_matches(&self, e: &Value) -> bool {
+        match e {
+            Value::Null => false,
+            Value::Str(s) => self.strs.contains(s.as_str()),
+            other => self.scalars.iter().any(|x| compare_typed(other, x) == Some(Ordering::Equal)),
+        }
+    }
+
+    fn element_comparable(&self, e: &Value) -> bool {
+        match e {
+            Value::Null => false,
+            Value::Str(_) => !self.strs.is_empty(),
+            other => self.scalars.iter().any(|x| compare_typed(other, x).is_some()),
+        }
+    }
+
+    /// Exactly `matches(v, CmpOp::In, lit)`.
+    pub fn matches(&self, v: &Value) -> bool {
+        match v {
+            Value::Null => false,
+            // A scalar array matches if an element does, or if the whole
+            // array equals an array literal in the list.
+            Value::Array(a) => {
+                a.iter().any(|e| self.element_matches(e))
+                    || self.arrays.iter().any(|x| compare_typed(v, x) == Some(Ordering::Equal))
+            }
+            other => self.element_matches(other),
+        }
+    }
+
+    /// Exactly `comparable(v, CmpOp::In, lit)`.
+    pub fn comparable(&self, v: &Value) -> bool {
+        match v {
+            Value::Null => false,
+            Value::Array(a) => {
+                a.iter().any(|e| self.element_comparable(e))
+                    || self.arrays.iter().any(|x| compare_typed(v, x).is_some())
+            }
+            other => self.element_comparable(other),
+        }
+    }
+}
+
 pub fn filter_variant(
     blobs: &dyn Fn(u32) -> Result<Option<Vec<u8>>>,
     num_docs: usize,
@@ -1377,10 +1505,15 @@ pub fn filter_variant(
     candidates: &Bitmap,
 ) -> Result<Bitmap> {
     let mut out = Bitmap::new(num_docs);
+    let set = if op == CmpOp::In { InSet::new(lit) } else { None };
     for ord in candidates.iter() {
         let Some(blob) = blobs(ord)? else { continue };
         let v = crate::variant::decode_path(&blob, path).unwrap_or(Value::Null);
-        if matches(&v, op, lit) {
+        let hit = match &set {
+            Some(set) => set.matches(&v),
+            None => matches(&v, op, lit),
+        };
+        if hit {
             out.set(ord as usize);
         }
     }
@@ -1398,10 +1531,15 @@ pub fn comparable_variant(
     candidates: &Bitmap,
 ) -> Result<Bitmap> {
     let mut out = Bitmap::new(num_docs);
+    let set = if op == CmpOp::In { InSet::new(lit) } else { None };
     for ord in candidates.iter() {
         let Some(blob) = blobs(ord)? else { continue };
         let v = crate::variant::decode_path(&blob, path).unwrap_or(Value::Null);
-        if comparable(&v, op, lit) {
+        let hit = match &set {
+            Some(set) => set.comparable(&v),
+            None => comparable(&v, op, lit),
+        };
+        if hit {
             out.set(ord as usize);
         }
     }
@@ -1411,6 +1549,93 @@ pub fn comparable_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set is an optimisation of the linear definition, never a
+    /// redefinition: over every mix of value and literal shapes the two
+    /// answer alike, for the match and for its three-valued companion.
+    #[test]
+    fn in_set_means_what_the_linear_definition_means() {
+        let scalars = vec![
+            Value::Null,
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Float(1.0),
+            Value::Float(2.5),
+            Value::Bool(true),
+        ];
+        let mut values = scalars.clone();
+        values.push(Value::Array(vec![Value::Str("z".into()), Value::Int(2)]));
+        values.push(Value::Array(vec![Value::Array(vec![Value::Int(1)])]));
+        values.push(Value::Array(vec![]));
+        values.push(Value::Array(vec![Value::Null]));
+        let lists = vec![
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Str("a".into()), Value::Str("q".into())]),
+            Value::Array(vec![Value::Int(1), Value::Int(9)]),
+            Value::Array(vec![Value::Float(1.0), Value::Str("b".into())]),
+            Value::Array(vec![Value::Array(vec![Value::Str("z".into()), Value::Int(2)])]),
+            Value::Array(vec![Value::Array(vec![Value::Int(1)]), Value::Null]),
+            Value::Array(vec![Value::Bool(true)]),
+        ];
+        for lit in &lists {
+            let set = InSet::new(lit).unwrap();
+            for v in &values {
+                assert_eq!(set.matches(v), matches(v, CmpOp::In, lit), "{v:?} IN {lit:?}");
+                assert_eq!(set.comparable(v), comparable(v, CmpOp::In, lit), "{v:?} IN? {lit:?}");
+            }
+        }
+        assert!(InSet::new(&Value::Int(1)).is_none(), "IN takes an array");
+    }
+
+    /// An `IN` of ten thousand keys is one scan, not ten thousand: the
+    /// answer is the union of the equalities, and the cost is within a
+    /// small multiple of one equality's. Reverting to a scan per literal
+    /// costs thousands of times an equality here.
+    #[test]
+    fn an_in_list_of_ten_thousand_keys_costs_a_scan_not_a_scan_per_key() {
+        let n = 20_000usize;
+        let mut b = ColumnBuilder::new("id", ValueType::Str);
+        for i in 0..n {
+            b.push(i as u32, Some(Value::Str(format!("p{i:06}"))));
+        }
+        let col = b.finish(n);
+        // Every even key up to 20000 -- half in the column, half beyond it.
+        let items: Vec<Value> = (0..10_000).map(|i| Value::Str(format!("p{:06}", i * 2))).collect();
+        let lit = Value::Array(items);
+        let t0 = std::time::Instant::now();
+        let eq = col.filter(CmpOp::Eq, &Value::Str("p000042".into()));
+        let t_eq = t0.elapsed();
+        assert_eq!(eq.popcount(), 1);
+        let t0 = std::time::Instant::now();
+        let got = col.filter(CmpOp::In, &lit);
+        let t_in = t0.elapsed();
+        assert_eq!(got.popcount(), 10_000, "every even key under 20000");
+        assert!(got.get(0) && got.get(19_998) && !got.get(1) && !got.get(19_999));
+        assert!(
+            t_in <= t_eq * 200 + std::time::Duration::from_millis(20),
+            "IN of 10k keys took {t_in:?} against {t_eq:?} for one equality"
+        );
+        // The same list against the three other stores the column can be.
+        let mut b = ColumnBuilder::new("tags", ValueType::Array);
+        for i in 0..n {
+            b.push(
+                i as u32,
+                Some(Value::Array(vec![Value::Str(format!("p{i:06}")), Value::Str("x".into())])),
+            );
+        }
+        let multi = b.finish(n);
+        assert_eq!(multi.filter(CmpOp::In, &lit).popcount(), 10_000);
+        let mut b = ColumnBuilder::new("n", ValueType::Number);
+        for i in 0..n {
+            b.push(i as u32, Some(Value::Int(i as i64)));
+        }
+        let nums = b.finish(n);
+        let ints = Value::Array((0..10_000).map(|i| Value::Int(i * 2)).collect());
+        assert_eq!(nums.filter(CmpOp::In, &ints).popcount(), 10_000);
+        assert_eq!(nums.filter(CmpOp::In, &lit).popcount(), 0, "strings match no number");
+    }
 
     fn num_col(n: usize) -> Column {
         let mut b = ColumnBuilder::new("n", ValueType::Number);

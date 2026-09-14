@@ -3747,6 +3747,19 @@ mod tests {
             ("n", IsNull, Value::Null),
             ("n", IsNotNull, Value::Null),
             ("n", In, Value::Array(vec![Value::Int(1), Value::Int(9)])),
+            ("s", In, Value::Array(vec![Value::Str("alpha".into()), Value::Str("nope".into())])),
+            // Past the per-literal threshold: the set scan, on both sides.
+            (
+                "s",
+                In,
+                Value::Array(
+                    ["alpha", "beta", "gamma", "delta", "odd", "x", "y"]
+                        .iter()
+                        .map(|s| Value::Str(s.to_string()))
+                        .collect(),
+                ),
+            ),
+            ("n", In, Value::Array((0..40).map(|i| Value::Int(i - 8)).collect())),
             ("tags", ArrayContains, Value::Str("hot".into())),
             ("tags", Eq, Value::Str("hot".into())),
             ("tags", Ne, Value::Str("cold".into())),

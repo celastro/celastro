@@ -270,12 +270,15 @@ impl Memtable {
     /// *defined* rather than true — the negation half of three-valued logic.
     pub fn eval(&self, path: &str, op: CmpOp, lit: &Value, want_comparable: bool) -> Bitmap {
         let mut out = Bitmap::new(self.docs.len());
+        // An `IN` list is prepared once for the scan; see `column::InSet`.
+        let set = if op == CmpOp::In { crate::column::InSet::new(lit) } else { None };
         for (i, d) in self.docs.iter().enumerate() {
             let v = d.doc.path(path).cloned().unwrap_or(Value::Null);
-            let hit = if want_comparable {
-                crate::column::comparable(&v, op, lit)
-            } else {
-                matches(&v, op, lit)
+            let hit = match (&set, want_comparable) {
+                (Some(set), true) => set.comparable(&v),
+                (Some(set), false) => set.matches(&v),
+                (None, true) => crate::column::comparable(&v, op, lit),
+                (None, false) => matches(&v, op, lit),
             };
             if hit {
                 out.set(i);

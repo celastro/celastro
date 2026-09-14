@@ -525,30 +525,38 @@ console's HTTP API in one process; every fused statement was run ten times
 and returned identical rows every time.
 
 Outgoing walks — what `x` cites and what those cite — reach 17 to 27
-documents. The three statements cost 83 to 86 ms together, 28 to 30 ms for
-the fused one, against 26 to 32 ms for the same text-and-vector statement
+documents. The three statements cost 96 to 100 ms together, 27 to 31 ms for
+the fused one, against 26 to 31 ms for the same text-and-vector statement
 without the graph filter: the walk costs two extra round trips of a
 statement's fixed overhead and nothing else. Incoming walks from the ten
 most-cited documents — what cites `x` and what cites those — reach 18,147 to
 43,861 documents, up to 88% of the corpus. There the three statements cost
-5.0 to 17.8 seconds: the second hop carries 2,533 to 7,717 keys as SQL
-literals and takes 3.0 to 12.4 s, and the fused statement carries the whole
-frontier and takes 1.9 to 5.3 s, against 26 to 30 ms for the same statement
-without the graph filter. That is a factor of 200 to 600, and all of it is
-the key set travelling as a list of literals and being matched per document.
+278 to 862 ms: the second hop carries 2,533 to 7,717 keys in and 18,000 to
+44,000 rows out and takes 198 to 709 ms, and the fused statement carries the
+whole frontier as literals and takes 34 to 75 ms, against 26 to 30 ms for the
+same statement without the graph filter.
 
-Three things follow. The fused evaluation is not where the cost is: text,
-vector and structured predicates over 50,000 documents answer in under
-30 ms with or without a neighbourhood, so decision 3 — the frontier as keys
-until the last hop, then one key-set-to-bitmap pass per segment — is aimed at
-the whole of the measured cost, and the number the slice has to show is a
-hub walk answering in the low hundreds of milliseconds, not seconds. Second,
-a two-hop neighbourhood of a hub is most of the corpus: `max_frontier` will
-bind on real graphs at small `k`, which is why a cut that says so is part of
-the design and not an option on it. Third, `IN` with thousands of literals is
-slow in its own right, walk or no walk — it is evaluated per document against
-the list — and deserves a hash set per statement whether or not this section
-is ever built; that is filed on its own.
+Those are the numbers after a fix the first run of this measurement found.
+On the crate as it was, the same hub walks cost 5.0 to 17.8 seconds — the
+second hop 3.0 to 12.4 s and the fused statement 1.9 to 5.3 s — because an
+`IN` list was evaluated per document against every literal; it is one scan
+against a set now, and the measurement is what pinned the fix.
+
+Three things follow. The fused evaluation is not where the remaining cost is:
+matching a 44,000-key neighbourhood inside the text-and-vector statement
+costs 10 to 45 ms over the statement without it, so decision 3 — the
+frontier as keys until the last hop, then one key-set-to-bitmap pass per
+segment — starts from a pass that is already cheap. What is left is the key
+set travelling: out of the database as rows and back in as literals, two
+round trips of up to 44,000 keys, 200 to 700 ms on a loopback connection and
+more on a network. The slice keeps the frontier inside the plan, so the number
+it has to show is a hub walk within a few times the statement without the
+walk, with nothing crossing the client. Second, a two-hop neighbourhood of a
+hub is most of the corpus: `max_frontier` will bind on real graphs at small
+`k`, which is why a cut that says so is part of the design and not an option
+on it. Third, every fused statement returned identical rows across ten runs,
+before and after the fix, which is the property the slice has to keep across
+shard counts.
 
 ### Done when
 

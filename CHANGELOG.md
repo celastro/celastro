@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`IN` with a long list is one scan against a set.** It was one equality
+scan per literal on a column and one comparison per literal per document
+elsewhere, so a list of thousands of keys — the shape a client-side join
+produces — cost seconds where the same statement without it cost
+milliseconds: measured in docs/design.md, a 7,717-key `IN` over 250,000
+documents went from 12 s to 33 ms. Past four literals the list is prepared
+once and each document is a lookup; the semantics are unchanged and pinned
+against the linear definition. `column::InSet` is public.
+
 ## 0.18.1 — 2026-09-14
 
 A notice and a field, hence a patch.
