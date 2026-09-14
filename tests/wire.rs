@@ -403,3 +403,110 @@ fn a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A walk whose edges and nodes are both spread over three nodes answers,
+/// from any node, what one process answers -- the frontier crosses the wire
+/// at every hop through `expand` and `present`, the shards on other nodes
+/// bind the same key set the coordinator did, and the plan shows the hops.
+#[test]
+fn a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("walk-a");
+    let b = Node::start("walk-b");
+    let c = Node::start("walk-c");
+    let one_dir = dir("walk-one");
+    let mut one = Db::open(&one_dir, DbOpts::default()).unwrap();
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+
+    const EDGES: &str =
+        "CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT \
+                         NOT NULL) WITH (nodes_of = 'items', splits = ['e090', 'e180'])";
+    const ADJ: &str = "CREATE INDEX cites_adj ON cites USING adjacency (src, dst)";
+    for sql in [CREATE, INDEXES[0], INDEXES[1], EDGES, ADJ] {
+        let m = a.ack(sql);
+        assert!(m.contains(" on ") || m.contains("and on"), "{sql}: {m}");
+        one.execute(sql).unwrap();
+    }
+    assert_eq!(b.local_shards("cites"), vec![1]);
+    for i in 0..90usize {
+        let via = [&a, &b, &c][i % 3];
+        if i == 60 {
+            a.ack("FLUSH items");
+            a.ack("FLUSH cites");
+            one.execute("FLUSH items").unwrap();
+            one.execute("FLUSH cites").unwrap();
+        }
+        via.db.lock().unwrap().insert("items", doc(i)).unwrap();
+        one.insert("items", doc(i)).unwrap();
+        for (j, step) in [1usize, 3, 11].iter().enumerate() {
+            let e = celastro::json::parse(&format!(
+                r#"{{"id":"e{:03}","src":"doc-{i:03}","dst":"doc-{:03}","w":{j}}}"#,
+                i * 3 + j,
+                (i + step) % 90
+            ))
+            .unwrap();
+            via.db.lock().unwrap().insert("cites", e.clone()).unwrap();
+            one.insert("cites", e).unwrap();
+        }
+    }
+    assert!(b.db.lock().unwrap().delete_key("items", "t1\u{1}doc-013").unwrap());
+    assert!(one.delete_key("items", "t1\u{1}doc-013").unwrap());
+
+    let walks = [
+        "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-010' VIA cites AND text_match(body, \
+         'graph') ORDER BY embedding <=> [0.5, 0.5, 0.5, 1.0] LIMIT 10",
+        "SELECT id FROM items WHERE id WITHIN 3 HOPS OF 'doc-002' VIA cites WHERE w > 0 ORDER BY \
+         hybrid(text_match(body, 'vector index'), embedding <=> [0.2, 0.2, 0.9, 1.0], method => \
+         'linear') LIMIT 6",
+        "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-050' VIA cites REVERSE LIMIT 100",
+        "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-030' VIA cites LIMIT 100 WITH \
+         (max_frontier = 5, max_fanout = 2)",
+    ];
+    for q in walks {
+        let r = one.query(q).unwrap();
+        let want = (shape(&r), r.cut_walks.clone());
+        assert!(!want.0.is_empty(), "{q}");
+        for n in [&a, &b, &c] {
+            let r = n.query(q).unwrap();
+            assert_eq!((shape(&r), r.cut_walks.clone()), want, "{q} on {}", n.url);
+            assert!(r.missing.is_empty(), "{q} on {}: {:?}", n.url, r.missing);
+        }
+    }
+    let plan = match c.exec(&format!("EXPLAIN ANALYZE {}", walks[0])).unwrap() {
+        Outcome::Explain(t) => t,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        plan.contains("walk: WITHIN 2 HOPS OF 'doc-010' VIA cites (index cites_adj, outgoing)"),
+        "{plan}"
+    );
+    // doc-010 cites doc-011, doc-013 (deleted) and doc-021.
+    assert!(
+        plan.contains("hop 1: 1 key(s) expanded over 3 edge(s): 3 new, 1 dangling, frontier 2"),
+        "doc-013 is deleted:\n{plan}"
+    );
+    assert!(
+        plan.contains("hop 2: 2 key(s) expanded over 6 edge(s): 5 new, 0 dangling, frontier 5"),
+        "{plan}"
+    );
+
+    // A holder of the edges that stops answering is a deadline, or under
+    // partial_results a named absence, never a quietly shorter neighbourhood.
+    drop(b);
+    settle();
+    let e = a.query(walks[2]).unwrap_err().to_string();
+    assert!(e.contains("did not answer") && e.contains("partial_results"), "{e}");
+    let r = a.query(&format!("{} WITH (partial_results)", walks[2])).unwrap();
+    assert!(r.rows.len() < 100, "the neighbourhood is short without b's edges");
+    assert!(
+        r.missing.iter().any(|m| m.starts_with("cites shard 1") || m == "shard 1"),
+        "{:?}",
+        r.missing
+    );
+
+    for d in [&a.dir, &c.dir, &one_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

@@ -1199,6 +1199,7 @@ fn index_kind_name(kind: &IndexKind) -> &'static str {
         IndexKind::FullText { .. } => "fulltext",
         IndexKind::Vector { .. } => "vector",
         IndexKind::Secondary => "secondary",
+        IndexKind::Adjacency { .. } => "adjacency",
     }
 }
 
@@ -1240,7 +1241,7 @@ fn catalog_json(db: &Db) -> String {
     out
 }
 
-fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
+pub(crate) fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
     let count = r.rows.len();
     let mut out = format!(r#"{{"ok":true,"kind":"rows","count":{count},"#);
     out.push_str(&format!(r#""elapsed_ms":{elapsed_ms},"missing":["#));
@@ -1254,6 +1255,13 @@ fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
     // has no other way to learn the count is short because a `foo*` was cut.
     out.push_str(r#"],"truncated_prefixes":["#);
     for (i, t) in r.truncated_prefixes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&jstr(t));
+    }
+    out.push_str(r#"],"cut_walks":["#);
+    for (i, t) in r.cut_walks.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -1860,6 +1868,11 @@ mod tests {
         assert!(read < shown, "rendered before it is read");
         let partial = APP_JS.find("PARTIAL RESULT").unwrap();
         assert!((read as i64 - partial as i64).abs() < 1200, "not beside the partial-result block");
+        // The third sibling, a walk a cap bound, the same way.
+        let read = APP_JS.find("res.cut_walks").expect("cut_walks is never read");
+        let shown = APP_JS.find("'CUT — '").expect("cut_walks is never rendered");
+        assert!(read < shown, "rendered before it is read");
+        assert!((read as i64 - partial as i64).abs() < 1200, "not beside the partial-result block");
     }
 
     /// The console executes SQL for whoever holds the token, over HTTP, which
@@ -1931,6 +1944,7 @@ mod tests {
         r.rows = vec![Row { key: key.clone(), doc, score: Some(1.5), distance: None }];
         r.missing = vec!["tablet\"1".to_string()];
         r.truncated_prefixes = vec![r#"text_match(body, 'a"b*') was cut\"#.to_string()];
+        r.cut_walks = vec!["WITHIN 2 HOPS OF 'p\"1' VIA cites was cut at hop 2".to_string()];
         r.next_cursor = Some("cursor\\\"value".to_string());
         let text = rows_json(&r, 7);
 
@@ -1957,6 +1971,8 @@ mod tests {
         let cut = parsed.get("truncated_prefixes").and_then(|v| v.as_array()).unwrap();
         assert_eq!(cut.len(), 1);
         assert_eq!(cut[0].as_str(), Some(r#"text_match(body, 'a"b*') was cut\"#));
+        let walks = parsed.get("cut_walks").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(walks[0].as_str(), Some("WITHIN 2 HOPS OF 'p\"1' VIA cites was cut at hop 2"));
         let rows = parsed.get("rows").and_then(|v| v.as_array()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("key").and_then(|v| v.as_str()), Some(key.as_str()));

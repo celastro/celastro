@@ -205,9 +205,11 @@ impl<'a> Parser<'a> {
                 let collection = self.ident()?;
                 self.expect_kw("SET")?;
                 let mut prefix_expansion = None;
+                let mut nodes_of = None;
                 for (key, v) in self.option_list()? {
                     match key.as_str() {
                         "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
+                        "nodes_of" => nodes_of = Some(name_option(&key, v)?),
                         "splits" => {
                             return Err(Error::Sql(
                                 "splits are fixed when the collection is created and cannot \
@@ -220,14 +222,14 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                let Some(prefix_expansion) = prefix_expansion else {
+                if prefix_expansion.is_none() && nodes_of.is_none() {
                     return Err(Error::Sql(
-                        "ALTER COLLECTION ... SET names no option; the one it takes is \
-                         prefix_expansion"
+                        "ALTER COLLECTION ... SET names no option; it takes prefix_expansion \
+                         and nodes_of"
                             .into(),
                     ));
-                };
-                return Ok(Statement::AlterCollection { collection, prefix_expansion });
+                }
+                return Ok(Statement::AlterCollection { collection, prefix_expansion, nodes_of });
             }
             if !self.eat_kw("INDEX") {
                 return Err(Error::Sql("expected COLLECTION or INDEX after ALTER".into()));
@@ -397,9 +399,13 @@ impl<'a> Parser<'a> {
         let mut splits = Vec::new();
         let mut prefix_expansion = None;
         let mut nodes = Vec::new();
+        let mut nodes_of = None;
+        let mut undirected = false;
         if self.eat_kw("WITH") {
             for (key, v) in self.option_list()? {
                 match key.as_str() {
+                    "nodes_of" => nodes_of = Some(name_option(&key, v)?),
+                    "undirected" => undirected = bool_option(&key, Some(v))?,
                     "splits" => {
                         splits = v
                             .as_array()
@@ -441,6 +447,8 @@ impl<'a> Parser<'a> {
             splits,
             prefix_expansion,
             nodes,
+            nodes_of,
+            undirected,
         }))
     }
 
@@ -484,6 +492,8 @@ impl<'a> Parser<'a> {
         let kind = self.ident()?;
         self.expect_punct("(")?;
         let path = self.path()?;
+        // `adjacency (src, dst)` names two columns; every other kind one.
+        let second = if self.eat_punct(",") { Some(self.path()?) } else { None };
         self.expect_punct(")")?;
         let mut analyzer = "standard".to_string();
         let mut dims: Option<usize> = None;
@@ -523,6 +533,20 @@ impl<'a> Parser<'a> {
             self.expect_punct(")")?;
         }
         let spec = match kind.to_ascii_lowercase().as_str() {
+            "adjacency" => IndexSpec::Adjacency {
+                to: second.clone().ok_or_else(|| {
+                    Error::Sql(
+                        "an adjacency index names the column a hop probes and the one it \
+                         reads: USING adjacency (src, dst)"
+                            .into(),
+                    )
+                })?,
+            },
+            _ if second.is_some() => {
+                return Err(Error::Sql(format!(
+                    "a {kind} index is over one column; only adjacency takes two"
+                )))
+            }
             "fulltext" | "text" => IndexSpec::FullText { analyzer },
             "vector" => IndexSpec::Vector {
                 dims: dims.ok_or_else(|| {
@@ -750,6 +774,24 @@ impl<'a> Parser<'a> {
                     let n = usize::try_from(n)
                         .map_err(|_| Error::Sql("`max_visits` is too large".into()))?;
                     w.max_visits = Some(n);
+                }
+                "max_frontier" => {
+                    let n = count_option(&key, val)?;
+                    let n = usize::try_from(n)
+                        .map_err(|_| Error::Sql("`max_frontier` is too large".into()))?;
+                    if n == 0 {
+                        return Err(Error::Sql("`max_frontier` must be at least 1".into()));
+                    }
+                    w.max_frontier = Some(n);
+                }
+                "max_fanout" => {
+                    let n = count_option(&key, val)?;
+                    let n = usize::try_from(n)
+                        .map_err(|_| Error::Sql("`max_fanout` is too large".into()))?;
+                    if n == 0 {
+                        return Err(Error::Sql("`max_fanout` must be at least 1".into()));
+                    }
+                    w.max_fanout = Some(n);
                 }
                 "deadline_ms" => w.deadline_ms = Some(count_option(&key, val)?),
                 "no_deadline" => w.no_deadline = bool_option(&key, val)?,
@@ -993,6 +1035,36 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Compare { path, op: CmpOp::ArrayContains, lit });
         }
         let path = self.path()?;
+        // `id WITHIN 2 HOPS OF 'p1' VIA cites [REVERSE] [WHERE kind = 'x']`:
+        // a walk. The edge filter is ONE term -- a comparison, a `NOT`, or a
+        // parenthesised predicate -- so that the `AND` after it belongs to
+        // the statement, where a reader expects it, and never to the walk.
+        if self.eat_kw("WITHIN") {
+            let k = self.usize_literal()?;
+            if !self.eat_kw("HOPS") && !self.eat_kw("HOP") {
+                return Err(Error::Sql(format!(
+                    "expected `HOPS`, found {}",
+                    self.peek().describe()
+                )));
+            }
+            self.expect_kw("OF")?;
+            let start = match self.literal()? {
+                Value::Str(s) => s,
+                other => crate::json::to_string(&other),
+            };
+            self.expect_kw("VIA")?;
+            let via = self.ident()?;
+            let reverse = self.eat_kw("REVERSE");
+            let filter = if self.eat_kw("WHERE") {
+                self.enter()?;
+                let f = self.not_expr();
+                self.leave();
+                Some(Box::new(f?))
+            } else {
+                None
+            };
+            return Ok(Expr::Hops { path, k, start, via, reverse, filter });
+        }
         // `path <=> [..] < 0.2`: a distance threshold. The operator decides
         // the metric, exactly as it does under `ORDER BY`, and the
         // comparison that follows is an ordinary one against a number.
@@ -1279,6 +1351,17 @@ fn count_option(key: &str, val: Option<Value>) -> Result<u64> {
 /// ... SET`: a count, as the other integer options are. Whether the engine can
 /// honour it is the engine's decision, because the bound is its cache and not
 /// the grammar's.
+/// An option whose value names a collection.
+fn name_option(key: &str, v: Value) -> Result<String> {
+    match v {
+        Value::Str(s) if !s.is_empty() => Ok(s),
+        other => Err(Error::Sql(format!(
+            "`{key}` names a collection, as a string, not {}",
+            crate::json::to_string(&other)
+        ))),
+    }
+}
+
 fn cap_option(key: &str, v: Value) -> Result<usize> {
     let n = count_option(key, Some(v))?;
     usize::try_from(n).map_err(|_| Error::Sql(format!("`{key}` is out of range")))
@@ -1624,9 +1707,10 @@ mod tests {
     #[test]
     fn a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later() {
         match parse("ALTER COLLECTION notes SET (prefix_expansion = 2048)", &[]).unwrap() {
-            Statement::AlterCollection { collection, prefix_expansion } => {
+            Statement::AlterCollection { collection, prefix_expansion, nodes_of } => {
                 assert_eq!(collection, "notes");
-                assert_eq!(prefix_expansion, 2048);
+                assert_eq!(prefix_expansion, Some(2048));
+                assert_eq!(nodes_of, None);
             }
             other => panic!("{other:?}"),
         }
@@ -1722,6 +1806,87 @@ mod tests {
         ] {
             let e = parse(sql, &[]).unwrap_err().to_string();
             assert!(e.contains(why), "{sql}: {e}");
+        }
+    }
+
+    /// The walk is one predicate term beside the others, so it nests under
+    /// `AND`, `OR` and `NOT` like any of them, and its edge filter is ONE
+    /// term: the `AND` after it belongs to the statement. The caps are
+    /// counts of at least one, the edge collection is declared with the
+    /// node collection it points into, and the adjacency index names two
+    /// columns where every other kind names one.
+    #[test]
+    fn a_walk_parses_as_a_filter_with_a_one_term_edge_filter() {
+        let s = sel(
+            "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'c' \
+             AND text_match(body, 'graph') ORDER BY embedding <=> [1, 0] LIMIT 5 \
+             WITH (max_frontier = 100, max_fanout = 8)",
+            &[],
+        );
+        let Some(Expr::And(parts)) = &s.predicate else { panic!("{:?}", s.predicate) };
+        assert_eq!(parts.len(), 2, "the AND after the edge filter is the statement's");
+        match &parts[0] {
+            Expr::Hops { path, k, start, via, reverse, filter } => {
+                assert_eq!(
+                    (path.as_str(), *k, start.as_str(), via.as_str(), *reverse),
+                    ("id", 2, "p1", "cites", false)
+                );
+                assert!(
+                    matches!(filter.as_deref(), Some(Expr::Compare { path, op: CmpOp::Eq, .. }) if path == "kind")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(&parts[1], Expr::TextMatch { .. }));
+        assert_eq!(s.with.max_frontier, Some(100));
+        assert_eq!(s.with.max_fanout, Some(8));
+
+        let s = sel("SELECT id FROM papers WHERE NOT (id WITHIN 1 HOP OF 'p1' VIA cites REVERSE WHERE (a = 1 OR b = 2))", &[]);
+        let Some(Expr::Not(inner)) = &s.predicate else { panic!("{:?}", s.predicate) };
+        match inner.as_ref() {
+            Expr::Hops { k, reverse, filter, .. } => {
+                assert_eq!((*k, *reverse), (1, true));
+                assert!(matches!(filter.as_deref(), Some(Expr::Or(v)) if v.len() == 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        for (sql, why) in [
+            ("SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1'", "expected `VIA`"),
+            ("SELECT id FROM papers WHERE id WITHIN 2 OF 'p1' VIA cites", "expected `HOPS`"),
+            ("SELECT id FROM papers WITH (max_frontier = 0)", "at least 1"),
+            ("SELECT id FROM papers WITH (max_fanout = 0)", "at least 1"),
+            ("CREATE INDEX x ON cites USING adjacency (src)", "USING adjacency (src, dst)"),
+            ("CREATE INDEX x ON cites USING secondary (src, dst)", "over one column"),
+            ("CREATE COLLECTION c (id TEXT PRIMARY KEY) WITH (nodes_of = 3)", "names a collection"),
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
+        match parse(
+            "CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'papers', undirected = true)",
+            &[],
+        )
+        .unwrap()
+        {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.nodes_of.as_deref(), Some("papers"));
+                assert!(c.undirected);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("CREATE INDEX cites_adj ON cites USING adjacency (src, dst)", &[]).unwrap() {
+            Statement::CreateIndex(c) => {
+                assert_eq!(c.path, "src");
+                assert!(matches!(c.spec, IndexSpec::Adjacency { ref to } if to == "dst"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("ALTER COLLECTION cites SET (nodes_of = 'papers')", &[]).unwrap() {
+            Statement::AlterCollection { prefix_expansion, nodes_of, .. } => {
+                assert_eq!((prefix_expansion, nodes_of.as_deref()), (None, Some("papers")));
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

@@ -111,6 +111,46 @@ pub struct Explain {
     pub fetch_micros: u128,
     pub missing: Vec<String>,
     pub notes: Vec<String>,
+    /// Each `WITHIN k HOPS OF` of the statement, as the coordinator walked
+    /// it before the scatter: the frontier after every hop and what cut it.
+    pub walks: Vec<WalkExplain>,
+}
+
+/// One walk of the statement, resolved before the scatter.
+#[derive(Debug, Clone, Default)]
+pub struct WalkExplain {
+    /// The clause as written.
+    pub label: String,
+    /// The adjacency index it read.
+    pub index: String,
+    /// `outgoing`, `reverse` or `both directions`.
+    pub direction: String,
+    pub hops: Vec<HopExplain>,
+    /// Keys in the final set: every node in `1..k` hops, the start excluded.
+    pub keys: usize,
+    pub micros: u128,
+}
+
+/// One hop of a walk.
+#[derive(Debug, Clone, Default)]
+pub struct HopExplain {
+    pub hop: usize,
+    /// Keys expanded from.
+    pub expanded: usize,
+    /// Edges followed, after the fan-out cap.
+    pub edges: usize,
+    /// Keys reached that no earlier hop had, before the frontier cap.
+    pub found: usize,
+    /// Keys reached that name no live document: skipped, and counted here.
+    pub dangling: usize,
+    /// Keys the next hop expands from: found, capped, live.
+    pub frontier: usize,
+    /// Which cap bound this hop, one line each; empty for none.
+    pub cut: Vec<String>,
+    /// Time in the edge shards' `expand` calls and the coordinator's merge.
+    pub expand_micros: u128,
+    /// Time in the node shards' `present` calls.
+    pub check_micros: u128,
 }
 
 impl Explain {
@@ -138,6 +178,34 @@ impl Explain {
             "  term statistics: {}\n",
             if self.stats_exact { "exact (two-phase)" } else { "cached approximate" }
         ));
+        for w in &self.walks {
+            o.push_str(&format!("  walk: {} (index {}, {})\n", w.label, w.index, w.direction));
+            for h in &w.hops {
+                o.push_str(&format!(
+                    "    hop {}: {} key(s) expanded over {} edge(s): {} new, {} dangling, \
+                     frontier {}{} (expand {:.2} ms, check {:.2} ms)\n",
+                    h.hop,
+                    h.expanded,
+                    h.edges,
+                    h.found,
+                    h.dangling,
+                    h.frontier,
+                    if h.cut.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; CUT: {}", h.cut.join(", "))
+                    },
+                    h.expand_micros as f64 / 1000.0,
+                    h.check_micros as f64 / 1000.0,
+                ));
+            }
+            o.push_str(&format!(
+                "    {} key(s) in 1..{} hop(s), {:.2} ms\n",
+                w.keys,
+                w.hops.len(),
+                w.micros as f64 / 1000.0
+            ));
+        }
         for s in &self.shards {
             o.push_str(&render_shard(s));
         }

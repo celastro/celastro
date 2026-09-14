@@ -1,0 +1,425 @@
+//! A bounded walk over an edge collection, resolved by the coordinator into
+//! a set of primary keys before the scatter.
+//!
+//! `WHERE id WITHIN k HOPS OF 'x' VIA cites` is a filter like `text_match`:
+//! it selects and contributes no rank. What makes it different is that no
+//! unit can evaluate it alone -- an edge lives in another collection, on
+//! whatever shard its own key put it -- so the coordinator walks first. Each
+//! hop asks every edge shard for the edges leaving the frontier
+//! ([`ShardService::expand`]), keeps the keys that are live nodes at the
+//! statement's instant ([`ShardService::present`]), and the union over
+//! `1..k` hops, the start excluded, is handed to the executor as the key set
+//! of an `id IN (...)`. Every unit then turns it into an ordinal bitmap
+//! exactly as it does for an `IN`, and the hybrid intersection is untouched.
+//!
+//! The walk is deterministic and layout-independent: pairs are sorted,
+//! frontiers are sets, and both caps cut lexicographically, so the answer
+//! at one shard is the answer at six. A cut is reported on the response and
+//! in the plan, per hop, never applied quietly.
+
+use std::collections::BTreeSet;
+use std::time::Instant;
+
+use crate::catalog::{Collection, IndexDef, IndexKind};
+use crate::column::CmpOp;
+use crate::deadline;
+use crate::error::{Error, Result};
+use crate::plan::exec;
+use crate::plan::explain::{HopExplain, UnitExplain, WalkExplain};
+use crate::plan::service::ShardService;
+use crate::shard::Shard;
+use crate::sql::ast::{Expr, Select};
+use crate::time::Timestamp;
+use crate::value::Value;
+
+/// What an edge shard needs to expand one hop.
+pub struct ExpandRequest<'a> {
+    /// The edge collection.
+    pub coll: &'a Collection,
+    /// The keys to expand from.
+    pub frontier: &'a [String],
+    pub ts: Timestamp,
+    /// Keep at most this many pairs per `from` key, the lexicographically
+    /// first by `to`. The coordinator asks for one more than its cap, which
+    /// is how it tells a full expansion from a cut one; the global first
+    /// `n` are among the union of each shard's first `n + 1`.
+    pub limit: Option<usize>,
+    /// Follow the adjacency index against its declared order.
+    pub reverse: bool,
+    /// A structured predicate on the edge collection, applied at every hop.
+    pub filter: Option<&'a Expr>,
+    /// The statement's text and parameters, for a shard on another node,
+    /// which re-parses them and finds the filter as the `walk`-th walk of
+    /// the predicate.
+    pub statement: &'a str,
+    pub params: &'a [Value],
+    pub walk: usize,
+}
+
+/// The shard's half of a hop: every live edge whose probed column is in the
+/// frontier and which the filter admits, as `(from, to)` pairs, sorted and
+/// distinct, at most `limit` per `from`. An undirected collection yields
+/// both orders.
+pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+    let idx = req
+        .coll
+        .adjacency_index()
+        .ok_or_else(|| Error::Plan(format!("no adjacency index on `{}`", req.coll.name)))?;
+    let IndexKind::Adjacency { to } = &idx.kind else { unreachable!("adjacency_index") };
+    let (from, to) = (idx.path.as_str(), to.as_str());
+    let orders: Vec<(&str, &str)> = if req.coll.undirected {
+        vec![(from, to), (to, from)]
+    } else if req.reverse {
+        vec![(to, from)]
+    } else {
+        vec![(from, to)]
+    };
+    let lit = Value::Array(req.frontier.iter().map(|k| Value::Str(k.clone())).collect());
+    let snap = shard.snapshot_at(req.ts);
+    let units = shard.sources(&snap);
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut ux = UnitExplain::default();
+    for unit in &units {
+        if unit.num_docs() == 0 {
+            continue;
+        }
+        let vis = unit.visibility(req.ts);
+        for (probe, read) in &orders {
+            let mut bm = unit.filter(probe, CmpOp::In, &lit, &vis)?.0;
+            bm.and_inplace(&vis);
+            if let Some(f) = req.filter {
+                let fb = exec::eval_structured(unit, f, &vis, &bm, &mut ux)?;
+                bm.and_inplace(&fb);
+            }
+            if bm.is_empty() {
+                continue;
+            }
+            let (froms, tos) = (unit.strings(probe)?, unit.strings(read)?);
+            for ord in bm.iter() {
+                if let (Some(a), Some(b)) = (froms.at(ord)?, tos.at(ord)?) {
+                    pairs.push((a, b));
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if let Some(n) = req.limit {
+        pairs = cut_fanout(pairs, n).0;
+    }
+    Ok(pairs)
+}
+
+/// The shard's half of the liveness check: which of `keys` are primary
+/// keys of a document visible at `ts`, sorted and distinct.
+pub(crate) fn present_on(
+    shard: &Shard,
+    coll: &Collection,
+    keys: &[String],
+    ts: Timestamp,
+) -> Result<Vec<String>> {
+    let lit = Value::Array(keys.iter().map(|k| Value::Str(k.clone())).collect());
+    let snap = shard.snapshot_at(ts);
+    let units = shard.sources(&snap);
+    let mut out = Vec::new();
+    for unit in &units {
+        if unit.num_docs() == 0 {
+            continue;
+        }
+        let vis = unit.visibility(ts);
+        let mut bm = unit.filter(&coll.primary_key, CmpOp::In, &lit, &vis)?.0;
+        bm.and_inplace(&vis);
+        if bm.is_empty() {
+            continue;
+        }
+        let keys = unit.strings(&coll.primary_key)?;
+        for ord in bm.iter() {
+            if let Some(k) = keys.at(ord)? {
+                out.push(k);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Keep the first `n` pairs per `from` of a sorted list; the count of `from`
+/// keys that had more comes back with them.
+fn cut_fanout(pairs: Vec<(String, String)>, n: usize) -> (Vec<(String, String)>, usize) {
+    let mut out = Vec::with_capacity(pairs.len());
+    let mut bound = 0;
+    let mut run = 0usize;
+    let mut last: Option<&str> = None;
+    for p in &pairs {
+        if last != Some(p.0.as_str()) {
+            last = Some(p.0.as_str());
+            run = 0;
+        }
+        run += 1;
+        if run <= n {
+            out.push(p.clone());
+        } else if run == n + 1 {
+            bound += 1;
+        }
+    }
+    (out, bound)
+}
+
+/// One walk of a statement, as the coordinator runs it.
+pub struct WalkSpec<'a> {
+    /// The clause as written, for the plan and the cut report.
+    pub label: String,
+    pub k: usize,
+    pub start: &'a str,
+    pub reverse: bool,
+    pub filter: Option<&'a Expr>,
+    /// The edge collection and its adjacency index.
+    pub edges: &'a Collection,
+    pub index: &'a IndexDef,
+    /// The node collection the statement is over.
+    pub nodes: &'a Collection,
+    pub walk: usize,
+    pub statement: &'a str,
+    pub params: &'a [Value],
+    pub max_frontier: Option<usize>,
+    pub max_fanout: Option<usize>,
+}
+
+/// What a walk produced: the keys, sorted and distinct; the plan; the cut
+/// lines for the response; and the edge shards that did not answer, under
+/// `partial_results`, named for `missing`.
+pub struct WalkOutcome {
+    pub keys: Vec<String>,
+    pub explain: WalkExplain,
+    pub cuts: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+/// The walk: `k` rounds of expand-then-check over the edge and node shards,
+/// each round under the statement's deadline.
+///
+/// A shard that does not answer is the statement's error, or under
+/// `partial` is skipped, named, and never asked again: an edge shard's
+/// absence loses the edges it held, and a node shard's absence loses the
+/// keys only it could confirm -- they are neither answered nor walked
+/// through. Not "kept unverified": a key that shard holds could not reach
+/// the answer anyway, since the scatter skips the shard too, and a deleted
+/// node it would have reported dead must not be walked through to nodes
+/// the true answer does not hold. A fault shortens, and `missing` says so;
+/// it never lengthens.
+#[allow(clippy::too_many_arguments)]
+pub fn walk(
+    spec: &WalkSpec<'_>,
+    edge_services: &[Box<dyn ShardService + '_>],
+    edge_unreachable: &mut Vec<usize>,
+    node_services: &[Box<dyn ShardService + '_>],
+    node_unreachable: &mut Vec<usize>,
+    ts: Timestamp,
+    partial: bool,
+) -> Result<WalkOutcome> {
+    let t0 = Instant::now();
+    let mut missing = Vec::new();
+    let mut cuts = Vec::new();
+    let mut hops = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    seen.insert(spec.start.to_string());
+    let mut answer: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<String> = vec![spec.start.to_string()];
+    // A partitioned node collection is keyed `(partition, key)`, and a walk
+    // carries bare keys, so its tablet map cannot prune a check; every shard
+    // is asked. Unpartitioned, the key is the composite and the map can.
+    let prune = spec.nodes.partition_key.is_none();
+    for hop in 1..=spec.k {
+        if frontier.is_empty() {
+            break;
+        }
+        deadline::check()?;
+        let t_expand = Instant::now();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let req = ExpandRequest {
+            coll: spec.edges,
+            frontier: &frontier,
+            ts,
+            limit: spec.max_fanout.map(|n| n + 1),
+            reverse: spec.reverse,
+            filter: spec.filter,
+            statement: spec.statement,
+            params: spec.params,
+            walk: spec.walk,
+        };
+        for s in edge_services {
+            if edge_unreachable.contains(&s.index()) {
+                continue;
+            }
+            match s.expand(&req) {
+                Ok(p) => pairs.extend(p),
+                Err(Error::Deadline(e)) => {
+                    if !partial {
+                        return Err(Error::Deadline(e));
+                    }
+                    edge_unreachable.push(s.index());
+                    missing.push(format!("{} shard {} (hop {hop})", spec.edges.name, s.index()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        pairs.sort();
+        pairs.dedup();
+        let expand_micros = t_expand.elapsed().as_micros();
+        let expanded = frontier.len();
+        let mut cut = Vec::new();
+        if let Some(n) = spec.max_fanout {
+            let (kept, bound) = cut_fanout(pairs, n);
+            pairs = kept;
+            if bound > 0 {
+                cut.push(format!("max_fanout = {n} bound {bound} node(s)"));
+                cuts.push(format!(
+                    "{} was cut at hop {hop}: max_fanout = {n} bound {bound} node(s), whose \
+                     remaining edges were not followed",
+                    spec.label
+                ));
+            }
+        }
+        let edges = pairs.len();
+        let mut new: Vec<String> = pairs
+            .into_iter()
+            .map(|(_, to)| to)
+            .filter(|to| !seen.contains(to))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        let found = new.len();
+        if let Some(n) = spec.max_frontier {
+            if new.len() > n {
+                new.truncate(n);
+                cut.push(format!("max_frontier = {n} kept {n} of {found}"));
+                cuts.push(format!(
+                    "{} was cut at hop {hop}: max_frontier = {n} kept {n} of {found} keys",
+                    spec.label
+                ));
+            }
+        }
+        // Which of the new keys are live nodes at `ts`. A key nothing
+        // reachable could confirm is absent.
+        let t_check = Instant::now();
+        let mut present: BTreeSet<String> = BTreeSet::new();
+        for s in node_services {
+            let mine: Vec<String> = if prune {
+                new.iter().filter(|k| s.may_hold(k)).cloned().collect()
+            } else {
+                new.clone()
+            };
+            if mine.is_empty() {
+                continue;
+            }
+            if node_unreachable.contains(&s.index()) {
+                continue;
+            }
+            match s.present(&mine, ts) {
+                Ok(p) => present.extend(p),
+                Err(Error::Deadline(e)) => {
+                    if !partial {
+                        return Err(Error::Deadline(e));
+                    }
+                    node_unreachable.push(s.index());
+                    missing.push(format!("{} shard {} (hop {hop})", spec.nodes.name, s.index()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let dangling = new.iter().filter(|k| !present.contains(*k)).count();
+        seen.extend(new.iter().cloned());
+        frontier = new.into_iter().filter(|k| present.contains(k)).collect();
+        answer.extend(frontier.iter().cloned());
+        hops.push(HopExplain {
+            hop,
+            expanded,
+            edges,
+            found,
+            dangling,
+            frontier: frontier.len(),
+            cut,
+            expand_micros,
+            check_micros: t_check.elapsed().as_micros(),
+        });
+    }
+    let keys: Vec<String> = answer.into_iter().collect();
+    let explain = WalkExplain {
+        label: spec.label.clone(),
+        index: spec.index.name.clone(),
+        direction: if spec.edges.undirected {
+            "both directions"
+        } else if spec.reverse {
+            "reverse"
+        } else {
+            "outgoing"
+        }
+        .to_string(),
+        hops,
+        keys: keys.len(),
+        micros: t0.elapsed().as_micros(),
+    };
+    Ok(WalkOutcome { keys, explain, cuts, missing })
+}
+
+/// Every walk in a predicate, in the order `bind_hops` replaces them.
+pub fn hops_in(e: &Expr) -> Vec<&Expr> {
+    fn go<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::Hops { .. } => out.push(e),
+            Expr::And(v) | Expr::Or(v) => v.iter().for_each(|x| go(x, out)),
+            Expr::Not(x) => go(x, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(e, &mut out);
+    out
+}
+
+/// The statement with each walk replaced by `key IN (frontier)`, in the
+/// order `hops_in` lists them. A shard on another node re-parses the
+/// statement and applies the same replacement to the same frontiers, so
+/// every shard evaluates the same predicate.
+pub fn bind_hops(sel: &Select, frontiers: &[Vec<String>]) -> Select {
+    fn go(e: &mut Expr, frontiers: &[Vec<String>], next: &mut usize) {
+        match e {
+            Expr::Hops { path, .. } => {
+                let keys = frontiers.get(*next).map(|v| v.as_slice()).unwrap_or(&[]);
+                *next += 1;
+                *e = Expr::Compare {
+                    path: path.clone(),
+                    op: CmpOp::In,
+                    lit: Value::Array(keys.iter().map(|k| Value::Str(k.clone())).collect()),
+                };
+            }
+            Expr::And(v) | Expr::Or(v) => v.iter_mut().for_each(|x| go(x, frontiers, next)),
+            Expr::Not(x) => go(x, frontiers, next),
+            _ => {}
+        }
+    }
+    let mut out = sel.clone();
+    if let Some(p) = &mut out.predicate {
+        go(p, frontiers, &mut 0);
+    }
+    out
+}
+
+/// An edge filter is structured: comparisons on the edge collection's
+/// fields. A text match or a distance would need that collection's
+/// statistics and indexes at every hop, and a nested walk has no start.
+pub fn check_edge_filter(edges: &Collection, e: &Expr) -> Result<()> {
+    match e {
+        Expr::Compare { .. } | Expr::True => Ok(()),
+        Expr::And(v) | Expr::Or(v) => v.iter().try_for_each(|x| check_edge_filter(edges, x)),
+        Expr::Not(x) => check_edge_filter(edges, x),
+        Expr::TextMatch { .. } | Expr::VectorDistance { .. } | Expr::Hops { .. } => {
+            Err(Error::Plan(format!(
+                "the edge filter on `{}` is structured: comparisons, IN, LIKE, IS NULL and \
+                 their AND/OR/NOT; text_match, a distance and a nested walk are not",
+                edges.name
+            )))
+        }
+    }
+}

@@ -24,6 +24,7 @@ use crate::error::Result;
 use crate::plan::exec::{self, SourcePlan};
 use crate::plan::explain::ShardExplain;
 use crate::plan::fusion::Candidate;
+use crate::plan::walk::{self, ExpandRequest};
 use crate::shard::Shard;
 use crate::sql::ast::Select;
 use crate::text::scorer::GlobalStats;
@@ -58,6 +59,10 @@ pub struct CandidatesRequest<'a> {
     /// which parses them with the same crate into the same `select`.
     pub statement: &'a str,
     pub params: &'a [Value],
+    /// The key set each `WITHIN k HOPS OF` of the statement resolved to, in
+    /// predicate order. A shard on another node re-parses the statement and
+    /// binds these the way the coordinator did (`walk::bind_hops`).
+    pub frontiers: &'a [Vec<String>],
 }
 
 /// A shard's answer to a ranked statement: per source, at most `k_prime`
@@ -86,6 +91,7 @@ pub struct ScanRequest<'a> {
     pub fields: &'a [(String, bool)],
     pub statement: &'a str,
     pub params: &'a [Value],
+    pub frontiers: &'a [Vec<String>],
 }
 
 /// One row a shard retained. `doc` is present when the shard had to decode
@@ -153,6 +159,14 @@ pub trait ShardService {
     ) -> Result<Vec<Value>>;
     /// A document by primary key, visible at `ts`.
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>>;
+    /// One hop of a walk over this shard of an edge collection: the live
+    /// edges leaving the frontier that the filter admits, as `(from, to)`
+    /// pairs, sorted and distinct, at most `limit` per `from`.
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>>;
+    /// Which of `keys` are primary keys of documents visible at `ts` on
+    /// this shard, sorted and distinct. How a walk tells a node from a
+    /// dangling edge.
+    fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>>;
 }
 
 /// A shard in this process, answered by direct call.
@@ -211,5 +225,13 @@ impl ShardService for Local<'_> {
 
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>> {
         self.shard.get(key, ts)
+    }
+
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+        walk::expand_on(self.shard, req)
+    }
+
+    fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>> {
+        walk::present_on(self.shard, &self.shard.coll, keys, ts)
     }
 }

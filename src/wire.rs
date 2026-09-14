@@ -57,13 +57,14 @@ use crate::plan::service::{
     CandidatesRequest, Local, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
     TermStats,
 };
-use crate::sql::ast::{Select, Statement};
+use crate::plan::walk::{self, ExpandRequest};
+use crate::sql::ast::{Expr, Select, Statement};
 use crate::text::scorer::{Expansion, GlobalStats, PrefixUse};
 use crate::time::Timestamp;
 use crate::value::Value;
 
 /// Refused on mismatch, in both directions.
-pub const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 2;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 const MAX_FRAME: u32 = 256 << 20;
@@ -85,6 +86,8 @@ enum Call {
     Delete = 10,
     Statement = 11,
     CreateCollection = 12,
+    Expand = 13,
+    Present = 14,
 }
 
 impl Call {
@@ -102,6 +105,8 @@ impl Call {
             10 => Call::Delete,
             11 => Call::Statement,
             12 => Call::CreateCollection,
+            13 => Call::Expand,
+            14 => Call::Present,
             _ => return None,
         })
     }
@@ -120,6 +125,8 @@ impl Call {
             Call::Delete => "delete",
             Call::Statement => "statement",
             Call::CreateCollection => "create_collection",
+            Call::Expand => "expand",
+            Call::Present => "present",
         }
     }
 }
@@ -210,6 +217,31 @@ fn put_strs(out: &mut Vec<u8>, v: &[String]) {
 fn get_strs(b: &[u8], i: &mut usize) -> Result<Vec<String>> {
     let n = get_count(b, i)?;
     (0..n).map(|_| get_string(b, i)).collect()
+}
+
+fn put_frontiers(out: &mut Vec<u8>, v: &[Vec<String>]) {
+    put_uvarint(out, v.len() as u64);
+    for f in v {
+        put_strs(out, f);
+    }
+}
+
+fn get_frontiers(b: &[u8], i: &mut usize) -> Result<Vec<Vec<String>>> {
+    let n = get_count(b, i)?;
+    (0..n).map(|_| get_strs(b, i)).collect()
+}
+
+fn put_pairs(out: &mut Vec<u8>, v: &[(String, String)]) {
+    put_uvarint(out, v.len() as u64);
+    for (a, b) in v {
+        put_str(out, a);
+        put_str(out, b);
+    }
+}
+
+fn get_pairs(b: &[u8], i: &mut usize) -> Result<Vec<(String, String)>> {
+    let n = get_count(b, i)?;
+    (0..n).map(|_| Ok((get_string(b, i)?, get_string(b, i)?))).collect()
 }
 
 fn put_value(out: &mut Vec<u8>, v: &Value) {
@@ -719,6 +751,7 @@ impl ShardService for Remote {
         put_uvarint(&mut body, req.k_prime as u64);
         put_stats(&mut body, req.stats);
         put_bool(&mut body, req.analyze);
+        put_frontiers(&mut body, req.frontiers);
         let b = self.call(Call::Candidates, &body)?;
         get_candidates(&b, &mut 0)
     }
@@ -738,6 +771,7 @@ impl ShardService for Remote {
             put_str(&mut body, f);
             put_bool(&mut body, *asc);
         }
+        put_frontiers(&mut body, req.frontiers);
         let b = self.call(Call::Scan, &body)?;
         get_scan(&b, &mut 0)
     }
@@ -771,6 +805,36 @@ impl ShardService for Remote {
         } else {
             Ok(None)
         }
+    }
+
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+        // The filter travels as the statement it came from: the holder
+        // parses the same text with the same crate and takes the `walk`-th
+        // walk's filter, as it takes the statement's predicate for a scan.
+        let mut body = Vec::new();
+        put_str(&mut body, req.statement);
+        put_values(&mut body, req.params);
+        put_ts(&mut body, req.ts);
+        put_strs(&mut body, req.frontier);
+        match req.limit {
+            Some(n) => {
+                put_bool(&mut body, true);
+                put_uvarint(&mut body, n as u64);
+            }
+            None => put_bool(&mut body, false),
+        }
+        put_bool(&mut body, req.reverse);
+        put_uvarint(&mut body, req.walk as u64);
+        let b = self.call(Call::Expand, &body)?;
+        get_pairs(&b, &mut 0)
+    }
+
+    fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>> {
+        let mut body = Vec::new();
+        put_strs(&mut body, keys);
+        put_ts(&mut body, ts);
+        let b = self.call(Call::Present, &body)?;
+        get_strs(&b, &mut 0)
     }
 }
 
@@ -947,7 +1011,9 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
         | Call::Candidates
         | Call::Scan
         | Call::Documents
-        | Call::Get => {
+        | Call::Get
+        | Call::Expand
+        | Call::Present => {
             // Reads see the same statistics a local statement would: the
             // inferred path classes are folded in before planning, as
             // `Db::run_select` does for its own shards.
@@ -994,7 +1060,8 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                     let k_prime = get_count(body, &mut j)?;
                     let stats = get_stats(body, &mut j)?;
                     let analyze = get_bool(body, &mut j)?;
-                    let sel = select_of(&sql, &params)?;
+                    let frontiers = get_frontiers(body, &mut j)?;
+                    let sel = walk::bind_hops(&select_of(&sql, &params)?, &frontiers);
                     let k = sel.limit.unwrap_or(10);
                     let planned = exec::plan_sources(&coll, &sel, k)?;
                     let req = CandidatesRequest {
@@ -1008,6 +1075,7 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                         analyze,
                         statement: &sql,
                         params: &params,
+                        frontiers: &frontiers,
                     };
                     put_candidates(&mut out, &local.candidates(&req)?);
                 }
@@ -1025,7 +1093,8 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                     for _ in 0..nf {
                         fields.push((get_string(body, &mut j)?, get_bool(body, &mut j)?));
                     }
-                    let sel = select_of(&sql, &params)?;
+                    let frontiers = get_frontiers(body, &mut j)?;
+                    let sel = walk::bind_hops(&select_of(&sql, &params)?, &frontiers);
                     let req = ScanRequest {
                         coll: &coll,
                         select: &sel,
@@ -1038,6 +1107,7 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                         fields: &fields,
                         statement: &sql,
                         params: &params,
+                        frontiers: &frontiers,
                     };
                     put_scan(&mut out, &local.scan(&req)?);
                 }
@@ -1063,6 +1133,45 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
                         }
                         None => put_bool(&mut out, false),
                     }
+                }
+                Call::Expand => {
+                    let sql = get_string(body, &mut j)?;
+                    let params = get_values(body, &mut j)?;
+                    let ts = get_ts(body, &mut j)?;
+                    let frontier = get_strs(body, &mut j)?;
+                    let limit =
+                        if get_bool(body, &mut j)? { Some(get_count(body, &mut j)?) } else { None };
+                    let reverse = get_bool(body, &mut j)?;
+                    let wi = get_count(body, &mut j)?;
+                    let sel = select_of(&sql, &params)?;
+                    let hops = sel.predicate.as_ref().map(walk::hops_in).unwrap_or_default();
+                    let Some(Expr::Hops { via, filter, .. }) = hops.get(wi) else {
+                        return Err(Error::Plan(format!(
+                            "the statement has no walk number {wi} to expand"
+                        )));
+                    };
+                    if via != &collection {
+                        return Err(Error::Plan(format!(
+                            "walk {wi} is over `{via}`, and this call is for `{collection}`"
+                        )));
+                    }
+                    let req = ExpandRequest {
+                        coll: &coll,
+                        frontier: &frontier,
+                        ts,
+                        limit,
+                        reverse,
+                        filter: filter.as_deref(),
+                        statement: &sql,
+                        params: &params,
+                        walk: wi,
+                    };
+                    put_pairs(&mut out, &local.expand(&req)?);
+                }
+                Call::Present => {
+                    let keys = get_strs(body, &mut j)?;
+                    let ts = get_ts(body, &mut j)?;
+                    put_strs(&mut out, &local.present(&keys, ts)?);
                 }
                 _ => unreachable!(),
             }

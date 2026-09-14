@@ -149,7 +149,7 @@ impl Memtable {
                 IndexKind::Vector { dims, metric } => {
                     vectors.insert(idx.path.clone(), VectorStore::new(*dims, *metric));
                 }
-                IndexKind::Secondary => {}
+                IndexKind::Secondary | IndexKind::Adjacency { .. } => {}
             }
         }
         Memtable {

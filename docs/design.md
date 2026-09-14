@@ -45,6 +45,7 @@ test that pins it.
 | runtime filtered-search selection | `vector::VectorStore::choose` | brute force / post-filter / ACORN-style |
 | `COLLAPSE BY` | `plan::exec` | with `k` amplification |
 | rank fusion, coordinator only | `plan::fusion` | RRF and weighted linear |
+| a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF`, `expand` and `present` on `ShardService` |
 | scatter-gather, query-then-fetch | `plan::exec` | shards return `(pk, source, raw score)` |
 | global term statistics | `engine::Db::gather_stats` | cached approximate, or exact two-phase |
 | size-tiered compaction with a hard cap | `compaction` | dead-ratio, tier and format-upgrade triggers |
@@ -298,9 +299,10 @@ that path until compaction rewrites it, which the plan says -- `CREATE INDEX`
 never backfilled, and a `DROP INDEX` that seals a memtable makes such a unit
 on purpose.
 
-The catalog format is version 4 for the node list and the placement; a 3 is
-read with every collection placed wholly on this node, derived from its shard
-directories at open. Not built yet, by decision: moving a shard between nodes
+The catalog format is version 4 for the node list and the placement, and 5
+for the edge-collection fields of the section after this one; a 3 is read
+with every collection placed wholly on this node, derived from its shard
+directories at open, and a 4 as one with no edge collections. Not built yet, by decision: moving a shard between nodes
 (`MOVE SHARD`, and rebalancing when nodes come and go), which the placement by
 index is shaped for; replication, so a node that is down is a shard that is
 down; and a chart for more than one pod.
@@ -373,8 +375,9 @@ without a dot.
 Consensus and replication, follower reads and closed timestamps, hedged
 requests, two-phase commit for multi-shard writes and for multi-node DDL,
 stateless compaction workers, dynamic shard split and merge, moving a shard
-between nodes, and edges — the last designed and measured in the section
-after this one, and not built. A collection's shards can be spread over nodes and any
+between nodes, and a graph database's pattern language, unbounded paths and
+analytics — the bounded walk in the section after this one is a retrieval
+mode, and says what it is not. A collection's shards can be spread over nodes and any
 holder can coordinate, but each shard has exactly one holder and a statement
 that changes the catalog reaches the holders one by one, reporting the ones it
 did not reach. The
@@ -401,7 +404,7 @@ them first:
   coordination round.
 - **A query reaches a shard through one boundary**, `plan::service::ShardService`:
   statistics, prefix expansion, candidates, an unranked scan, payload fetches,
-  and nothing else. A shard on this node answers by direct call, a shard on
+  the two calls of a walk, and nothing else. A shard on this node answers by direct call, a shard on
   another node through `wire::Remote`, and the simulator puts a seeded fault
   schedule on the same seam.
 
@@ -416,11 +419,12 @@ leaves dead rows behind for each shard to collect on its own schedule.
 
 ## Graph-constrained hybrid search
 
-celastro has no notion of an edge. This section is the design for one, made
-before any code, so that the questions it raises are answered where they
-constrain each other and not one at a time in the tree. It is the result of a
-design pass on 2026-09-14; the backlog item it belongs to is `ready` on the
-strength of it.
+This section is the design for an edge, made before any code, so that the
+questions it raises were answered where they constrain each other and not one
+at a time in the tree. It is the result of a design pass on 2026-09-14, and
+the first slice — everything in *Shipped* below — was built against it the
+same day. Where the code settled a detail the design left open, the decision
+says so.
 
 **The query.** *Documents within `k` hops of node `x`, matching text `t`,
 nearest to vector `v`, under structured predicate `p`* — the shape retrieval
@@ -437,7 +441,7 @@ paths, no shortest path, no centrality or community detection (batch
 analytics, not a query plan), no index-free adjacency. Immutable segments
 cannot chase pointers; adjacency is an index rebuilt at compaction, and a deep
 walk pays a probe per hop. The win is the fused query and the bounded
-behaviour, not the hop, and the README will say so the day this ships.
+behaviour, not the hop, and the README says so.
 
 ### Decisions
 
@@ -477,16 +481,31 @@ behaviour, not the hop, and the README will say so the day this ships.
    walk. `WITH (max_frontier = N)` caps the key set after any hop and
    `WITH (max_fanout = N)` caps one node's expansion, which is what a hub
    costs. Hitting either is reported the way a truncated prefix is: on the
-   response, in the plan, per hop. The statement deadline applies per hop.
-   `EXPLAIN ANALYZE` shows the frontier after each hop and which cap bound.
+   response (`cut_walks`, beside `missing` and `truncated_prefixes`), in the
+   plan, per hop. The statement deadline applies per hop. `EXPLAIN ANALYZE`
+   shows the frontier after each hop and which cap bound. Both cuts keep the
+   lexicographically first — the first `N` targets of a node by key, the
+   first `N` keys a hop found — so a cut answer is the same cut answer at
+   every layout, and the frontier cap is applied to what a hop found before
+   the liveness check of decision 9, so that the work a cap bounds is
+   bounded by the cap: a key it cut is neither checked nor counted.
 
 6. **Shards.** A shard never sees another shard's candidates, so a frontier
-   crossing shards is expanded through the coordinator each round: one more
-   call on `plan::service::ShardService`, `expand(frontier, edge index,
-   filter, ts) -> keys`, which the simulator covers for free and the wire
-   carries. The exit test is the existing one extended: a `k`-hop statement
-   is bit-identical at 1, 3 and 6 shards, and a shard that stops answering
-   mid-walk shortens the answer only by saying so.
+   crossing shards is expanded through the coordinator each round: two more
+   calls on `plan::service::ShardService`, `expand(frontier, filter, ts) ->
+   (from, to) pairs` on every shard of the edge collection and
+   `present(keys, ts) -> keys` on every shard of the node collection that may
+   hold them, which the simulator covers for free and the wire carries as
+   calls 13 and 14. Pairs rather than keys, so that the fan-out cap is exact
+   across shards: a shard returns at most `N + 1` targets per source, the
+   coordinator keeps the first `N` of the union, and the extra one is how it
+   knows the cap bound. The final key set reaches the shards bound into the
+   statement as an `IN` list, and a shard on another node — which re-parses
+   the statement text — is handed the same list and binds it the same way,
+   so every unit evaluates the same predicate. The exit test is the existing
+   one extended: a `k`-hop statement is bit-identical at 1, 3 and 6 shards,
+   and a shard that stops answering mid-walk shortens the answer only by
+   saying so.
 
 7. **Residency.** `USING adjacency (src, dst)` takes a tier like any index
    and a policy may demote it. A walk that finds it below `cached` is
@@ -494,11 +513,15 @@ behaviour, not the hop, and the README will say so the day this ships.
    archive fault-ins per hop; the operator raises the tier or narrows the
    walk.
 
-8. **Direction and kinds.** Outgoing edges by default; a collection created
-   `UNDIRECTED` indexes both orders and its walks follow both. `VIA cites
-   WHERE kind = 'cites' AND weight > 0.5` is a structured bitmap on the edge
-   collection applied at every hop; one filter for the whole walk, per-hop
-   filters a later extension.
+8. **Direction and kinds.** Outgoing edges by default — from the column the
+   adjacency index names first to the one it names second; `VIA cites
+   REVERSE` follows them the other way, which is what *what cites `x`* needs
+   and costs a keyword rather than a second edge collection; a collection
+   created `WITH (undirected = true)` follows both. `VIA cites WHERE kind =
+   'cites'` is a structured bitmap on the edge collection applied at every
+   hop: comparisons and their `AND`/`OR`/`NOT`, a compound one in
+   parentheses so that the `AND` after the walk belongs to the statement.
+   One filter for the whole walk, per-hop filters a later extension.
 
 9. **Dangling edges.** An edge whose `dst` is deleted at the statement's
    instant, or never existed, is followed and resolves to nothing: skipped
@@ -509,11 +532,12 @@ behaviour, not the hop, and the README will say so the day this ships.
     excluded: the neighbourhood, which is what a retrieval filter wants.
     `OR id = 'x'` puts the start back.
 
-### What it costs today, measured
+### What it cost before the walk, measured
 
-Measured on 2026-09-14, on this crate as it is, with the graph step done the
-only way it can be done today — as client round trips — so that the number
-the first slice has to beat is written down before the slice exists. The
+Measured on 2026-09-14, on the crate before the walk existed, with the graph
+step done the only way it could be done then — as client round trips — so
+that the number the first slice had to beat was written down before the
+slice existed. The
 corpus: 50,000 documents of 20 words each from a 2,000-word vocabulary drawn
 Zipf-like, a 128-dimensional embedding per document in 64 clusters, and
 249,950 citation edges, every document citing five earlier ones by
@@ -562,20 +586,60 @@ on it. Third, every fused statement returned identical rows across ten runs,
 before and after the fix, which is the property the slice has to keep across
 shard counts.
 
-### Done when
+### What it costs with the walk in the plan, measured
 
-An edge collection with `WITH (nodes_of = ...)` and `CREATE INDEX ... USING
-adjacency (src, dst)`; `WITHIN k HOPS OF` fused with `text_match` and `<=>`
-in one plan; `exact` mode bit-identical across shard counts for hop
-statements; a cut walk says so on the response and in the plan; `EXPLAIN
-ANALYZE` shows the frontier per hop; the measurement above re-run against the
-fused plan and the numbers replaced; and the README says what this is and is
-not. A minor release. The tests it will name: `engine::tests::a_hop_filter_
-selects_the_neighbourhood_and_nothing_else`, `a_hop_statement_is_bit_
-identical_across_shard_counts`, `a_cut_walk_says_which_cap_bound_it`,
-`a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `a_dangling_
-edge_is_skipped_and_counted`, and the simulator's fault property over
-`expand`.
+Measured on 2026-09-14 on the slice as shipped, same box, same corpus, same
+twenty statements, each now one statement: `WHERE id WITHIN 2 HOPS OF x VIA
+cites [REVERSE] AND text_match(body, t) ORDER BY embedding <=> v LIMIT 10`,
+best of five over the console's HTTP API, ten runs each. Every statement
+returned exactly the rows the three-statement version returned, and
+identical rows across the ten runs.
+
+Outgoing walks, 17 to 27 documents: 53 to 56 ms fused, against 96 to 100
+ms as three statements and 26 to 32 ms for the statement without the walk.
+The walk itself is 25 to 28 ms of that, `EXPLAIN ANALYZE` says, and almost
+none of it is the frontier: a hop is a scan of the probed column of every
+unit of the edge collection against the frontier as a set, and a liveness
+check is the same scan of the node collection's key column, so two hops
+over 250,000 edges cost the same 25 ms whether the frontier is five keys or
+five thousand. Incoming walks from the ten most-cited documents, 18,147 to
+43,861 documents: 165 to 463 ms fused, against 278 to 862 ms as three
+statements. The largest, 43,861 keys: hop 1 expands one key over 7,180
+edges in 11 ms and checks 7,180 keys in 25 ms; hop 2 expands 7,180 keys
+over 77,767 edges in 128 ms and checks 36,681 keys in 155 ms; the fused
+statement over the 43,861-key set then costs 30 ms, the same as it did with
+the keys as literals.
+
+So the slice did what it was for — nothing crosses the client, the answer is
+the same, and the two round trips of up to 44,000 keys are gone — and the
+number it has to beat next is its own: a hub walk is six to seventeen times
+the statement without the walk, and the plan says where. Expand is a column
+scan per unit, not a probe, and materialises a `(from, to)` pair per edge;
+the check builds the key set once per unit rather than once per call. An
+adjacency index that probes — a sorted value-to-ordinals map per unit, which
+is what "secondary index" ought to mean here too — takes the scan out of
+every hop and is the next item; the cap semantics, the plan and the tests
+do not change under it.
+
+### Shipped
+
+The first slice, in 0.20.0: an edge collection with `WITH (nodes_of = ...)`
+— or `ALTER COLLECTION ... SET (nodes_of = ...)` for one loaded before —
+and `CREATE INDEX ... USING adjacency (src, dst)`; `WITHIN k HOPS OF` fused
+with `text_match` and `<=>` in one plan; bit-identical across shard counts
+and across nodes; a cut walk says so on the response and in the plan;
+`EXPLAIN ANALYZE` shows the frontier per hop; the measurement re-run against
+the fused plan; the README says what this is and is not. The tests:
+`engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else`,
+`a_hop_statement_is_bit_identical_across_shard_counts`,
+`a_cut_walk_says_which_cap_bound_it`,
+`a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`,
+`a_dangling_edge_is_skipped_and_counted`,
+`sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so`
+and, over a real transport,
+`a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers`.
+Not in it, and open: hop distance as a fusion source (decision 4), per-hop
+edge filters (decision 8), and a pattern surface.
 
 ## Design notes
 
@@ -1027,6 +1091,7 @@ guarantee:
 | a dropped collection leaves nothing behind under its name, and an interrupted drop completes at the next open | `engine::tests::dropping_a_collection_removes_it_and_everything_recorded_against_its_name` (files, statistics and clocks gone; a recreated collection measured afresh; the policy refusal; the interrupted state completed and swept at open), `archive_s3::dropping_a_collection_deletes_its_objects_from_the_store` |
 | a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
 | a fault on the coordinator-to-shard boundary can shorten an answer only by saying so, and a seeded run reproduces exactly | `sim::tests::a_fault_cannot_change_an_answer_without_saying_so` (twenty seeds of drops and restarts, every query shape: refused or bit-identical, never different), `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (`missing` is exactly the dropped shards, no second call to a shard given up on, real rows only, and the cache holds no partial sum afterwards), `sim::tests::a_shard_that_restarted_answers_exactly_what_it_did_before` (every call answered by a replacement opened from the directory), `sim::tests::the_order_shards_answer_in_does_not_change_the_answer` (and the plan lists shards by index), `sim::tests::a_seeded_run_reproduces_its_trace_and_its_answers` |
+| a walk is the neighbourhood and nothing else, the same at every layout and across nodes, and a cut or a dangling edge is said, never hidden | `engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else` (1..k, the start excluded, the edge filter at every hop, `REVERSE`, `OR`/`NOT`, fused with text and a distance, every refusal), `engine::tests::a_hop_statement_is_bit_identical_across_shard_counts` (1, 3 and 6 shards of both collections, memtable and segments, a deleted node and a dangling edge), `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers` (the same through the wire, and a holder that stops answering is a deadline or a named absence), `engine::tests::a_cut_walk_says_which_cap_bound_it` (both caps, the lexicographically first kept, the line on the response, in the plan and in the console's JSON), `engine::tests::a_dangling_edge_is_skipped_and_counted` (a never-existed and a deleted target, per hop, and nothing walked through a deleted node), `engine::tests::a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so` (twenty seeds over `expand` and `present`: refused or bit-identical, a partial answer inside the unfaulted neighbourhood and short only with `missing`), `sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`, `catalog::tests::catalog_round_trips` (format 5: `nodes_of`, `undirected`, the adjacency kind, and a 4 read as a plain collection) |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
 | a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |

@@ -862,6 +862,7 @@ fn kind_name(kind: &IndexKind) -> &'static str {
         IndexKind::FullText { .. } => "fulltext",
         IndexKind::Vector { .. } => "vector",
         IndexKind::Secondary => "secondary",
+        IndexKind::Adjacency { .. } => "adjacency",
     }
 }
 
@@ -870,6 +871,7 @@ fn index_kind(kind: &IndexKind) -> String {
         IndexKind::FullText { analyzer } => format!("fulltext, analyzer {analyzer}"),
         IndexKind::Vector { dims, metric } => format!("vector, {dims} dims, {}", metric.name()),
         IndexKind::Secondary => "secondary".to_string(),
+        IndexKind::Adjacency { to } => format!("adjacency, reads {to}"),
     }
 }
 
@@ -945,6 +947,13 @@ fn truncation_report(r: &QueryResult) -> String {
     let mut out = String::new();
     for t in &r.truncated_prefixes {
         out.push_str("TRUNCATED — ");
+        out.push_str(t);
+        out.push('\n');
+    }
+    // A walk a cap bound is the third sibling of `missing`, rendered in the
+    // same block for the same reason: the table is short and says so.
+    for t in &r.cut_walks {
+        out.push_str("CUT — ");
         out.push_str(t);
         out.push('\n');
     }
@@ -1110,6 +1119,7 @@ fn rows_json(r: &QueryResult, d: Duration) -> Value {
     let missing: Vec<Value> = r.missing.iter().map(|m| Value::Str(m.clone())).collect();
     let truncated: Vec<Value> =
         r.truncated_prefixes.iter().map(|t| Value::Str(t.clone())).collect();
+    let cut_walks: Vec<Value> = r.cut_walks.iter().map(|t| Value::Str(t.clone())).collect();
     let cursor = match &r.next_cursor {
         Some(c) => Value::Str(c.clone()),
         None => Value::Null,
@@ -1121,6 +1131,7 @@ fn rows_json(r: &QueryResult, d: Duration) -> Value {
         ("elapsed_ms".to_string(), Value::Int(elapsed_ms(d))),
         ("missing".to_string(), Value::Array(missing)),
         ("truncated_prefixes".to_string(), Value::Array(truncated)),
+        ("cut_walks".to_string(), Value::Array(cut_walks)),
         ("next_cursor".to_string(), cursor),
         ("rows".to_string(), Value::Array(rows)),
     ])
@@ -1643,6 +1654,17 @@ mod tests {
         let clean = json::to_string(&rows_json(&QueryResult::default(), Duration::from_millis(0)));
         let parsed = json::parse(&clean).unwrap();
         assert_eq!(parsed.get("truncated_prefixes"), Some(&Value::Array(Vec::new())), "{clean}");
+        assert_eq!(parsed.get("cut_walks"), Some(&Value::Array(Vec::new())), "{clean}");
+        let mut r = QueryResult::default();
+        r.cut_walks = vec!["WITHIN 2 HOPS OF 'p\"1' VIA cites was cut at hop 2".to_string()];
+        let out = json::to_string(&rows_json(&r, Duration::from_millis(0)));
+        let parsed = json::parse(&out).unwrap();
+        let cut = parsed.get("cut_walks").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            cut[0].as_str(),
+            Some("WITHIN 2 HOPS OF 'p\"1' VIA cites was cut at hop 2"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1711,6 +1733,9 @@ mod tests {
             });
         }
         r.truncated_prefixes = vec!["text_match(body, 'a*') was cut: documents are missing".into()];
+        r.cut_walks =
+            vec!["WITHIN 2 HOPS OF 'x' VIA cites was cut at hop 1: max_fanout = 4 bound 1 node(s)"
+                .into()];
         r.next_cursor = Some("#00000000|2|b".into());
         let mut out = Vec::new();
         render_rows(&r, &mut out);
@@ -1724,10 +1749,11 @@ mod tests {
         };
         let last_row = at("b   | 0.500000 | b");
         let cut = at("TRUNCATED — text_match(body, 'a*') was cut");
+        let walk = at("CUT — WITHIN 2 HOPS OF 'x' VIA cites was cut at hop 1");
         let count = at("2 row(s)");
         let cursor = at("next cursor:");
-        assert!(last_row < cut && cut < count && count < cursor, "{text}");
-        assert_eq!(count - cut, 1, "something came between the block and the count: {text}");
+        assert!(last_row < cut && cut < walk && walk < count && count < cursor, "{text}");
+        assert_eq!(count - cut, 2, "something came between the block and the count: {text}");
     }
 
     #[test]

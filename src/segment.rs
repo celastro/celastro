@@ -1025,7 +1025,7 @@ impl SegmentBuilder {
                 IndexKind::Vector { dims, metric } => {
                     vec_stores.insert(idx.path.clone(), VectorStore::new(*dims, *metric));
                 }
-                IndexKind::Secondary => {}
+                IndexKind::Secondary | IndexKind::Adjacency { .. } => {}
             }
         }
 

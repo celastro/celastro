@@ -42,6 +42,7 @@ use crate::error::{Error, Result};
 use crate::plan::service::{
     CandidatesRequest, Local, ScanRequest, ShardCandidates, ShardScan, ShardService, TermStats,
 };
+use crate::plan::walk::ExpandRequest;
 use crate::shard::Shard;
 use crate::time::Timestamp;
 use crate::value::Value;
@@ -289,6 +290,14 @@ impl ShardService for SimShard<'_> {
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>> {
         self.deliver("get", |s| s.get(key, ts))
     }
+
+    fn expand(&self, req: &ExpandRequest<'_>) -> Result<Vec<(String, String)>> {
+        self.deliver("expand", |s| s.expand(req))
+    }
+
+    fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>> {
+        self.deliver("present", |s| s.present(keys, ts))
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +358,55 @@ mod tests {
         db.delete_key("items", "t2\u{1}doc-071").unwrap();
         db
     }
+
+    /// The fixture plus an edge collection over it, in three shards of its
+    /// own: each item cites the next, the third after and the eleventh
+    /// after, wrapping, so a walk crosses every shard of both collections.
+    fn graph_fixture(dir: &Path) -> Db {
+        let mut db = fixture(dir);
+        db.execute(
+            "CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'items', splits = ['e090', 'e180'])",
+        )
+        .unwrap();
+        db.execute("CREATE INDEX cites_adj ON cites USING adjacency (src, dst)").unwrap();
+        for i in 0..90usize {
+            if i == 60 {
+                db.execute("FLUSH cites").unwrap();
+            }
+            for (j, step) in [1usize, 3, 11].iter().enumerate() {
+                db.insert(
+                    "cites",
+                    crate::json::parse(&format!(
+                        r#"{{"id":"e{:03}","src":"doc-{i:03}","dst":"doc-{:03}","w":{j}}}"#,
+                        i * 3 + j,
+                        (i + step) % 90
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    /// Walk clauses and the rest of the statement each is fused with.
+    const WALKS: &[(&str, &str)] = &[
+        (
+            "id WITHIN 2 HOPS OF 'doc-010' VIA cites",
+            "AND text_match(body, 'graph') ORDER BY embedding <=> [0.5, 0.5, 0.5, 1.0] LIMIT 10",
+        ),
+        (
+            "id WITHIN 3 HOPS OF 'doc-002' VIA cites WHERE w > 0",
+            "ORDER BY hybrid(text_match(body, 'vector index'), embedding <=> [0.2, 0.2, 0.9, 1.0], \
+             method => 'linear') LIMIT 6",
+        ),
+        ("id WITHIN 2 HOPS OF 'doc-050' VIA cites REVERSE", "LIMIT 100"),
+        (
+            "id WITHIN 2 HOPS OF 'doc-030' VIA cites",
+            "LIMIT 100 WITH (max_frontier = 5, max_fanout = 2)",
+        ),
+    ];
 
     const QUERIES: &[&str] = &[
         "SELECT id FROM items ORDER BY hybrid(text_match(body, 'graph search'), embedding <=> \
@@ -569,6 +627,89 @@ mod tests {
     /// replacement that opened the directory: sealed rows through the
     /// manifest, unsealed ones through the WAL, deletes on both sides. The
     /// answers are bit-identical to the live shards'.
+    /// The walk's two calls, `expand` and `present`, are faulted like every
+    /// other. Without `partial_results` a faulted walk is refused or answers
+    /// exactly as with no faults; with it, every row is inside the unfaulted
+    /// neighbourhood -- a dropped `expand` loses edges and can never invent
+    /// one -- and a short answer names a shard, of either collection, that
+    /// did not answer. The schedule has to have dropped a walk call for the
+    /// test to mean anything, and it says so.
+    #[test]
+    fn a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so() {
+        let dir = tmp("walk-faults");
+        let mut db = graph_fixture(&dir);
+        let statements: Vec<String> = WALKS
+            .iter()
+            .map(|(w, rest)| format!("SELECT id FROM items WHERE {w} {rest}"))
+            .collect();
+        let want: Vec<_> = statements.iter().map(|q| shape(&db.query(q).unwrap())).collect();
+        let hoods: Vec<BTreeSet<String>> = WALKS
+            .iter()
+            .map(|(w, _)| {
+                db.query(&format!("SELECT id FROM items WHERE {w} LIMIT 1000"))
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|r| r.key)
+                    .collect()
+            })
+            .collect();
+        for (w, h) in want.iter().zip(&hoods) {
+            assert!(!w.is_empty() && h.len() >= w.len(), "a walk with no answer measures nothing");
+        }
+        let (mut refused, mut agreed, mut short) = (0, 0, 0);
+        let (mut dropped_expand, mut dropped_present) = (0, 0);
+        // Two hundred seeds, not twenty: the fault this has to reach is a
+        // dropped `present` on exactly the shard holding a deleted node at
+        // the hop that reaches it -- the one that, kept "unverified", walks
+        // through the dead node and lengthens the answer -- and at a rate
+        // low enough for "agreed" to be reachable that is a few seeds in a
+        // hundred. The schedule is a function of the seed, so once a seed
+        // reaches it, it always does.
+        for seed in 1..=200u64 {
+            // A walk makes a call per shard of both collections per hop
+            // before the scatter even starts, so at the rate the other
+            // properties use every statement is refused and "agreed" is
+            // never measured; a lower rate leaves both outcomes reachable.
+            let sim = Sim::new(seed, Faults::new(30, 30, true));
+            db.install_sim(sim.clone());
+            for ((q, want), hood) in statements.iter().zip(&want).zip(&hoods) {
+                match db.query(q) {
+                    Ok(r) => {
+                        assert_eq!(&shape(&r), want, "seed {seed}: `{q}` answered differently");
+                        assert!(r.missing.is_empty());
+                        agreed += 1;
+                    }
+                    Err(Error::Deadline(_)) => refused += 1,
+                    Err(e) => panic!("seed {seed}: `{q}`: {e}"),
+                }
+                let partial = match q.strip_suffix(')') {
+                    Some(head) if q.contains(" WITH (") => format!("{head}, partial_results)"),
+                    _ => format!("{q} WITH (partial_results)"),
+                };
+                let r = db.query(&partial).unwrap();
+                for row in &r.rows {
+                    assert!(hood.contains(&row.key), "seed {seed}: `{q}` invented {}", row.key);
+                }
+                if r.rows.len() < want.len() {
+                    assert!(!r.missing.is_empty(), "seed {seed}: `{q}` is short and says nothing");
+                    short += 1;
+                }
+            }
+            let trace = sim.trace();
+            dropped_expand +=
+                trace.iter().filter(|e| e.fate == Fate::Dropped && e.call == "expand").count();
+            dropped_present +=
+                trace.iter().filter(|e| e.fate == Fate::Dropped && e.call == "present").count();
+        }
+        assert!(
+            refused > 0 && agreed > 0 && short > 0 && dropped_expand > 0 && dropped_present > 0,
+            "refused {refused}, agreed {agreed}, short {short}, dropped expand {dropped_expand}, \
+             dropped present {dropped_present}: nothing measured"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_shard_that_restarted_answers_exactly_what_it_did_before() {
         let dir = tmp("restart");

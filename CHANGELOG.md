@@ -6,6 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.20.0 — 2026-09-14
+
+A new retrieval mode, hence a minor.
+
+**A bounded graph walk in the plan.** An edge collection is a collection
+created `WITH (nodes_of = '<node collection>')` — or pointed there later by
+`ALTER COLLECTION ... SET (nodes_of = ...)` — with an adjacency index over
+its two key columns, `CREATE INDEX ... USING adjacency (src, dst)`. `WHERE id
+WITHIN k HOPS OF 'x' VIA cites` then selects the nodes reachable in one to
+`k` hops, the start excluded, beside `text_match` and a distance in the same
+statement and the same plan: the coordinator walks first, at the statement's
+instant, and the neighbourhood reaches every unit as a key set, so the answer
+is the same at any shard count and across nodes. `REVERSE` walks the index
+backwards, `WITH (undirected = true)` at creation walks both ways, `VIA cites
+WHERE kind = 'x'` filters the edges at every hop. `WITH (max_fanout = N)` and
+`WITH (max_frontier = N)` bound a hub; a cut is reported on the response
+(`cut_walks`, a `CUT` line in both shells and the console) and per hop in
+`EXPLAIN ANALYZE`, which shows the frontier after every hop. A dangling edge
+is skipped and counted. A walk over an adjacency index below `cached` is
+refused naming the tier. The wire version is 2: a walk crosses it as two
+more calls, and every node has to run this version.
+
 ## 0.19.0 — 2026-09-14
 
 A statement that worked stops working, hence a minor.

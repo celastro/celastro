@@ -30,15 +30,18 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 4;
+const CATALOG_VERSION: u8 = 5;
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
 /// and nothing else moves. Version 4 appends the node list and the placement
 /// map after the activity clocks; a 3 is read as a 4 with no nodes and no
 /// placement, and `Db::open` derives the placement of every collection from
-/// its shard directories. Version 1 is refused: its tier bytes name different
-/// tiers.
+/// its shard directories. Version 5 appends, after each collection's prefix
+/// cap, the node collection its edges point into and whether its walks are
+/// undirected, and adds the adjacency index kind; a 4 is read as a 5 whose
+/// collections are not edge collections. Version 1 is refused: its tier
+/// bytes name different tiers.
 const CATALOG_VERSION_OLDEST: u8 = 2;
 
 /// Where one shard of a collection lives: the node that holds it and the
@@ -236,6 +239,13 @@ pub enum IndexKind {
     /// Local secondary index. Global secondary indexes require cross-shard 2PC
     /// per write and are deliberately absent (§5.5).
     Secondary,
+    /// The walk index of an edge collection: `path` is the column a hop
+    /// probes, `to` the one it reads. No region of its own: both are declared
+    /// columns, and the index is the declaration that a walk may use them and
+    /// the tier they are kept at.
+    Adjacency {
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +336,12 @@ pub struct Collection {
     /// Travels with an export, so a copy answers a prefix the way its source
     /// does.
     pub prefix_expansion: Option<usize>,
+    /// The node collection this collection's edges point into, when it is
+    /// an edge collection: every `src` and `dst` is a primary key of it.
+    /// `CREATE COLLECTION ... WITH (nodes_of = 'papers')`.
+    pub nodes_of: Option<String>,
+    /// A walk over this collection's edges follows them in both directions.
+    pub undirected: bool,
 }
 
 impl Collection {
@@ -339,7 +355,14 @@ impl Collection {
             paths: BTreeMap::new(),
             doc_count: 0,
             prefix_expansion: None,
+            nodes_of: None,
+            undirected: false,
         }
+    }
+
+    /// The adjacency index a walk over this collection uses, if declared.
+    pub fn adjacency_index(&self) -> Option<&IndexDef> {
+        self.indexes.iter().find(|i| matches!(i.kind, IndexKind::Adjacency { .. }))
     }
 
     /// The prefix expansion cap in force: the collection's own, or the
@@ -376,7 +399,9 @@ impl Collection {
         match idx.kind {
             IndexKind::FullText { .. } => crate::segment::text_component(&idx.path),
             IndexKind::Vector { .. } => crate::segment::vector_component(&idx.path),
-            IndexKind::Secondary => crate::segment::column_component(&idx.path),
+            IndexKind::Secondary | IndexKind::Adjacency { .. } => {
+                crate::segment::column_component(&idx.path)
+            }
         }
     }
 
@@ -675,6 +700,10 @@ impl Catalog {
                         out.push(*metric as u8);
                     }
                     IndexKind::Secondary => out.push(2),
+                    IndexKind::Adjacency { to } => {
+                        out.push(3);
+                        put_str(&mut out, to);
+                    }
                 }
                 out.push(i.tier.as_u8());
                 out.push(i.declared_tier.as_u8());
@@ -694,6 +723,12 @@ impl Catalog {
             // setting itself can never be zero.
             if format >= 3 {
                 put_uvarint(&mut out, c.prefix_expansion.unwrap_or(0) as u64);
+            }
+            // Version 5 appends the edge-collection fields; an empty name is
+            // "not an edge collection".
+            if format >= 5 {
+                put_str(&mut out, c.nodes_of.as_deref().unwrap_or(""));
+                out.push(c.undirected as u8);
             }
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
@@ -762,6 +797,7 @@ impl Catalog {
                             },
                         }
                     }
+                    3 => IndexKind::Adjacency { to: get_str(b, &mut i).ok_or_else(bad)? },
                     _ => IndexKind::Secondary,
                 };
                 // Bounded rather than saturating: `Tier::from_u8` maps every
@@ -802,6 +838,12 @@ impl Catalog {
             if format >= 3 {
                 let cap = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
                 c.prefix_expansion = if cap == 0 { None } else { Some(cap) };
+            }
+            if format >= 5 {
+                let of = get_str(b, &mut i).ok_or_else(bad)?;
+                c.nodes_of = if of.is_empty() { None } else { Some(of) };
+                c.undirected = *b.get(i).ok_or_else(bad)? == 1;
+                i += 1;
             }
             collections.insert(name, c);
         }
@@ -938,6 +980,35 @@ mod tests {
         assert_eq!(back.placement, cat.placement, "and so does the placement");
         let three = Catalog::decode(&cat.encode_as(3)).unwrap();
         assert!(three.nodes.is_empty() && three.placement.is_empty(), "a 3 has neither");
+
+        // An edge collection: which collection it points into, whether its
+        // walks are undirected, and the adjacency index's second column all
+        // survive a reopen, and a 4 -- which has none of them -- is read as
+        // a plain collection.
+        let mut e = Collection::new("cites", "id", None);
+        e.nodes_of = Some("articles".into());
+        e.undirected = true;
+        e.indexes.push(IndexDef::new(
+            "cites_adj",
+            "src",
+            IndexKind::Adjacency { to: "dst".into() },
+            crate::residency::Tier::Cached,
+        ));
+        cat.create(e).unwrap();
+        let back = Catalog::decode(&cat.encode()).unwrap();
+        let e = back.get("cites").unwrap();
+        assert_eq!(e.nodes_of.as_deref(), Some("articles"));
+        assert!(e.undirected);
+        assert!(
+            matches!(&e.adjacency_index().unwrap().kind, IndexKind::Adjacency { to } if to == "dst")
+        );
+        assert_eq!(
+            Collection::index_component(e.adjacency_index().unwrap()),
+            crate::segment::column_component("src")
+        );
+        let four = Catalog::decode(&cat.encode_as(4)).unwrap();
+        let e4 = four.get("cites").unwrap();
+        assert!(e4.nodes_of.is_none() && !e4.undirected, "a 4 knows no edge collections");
     }
 
     /// A catalog written by a 0.14 build has no cap field: it is read at the
@@ -987,7 +1058,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 4"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 5"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

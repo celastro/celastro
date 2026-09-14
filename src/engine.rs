@@ -28,6 +28,7 @@ use crate::memtable::{FlushThresholds, MemtableBudget};
 use crate::mvcc::DeleteLog;
 use crate::plan::exec::{self, ExecInput, QueryResult};
 use crate::plan::service::{Local, ShardService, TermStats};
+use crate::plan::walk::{self, WalkSpec};
 use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
 use crate::segment::BuildOpts;
 use crate::segment::{PendingDoc, SegmentBuilder, SegmentSource};
@@ -35,7 +36,7 @@ use crate::shard::{sort_key, Searchable, SegmentHandle, Shard, ShardOpts};
 use crate::sql::{self, ast::*};
 use crate::text::scorer::{Expansion, GlobalStats};
 use crate::time::{Hlc, Timestamp};
-use crate::value::Value;
+use crate::value::{Value, ValueType};
 
 /// How stale cached global term statistics may get before a refresh. "Shards
 /// publish per-term document frequency and average document length on a short
@@ -2143,6 +2144,11 @@ impl Db {
                     check_prefix_cap(n)?;
                     coll.prefix_expansion = Some(n);
                 }
+                if let Some(of) = &c.nodes_of {
+                    self.check_nodes_of(&c.name, of)?;
+                    coll.nodes_of = Some(of.clone());
+                }
+                coll.undirected = c.undirected;
                 for col in &c.columns {
                     coll.declared.push(ColumnDef {
                         path: col.path.clone(),
@@ -2171,6 +2177,10 @@ impl Db {
                     IndexSpec::FullText { analyzer } => IndexKind::FullText { analyzer },
                     IndexSpec::Vector { dims, metric } => IndexKind::Vector { dims, metric },
                     IndexSpec::Secondary => IndexKind::Secondary,
+                    IndexSpec::Adjacency { to } => {
+                        self.check_adjacency(&c.collection, &c.path, &to)?;
+                        IndexKind::Adjacency { to }
+                    }
                 };
                 self.add_index(&c.collection, IndexDef::new(&c.name, &c.path, kind, c.tier))?;
                 Ok(Outcome::Ack(format!(
@@ -2381,13 +2391,21 @@ impl Db {
                     tier.name()
                 )))
             }
-            Statement::AlterCollection { collection, prefix_expansion } => {
-                let from = self.set_prefix_expansion(&collection, prefix_expansion)?;
-                Ok(Outcome::Ack(format!(
-                    "collection `{collection}` prefix_expansion {from} -> {prefix_expansion}; \
-                     its statements may now name {} distinct prefix(es)",
-                    prefix_leaves_limit(prefix_expansion)
-                )))
+            Statement::AlterCollection { collection, prefix_expansion, nodes_of } => {
+                let mut acks = Vec::new();
+                if let Some(cap) = prefix_expansion {
+                    let from = self.set_prefix_expansion(&collection, cap)?;
+                    acks.push(format!(
+                        "prefix_expansion {from} -> {cap}; its statements may now name {} \
+                         distinct prefix(es)",
+                        prefix_leaves_limit(cap)
+                    ));
+                }
+                if let Some(of) = nodes_of {
+                    self.set_nodes_of(&collection, &of)?;
+                    acks.push(format!("its edges point into `{of}`"));
+                }
+                Ok(Outcome::Ack(format!("collection `{collection}` {}", acks.join("; "))))
             }
             Statement::CreateLifecyclePolicy(d) => {
                 let name = d.name.clone();
@@ -2503,6 +2521,103 @@ impl Db {
             return Err(e);
         }
         Ok(from)
+    }
+
+    /// An edge collection points into a node collection that exists and is
+    /// not itself; the columns a walk reads are declared when the adjacency
+    /// index is, not here.
+    fn check_nodes_of(&self, collection: &str, of: &str) -> Result<()> {
+        if of == collection {
+            return Err(Error::Schema(format!(
+                "`{collection}` cannot be its own node collection; an edge collection's \
+                 nodes_of names the collection its src and dst are primary keys of"
+            )));
+        }
+        let target = self.catalog.get(of).map_err(|_| {
+            Error::Schema(format!(
+                "nodes_of names `{of}`, which does not exist; create the node collection first"
+            ))
+        })?;
+        if target.nodes_of.is_some() {
+            return Err(Error::Schema(format!(
+                "nodes_of names `{of}`, which is itself an edge collection (its edges point \
+                 into `{}`); edges point at nodes, not at edges",
+                target.nodes_of.as_deref().unwrap_or("")
+            )));
+        }
+        Ok(())
+    }
+
+    /// An adjacency index needs an edge collection and two declared text
+    /// columns: the walk reads them as keys, and a column that could hold
+    /// anything else is a walk that silently skips edges.
+    fn check_adjacency(&self, collection: &str, from: &str, to: &str) -> Result<()> {
+        let c = self.catalog.get(collection)?;
+        if c.nodes_of.is_none() {
+            return Err(Error::Schema(format!(
+                "`{collection}` is not an edge collection; an adjacency index needs one: \
+                 CREATE COLLECTION ... WITH (nodes_of = '<node collection>'), or ALTER \
+                 COLLECTION {collection} SET (nodes_of = ...)"
+            )));
+        }
+        if let Some(a) = c.adjacency_index() {
+            return Err(Error::Schema(format!(
+                "`{collection}` already has an adjacency index, `{}`; a walk uses one",
+                a.name
+            )));
+        }
+        if from == to {
+            return Err(Error::Schema(format!(
+                "an adjacency index probes one column and reads another; both are `{from}`"
+            )));
+        }
+        for col in [from, to] {
+            match c.declared.iter().find(|d| d.path == col) {
+                Some(d) if d.ty == ValueType::Str => {}
+                Some(d) => {
+                    return Err(Error::Schema(format!(
+                        "`{col}` is declared {} and an adjacency index reads keys: declare \
+                         it TEXT",
+                        d.ty.name()
+                    )))
+                }
+                None => {
+                    return Err(Error::Schema(format!(
+                        "`{col}` is not a declared column of `{collection}`; an adjacency \
+                         index reads declared TEXT columns"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `ALTER COLLECTION ... SET (nodes_of = ...)`: the same setting the
+    /// `CREATE` takes, for a collection loaded before it had a walk.
+    pub fn set_nodes_of(&mut self, collection: &str, of: &str) -> Result<()> {
+        self.check_nodes_of(collection, of)?;
+        let c = self.catalog.get_mut(collection)?;
+        let before = c.nodes_of.clone();
+        c.nodes_of = Some(of.to_string());
+        let coll = c.clone();
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                s.adopt_definition(coll.clone());
+            }
+        }
+        if let Err(e) = self.persist_catalog() {
+            if let Ok(c) = self.catalog.get_mut(collection) {
+                c.nodes_of = before;
+                let coll = c.clone();
+                if let Some(shards) = self.shards.get_mut(collection) {
+                    for s in shards.iter_mut() {
+                        s.adopt_definition(coll.clone());
+                    }
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn set_index_tier(&mut self, collection: &str, index: &str, tier: Tier) -> Result<Tier> {
@@ -3036,6 +3151,93 @@ impl Db {
         partial: bool,
         mut unreachable: Vec<usize>,
     ) -> Result<QueryResult> {
+        // Every walk first: `WITHIN k HOPS OF` is resolved to a key set here,
+        // at the same pinned instant as everything after it, and bound into
+        // the statement as an `IN` before the prefixes, the statistics and
+        // the scatter see it. Nothing below knows a walk happened, which is
+        // the point: the hybrid intersection is untouched.
+        let mut ts = ts;
+        let mut frontiers: Vec<Vec<String>> = Vec::new();
+        let mut walks = Vec::new();
+        let mut cut_walks = Vec::new();
+        let mut walk_missing = Vec::new();
+        let hops: Vec<Expr> = sel
+            .predicate
+            .as_ref()
+            .map(|p| walk::hops_in(p).into_iter().cloned().collect())
+            .unwrap_or_default();
+        for (wi, h) in hops.iter().enumerate() {
+            let Expr::Hops { path, k, start, via, reverse, filter } = h else { unreachable!() };
+            let (edges, index) = self.check_walk(coll, path, *k, via, filter.as_deref())?;
+            self.touch_indexes(via, &[(index.path.clone(), IndexUse::Walk)])?;
+            // The edge collection's holders, for its instant and its shards.
+            let tablets = self.catalog.placement.get(via).cloned().unwrap_or_default();
+            let mut edge_unreachable: Vec<usize> = Vec::new();
+            let mut remotes: BTreeMap<String, Arc<crate::wire::Node>> = BTreeMap::new();
+            for url in self.holders(via) {
+                let node = self.node_conn(&url)?;
+                match node.counters(via) {
+                    Ok((t, _)) => ts = ts.max(t),
+                    Err(Error::Deadline(e)) => {
+                        if !partial {
+                            return Err(Error::Deadline(e));
+                        }
+                        for (i, t) in tablets.iter().enumerate() {
+                            if t.node == url {
+                                edge_unreachable.push(i);
+                                walk_missing.push(format!("{via} shard {i}"));
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                remotes.insert(url, node);
+            }
+            let label = format!(
+                "WITHIN {k} HOPS OF '{start}' VIA {via}{}",
+                if *reverse { " REVERSE" } else { "" }
+            );
+            let spec = WalkSpec {
+                label,
+                k: *k,
+                start,
+                reverse: *reverse,
+                filter: filter.as_deref(),
+                edges: &edges,
+                index: &index,
+                nodes: coll,
+                walk: wi,
+                statement: sql,
+                params,
+                max_frontier: sel.with.max_frontier,
+                max_fanout: sel.with.max_fanout,
+            };
+            let out = {
+                let taken = Taken::take(self, via)?;
+                let sim = taken.db.sim.clone();
+                let edge_services = services_for(&taken.shards, &tablets, &remotes, via, sim);
+                walk::walk(
+                    &spec,
+                    &edge_services,
+                    &mut edge_unreachable,
+                    services,
+                    &mut unreachable,
+                    ts,
+                    partial,
+                )?
+            };
+            frontiers.push(out.keys);
+            walks.push(out.explain);
+            cut_walks.extend(out.cuts);
+            walk_missing.extend(out.missing);
+        }
+        let bound;
+        let sel = if frontiers.is_empty() {
+            sel
+        } else {
+            bound = walk::bind_hops(sel, &frontiers);
+            &bound
+        };
         let mut want = exec::required_terms(coll, sel);
         // Resolve every prefix in the statement HERE, once, before the gather.
         //
@@ -3246,7 +3448,78 @@ impl Db {
             stats: &stats,
             analyze,
             statement: sql.to_string(),
+            frontiers: &frontiers,
+            walks,
+            cut_walks,
+            walk_missing,
         })
+    }
+
+    /// Whether a walk can run: it selects by the node collection's primary
+    /// key, over an edge collection that points into it, through an
+    /// adjacency index warm enough to read at every hop, with a structured
+    /// edge filter. The edge collection and the index, cloned, for the walk.
+    fn check_walk(
+        &self,
+        coll: &Collection,
+        path: &str,
+        k: usize,
+        via: &str,
+        filter: Option<&Expr>,
+    ) -> Result<(Collection, IndexDef)> {
+        if path != coll.primary_key {
+            return Err(Error::Plan(format!(
+                "a walk selects by primary key: `{path}` is not the primary key of `{}`, \
+                 which is `{}`",
+                coll.name, coll.primary_key
+            )));
+        }
+        if k == 0 {
+            return Err(Error::Plan(
+                "WITHIN 0 HOPS OF selects nothing; a walk is at least one hop".into(),
+            ));
+        }
+        let edges = self
+            .catalog
+            .get(via)
+            .map_err(|_| Error::Plan(format!("no collection `{via}` to walk over")))?;
+        if edges.nodes_of.as_deref() != Some(coll.name.as_str()) {
+            return Err(Error::Plan(match &edges.nodes_of {
+                Some(of) => format!(
+                    "`{via}` is an edge collection of `{of}`, not of `{}`; a walk follows \
+                     edges whose src and dst are keys of the collection it selects from",
+                    coll.name
+                ),
+                None => format!(
+                    "`{via}` is not an edge collection; CREATE COLLECTION ... WITH (nodes_of = \
+                     '{}') or ALTER COLLECTION {via} SET (nodes_of = '{}'), then CREATE INDEX \
+                     ... ON {via} USING adjacency (src, dst)",
+                    coll.name, coll.name
+                ),
+            }));
+        }
+        let Some(index) = edges.adjacency_index() else {
+            return Err(Error::Plan(format!(
+                "no adjacency index on `{via}`; CREATE INDEX ... ON {via} USING adjacency \
+                 (src, dst)"
+            )));
+        };
+        // A walk reads the index at every hop, so an index below `cached`
+        // would pay a chain of fault-ins per hop; that is refused, not paid.
+        if index.tier.is_colder_than(Tier::Cached) {
+            return Err(Error::Plan(format!(
+                "the walk over `{via}` is refused: its adjacency index `{}` is on the {} tier \
+                 and a walk reads it at every hop; ALTER INDEX {} ON {via} SET TIER 'cached' \
+                 (or warmer), or narrow the walk",
+                index.name,
+                index.tier.name(),
+                index.name
+            )));
+        }
+        if let Some(f) = filter {
+            walk::check_edge_filter(edges, f)?;
+        }
+        Ok((edges.clone(), index.clone()))
     }
 
     /// Sample production vector queries for the recall harness (§12.1). The
@@ -3499,6 +3772,8 @@ enum IndexUse {
     Text,
     Vector,
     Scalar,
+    /// A walk over an edge collection's adjacency index.
+    Walk,
 }
 
 impl IndexUse {
@@ -3508,6 +3783,7 @@ impl IndexUse {
             (IndexUse::Text, IndexKind::FullText { .. })
                 | (IndexUse::Vector, IndexKind::Vector { .. })
                 | (IndexUse::Scalar, IndexKind::Secondary)
+                | (IndexUse::Walk, IndexKind::Adjacency { .. })
         )
     }
 }
@@ -3520,6 +3796,9 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
             Expr::Compare { path, .. } => out.push((path.clone(), IndexUse::Scalar)),
             Expr::TextMatch { path, .. } => out.push((path.clone(), IndexUse::Text)),
             Expr::VectorDistance { path, .. } => out.push((path.clone(), IndexUse::Vector)),
+            // The walk's index is on ANOTHER collection; `run_over` touches
+            // it there. The primary key it selects by is no index here.
+            Expr::Hops { .. } => {}
             Expr::And(v) | Expr::Or(v) => v.iter().for_each(|x| walk(x, out)),
             Expr::Not(b) => walk(b, out),
             Expr::True => {}
@@ -6994,8 +7273,7 @@ mod tests {
     /// not `k` children of the first one.
     #[test]
     fn a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one() {
-        use crate::shard::DOCUMENTS_DECODED;
-        use std::sync::atomic::Ordering;
+        use crate::shard::documents_decoded;
         let dir = tmp("bounded-scan");
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
         db.execute(
@@ -7022,9 +7300,9 @@ mod tests {
 
         // Key order: decodes exactly the page, wherever the page is.
         let decoded = |db: &mut Db, sql: &str| {
-            let before = DOCUMENTS_DECODED.load(Ordering::Relaxed);
+            let before = documents_decoded();
             let r = db.query(sql).unwrap();
-            (r, DOCUMENTS_DECODED.load(Ordering::Relaxed) - before)
+            (r, documents_decoded() - before)
         };
         let (page, n) = decoded(&mut db, "SELECT * FROM items LIMIT 5");
         assert_eq!(keys(&page), keys(&full)[..5].to_vec());
@@ -7363,6 +7641,468 @@ mod tests {
         drop(db);
         let re = Db::open(&dir, DbOpts::default()).unwrap();
         assert_eq!(re.shards("notes").unwrap()[0].num_docs(crate::time::MAX_TS), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------- walks (G1)
+
+    /// The citation graph every walk test starts from. Nine papers and the
+    /// edges between them, in an edge collection pointed at `papers` with an
+    /// adjacency index over `(src, dst)`:
+    ///
+    ///   p1 -> p2, p3, p8(kind weak)     p2 -> p4, pX(dangling)
+    ///   p3 -> p4, p5                    p4 -> p6
+    ///   p5 -> p1 (back to the start)    p7 -> p1 (into the start)
+    ///   p8 -> p9
+    fn graph(dir: &Path) -> Db {
+        let mut db = Db::open(dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION papers (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX papers_body ON papers USING fulltext (body) WITH (analyzer = 'standard')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX papers_emb ON papers USING vector (embedding) WITH (dims = 2, metric = 'l2')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'papers')",
+        )
+        .unwrap();
+        db.execute("CREATE INDEX cites_adj ON cites USING adjacency (src, dst)").unwrap();
+        let bodies = [
+            ("p1", "graph search"),
+            ("p2", "graph index"),
+            ("p3", "vector index"),
+            ("p4", "graph vector"),
+            ("p5", "segment"),
+            ("p6", "graph"),
+            ("p7", "graph"),
+            ("p8", "graph"),
+            ("p9", "graph"),
+        ];
+        for (i, (id, body)) in bodies.iter().enumerate() {
+            db.execute(&format!(
+                r#"INSERT INTO papers VALUES ('{{"id":"{id}","body":"{body}","embedding":[{i}.0, 0.0]}}')"#
+            ))
+            .unwrap();
+        }
+        let edges = [
+            ("e01", "p1", "p2", "cites"),
+            ("e02", "p1", "p3", "cites"),
+            ("e03", "p1", "p8", "weak"),
+            ("e04", "p2", "p4", "cites"),
+            ("e05", "p2", "pX", "cites"),
+            ("e06", "p3", "p4", "cites"),
+            ("e07", "p3", "p5", "cites"),
+            ("e08", "p4", "p6", "cites"),
+            ("e09", "p5", "p1", "cites"),
+            ("e10", "p7", "p1", "cites"),
+            ("e11", "p8", "p9", "cites"),
+        ];
+        for (id, src, dst, kind) in edges {
+            db.execute(&format!(
+                r#"INSERT INTO cites VALUES ('{{"id":"{id}","src":"{src}","dst":"{dst}","kind":"{kind}"}}')"#
+            ))
+            .unwrap();
+        }
+        db
+    }
+
+    fn key_set(r: &QueryResult) -> Vec<String> {
+        let mut v: Vec<String> = r.rows.iter().map(|r| r.key.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn plan_of(db: &mut Db, sql: &str) -> String {
+        match db.execute(&format!("EXPLAIN ANALYZE {sql}")).unwrap() {
+            Outcome::Explain(t) => t,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `WITHIN k HOPS OF` is the neighbourhood: every node in 1..k hops, the
+    /// start excluded, whichever way the graph loops back; the edge filter
+    /// applies at every hop; `REVERSE` follows the index backwards; `OR id =
+    /// 'x'` puts the start back and `NOT` takes the complement. Fused with a
+    /// text match and a distance it is one plan, and the plan shows every
+    /// hop. What cannot walk is refused naming why.
+    #[test]
+    fn a_hop_filter_selects_the_neighbourhood_and_nothing_else() {
+        let dir = tmp("hops");
+        let mut db = graph(&dir);
+        let hop = |db: &mut Db, clause: &str| {
+            key_set(&db.query(&format!("SELECT id FROM papers WHERE {clause} LIMIT 100")).unwrap())
+        };
+        assert_eq!(hop(&mut db, "id WITHIN 1 HOP OF 'p1' VIA cites"), ["p2", "p3", "p8"]);
+        assert_eq!(
+            hop(&mut db, "id WITHIN 2 HOPS OF 'p1' VIA cites"),
+            ["p2", "p3", "p4", "p5", "p8", "p9"],
+            "the union over both hops; pX is dangling and p1 is the start"
+        );
+        assert_eq!(
+            hop(&mut db, "id WITHIN 3 HOPS OF 'p1' VIA cites"),
+            ["p2", "p3", "p4", "p5", "p6", "p8", "p9"],
+            "p5 -> p1 loops back to the start, which stays excluded"
+        );
+        assert_eq!(
+            hop(&mut db, "id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'cites'"),
+            ["p2", "p3", "p4", "p5"],
+            "the weak edge is filtered at hop 1, so p8 and p9 are never reached"
+        );
+        assert_eq!(hop(&mut db, "id WITHIN 1 HOP OF 'p1' VIA cites REVERSE"), ["p5", "p7"]);
+        assert_eq!(
+            hop(&mut db, "id WITHIN 1 HOP OF 'p1' VIA cites OR id = 'p1'"),
+            ["p1", "p2", "p3", "p8"]
+        );
+        assert_eq!(
+            hop(&mut db, "NOT (id WITHIN 1 HOP OF 'p1' VIA cites)"),
+            ["p1", "p4", "p5", "p6", "p7", "p9"]
+        );
+        assert_eq!(hop(&mut db, "id WITHIN 2 HOPS OF 'p9' VIA cites"), Vec::<String>::new());
+        assert_eq!(hop(&mut db, "id WITHIN 2 HOPS OF 'nobody' VIA cites"), Vec::<String>::new());
+
+        // One plan: the walk, the text filter and the distance order.
+        let fused = "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites \
+                     AND text_match(body, 'graph') ORDER BY embedding <-> [9.0, 0.0] LIMIT 2";
+        let r = db.query(fused).unwrap();
+        let keys: Vec<&str> = r.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["p9", "p8"],
+            "nearest first, within the neighbourhood, matching the text"
+        );
+        assert!(r.cut_walks.is_empty() && r.missing.is_empty());
+        let plan = plan_of(&mut db, fused);
+        assert!(
+            plan.contains("walk: WITHIN 2 HOPS OF 'p1' VIA cites (index cites_adj, outgoing)"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("hop 1: 1 key(s) expanded over 3 edge(s): 3 new, 0 dangling, frontier 3"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("hop 2: 3 key(s) expanded over 5 edge(s): 4 new, 1 dangling, frontier 3"),
+            "{plan}"
+        );
+        assert!(plan.contains("6 key(s) in 1..2 hop(s)"), "{plan}");
+        assert!(plan.contains("id IN ["), "the units saw an IN:\n{plan}");
+        let hybrid = "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites ORDER BY \
+                      hybrid(text_match(body, 'graph index'), embedding <-> [2.0, 0.0], method => 'linear') LIMIT 3";
+        let r = db.query(hybrid).unwrap();
+        for row in &r.rows {
+            assert!(
+                ["p2", "p3", "p4", "p5", "p8", "p9"].contains(&row.key.as_str()),
+                "{}",
+                row.key
+            );
+        }
+        assert_eq!(r.rows[0].key, "p2", "the best fused candidate inside the neighbourhood");
+
+        // Refusals, each naming what is missing.
+        for (sql, why) in [
+            ("SELECT id FROM papers WHERE body WITHIN 1 HOP OF 'p1' VIA cites", "not the primary key"),
+            ("SELECT id FROM papers WHERE id WITHIN 0 HOPS OF 'p1' VIA cites", "at least one hop"),
+            ("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA nothing", "no collection `nothing`"),
+            ("SELECT id FROM cites WHERE id WITHIN 1 HOP OF 'e01' VIA cites", "is an edge collection of `papers`"),
+            ("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA papers", "not an edge collection"),
+            (
+                "SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA cites WHERE text_match(kind, 'x')",
+                "edge filter on `cites` is structured",
+            ),
+        ] {
+            let e = db.query(sql).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
+        db.execute(
+            "CREATE COLLECTION links (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'papers')",
+        )
+        .unwrap();
+        let e = db
+            .query("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA links")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no adjacency index on `links`"), "{e}");
+        for (sql, why) in [
+            (
+                "CREATE INDEX links_adj ON links USING adjacency (src, weight)",
+                "not a declared column",
+            ),
+            ("CREATE INDEX links_adj ON links USING adjacency (src, src)", "both are `src`"),
+            (
+                "CREATE INDEX papers_adj ON papers USING adjacency (src, dst)",
+                "not an edge collection",
+            ),
+            (
+                "CREATE INDEX cites_adj2 ON cites USING adjacency (dst, src)",
+                "already has an adjacency index",
+            ),
+            (
+                "CREATE COLLECTION loops (id TEXT PRIMARY KEY) WITH (nodes_of = 'loops')",
+                "its own node collection",
+            ),
+            (
+                "CREATE COLLECTION meta (id TEXT PRIMARY KEY) WITH (nodes_of = 'cites')",
+                "itself an edge collection",
+            ),
+            (
+                "CREATE COLLECTION orphan (id TEXT PRIMARY KEY) WITH (nodes_of = 'nowhere')",
+                "does not exist",
+            ),
+        ] {
+            let e = db.execute(sql).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
+        // A collection loaded before it was an edge collection can become one.
+        db.execute(
+            "CREATE COLLECTION later (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL)",
+        )
+        .unwrap();
+        db.execute("ALTER COLLECTION later SET (nodes_of = 'papers')").unwrap();
+        db.execute("CREATE INDEX later_adj ON later USING adjacency (src, dst)").unwrap();
+        db.execute(r#"INSERT INTO later VALUES ('{"id":"l1","src":"p9","dst":"p1"}')"#).unwrap();
+        assert_eq!(hop(&mut db, "id WITHIN 1 HOP OF 'p9' VIA later"), ["p1"]);
+        // And all of it survives a reopen.
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(
+            hop(&mut db, "id WITHIN 2 HOPS OF 'p1' VIA cites"),
+            ["p2", "p3", "p4", "p5", "p8", "p9"]
+        );
+        assert_eq!(hop(&mut db, "id WITHIN 1 HOP OF 'p9' VIA later"), ["p1"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same graph laid out over one, three and six shards of each
+    /// collection -- with a flush half way so both memtables and segments
+    /// are in play -- answers a hop statement, fused with text and a vector,
+    /// bit for bit the same. The walk is a function of the live graph at the
+    /// instant, not of where its edges happen to be.
+    #[test]
+    fn a_hop_statement_is_bit_identical_across_shard_counts() {
+        let layouts: [(&str, &str); 3] = [
+            ("", ""),
+            (" WITH (splits = ['n020', 'n040'])", " WITH (nodes_of = 'nodes', splits = ['e0100', 'e0200'])"),
+            (
+                " WITH (splits = ['n010', 'n020', 'n030', 'n040', 'n050'])",
+                " WITH (nodes_of = 'nodes', splits = ['e0050', 'e0100', 'e0150', 'e0200', 'e0250'])",
+            ),
+        ];
+        let words = ["graph", "search", "vector", "index", "segment", "fusion", "rank"];
+        let statements = [
+            "SELECT id FROM nodes WHERE id WITHIN 2 HOPS OF 'n007' VIA edges AND text_match(body, 'graph') \
+             ORDER BY embedding <=> [0.5, 0.5, 0.5, 1.0] LIMIT 10 WITH (exact)",
+            "SELECT id FROM nodes WHERE id WITHIN 3 HOPS OF 'n001' VIA edges WHERE w > 2 ORDER BY \
+             hybrid(text_match(body, 'vector index'), embedding <=> [0.2, 0.2, 0.9, 1.0], method => 'linear') \
+             LIMIT 8 WITH (exact)",
+            "SELECT id FROM nodes WHERE id WITHIN 2 HOPS OF 'n030' VIA edges REVERSE LIMIT 100",
+            "SELECT id FROM nodes WHERE id WITHIN 2 HOPS OF 'n003' VIA edges LIMIT 100 WITH (max_frontier = 7, max_fanout = 3)",
+        ];
+        let mut answers: Vec<Vec<String>> = Vec::new();
+        for (li, (nsplit, esplit)) in layouts.iter().enumerate() {
+            let dir = tmp(&format!("hops-layout-{li}"));
+            let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+            db.execute(&format!("CREATE COLLECTION nodes (id TEXT PRIMARY KEY){nsplit}")).unwrap();
+            db.execute("CREATE INDEX nodes_body ON nodes USING fulltext (body) WITH (analyzer = 'english')").unwrap();
+            db.execute("CREATE INDEX nodes_emb ON nodes USING vector (embedding) WITH (dims = 4, metric = 'cosine')").unwrap();
+            let esplit = if esplit.is_empty() { " WITH (nodes_of = 'nodes')" } else { esplit };
+            db.execute(&format!(
+                "CREATE COLLECTION edges (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL){esplit}"
+            ))
+            .unwrap();
+            db.execute("CREATE INDEX edges_adj ON edges USING adjacency (src, dst)").unwrap();
+            for i in 0..60usize {
+                if i == 40 {
+                    db.execute("FLUSH nodes").unwrap();
+                    db.execute("FLUSH edges").unwrap();
+                }
+                let body =
+                    format!("{} {} {}", words[i % 7], words[(i * 3) % 7], words[(i * 5) % 7]);
+                db.execute(&format!(
+                    r#"INSERT INTO nodes VALUES ('{{"id":"n{i:03}","body":"{body}","embedding":[{},{},{},1.0]}}')"#,
+                    (i % 7) as f32 / 7.0,
+                    (i % 5) as f32 / 5.0,
+                    (i % 3) as f32 / 3.0,
+                ))
+                .unwrap();
+                // Five edges each, forward by 1, 3, 7, 11 and 19, wrapping.
+                for (j, step) in [1usize, 3, 7, 11, 19].iter().enumerate() {
+                    let dst = (i + step) % 60;
+                    db.execute(&format!(
+                        r#"INSERT INTO edges VALUES ('{{"id":"e{:04}","src":"n{i:03}","dst":"n{dst:03}","w":{}}}')"#,
+                        i * 5 + j,
+                        (i + j) % 5
+                    ))
+                    .unwrap();
+                }
+            }
+            db.execute(
+                r#"INSERT INTO edges VALUES ('{"id":"e9999","src":"n007","dst":"gone","w":4}')"#,
+            )
+            .unwrap();
+            db.delete_key("nodes", "n008").unwrap();
+            let mut got = Vec::new();
+            for sql in statements {
+                let r = db.query(sql).unwrap();
+                assert!(!r.rows.is_empty(), "{sql}");
+                got.push(format!(
+                    "{:?} cut={:?}",
+                    r.rows
+                        .iter()
+                        .map(|row| (
+                            row.key.clone(),
+                            row.score.map(f32::to_bits),
+                            row.distance.map(f32::to_bits)
+                        ))
+                        .collect::<Vec<_>>(),
+                    r.cut_walks
+                ));
+            }
+            let plan = plan_of(&mut db, statements[0]);
+            // n007 -> n008 (deleted) and n007 -> gone (never a node).
+            assert!(
+                plan.contains("6 new, 2 dangling, frontier 4"),
+                "layout {li}: both dangling edges are counted:\n{plan}"
+            );
+            answers.push(got);
+            let _ = fs::remove_dir_all(&dir);
+        }
+        for (li, a) in answers.iter().enumerate().skip(1) {
+            assert_eq!(a, &answers[0], "layout {li} answered differently from one shard");
+        }
+    }
+
+    /// A cap that binds says so on the response, in the plan, and per hop:
+    /// which cap, at which hop, how much it kept. What it keeps is the
+    /// lexicographically first, so a cut answer is the same cut answer at
+    /// every layout. A statement no cap bound carries no such line.
+    #[test]
+    fn a_cut_walk_says_which_cap_bound_it() {
+        let dir = tmp("hops-cut");
+        let mut db = graph(&dir);
+        // A hub: p1 gains twenty more targets.
+        for i in 0..20 {
+            db.execute(&format!(r#"INSERT INTO papers VALUES ('{{"id":"q{i:02}","body":"graph","embedding":[0.0,{i}.0]}}')"#)).unwrap();
+            db.execute(&format!(r#"INSERT INTO cites VALUES ('{{"id":"h{i:02}","src":"p1","dst":"q{i:02}","kind":"cites"}}')"#)).unwrap();
+        }
+        let r = db
+            .query("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA cites LIMIT 100")
+            .unwrap();
+        assert_eq!(r.rows.len(), 23);
+        assert!(r.cut_walks.is_empty(), "nothing bound: {:?}", r.cut_walks);
+
+        let r = db
+            .query("SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA cites LIMIT 100 WITH (max_fanout = 4)")
+            .unwrap();
+        assert_eq!(key_set(&r), ["p2", "p3", "p8", "q00"], "the first four by key");
+        assert_eq!(r.cut_walks.len(), 1, "{:?}", r.cut_walks);
+        assert_eq!(
+            r.cut_walks[0],
+            "WITHIN 1 HOPS OF 'p1' VIA cites was cut at hop 1: max_fanout = 4 bound 1 node(s), \
+             whose remaining edges were not followed"
+        );
+        let plan = plan_of(&mut db, "SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA cites LIMIT 100 WITH (max_fanout = 4)");
+        assert!(plan.contains("frontier 4; CUT: max_fanout = 4 bound 1 node(s)"), "{plan}");
+        assert!(plan.contains("note: WITHIN 1 HOPS OF 'p1' VIA cites was cut at hop 1"), "{plan}");
+
+        let r = db
+            .query("SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites LIMIT 100 WITH (max_frontier = 2)")
+            .unwrap();
+        // Hop 1 keeps p2 and p3 of 23; hop 2 from them finds p4, p5 and pX
+        // and keeps the first two. The cap is applied to what the hop found,
+        // before the liveness check, so the work it bounds is bounded; pX
+        // was cut, not found dangling.
+        assert_eq!(key_set(&r), ["p2", "p3", "p4", "p5"]);
+        assert_eq!(
+            r.cut_walks,
+            [
+                "WITHIN 2 HOPS OF 'p1' VIA cites was cut at hop 1: max_frontier = 2 kept 2 of 23 keys",
+                "WITHIN 2 HOPS OF 'p1' VIA cites was cut at hop 2: max_frontier = 2 kept 2 of 3 keys",
+            ]
+        );
+        let plan = plan_of(&mut db, "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites LIMIT 100 WITH (max_frontier = 2)");
+        assert!(plan.contains("hop 1: 1 key(s) expanded over 23 edge(s): 23 new, 0 dangling, frontier 2; CUT: max_frontier = 2 kept 2 of 23"), "{plan}");
+        assert!(plan.contains("hop 2: 2 key(s) expanded over 4 edge(s): 3 new, 0 dangling, frontier 2; CUT: max_frontier = 2 kept 2 of 3"), "{plan}");
+        // The console and any client see the same line the rows came with.
+        let text = crate::serve::rows_json(&r, 0);
+        assert!(
+            text.contains(r#""cut_walks":["WITHIN 2 HOPS OF 'p1' VIA cites was cut at hop 1"#),
+            "{text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An adjacency index is tiered like any index, and a walk that finds it
+    /// below `cached` is refused naming the tier and the index, rather than
+    /// paying a chain of archive fault-ins per hop. Raising the tier makes
+    /// the same statement answer again.
+    #[test]
+    fn a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier() {
+        let dir = tmp("hops-cold");
+        let mut db = graph(&dir);
+        db.execute("FLUSH cites").unwrap();
+        let sql = "SELECT id FROM papers WHERE id WITHIN 1 HOP OF 'p1' VIA cites LIMIT 100";
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p8"]);
+        db.execute("ALTER INDEX cites_adj ON cites SET TIER 'archived'").unwrap();
+        let e = db.query(sql).unwrap_err().to_string();
+        assert!(
+            e.contains("archived") && e.contains("cites_adj") && e.contains("SET TIER 'cached'"),
+            "{e}"
+        );
+        db.execute("ALTER INDEX cites_adj ON cites SET TIER 'cached'").unwrap();
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p8"]);
+        // `minimal` and `active` are warmer than `cached`, so they walk too.
+        db.execute("ALTER INDEX cites_adj ON cites SET TIER 'minimal'").unwrap();
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p8"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An edge to a node that is deleted at the statement's instant, or that
+    /// never existed, is followed and resolves to nothing: the key is not in
+    /// the answer, nothing beyond it is walked, and the plan counts it at
+    /// the hop that found it. A read at an instant before the delete still
+    /// walks through the node, because MVCC hides it only after.
+    #[test]
+    fn a_dangling_edge_is_skipped_and_counted() {
+        let dir = tmp("hops-dangling");
+        let mut db = graph(&dir);
+        let sql = "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'cites' LIMIT 100";
+        assert_eq!(key_set(&db.query(sql).unwrap()), ["p2", "p3", "p4", "p5"]);
+        let plan = plan_of(&mut db, sql);
+        assert!(
+            plan.contains("hop 1: 1 key(s) expanded over 2 edge(s): 2 new, 0 dangling, frontier 2"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("hop 2: 2 key(s) expanded over 4 edge(s): 3 new, 1 dangling, frontier 2"),
+            "{plan}"
+        );
+        db.delete_key("papers", "p3").unwrap();
+        assert_eq!(
+            key_set(&db.query(sql).unwrap()),
+            ["p2", "p4"],
+            "p3 is gone, and p5 -- reachable only through it -- with it"
+        );
+        let plan = plan_of(&mut db, sql);
+        assert!(
+            plan.contains("hop 1: 1 key(s) expanded over 2 edge(s): 2 new, 1 dangling, frontier 1"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("hop 2: 1 key(s) expanded over 2 edge(s): 2 new, 1 dangling, frontier 1"),
+            "{plan}"
+        );
+        assert!(plan.contains("2 key(s) in 1..2 hop(s)"), "{plan}");
+        // The edge rows themselves are untouched: the walk hides the node,
+        // not the edge.
+        assert_eq!(
+            db.query("SELECT id FROM cites WHERE src = 'p3' LIMIT 10").unwrap().rows.len(),
+            2
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

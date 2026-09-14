@@ -277,6 +277,13 @@ fn truncation_report(r: &QueryResult) -> String {
         out.push_str(t);
         out.push('\n');
     }
+    // A walk a cap bound is the third sibling of `missing`, rendered in the
+    // same block for the same reason: the table is short and says so.
+    for t in &r.cut_walks {
+        out.push_str("CUT — ");
+        out.push_str(t);
+        out.push('\n');
+    }
     out
 }
 
@@ -530,6 +537,9 @@ mod tests {
             });
         }
         r.truncated_prefixes = vec!["text_match(body, 'a*') was cut: documents are missing".into()];
+        r.cut_walks =
+            vec!["WITHIN 2 HOPS OF 'x' VIA cites was cut at hop 1: max_fanout = 4 bound 1 node(s)"
+                .into()];
         r.next_cursor = Some("#00000000|2|b".into());
         let mut out = Vec::new();
         render_rows(&r, &mut out);
@@ -543,10 +553,11 @@ mod tests {
         };
         let last_row = at("b  score=0.500000");
         let cut = at("TRUNCATED — text_match(body, 'a*') was cut");
+        let walk = at("CUT — WITHIN 2 HOPS OF 'x' VIA cites was cut at hop 1");
         let count = at("2 row(s)");
         let cursor = at("next cursor:");
-        assert!(last_row < cut && cut < count && count < cursor, "{text}");
-        assert_eq!(count - cut, 1, "something came between the block and the count: {text}");
+        assert!(last_row < cut && cut < walk && walk < count && count < cursor, "{text}");
+        assert_eq!(count - cut, 2, "something came between the block and the count: {text}");
     }
 
     #[test]

@@ -36,7 +36,9 @@ use crate::catalog::{Collection, Metric};
 use crate::column::CmpOp;
 use crate::deadline;
 use crate::error::{Error, Result};
-use crate::plan::explain::{Explain, ShardExplain, TextExplain, TextStrategy, UnitExplain};
+use crate::plan::explain::{
+    Explain, ShardExplain, TextExplain, TextStrategy, UnitExplain, WalkExplain,
+};
 use crate::plan::fusion::{fuse, Candidate, Direction, Fused, SourceList};
 use crate::plan::service::{
     CandidatesRequest, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
@@ -127,6 +129,11 @@ pub struct QueryResult {
     /// prefix takes, it returns whatever fraction of the matching documents the
     /// cap left, and before this it said nothing on any path.
     pub truncated_prefixes: Vec<String>,
+    /// Walks a cap bound, one line each naming the clause, the hop and the
+    /// cap. The third sibling of `missing`: a `WITHIN k HOPS OF` under
+    /// `max_frontier` or `max_fanout` returns the part of the neighbourhood
+    /// the cap left, and says so here on every path, not only in the plan.
+    pub cut_walks: Vec<String>,
     pub next_cursor: Option<String>,
 }
 
@@ -246,6 +253,17 @@ pub struct ExecInput<'a> {
     pub stats: &'a BTreeMap<String, GlobalStats>,
     pub analyze: bool,
     pub statement: String,
+    /// The key set each walk of the statement resolved to, in predicate
+    /// order; `select` already has them bound as `IN` lists, and these are
+    /// for the shards on other nodes that re-parse the statement.
+    pub frontiers: &'a [Vec<String>],
+    /// The walks as the coordinator ran them, for the plan.
+    pub walks: Vec<WalkExplain>,
+    /// Cut lines from the walks, for the response.
+    pub cut_walks: Vec<String>,
+    /// Edge shards that did not answer during a walk, under
+    /// `partial_results`, for `missing`.
+    pub walk_missing: Vec<String>,
 }
 
 /// Terms this statement needs global statistics for, per path. The coordinator
@@ -456,6 +474,12 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             Expr::VectorDistance { path, op, query, .. } => check_vector(coll, path, *op, query),
             Expr::And(v) | Expr::Or(v) => v.iter().try_for_each(|x| check_thresholds(coll, x)),
             Expr::Not(x) => check_thresholds(coll, x),
+            // The coordinator binds every walk to a key set before the
+            // executor sees the statement; one that reached here was not.
+            Expr::Hops { via, .. } => Err(Error::Plan(format!(
+                "a walk over `{via}` reached the executor unresolved; only the coordinator \
+                 can walk, through Db::run_select"
+            ))),
             Expr::Compare { .. } | Expr::TextMatch { .. } | Expr::True => Ok(()),
         }
     }
@@ -474,6 +498,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         exact_mode: sel.with.exact,
         deadline_ms: deadline::limit_ms(),
         stats_exact: input.stats.values().next().map(|s| s.exact).unwrap_or(sel.with.exact_scoring),
+        walks: input.walks.clone(),
         ..Default::default()
     };
 
@@ -528,16 +553,21 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         ex.total_micros = t0.elapsed().as_micros();
         let cut = truncated_prefixes(input.stats);
         ex.notes.extend(cut.iter().cloned());
+        ex.notes.extend(input.cut_walks.iter().cloned());
         let mut rows = out.0;
         project(&input.select.projections, &mut rows);
         if !sel.with.partial_results {
             deadline::check()?;
         }
+        let mut missing = input.walk_missing.clone();
+        missing.extend(out.1);
+        ex.missing = missing.clone();
         return Ok(QueryResult {
             rows,
             explain: if input.analyze { Some(ex) } else { None },
-            missing: out.1,
+            missing,
             truncated_prefixes: cut,
+            cut_walks: input.cut_walks.clone(),
             next_cursor: None,
         });
     }
@@ -591,6 +621,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             analyze: input.analyze,
             statement: &input.statement,
             params: input.params,
+            frontiers: input.frontiers,
         };
         match shard.candidates(&req) {
             Ok(a) => {
@@ -721,10 +752,17 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         .map(|r| encode_cursor(last_sort.unwrap_or(0.0), cursor_depth + rows.len(), &r.key));
     missing.sort();
     missing.dedup();
+    let mut missing = {
+        let mut m = input.walk_missing.clone();
+        m.extend(missing);
+        m
+    };
+    missing.dedup();
     ex.missing = missing.clone();
     ex.total_micros = t0.elapsed().as_micros();
     let cut = truncated_prefixes(input.stats);
     ex.notes.extend(cut.iter().cloned());
+    ex.notes.extend(input.cut_walks.iter().cloned());
     project(&input.select.projections, &mut rows);
     // Strict at the end: a deadline that passed during the last unit's work
     // is a statement that did not finish in time, whatever the loop managed
@@ -738,6 +776,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         explain: if input.analyze { Some(ex) } else { None },
         missing,
         truncated_prefixes: cut,
+        cut_walks: input.cut_walks.clone(),
         next_cursor,
     })
 }
@@ -960,6 +999,11 @@ fn eval_expr(
             acc.andnot_inplace(&t);
             acc
         }
+        Expr::Hops { via, .. } => {
+            return Err(Error::Plan(format!(
+                "a walk over `{via}` reached a unit unresolved; only the coordinator can walk"
+            )))
+        }
         Expr::Compare { path, op, lit } => {
             let (bm, used_column) = unit.filter(path, *op, lit, candidates)?;
             ux.access_paths.push(format!(
@@ -1098,6 +1142,11 @@ fn eval_defined(
         }
         Expr::Not(inner) => eval_defined(unit, inner, vis, candidates, stats, analyze, ux)?,
         Expr::Compare { path, op, lit } => unit.comparable(path, *op, lit, candidates)?,
+        Expr::Hops { via, .. } => {
+            return Err(Error::Plan(format!(
+                "a walk over `{via}` reached a unit unresolved; only the coordinator can walk"
+            )))
+        }
         // A text match is two-valued: a document either matches or it does not.
         Expr::TextMatch { .. } => Bitmap::all(n),
         // A distance is defined where the document has a vector; elsewhere the
@@ -1129,8 +1178,23 @@ fn predicate_cost(unit: &Searchable<'_>, e: &Expr) -> u32 {
         Expr::VectorDistance { .. } => 20,
         Expr::And(v) | Expr::Or(v) => v.iter().map(|x| predicate_cost(unit, x)).max().unwrap_or(1),
         Expr::Not(x) => predicate_cost(unit, x) + 1,
-        Expr::True => 0,
+        // Bound to an `IN` before any unit sees it; the executor refuses one
+        // that was not, so the cost is never read.
+        Expr::True | Expr::Hops { .. } => 0,
     }
+}
+
+/// A structured predicate over `candidates` of one unit, for a walk's edge
+/// filter: the same evaluator the executor runs, with no statistics, since
+/// `walk::check_edge_filter` admits no leaf that needs them.
+pub(crate) fn eval_structured(
+    unit: &Searchable<'_>,
+    e: &Expr,
+    vis: &Bitmap,
+    candidates: &Bitmap,
+    ux: &mut UnitExplain,
+) -> Result<Bitmap> {
+    eval_expr(unit, e, vis, candidates, &BTreeMap::new(), false, ux)
 }
 
 fn short(v: &Value) -> String {
@@ -1288,6 +1352,7 @@ fn scan(
             fields: &fields,
             statement: &input.statement,
             params: input.params,
+            frontiers: input.frontiers,
         };
         match shard.scan(&req) {
             Ok(a) => {

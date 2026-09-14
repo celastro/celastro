@@ -191,6 +191,9 @@ function renderRows(res) {
   // the one surface that showed the short table and said nothing.
   var cut = Array.isArray(res.truncated_prefixes) ? res.truncated_prefixes : [];
   cut.forEach(function (line) { warnings.push('TRUNCATED — ' + line); });
+  // And the third sibling: a walk one of its caps bound.
+  var cutWalks = Array.isArray(res.cut_walks) ? res.cut_walks : [];
+  cutWalks.forEach(function (line) { warnings.push('CUT — ' + line); });
   if (warnings.length) {
     warnings.forEach(function (w) { results.appendChild(el('p', 'warn', w)); });
     setStatus(summary + '. ' + warnings.join(' '), 'warn');

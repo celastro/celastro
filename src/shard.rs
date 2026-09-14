@@ -203,6 +203,31 @@ impl SegmentHandle {
     }
 }
 
+/// The strings at one path of one unit, by ordinal. See
+/// [`Searchable::strings`].
+pub struct StrReader<'a> {
+    unit: &'a Searchable<'a>,
+    path: &'a str,
+    col: Option<Arc<crate::column::Column>>,
+}
+
+impl StrReader<'_> {
+    /// The string at the ordinal, or `None` when the document has no string
+    /// there. From the column when the unit has one and the value is of its
+    /// type, and from the document otherwise.
+    pub fn at(&self, ord: u32) -> Result<Option<String>> {
+        if let Some(c) = &self.col {
+            match c.get(ord) {
+                Value::Str(s) => return Ok(Some(s)),
+                // A value the column declined is in the document.
+                Value::Null if c.mismatch.get(ord as usize) => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(self.unit.document(ord)?.path(self.path).and_then(|v| v.as_str()).map(str::to_string))
+    }
+}
+
 /// What a query iterates over: the memtable and every sealed segment, behind
 /// one interface. Candidate generation is written once and neither knows nor
 /// cares which it is looking at.
@@ -409,9 +434,22 @@ impl<'a> Searchable<'a> {
         }
     }
 
+    /// A reader of the strings at `path`, by ordinal, for a caller that
+    /// reads many: the shredded column is resolved once here, because
+    /// resolving it is a residency acquisition with a lock and an
+    /// allocation, and a walk reads two strings per edge over tens of
+    /// thousands of edges.
+    pub fn strings(&'a self, path: &'a str) -> Result<StrReader<'a>> {
+        let col = match self {
+            Searchable::Seg(h) => h.segment.column(path)?,
+            Searchable::Mem(_) => None,
+        };
+        Ok(StrReader { unit: self, path, col })
+    }
+
     pub fn document(&self, ord: u32) -> Result<Value> {
         #[cfg(test)]
-        DOCUMENTS_DECODED.fetch_add(1, AtomicOrdering::Relaxed);
+        DOCUMENTS_DECODED.with(|c| c.set(c.get() + 1));
         match self {
             Searchable::Mem(m) => m
                 .docs
@@ -423,12 +461,23 @@ impl<'a> Searchable<'a> {
     }
 }
 
-/// How many documents `Searchable::document` has produced, for the tests
-/// that pin what a scan does NOT decode. Counted here because this is the
-/// one door a query's payloads come through; a scan that reached a segment's
-/// decoder by another path would not be counted, which is the residual.
+/// How many documents `Searchable::document` has produced on this thread,
+/// for the tests that pin what a scan does NOT decode. Counted here because
+/// this is the one door a query's payloads come through; a scan that reached
+/// a segment's decoder by another path would not be counted, which is the
+/// residual. Per thread, because the test harness runs tests in parallel
+/// and a statement runs on the thread that issued it: a process-wide count
+/// measured across a query also counted every other test's decodes, and
+/// failed one run in a few once enough tests decoded documents.
 #[cfg(test)]
-pub(crate) static DOCUMENTS_DECODED: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn documents_decoded() -> u64 {
+    DOCUMENTS_DECODED.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static DOCUMENTS_DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// How many terms `Shard::term_stats` has been asked for, summed over calls
 /// and shards, for the tests that pin what a gather does NOT re-measure: the

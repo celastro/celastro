@@ -42,7 +42,11 @@ pub enum Statement {
     /// dictionary terms a prefix on the collection expands to.
     AlterCollection {
         collection: String,
-        prefix_expansion: usize,
+        prefix_expansion: Option<usize>,
+        /// `SET (nodes_of = 'papers')`: point an existing collection at the
+        /// node collection its edges join, so that a collection loaded before
+        /// it had an adjacency index can get one.
+        nodes_of: Option<String>,
     },
     CreateLifecyclePolicy(LifecycleDecl),
     DropLifecyclePolicy {
@@ -122,13 +126,29 @@ pub struct CreateCollection {
     /// `WITH (nodes = [...])`: the nodes to place the shards on, round-robin
     /// by shard index. Empty means every attached node and this one.
     pub nodes: Vec<String>,
+    /// `WITH (nodes_of = 'papers')`: this is an edge collection whose `src`
+    /// and `dst` are primary keys of `papers`.
+    pub nodes_of: Option<String>,
+    /// `WITH (undirected = true)`: a walk over this collection's edges
+    /// follows them in both directions.
+    pub undirected: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum IndexSpec {
-    FullText { analyzer: String },
-    Vector { dims: usize, metric: Metric },
+    FullText {
+        analyzer: String,
+    },
+    Vector {
+        dims: usize,
+        metric: Metric,
+    },
     Secondary,
+    /// `USING adjacency (src, dst)`: the walk index of an edge collection.
+    /// `path` is the column a hop probes, `to` the one it reads.
+    Adjacency {
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +204,23 @@ pub enum Expr {
         query: Vec<f32>,
         cmp: CmpOp,
         threshold: f64,
+    },
+    /// `id WITHIN k HOPS OF 'x' VIA cites [REVERSE] [WHERE <edge filter>]`:
+    /// the primary keys reachable from `x` in one to `k` hops over the edge
+    /// collection `via`, the start excluded. A filter contributing no rank,
+    /// like `text_match`. The coordinator resolves it to a key set before
+    /// the scatter and the shards see it as `id IN (...)`; an executor that
+    /// meets it unresolved refuses, since no unit can walk on its own.
+    Hops {
+        path: String,
+        k: usize,
+        start: String,
+        via: String,
+        /// Follow the adjacency index against its declared order.
+        reverse: bool,
+        /// A structured predicate on the edge collection, applied at every
+        /// hop.
+        filter: Option<Box<Expr>>,
     },
     And(Vec<Expr>),
     Or(Vec<Expr>),
@@ -299,6 +336,12 @@ pub struct WithOpts {
     /// visit, for a caller that would rather have a short answer. It binds
     /// knowingly: the plan shows the count beside it.
     pub max_visits: Option<usize>,
+    /// `WITH (max_frontier = N)`: the most keys one hop of a walk may yield;
+    /// the rest are cut, lexicographically, and the answer says so.
+    pub max_frontier: Option<usize>,
+    /// `WITH (max_fanout = N)`: the most edges one node's expansion follows
+    /// in a walk, which is what a hub costs; cut the same way.
+    pub max_fanout: Option<usize>,
     /// Query deadline in milliseconds. Zero is exceeded at once.
     pub deadline_ms: Option<u64>,
     /// `WITH (no_deadline)`: run without a budget, whatever the `Db`'s

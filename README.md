@@ -1,8 +1,8 @@
 # celastro
 
-A hybrid document database. Structured SQL, BM25 full-text and vector similarity
-are three first-class retrieval modes evaluated in a **single query plan**,
-rather than orchestrated across separate services.
+A hybrid document database. Structured SQL, BM25 full-text, vector similarity
+and a bounded graph walk are four first-class retrieval modes evaluated in a
+**single query plan**, rather than orchestrated across separate services.
 
 Written in Rust with **zero dependencies outside `std`** — no crates, no C
 libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
@@ -12,7 +12,7 @@ cargo install celastro        # the `celastro` REPL and the `celastro-cli` tool
 ```
 
 **Status.** Single node, with multiple shards in one process and explicit
-key-range splits. Immutable segments, size-tiered compaction under a hard
+key-range splits; shards can be spread over nodes. Immutable segments, size-tiered compaction under a hard
 segment cap, MVCC with snapshot reads, tiered vector indexes, runtime
 filtered-search strategy selection, storage tiers with lifecycle policies, and
 `EXPLAIN ANALYZE` over all of it. Replication, consensus and cross-shard
@@ -158,6 +158,52 @@ expression, because `a.b` always means the nested path. Both refusals say so.
 `celastro-cli demo` builds a 400-document corpus across three shards and walks
 through the same ideas at a size where the plan has choices to make. It runs in
 memory and needs nothing.
+
+---
+
+## Walking a graph
+
+An edge is a document in a collection of its own that points into a node
+collection, and a walk is a filter beside the others:
+
+```sql
+CREATE COLLECTION papers (id TEXT PRIMARY KEY);
+CREATE INDEX papers_body ON papers USING fulltext (body);
+CREATE INDEX papers_emb ON papers USING vector (embedding) WITH (dims = 4, metric = 'cosine');
+CREATE COLLECTION cites (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL)
+  WITH (nodes_of = 'papers');
+CREATE INDEX cites_adj ON cites USING adjacency (src, dst);
+
+-- everything p1 cites, and what those cite, matching the text, nearest the vector
+SELECT id FROM papers
+WHERE id WITHIN 2 HOPS OF 'p1' VIA cites AND text_match(body, 'retrieval')
+ORDER BY embedding <=> [0.5,0.5,0.0,0.0] LIMIT 10;
+```
+
+`WITHIN k HOPS OF` selects every node reachable in one to `k` hops, the start
+excluded (`OR id = 'p1'` puts it back). `VIA cites` follows edges from `src`
+to `dst`, the order the adjacency index was declared in; `VIA cites REVERSE`
+follows them the other way, and a collection created `WITH (undirected =
+true)` follows both. `VIA cites WHERE kind = 'cites'` applies a structured
+filter on the edge collection at every hop; a compound one goes in
+parentheses. The walk is resolved before the rest of the plan runs and the
+neighbourhood joins the text and vector sets as one more bitmap, so the
+answer is the same at any number of shards, and an edge collection can be
+spread over nodes like any other.
+
+`k` is required, and two caps bound what a hub can cost: `WITH (max_fanout =
+N)` follows at most `N` edges out of one node, `WITH (max_frontier = N)`
+keeps at most `N` of the keys a hop found. Either cut keeps the
+lexicographically first and says so, on the response as a `CUT` line and in
+`EXPLAIN ANALYZE`, which shows every hop: keys expanded, edges followed, new
+keys, dangling edges (a `dst` that names no live document is skipped and
+counted) and the frontier that goes on. An adjacency index is tiered like any
+index; a walk that finds it below `cached` is refused naming the tier, since
+a walk reads it at every hop.
+
+This is not a graph database: no pattern language, no unbounded paths, no
+shortest path, no centrality. It is the neighbourhood as a filter, fused with
+the other three modes in one plan.
 
 ---
 
@@ -314,7 +360,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.19.0 && docker tag ghcr.io/celastro/celastro:0.19.0 celastro
+docker pull ghcr.io/celastro/celastro:0.20.0 && docker tag ghcr.io/celastro/celastro:0.20.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
@@ -347,9 +393,10 @@ and 1-bit codes and full-precision rerank, runtime selection between brute
 force, post-filter and filter-aware vector search, and storage tiers with
 lifecycle policies.
 
-What is deliberately not here: everything that needs more than one process.
-Consensus and replication, follower reads, two-phase commit across shards,
-and dynamic shard split and merge. The boundaries those attach to are built
+What is deliberately not here: everything that needs more than one process
+— consensus and replication, follower reads, two-phase commit across shards,
+dynamic shard split and merge — and a graph database's pattern language and
+analytics, of which only the bounded walk above is a retrieval mode. The boundaries those attach to are built
 and tested — including a deterministic simulator that puts partitions,
 crashes and reordering on the coordinator-to-shard boundary and checks that a
 fault can shorten an answer only by saying so — but the distributed pieces
