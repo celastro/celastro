@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.17.0 — 2026-09-14
+
+A new module and a library type that changed shape, hence a minor. The
+on-disk format is unchanged.
 
 **A deterministic simulator, and the boundary it drives.** A query now
 reaches a shard through `plan::service::ShardService` — statistics, prefix
