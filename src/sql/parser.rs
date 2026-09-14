@@ -173,6 +173,23 @@ impl<'a> Parser<'a> {
                 Statement::DetachNode { url }
             });
         }
+        if self.eat_kw("MOVE") || self.is_kw("PLACE") {
+            let place = self.eat_kw("PLACE");
+            self.expect_kw("SHARD")?;
+            let shard = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            self.expect_kw(if place { "ON" } else { "TO" })?;
+            let node = self.node_address()?;
+            return Ok(if place {
+                Statement::PlaceShard { collection, shard, node }
+            } else {
+                Statement::MoveShard { collection, shard, to: node }
+            });
+        }
+        if self.eat_kw("REBALANCE") {
+            return Ok(Statement::Rebalance { collection: self.ident()? });
+        }
         if self.eat_kw("EXPLAIN") {
             let analyze = self.eat_kw("ANALYZE");
             // A prefix that recurses into `statement` is recursive descent like
@@ -558,6 +575,17 @@ impl<'a> Parser<'a> {
             other => return Err(Error::Sql(format!("unknown index type `{other}`"))),
         };
         Ok(Statement::CreateIndex(CreateIndex { name, collection, path, spec, tier }))
+    }
+
+    /// A node address literal, `'tcp://host:port'`.
+    fn node_address(&mut self) -> Result<String> {
+        match self.literal()? {
+            Value::Str(s) => Ok(s),
+            other => Err(Error::Sql(format!(
+                "a node address is a string like 'tcp://host:port', not {}",
+                crate::json::to_string(&other)
+            ))),
+        }
     }
 
     fn tier_name(&mut self) -> Result<Tier> {
@@ -1783,6 +1811,43 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match parse("detach node 'tcp://b:9000'", &[]).unwrap() {
+            Statement::DetachNode { url } => assert_eq!(url, "tcp://b:9000"),
+            other => panic!("{other:?}"),
+        }
+        match parse("MOVE SHARD 2 OF items TO 'tcp://c:9000'", &[]).unwrap() {
+            Statement::MoveShard { collection, shard, to } => {
+                assert_eq!((collection.as_str(), shard, to.as_str()), ("items", 2, "tcp://c:9000"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("PLACE SHARD 2 OF items ON 'tcp://c:9000'", &[]).unwrap() {
+            Statement::PlaceShard { collection, shard, node } => {
+                assert_eq!(
+                    (collection.as_str(), shard, node.as_str()),
+                    ("items", 2, "tcp://c:9000")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("LOCAL PLACE SHARD 0 OF items ON 'tcp://c:9000'", &[]).unwrap() {
+            Statement::Local(inner) => {
+                assert!(matches!(*inner, Statement::PlaceShard { shard: 0, .. }))
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("REBALANCE items", &[]).unwrap() {
+            Statement::Rebalance { collection } => assert_eq!(collection, "items"),
+            other => panic!("{other:?}"),
+        }
+        for (sql, why) in [
+            ("MOVE SHARD 1 OF items TO 9000", "a node address is a string"),
+            ("MOVE SHARD x OF items TO 'tcp://c:9000'", "expected a literal"),
+            ("MOVE SHARD 1 items TO 'tcp://c:9000'", "expected `OF`"),
+        ] {
+            let e = parse(sql, &[]).unwrap_err().to_string();
+            assert!(e.contains(why), "{sql}: {e}");
+        }
+        match parse("DETACH NODE 'tcp://b:9000'", &[]).unwrap() {
             Statement::DetachNode { url } => assert_eq!(url, "tcp://b:9000"),
             other => panic!("{other:?}"),
         }

@@ -287,6 +287,170 @@ impl CollectionExport {
     }
 }
 
+/// One shard of an export, pinned at `ts`: its sealed segments by handle,
+/// its delete logs as they stand, the rows still in memory sealed into one
+/// fresh segment, and a manifest naming all of it. What a collection export
+/// writes to disk and what a move sends across the wire.
+fn export_shard(
+    coll: &Collection,
+    s: &Shard,
+    ts: Timestamp,
+    build: BuildOpts,
+) -> Result<ExportShard> {
+    let snap = s.snapshot_at(ts);
+    let sealed = snap.segments.clone();
+    // Captured now, at the pin: a delete landed after this point
+    // goes into the source's log and not into these bytes. The test
+    // that pins this deletes sealed rows between the pin and the
+    // write and finds them in the copy.
+    let deletes: Vec<(u64, Option<Vec<u8>>)> =
+        sealed.iter().map(|h| (h.id(), h.encode_deletes())).collect();
+    // The memtable and any frozen memtable, visible at `ts`, in key
+    // order: one version per key is visible, so one segment holds
+    // them all.
+    let mut pending: Vec<PendingDoc> = Vec::new();
+    let mut units: Vec<Searchable<'_>> = vec![Searchable::Mem(snap.memtable)];
+    units.extend(snap.frozen.iter().map(|f| Searchable::Mem(f)));
+    for unit in &units {
+        let Searchable::Mem(m) = unit else { continue };
+        let vis = unit.visibility(ts);
+        for ord in vis.iter() {
+            let d = &m.docs[ord as usize];
+            pending.push(PendingDoc {
+                sort_key: d.sort_key.clone(),
+                commit_ts: d.commit_ts,
+                doc: d.doc.clone(),
+            });
+        }
+    }
+    pending.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    let next_id = sealed.iter().map(|h| h.id()).max().unwrap_or(0) + 1;
+    let mut handles: Vec<Arc<SegmentHandle>> = sealed.clone();
+    let mut fresh = None;
+    if !pending.is_empty() {
+        let mut b = SegmentBuilder::new(build);
+        for d in pending {
+            b.add(d);
+        }
+        let seg = b.build(next_id, 0, coll)?;
+        let bytes = seg.encode()?;
+        let handle = SegmentHandle::new(seg, DeleteLog::new(), None);
+        handles.push(handle);
+        fresh = Some((next_id, bytes));
+    }
+    let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1).encode();
+    let crc = crc32(&manifest);
+    put_u32(&mut manifest, crc);
+    Ok(ExportShard {
+        range: s.key_range.clone().unwrap_or((None, None)),
+        sealed,
+        deletes,
+        fresh,
+        manifest,
+    })
+}
+
+/// The shards pinned for moves, by `(collection, index)`, shared between
+/// the engine and the wire server.
+pub type Moves = Arc<std::sync::Mutex<BTreeMap<(String, usize), Arc<MoveOut>>>>;
+
+/// A shard pinned for a move: every file the target has to pull, as it was
+/// at the pin. Segment files are named by path -- the handles in `sealed`
+/// keep a retired file from being unlinked under the pull -- and everything
+/// captured at the pin is bytes.
+pub struct MoveOut {
+    pub to: String,
+    #[allow(dead_code)]
+    sealed: Vec<Arc<SegmentHandle>>,
+    files: Vec<(String, MoveFile)>,
+}
+
+enum MoveFile {
+    Path(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+/// How much of a file crosses the wire per call.
+pub const MOVE_CHUNK: u64 = 4 << 20;
+
+impl MoveOut {
+    fn from_export(to: &str, ex: ExportShard) -> Result<MoveOut> {
+        let mut files = Vec::new();
+        let (lo, hi) = &ex.range;
+        files.push((
+            "RANGE".to_string(),
+            MoveFile::Bytes(
+                format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default())
+                    .into_bytes(),
+            ),
+        ));
+        for h in &ex.sealed {
+            let name = format!("segments/{:016x}.seg", h.id());
+            let f = match h.segment.source() {
+                SegmentSource::File(p) | SegmentSource::Archive(p) => MoveFile::Path(p),
+                SegmentSource::Bytes(b) => MoveFile::Bytes(b.as_ref().clone()),
+                SegmentSource::Remote { store, key, .. } => MoveFile::Bytes(store.get(&key)?),
+            };
+            files.push((name, f));
+        }
+        for (id, log) in &ex.deletes {
+            if let Some(bytes) = log {
+                files.push((format!("deletes/{id:016x}.dlog"), MoveFile::Bytes(bytes.clone())));
+            }
+        }
+        if let Some((id, bytes)) = &ex.fresh {
+            files.push((format!("segments/{id:016x}.seg"), MoveFile::Bytes(bytes.clone())));
+        }
+        files.push(("MANIFEST".to_string(), MoveFile::Bytes(ex.manifest.clone())));
+        Ok(MoveOut { to: to.to_string(), sealed: ex.sealed, files })
+    }
+
+    /// Every file and its length, in the order the target writes them:
+    /// MANIFEST last, so a directory that stops short has no manifest and
+    /// cannot be mistaken for a shard.
+    pub fn list(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        for (name, f) in &self.files {
+            let len = match f {
+                MoveFile::Path(p) => fs::metadata(p)?.len(),
+                MoveFile::Bytes(b) => b.len() as u64,
+            };
+            out.push((name.clone(), len));
+        }
+        Ok(out)
+    }
+
+    /// `len` bytes of a file from `offset`, or fewer at its end.
+    pub fn read(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let Some((_, f)) = self.files.iter().find(|(n, _)| n == name) else {
+            return Err(Error::Plan(format!("the move has no file `{name}`")));
+        };
+        match f {
+            MoveFile::Bytes(b) => {
+                let a = (offset as usize).min(b.len());
+                let z = (offset.saturating_add(len) as usize).min(b.len());
+                Ok(b[a..z].to_vec())
+            }
+            MoveFile::Path(p) => {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut fh = fs::File::open(p)?;
+                fh.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; len.min(MOVE_CHUNK) as usize];
+                let mut got = 0;
+                while got < buf.len() {
+                    let n = fh.read(&mut buf[got..])?;
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                buf.truncate(got);
+                Ok(buf)
+            }
+        }
+    }
+}
+
 /// Copy a directory tree, every file published durably.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to)?;
@@ -533,6 +697,12 @@ pub struct Db {
     wire_token: Option<String>,
     /// One connection per other node, opened on demand. See `crate::wire`.
     nodes: BTreeMap<String, Arc<crate::wire::Node>>,
+    /// Shards of this node pinned for a move, by `(collection, index)`:
+    /// the files the target pulls, as they were at the pin. Shared with the
+    /// wire server, which answers a target's reads from it without this
+    /// lock, so that a coordinator that is also the source can hold the
+    /// lock for the whole statement while the target pulls.
+    moves: Moves,
     /// The client's read-your-writes token: the last commit timestamp it
     /// observed (§6). Subsequent reads pin at least this.
     pub last_commit: Timestamp,
@@ -578,6 +748,7 @@ impl Db {
             sim: None,
             wire_token: crate::wire::token_from_env(),
             nodes: BTreeMap::new(),
+            moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             queries_seen: 0,
             last_commit: 0,
         }
@@ -748,57 +919,7 @@ impl Db {
         catalog.collections.insert(name.to_string(), coll.clone());
         let mut shards = Vec::new();
         for s in self.shards(name)? {
-            let snap = s.snapshot_at(ts);
-            let sealed = snap.segments.clone();
-            // Captured now, at the pin: a delete landed after this point
-            // goes into the source's log and not into these bytes. The test
-            // that pins this deletes sealed rows between the pin and the
-            // write and finds them in the copy.
-            let deletes: Vec<(u64, Option<Vec<u8>>)> =
-                sealed.iter().map(|h| (h.id(), h.encode_deletes())).collect();
-            // The memtable and any frozen memtable, visible at `ts`, in key
-            // order: one version per key is visible, so one segment holds
-            // them all.
-            let mut pending: Vec<PendingDoc> = Vec::new();
-            let mut units: Vec<Searchable<'_>> = vec![Searchable::Mem(snap.memtable)];
-            units.extend(snap.frozen.iter().map(|f| Searchable::Mem(f)));
-            for unit in &units {
-                let Searchable::Mem(m) = unit else { continue };
-                let vis = unit.visibility(ts);
-                for ord in vis.iter() {
-                    let d = &m.docs[ord as usize];
-                    pending.push(PendingDoc {
-                        sort_key: d.sort_key.clone(),
-                        commit_ts: d.commit_ts,
-                        doc: d.doc.clone(),
-                    });
-                }
-            }
-            pending.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
-            let next_id = sealed.iter().map(|h| h.id()).max().unwrap_or(0) + 1;
-            let mut handles: Vec<Arc<SegmentHandle>> = sealed.clone();
-            let mut fresh = None;
-            if !pending.is_empty() {
-                let mut b = SegmentBuilder::new(self.opts.build);
-                for d in pending {
-                    b.add(d);
-                }
-                let seg = b.build(next_id, 0, &coll)?;
-                let bytes = seg.encode()?;
-                let handle = SegmentHandle::new(seg, DeleteLog::new(), None);
-                handles.push(handle);
-                fresh = Some((next_id, bytes));
-            }
-            let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1).encode();
-            let crc = crc32(&manifest);
-            put_u32(&mut manifest, crc);
-            shards.push(ExportShard {
-                range: s.key_range.clone().unwrap_or((None, None)),
-                sealed,
-                deletes,
-                fresh,
-                manifest,
-            });
+            shards.push(export_shard(&coll, s, ts, self.opts.build)?);
         }
         Ok(CollectionExport { name: name.to_string(), ts, catalog, shards })
     }
@@ -984,6 +1105,36 @@ impl Db {
     /// This node's advertised address, if it has one.
     pub fn node(&self) -> Option<&str> {
         self.opts.node.as_deref()
+    }
+
+    /// The data directory, or `None` in memory.
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    /// The shards pinned for a move, shared with the wire server. See
+    /// [`MoveOut`].
+    pub fn moves(&self) -> Moves {
+        self.moves.clone()
+    }
+
+    /// Where the shard owning `key` is going, if a move has pinned it: a
+    /// write to it is refused naming the move until the map has switched.
+    fn moving_to(&self, collection: &str, key: &str) -> Option<(usize, String)> {
+        let shards = self.shards.get(collection)?;
+        let s = shards.iter().find(|s| s.owns(key))?;
+        let moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
+        moves.get(&(collection.to_string(), s.index)).map(|m| (s.index, m.to.clone()))
+    }
+
+    fn refuse_if_moving(&self, collection: &str, key: &str) -> Result<()> {
+        match self.moving_to(collection, key) {
+            Some((i, to)) => Err(Error::Plan(format!(
+                "shard {i} of `{collection}` is moving to {to}; the write is refused until the \
+                 move completes, retry then"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// The instant a statement started now would read at.
@@ -1272,17 +1423,25 @@ impl Db {
         if !self.catalog.nodes.iter().any(|n| n == url) {
             return Err(Error::Plan(format!("node {url} is not attached")));
         }
-        let held: Vec<&String> = self
-            .catalog
-            .placement
-            .iter()
-            .filter(|(_, t)| t.iter().any(|x| x.node == url))
-            .map(|(n, _)| n)
-            .collect();
-        if !held.is_empty() {
+        // A node that still holds shards is not detached; the refusal is
+        // the plan that would empty it: one MOVE SHARD per shard, targets
+        // round-robin over the nodes that remain, in attach order.
+        let mut remaining: Vec<String> = self.opts.node.iter().cloned().collect();
+        remaining.extend(self.catalog.nodes.iter().filter(|n| *n != url).cloned());
+        let mut moves = Vec::new();
+        for (name, tablets) in &self.catalog.placement {
+            for (i, t) in tablets.iter().enumerate() {
+                if t.node == url {
+                    let target = &remaining[moves.len() % remaining.len()];
+                    moves.push(format!("MOVE SHARD {i} OF {name} TO '{target}'"));
+                }
+            }
+        }
+        if !moves.is_empty() {
             return Err(Error::Plan(format!(
-                "node {url} holds shards of {}; move or drop them first",
-                held.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                "node {url} holds {} shard(s); move them first: {}",
+                moves.len(),
+                moves.join("; ")
             )));
         }
         self.catalog.nodes.retain(|n| n != url);
@@ -1316,6 +1475,321 @@ impl Db {
             if done.is_empty() { String::new() } else { format!(" and on {}", done.join(", ")) },
             failures.join("; ")
         )))
+    }
+
+    // ------------------------------------------------------------- moves
+
+    /// Pin a shard this node holds for a move to `to`: from this call until
+    /// the map switches, writes to it are refused naming the move, and the
+    /// files as they are at this instant are what the target pulls. Returns
+    /// the file list. Idempotent for a move already begun to the same node,
+    /// so a target that retries its pull sees the same files.
+    pub fn begin_move(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        to: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let key = (collection.to_string(), shard);
+        {
+            let moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(m) = moves.get(&key) {
+                if m.to == to {
+                    return m.list();
+                }
+                return Err(Error::Plan(format!(
+                    "shard {shard} of `{collection}` is already moving to {}",
+                    m.to
+                )));
+            }
+        }
+        let coll = self.catalog.get(collection)?.clone();
+        self.absorb_shard_catalogs(collection)?;
+        let ts = self.clock.peek().max(self.last_commit);
+        let s = self
+            .shards
+            .get(collection)
+            .and_then(|v| v.iter().find(|s| s.index == shard))
+            .ok_or_else(|| {
+                Error::Plan(format!("shard {shard} of `{collection}` is not on this node"))
+            })?;
+        let ex = export_shard(&coll, s, ts, self.opts.build)?;
+        let out = Arc::new(MoveOut::from_export(to, ex)?);
+        let list = out.list()?;
+        self.moves.lock().unwrap_or_else(|p| p.into_inner()).insert(key, out);
+        Ok(list)
+    }
+
+    /// Let go of a pinned move: the shard takes writes again and its files
+    /// are its own. What a coordinator does when the pull failed.
+    pub fn abort_move(&mut self, collection: &str, shard: usize) {
+        self.moves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(collection.to_string(), shard));
+    }
+
+    /// `MOVE SHARD i OF c TO 'node'`, from wherever it was issued: the
+    /// source pins the shard, the target pulls its files and adopts it, and
+    /// then every holder is told the new map -- the target first, the source
+    /// last, so the source's copy goes only once everyone else can find the
+    /// new one. A holder the map did not reach is named with the `LOCAL
+    /// PLACE SHARD` that repairs it.
+    pub fn move_shard(&mut self, collection: &str, shard: usize, to: &str) -> Result<String> {
+        let _deadline = self.arm_default_deadline();
+        crate::wire::parse_url(to)?;
+        let coll = self.catalog.get(collection)?.clone();
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let Some(t) = tablets.get(shard) else {
+            return Err(Error::Plan(format!(
+                "`{collection}` has {} shard(s); there is no shard {shard}",
+                tablets.len()
+            )));
+        };
+        let from = t.node.clone();
+        if !self.is_self(to) && !self.catalog.nodes.iter().any(|n| n == to) {
+            return Err(Error::Plan(format!(
+                "node {to} is not attached; ATTACH NODE '{to}' first"
+            )));
+        }
+        if from == to || (self.is_self(&from) && self.is_self(to)) {
+            return Err(Error::Plan(format!("shard {shard} of `{collection}` is already on {to}")));
+        }
+        if self.dir.is_none() {
+            return Err(Error::Plan("a move needs a persistent database (--dir)".into()));
+        }
+        let mut new = tablets.clone();
+        new[shard].node = to.to_string();
+
+        // 1. The source pins.
+        let files = if self.is_self(&from) {
+            self.begin_move(collection, shard, to)?
+        } else {
+            self.node_conn(&from)?.begin_move(collection, shard, to)?
+        };
+        // 2. The target pulls and adopts.
+        let pulled = if self.is_self(to) {
+            let node = self.node_conn(&from)?;
+            self.pull_here(&coll, &new, shard, Some(&node), &files)
+        } else {
+            self.node_conn(to)?.pull_shard(&coll, &new, shard, &from)
+        };
+        if let Err(e) = pulled {
+            if self.is_self(&from) {
+                self.abort_move(collection, shard);
+            } else if let Ok(n) = self.node_conn(&from) {
+                let _ = n.abort_move(collection, shard);
+            }
+            return Err(e);
+        }
+        // 3. The map switches: here, then the target, then every other
+        // node that may coordinate a statement over the collection -- a
+        // holder, or any attached node, since one that dropped its last
+        // shard still carries the definition and routes by its map -- and
+        // the source last.
+        self.place_shard(collection, shard, to)?;
+        let mut order: Vec<String> = Vec::new();
+        if !self.is_self(to) {
+            order.push(to.to_string());
+        }
+        let others: Vec<String> = tablets
+            .iter()
+            .chain(new.iter())
+            .map(|t| t.node.clone())
+            .chain(self.catalog.nodes.iter().cloned())
+            .collect();
+        for n in others {
+            if !self.is_self(&n) && n != to && n != from && !order.contains(&n) {
+                order.push(n);
+            }
+        }
+        if !self.is_self(&from) {
+            order.push(from.clone());
+        }
+        let sql = format!("PLACE SHARD {shard} OF {collection} ON '{to}'");
+        let done = self.propagate(&order, &sql, &[])?;
+        Ok(format!(
+            "shard {shard} of `{collection}` moved from {} to {to}; {} file(s), map switched{}",
+            if self.is_self(&from) { "this node" } else { from.as_str() },
+            files.len(),
+            if done.is_empty() { String::new() } else { format!(" on {}", done.join(", ")) }
+        ))
+    }
+
+    /// The target's half of a move, on this node: pull every file of the
+    /// pinned shard from `source` (a node, or this process when the source
+    /// is this node too) into a directory beside the shard's, then adopt it.
+    pub fn pull_here(
+        &mut self,
+        coll: &Collection,
+        tablets: &[Tablet],
+        shard: usize,
+        source: Option<&Arc<crate::wire::Node>>,
+        files: &[(String, u64)],
+    ) -> Result<()> {
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| Error::Plan("a move needs a persistent database (--dir)".into()))?;
+        let cdir = dir.join("collections").join(&coll.name);
+        let incoming = cdir.join(format!("shard-{shard:04}.incoming"));
+        let _ = fs::remove_dir_all(&incoming);
+        fs::create_dir_all(incoming.join("segments"))?;
+        fs::create_dir_all(incoming.join("deletes"))?;
+        fs::create_dir_all(incoming.join("archive"))?;
+        let local = source.is_none().then(|| {
+            self.moves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(coll.name.clone(), shard))
+                .cloned()
+        });
+        for (name, len) in files {
+            let mut bytes = Vec::with_capacity(*len as usize);
+            let mut off = 0u64;
+            while off < *len {
+                let want = (*len - off).min(MOVE_CHUNK);
+                let chunk = match (source, &local) {
+                    (Some(n), _) => n.read_file(&coll.name, shard, name, off, want)?,
+                    (None, Some(Some(m))) => m.read(name, off, want)?,
+                    _ => return Err(Error::Plan("the move is not pinned here".into())),
+                };
+                if chunk.is_empty() {
+                    return Err(Error::Storage(format!(
+                        "shard {shard} of `{}`: `{name}` ended at {off} of {len} bytes",
+                        coll.name
+                    )));
+                }
+                off += chunk.len() as u64;
+                bytes.extend_from_slice(&chunk);
+            }
+            crate::shard::atomic_write(&incoming.join(name), &bytes)?;
+        }
+        crate::shard::sync_dir(&incoming)?;
+        self.adopt_shard(coll, tablets, shard, &incoming)
+    }
+
+    /// Take a pulled shard directory into this node: it becomes
+    /// `shard-<i>`, the collection is known here (adopted with the new map
+    /// if it was not), the shard is opened and the map recorded.
+    fn adopt_shard(
+        &mut self,
+        coll: &Collection,
+        tablets: &[Tablet],
+        shard: usize,
+        incoming: &Path,
+    ) -> Result<()> {
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| Error::Plan("a move needs a persistent database (--dir)".into()))?;
+        let name = coll.name.clone();
+        let cdir = dir.join("collections").join(&name);
+        let sdir = cdir.join(format!("shard-{shard:04}"));
+        if self.shards.get(&name).is_some_and(|v| v.iter().any(|s| s.index == shard)) {
+            return Err(Error::Plan(format!("shard {shard} of `{name}` is already on this node")));
+        }
+        if sdir.exists() {
+            fs::remove_dir_all(&sdir)?;
+        }
+        fs::rename(incoming, &sdir)?;
+        crate::shard::sync_dir(&cdir)?;
+        crate::shard::sync_dir(&dir.join("collections"))?;
+        if self.catalog.get(&name).is_err() {
+            let mut def = coll.clone();
+            def.doc_count = 0;
+            def.paths.clear();
+            self.catalog.create(def)?;
+        }
+        self.catalog.placement.insert(name.clone(), tablets.to_vec());
+        let def = self.catalog.get(&name)?.clone();
+        let (lo, hi) = read_range(&sdir, shard, &name)?;
+        let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
+        sh.key_range = Some((lo, hi));
+        sh.index = shard;
+        let v = self.shards.entry(name.clone()).or_default();
+        v.push(sh);
+        v.sort_by_key(|s| s.index);
+        self.absorb_shard_catalogs(&name)?;
+        self.persist_catalog()
+    }
+
+    /// `PLACE SHARD i OF c ON 'node'`: this node's map records the shard
+    /// there. A copy this node holds of a shard now placed elsewhere is
+    /// retired and its directory removed; a shard placed here that this
+    /// node does not hold is refused, since the pull has to come first.
+    pub fn place_shard(&mut self, collection: &str, shard: usize, node: &str) -> Result<()> {
+        // A node the collection never reached has no map to switch and
+        // nothing to drop; the move told it in case it coordinates later.
+        let Some(tablets) = self.catalog.placement.get_mut(collection) else {
+            return Ok(());
+        };
+        let Some(t) = tablets.get_mut(shard) else {
+            return Err(Error::Plan(format!("`{collection}` has no shard {shard}")));
+        };
+        t.node = node.to_string();
+        let held = self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == shard));
+        if self.is_self(node) {
+            if !held {
+                return Err(Error::Plan(format!(
+                    "shard {shard} of `{collection}` was placed here but this node has not \
+                     received it; run MOVE SHARD again"
+                )));
+            }
+        } else if held {
+            let mut gone = Vec::new();
+            if let Some(v) = self.shards.get_mut(collection) {
+                let mut keep = Vec::new();
+                for s in v.drain(..) {
+                    if s.index == shard {
+                        gone.push(s);
+                    } else {
+                        keep.push(s);
+                    }
+                }
+                *v = keep;
+            }
+            if self.shards.get(collection).is_some_and(|v| v.is_empty()) {
+                self.shards.remove(collection);
+            }
+            self.abort_move(collection, shard);
+            for mut s in gone {
+                s.retire_all();
+                if let Some(d) = s.dir().map(|d| d.to_path_buf()) {
+                    let _ = fs::remove_dir_all(&d);
+                    if let Some(p) = d.parent() {
+                        let _ = crate::shard::sync_dir(p);
+                    }
+                }
+            }
+        }
+        self.persist_catalog()
+    }
+
+    /// `REBALANCE c`: the moves that put shard `i` on the `i`-th of this
+    /// node and the attached ones, in attach order -- the placement a
+    /// `CREATE COLLECTION` with no nodes named makes -- each a `MOVE
+    /// SHARD`, stopping at the first that fails.
+    pub fn rebalance(&mut self, collection: &str) -> Result<Vec<String>> {
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let me = self.opts.node.clone().ok_or_else(|| {
+            Error::Plan("this node has no address; nothing to rebalance over".into())
+        })?;
+        let mut nodes = vec![me];
+        nodes.extend(self.catalog.nodes.iter().cloned());
+        let mut done = Vec::new();
+        for (i, t) in tablets.iter().enumerate() {
+            let target = &nodes[i % nodes.len()];
+            if &t.node == target || (self.is_self(&t.node) && self.is_self(target)) {
+                continue;
+            }
+            done.push(self.move_shard(collection, i, target)?);
+        }
+        Ok(done)
     }
 
     pub fn add_index(&mut self, collection: &str, idx: IndexDef) -> Result<()> {
@@ -1474,6 +1948,7 @@ impl Db {
                  the placement maps disagree"
             )));
         }
+        self.refuse_if_moving(collection, &key)?;
         let shards = self
             .shards
             .get_mut(collection)
@@ -1532,6 +2007,7 @@ impl Db {
                  the placement maps disagree"
             )));
         }
+        self.refuse_if_moving(collection, key)?;
         let shards = self
             .shards
             .get_mut(collection)
@@ -2433,6 +2909,21 @@ impl Db {
             Statement::DetachNode { url } => {
                 self.detach_node(&url)?;
                 Ok(Outcome::Ack(format!("node {url} detached")))
+            }
+            Statement::MoveShard { collection, shard, to } => {
+                Ok(Outcome::Ack(self.move_shard(&collection, shard, &to)?))
+            }
+            Statement::Rebalance { collection } => {
+                let done = self.rebalance(&collection)?;
+                Ok(Outcome::Ack(if done.is_empty() {
+                    format!("`{collection}` is balanced; nothing moved")
+                } else {
+                    done.join("\n")
+                }))
+            }
+            Statement::PlaceShard { collection, shard, node } => {
+                self.place_shard(&collection, shard, &node)?;
+                Ok(Outcome::Ack(format!("shard {shard} of `{collection}` placed on {node}")))
             }
             Statement::Local(inner) => self.run_one(*inner, sql, params, analyze),
             Statement::DropIndex { collection, index } => {

@@ -76,6 +76,30 @@ pub enum Statement {
     DetachNode {
         url: String,
     },
+    /// `MOVE SHARD <i> OF <collection> TO 'tcp://host:port'` — the shard's
+    /// files go to the node at a pinned instant, the map switches on every
+    /// holder, the source drops its copy. Writes to the shard are refused
+    /// for the duration, naming the move.
+    MoveShard {
+        collection: String,
+        shard: usize,
+        to: String,
+    },
+    /// `REBALANCE <collection>` — the moves that put shard `i` on the
+    /// `i`-th of this node and the attached ones, in attach order, as a
+    /// `CREATE COLLECTION` with no nodes named would have.
+    Rebalance {
+        collection: String,
+    },
+    /// `PLACE SHARD <i> OF <collection> ON 'tcp://host:port'` — this node's
+    /// placement map records the shard on that node; a copy this node holds
+    /// of a shard placed elsewhere is dropped. What a move sends every holder
+    /// as `LOCAL PLACE SHARD ...`, and what repairs a holder it did not reach.
+    PlaceShard {
+        collection: String,
+        shard: usize,
+        node: String,
+    },
     /// Evaluate the policies and carry out whatever they call for. Like
     /// compaction, tiering is scheduled and visible rather than an invisible
     /// background process (§12.1).

@@ -277,7 +277,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
 
     // A node cannot be detached while it holds a shard.
     let e = a.exec(&format!("DETACH NODE '{}'", b.url)).unwrap_err().to_string();
-    assert!(e.contains("holds shards"), "{e}");
+    assert!(e.contains("holds 1 shard(s); move them first: MOVE SHARD 1 OF items TO"), "{e}");
     // And an export needs every shard here.
     let e = match a.db.lock().unwrap().export_collection("items") {
         Err(e) => e.to_string(),
@@ -507,6 +507,155 @@ fn a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answ
     );
 
     for d in [&a.dir, &c.dir, &one_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// M4: a shard moves between nodes with no row lost or duplicated, every
+/// node agrees on the new map, writes to the shard are refused naming the
+/// move while it is pinned, and a node emptied by moves can be detached --
+/// and `DETACH NODE` of a node still holding shards says which moves would
+/// empty it. Every route is covered: source and target both elsewhere,
+/// target here, source here; the answers on every node equal one
+/// process's throughout, and the map survives a restart.
+#[test]
+fn a_shard_moves_between_nodes_and_every_node_agrees() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("move-a");
+    let b = Node::start("move-b");
+    let c = Node::start("move-c");
+    let one_dir = dir("move-one");
+    let mut one = Db::open(&one_dir, DbOpts::default()).unwrap();
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    for sql in [CREATE, INDEXES[0], INDEXES[1]] {
+        a.ack(sql);
+        one.execute(sql).unwrap();
+    }
+    for i in 0..90usize {
+        if i == 60 {
+            a.ack("FLUSH items");
+            one.execute("FLUSH items").unwrap();
+        }
+        [&a, &b, &c][i % 3].db.lock().unwrap().insert("items", doc(i)).unwrap();
+        one.insert("items", doc(i)).unwrap();
+    }
+    assert!(b.db.lock().unwrap().delete_key("items", "t1\u{1}doc-031").unwrap());
+    assert!(one.delete_key("items", "t1\u{1}doc-031").unwrap());
+    // Exact statistics on both sides: what a move has to keep is the rows
+    // and their order, and the cached statistics' refresh points differ
+    // between a node that restarted and the single-process reference by
+    // design (the epoch is per node), which is not what this test is about.
+    let agree = |what: &str, one: &mut Db, nodes: &[&Node]| {
+        for base in QUERIES {
+            let q = &format!("{base} WITH (exact_scoring)");
+            let want = shape(&one.query(q).unwrap());
+            for n in nodes {
+                let got = n.query(q).unwrap_or_else(|e| panic!("{what}: {q} on {}: {e}", n.url));
+                assert_eq!(shape(&got), want, "{what}: {q} on {}", n.url);
+            }
+        }
+    };
+    agree("before", &mut one, &[&a, &b, &c]);
+
+    // A node holding shards is not detached; the refusal is the plan.
+    let e = a.exec(&format!("DETACH NODE '{}'", b.url)).unwrap_err().to_string();
+    assert!(e.contains(&format!("MOVE SHARD 1 OF items TO '{}'", a.url)), "{e}");
+
+    // Source and target both elsewhere: b's shard 1 goes to c.
+    let m = a.ack(&format!("MOVE SHARD 1 OF items TO '{}'", c.url));
+    assert!(m.contains("moved from") && m.contains("map switched"), "{m}");
+    assert_eq!(b.local_shards("items"), Vec::<usize>::new());
+    assert_eq!(c.local_shards("items"), vec![1, 2]);
+    for n in [&a, &b] {
+        let cat = n.ack("SHOW CATALOG items");
+        assert!(cat.contains(&format!("shard 1 on {}", c.url)), "{}: {cat}", n.url);
+    }
+    assert!(c.ack("SHOW CATALOG items").contains("shard 1 on this node"));
+    assert!(
+        !b.dir.join("collections").join("items").join("shard-0001").exists(),
+        "b dropped its copy"
+    );
+    // A node holding two shards is offered two targets, round-robin over
+    // the nodes that remain, so the plan empties it without piling both
+    // onto one.
+    let e = a.exec(&format!("DETACH NODE '{}'", c.url)).unwrap_err().to_string();
+    assert!(e.contains(&format!("MOVE SHARD 1 OF items TO '{}'", a.url)), "{e}");
+    assert!(e.contains(&format!("MOVE SHARD 2 OF items TO '{}'", b.url)), "{e}");
+    agree("after 1 -> c", &mut one, &[&a, &b, &c]);
+    // Writes to the moved shard's keys route to c now, through any node.
+    b.db.lock().unwrap().insert("items", doc(91)).unwrap();
+    one.insert("items", doc(91)).unwrap();
+    assert_eq!(c.docs_here("items"), 30 + 29 + 1 - 1 + 1, "shards 1 and 2, plus doc-091 in t1");
+    agree("after a write", &mut one, &[&a, &b, &c]);
+
+    // Target here: a pulls shard 2 from c.
+    a.ack(&format!("MOVE SHARD 2 OF items TO '{}'", a.url));
+    assert_eq!(a.local_shards("items"), vec![0, 2]);
+    assert_eq!(c.local_shards("items"), vec![1]);
+    agree("after 2 -> a", &mut one, &[&a, &b, &c]);
+
+    // Source here: a's shard 0 goes to b, which held nothing.
+    a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", b.url));
+    assert_eq!(a.local_shards("items"), vec![2]);
+    assert_eq!(b.local_shards("items"), vec![0]);
+    agree("after 0 -> b", &mut one, &[&a, &b, &c]);
+    for (sql, why) in [
+        (format!("MOVE SHARD 0 OF items TO '{}'", b.url), "already on"),
+        ("MOVE SHARD 7 OF items TO 'tcp://127.0.0.1:1'".to_string(), "no shard 7"),
+        ("MOVE SHARD 0 OF items TO 'tcp://127.0.0.1:1'".to_string(), "not attached"),
+    ] {
+        let e = a.exec(&sql).unwrap_err().to_string();
+        assert!(e.contains(why), "{sql}: {e}");
+    }
+
+    // A pinned shard refuses writes naming the move, and takes them again
+    // once the pin is let go.
+    let files = b.db.lock().unwrap().begin_move("items", 0, &c.url).unwrap();
+    assert!(files.iter().any(|(n, _)| n == "MANIFEST"), "{files:?}");
+    let e = a.db.lock().unwrap().insert("items", doc(93)).unwrap_err().to_string();
+    assert!(e.contains("shard 0 of `items` is moving to") && e.contains(&c.url), "{e}");
+    b.db.lock().unwrap().abort_move("items", 0);
+    a.db.lock().unwrap().insert("items", doc(93)).unwrap();
+    one.insert("items", doc(93)).unwrap();
+    agree("after the aborted move", &mut one, &[&a, &b, &c]);
+
+    // REBALANCE puts shard i back on the i-th node in attach order.
+    let m = a.ack("REBALANCE items");
+    assert!(m.contains("moved"), "{m}");
+    assert_eq!(a.local_shards("items"), vec![0]);
+    assert_eq!(b.local_shards("items"), vec![1]);
+    assert_eq!(c.local_shards("items"), vec![2]);
+    assert!(a.ack("REBALANCE items").contains("nothing moved"));
+    agree("after the rebalance", &mut one, &[&a, &b, &c]);
+
+    // Empty a node, and it detaches.
+    a.ack(&format!("MOVE SHARD 1 OF items TO '{}'", c.url));
+    a.ack(&format!("DETACH NODE '{}'", b.url));
+    agree("after the detach", &mut one, &[&a, &c]);
+
+    // The map survives a restart of the node that pulled.
+    let c_dir = c.dir.clone();
+    let c_url = c.url.clone();
+    drop(c);
+    settle();
+    let c = {
+        let listener = TcpListener::bind(c_url.trim_start_matches("tcp://")).unwrap();
+        let mut opts = DbOpts::default();
+        opts.node = Some(c_url.clone());
+        let db = Arc::new(Mutex::new(Db::open(&c_dir, opts).unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (d, s) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            celastro::wire::serve(listener, d, TOKEN.to_string(), s).unwrap();
+        });
+        Node { url: c_url, db, stop, dir: c_dir }
+    };
+    assert_eq!(c.local_shards("items"), vec![1, 2]);
+    agree("after c's restart", &mut one, &[&a, &c]);
+
+    for d in [&a.dir, &b.dir, &c.dir, &one_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

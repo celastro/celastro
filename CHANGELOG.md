@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.22.0 — 2026-09-14
+
+A capability the cluster did not have, hence a minor.
+
+**A shard moves between nodes.** `MOVE SHARD i OF c TO 'tcp://host:port'`,
+from any node: the source pins the shard at an instant and refuses writes
+to it naming the move, the target pulls its files over the wire and opens
+them, and every holder takes the new map -- the target first, the source
+last, which drops its copy only then. Reads are answered throughout.
+`REBALANCE c` moves each shard to the node a `CREATE COLLECTION` with no
+nodes named would have placed it on, and `DETACH NODE` of a node holding
+shards is refused naming the `MOVE SHARD` statements that would empty it.
+`LOCAL PLACE SHARD i OF c ON 'node'` is the repair for a holder a move did
+not reach. The wire version is 3: four more calls.
+
 ## 0.21.0 — 2026-09-14
 
 A walk got cheaper and compaction does one more thing, hence a minor.

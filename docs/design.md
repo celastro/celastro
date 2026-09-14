@@ -305,10 +305,31 @@ segment lacking a region for a declared index is a rewrite job of its own
 The catalog format is version 4 for the node list and the placement, and 5
 for the edge-collection fields of the section after this one; a 3 is read
 with every collection placed wholly on this node, derived from its shard
-directories at open, and a 4 as one with no edge collections. Not built yet, by decision: moving a shard between nodes
-(`MOVE SHARD`, and rebalancing when nodes come and go), which the placement by
-index is shaped for; replication, so a node that is down is a shard that is
-down; and a chart for more than one pod.
+directories at open, and a 4 as one with no edge collections.
+
+**A shard moves.** `MOVE SHARD i OF c TO 'node'` is three steps from
+wherever it is issued: the source pins the shard (`Db::begin_move` -- the
+same per-shard export a collection copy takes, held by handle so no file
+goes away under it, and from that instant writes to the shard are refused
+naming the move), the target pulls the files in chunks and adopts the
+directory (`Db::pull_here`, `adopt_shard`: the incoming directory is
+complete before it is renamed into place, `MANIFEST` last, so a pull that
+stops short leaves nothing a reopen mistakes for a shard), and the map
+switches by `LOCAL PLACE SHARD` on every holder -- target first, others,
+source last, so the source's copy is dropped only once everyone else can
+find the new one. The pin is shared with the wire server outside the
+engine's lock: a coordinator that is also the source holds its lock for the
+whole statement while the target reads from the pin, and a target pulls
+without its own lock, serving its other shards meanwhile. What is not here:
+a write to a moving shard waits nowhere -- it is refused, and the client
+retries once the map has switched -- and a move is not resumable across a
+restart of the source (the pin is memory; the map is unchanged until the
+switch, so the statement is re-run). `REBALANCE c` is the moves that put
+shard `i` on the `i`-th node in attach order, and `DETACH NODE` of a node
+holding shards refuses with that plan.
+
+Not built yet, by decision: replication, so a node that is down is a shard
+that is down; and a chart for more than one pod.
 
 **The deterministic simulator states what a transport has to keep, before
 there is one.** `celastro::sim` puts a seeded fault schedule on the
@@ -1134,6 +1155,7 @@ guarantee:
 | a walk is the neighbourhood and nothing else, the same at every layout and across nodes, and a cut or a dangling edge is said, never hidden | `engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else` (1..k, the start excluded, the edge filter at every hop, `REVERSE`, `OR`/`NOT`, fused with text and a distance, every refusal), `engine::tests::a_hop_statement_is_bit_identical_across_shard_counts` (1, 3 and 6 shards of both collections, memtable and segments, a deleted node and a dangling edge), `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers` (the same through the wire, and a holder that stops answering is a deadline or a named absence), `engine::tests::a_cut_walk_says_which_cap_bound_it` (both caps, the lexicographically first kept, the line on the response, in the plan and in the console's JSON), `engine::tests::a_dangling_edge_is_skipped_and_counted` (a never-existed and a deleted target, per hop, and nothing walked through a deleted node), `engine::tests::a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so` (twenty seeds over `expand` and `present`: refused or bit-identical, a partial answer inside the unfaulted neighbourhood and short only with `missing`), `sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`, `catalog::tests::catalog_round_trips` (format 5: `nodes_of`, `undirected`, the adjacency kind, and a 4 read as a plain collection) |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
 | a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
+| a shard moves between nodes with no row lost or duplicated, every node agrees on the map, a pinned shard refuses writes naming the move, and an emptied node detaches | `wire::a_shard_moves_between_nodes_and_every_node_agrees` (source and target both elsewhere, target here, source here; answers on every node equal one process's after each; the refusal on a pinned shard and the write after the abort; `REBALANCE`; `DETACH` refused with the plan and accepted once empty; the map after a restart) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
 | a statement cannot run past its deadline, and the deadline is on by default | `deadline::tests::a_deadline_is_armed_per_statement_and_restored_when_the_statement_ends`, `vector::tests::a_search_stops_when_the_deadline_has_passed` (brute force, graph traversal and the threshold pass each stop at once), `text::scorer::tests::scoring_stops_when_the_deadline_has_passed` (top-k and the filter walk), `engine::tests::a_statement_past_its_deadline_is_refused_by_default_and_the_budget_is_named` (every query shape refused, `partial_results` reports the shards instead, `no_deadline` lifts it, and a default `Db` shows its budget in the plan) |
 | the console says a query was cut, and the shells say it where a reader looks | `serve::tests::the_console_script_reads_and_renders_a_truncated_expansion` (a static check on the script: the field is read and rendered as the shells render it), `celastro-cli::tests::a_cut_prefix_is_printed_between_the_table_and_the_row_count`, `celastro::tests::a_cut_prefix_is_printed_between_the_rows_and_the_row_count` (through a writer, so the placement is pinned and not only the text) |

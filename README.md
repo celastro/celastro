@@ -331,9 +331,23 @@ a forwarded statement did not reach is repaired. A node that does not answer
 is a deadline at the coordinator, with `WITH (partial_results)` naming its
 shard, the same rule as for a slow shard.
 
+A shard moves between nodes without stopping the collection:
+
+```sql
+MOVE SHARD 1 OF notes TO 'tcp://10.0.0.4:9000';
+REBALANCE notes;          -- shard i to the i-th node in attach order, as a CREATE places them
+DETACH NODE 'tcp://10.0.0.3:9000';   -- refused while it holds a shard, naming the moves that would empty it
+```
+
+The source pins the shard at an instant and refuses writes to it naming the
+move, the target pulls the files and opens them, then every holder is told
+the new map — the target first, the source last, which drops its copy only
+then. Reads of the shard are answered throughout. A holder the map did not
+reach is named with the `LOCAL PLACE SHARD ...` that repairs it. Nothing
+crosses the wire but the shard's files, so a move costs their size.
+
 The wire is plain TCP with a shared token and no TLS: for a network you
-trust. Moving a shard between nodes is the next thing to come; until then a
-shard stays where it was created.
+trust.
 
 ## The archived tier and an object store
 
@@ -363,7 +377,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.21.0 && docker tag ghcr.io/celastro/celastro:0.21.0 celastro
+docker pull ghcr.io/celastro/celastro:0.22.0 && docker tag ghcr.io/celastro/celastro:0.22.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

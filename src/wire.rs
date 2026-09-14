@@ -64,7 +64,7 @@ use crate::time::Timestamp;
 use crate::value::Value;
 
 /// Refused on mismatch, in both directions.
-pub const WIRE_VERSION: u8 = 2;
+pub const WIRE_VERSION: u8 = 3;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 const MAX_FRAME: u32 = 256 << 20;
@@ -88,6 +88,10 @@ enum Call {
     CreateCollection = 12,
     Expand = 13,
     Present = 14,
+    BeginMove = 15,
+    ReadFile = 16,
+    PullShard = 17,
+    AbortMove = 18,
 }
 
 impl Call {
@@ -107,6 +111,10 @@ impl Call {
             12 => Call::CreateCollection,
             13 => Call::Expand,
             14 => Call::Present,
+            15 => Call::BeginMove,
+            16 => Call::ReadFile,
+            17 => Call::PullShard,
+            18 => Call::AbortMove,
             _ => return None,
         })
     }
@@ -127,6 +135,10 @@ impl Call {
             Call::CreateCollection => "create_collection",
             Call::Expand => "expand",
             Call::Present => "present",
+            Call::BeginMove => "begin_move",
+            Call::ReadFile => "read_file",
+            Call::PullShard => "pull_shard",
+            Call::AbortMove => "abort_move",
         }
     }
 }
@@ -654,6 +666,62 @@ impl Node {
         put_tablets(&mut body, tablets);
         self.call(Call::CreateCollection, &coll.name, 0, &body).map(|_| ())
     }
+
+    /// Pin a shard the node holds for a move to `to`; the files to pull.
+    pub fn begin_move(
+        &self,
+        collection: &str,
+        shard: usize,
+        to: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut body = Vec::new();
+        put_str(&mut body, to);
+        let b = self.call(Call::BeginMove, collection, shard, &body)?;
+        let mut i = 0;
+        let n = get_count(&b, &mut i)?;
+        (0..n)
+            .map(|_| Ok((get_string(&b, &mut i)?, get_u64(&b, &mut i).ok_or_else(truncated)?)))
+            .collect()
+    }
+
+    pub fn abort_move(&self, collection: &str, shard: usize) -> Result<()> {
+        self.call(Call::AbortMove, collection, shard, &[]).map(|_| ())
+    }
+
+    /// `len` bytes of a pinned shard's file from `offset`.
+    pub fn read_file(
+        &self,
+        collection: &str,
+        shard: usize,
+        name: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        put_str(&mut body, name);
+        put_u64(&mut body, offset);
+        put_u64(&mut body, len);
+        let b = self.call(Call::ReadFile, collection, shard, &body)?;
+        Ok(get_bytes(&b, &mut 0).ok_or_else(truncated)?.to_vec())
+    }
+
+    /// Have the node pull a pinned shard from `from` and adopt it under
+    /// `tablets`, the map as it will be once the move completes.
+    pub fn pull_shard(
+        &self,
+        coll: &Collection,
+        tablets: &[Tablet],
+        shard: usize,
+        from: &str,
+    ) -> Result<()> {
+        let mut cat = Catalog::default();
+        cat.collections.insert(coll.name.clone(), coll.clone());
+        let mut body = Vec::new();
+        put_bytes(&mut body, &cat.encode());
+        put_tablets(&mut body, tablets);
+        put_str(&mut body, from);
+        self.call(Call::PullShard, &coll.name, shard, &body).map(|_| ())
+    }
 }
 
 fn decode_response(resp: Vec<u8>) -> Result<Vec<u8>> {
@@ -854,6 +922,7 @@ pub fn serve(
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let token = Arc::new(token);
+    let moves = db.lock().unwrap_or_else(|p| p.into_inner()).moves();
     loop {
         if stop.load(Ordering::Relaxed) || crate::signal::shutdown_requested() {
             return Ok(());
@@ -864,7 +933,8 @@ pub fn serve(
                 let db = db.clone();
                 let token = token.clone();
                 let stop = stop.clone();
-                std::thread::spawn(move || serve_connection(s, &db, &token, &stop));
+                let moves = moves.clone();
+                std::thread::spawn(move || serve_connection(s, &db, &moves, &token, &stop));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
             Err(e) => return Err(e.into()),
@@ -876,7 +946,15 @@ pub fn serve(
 /// open connections rather than serving them until the process ends.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
-fn serve_connection(mut s: TcpStream, db: &Mutex<Db>, token: &str, stop: &AtomicBool) {
+type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
+
+fn serve_connection(
+    mut s: TcpStream,
+    db: &Mutex<Db>,
+    moves: &Moves,
+    token: &str,
+    stop: &AtomicBool,
+) {
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(IDLE_POLL));
     loop {
@@ -891,7 +969,7 @@ fn serve_connection(mut s: TcpStream, db: &Mutex<Db>, token: &str, stop: &Atomic
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, token, &frame) {
+        match handle(db, moves, token, &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -936,7 +1014,7 @@ impl Drop for Serving {
     }
 }
 
-fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
+fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
     let _serving = Serving;
     let mut i = 0;
@@ -962,9 +1040,81 @@ fn handle(db: &Mutex<Db>, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
     };
     let body = &frame[i..];
     let _armed = crate::deadline::arm(deadline_ms);
-    let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
     let mut out = Vec::new();
+    // The move calls that must not wait for this node's lock. A target reads
+    // a pinned shard's files from the shared pin, so a coordinator that is
+    // also the source can hold its own lock for the whole statement while
+    // the target pulls from it; and a target pulls without its own lock, so
+    // it keeps serving its shards while the files arrive. Only the pin and
+    // the adoption take the lock.
     match call {
+        Call::ReadFile => {
+            let mut j = 0;
+            let name = get_string(body, &mut j)?;
+            let offset = get_u64(body, &mut j).ok_or_else(truncated)?;
+            let len = get_u64(body, &mut j).ok_or_else(truncated)?;
+            let pinned = moves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(collection.clone(), shard))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Plan(format!("shard {shard} of `{collection}` is not pinned for a move"))
+                })?;
+            put_bytes(&mut out, &pinned.read(&name, offset, len)?);
+            return Ok(out);
+        }
+        Call::BeginMove => {
+            let to = get_string(body, &mut 0)?;
+            let pinned = moves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(collection.clone(), shard))
+                .cloned();
+            let list = match pinned {
+                Some(m) if m.to == to => m.list()?,
+                _ => {
+                    let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+                    db.begin_move(&collection, shard, &to)?
+                }
+            };
+            put_uvarint(&mut out, list.len() as u64);
+            for (name, len) in &list {
+                put_str(&mut out, name);
+                put_u64(&mut out, *len);
+            }
+            return Ok(out);
+        }
+        Call::PullShard => {
+            let mut j = 0;
+            let bytes = get_bytes(body, &mut j).ok_or_else(truncated)?;
+            let cat = Catalog::decode(bytes)?;
+            let coll =
+                cat.collections.into_values().next().ok_or_else(|| {
+                    Error::Storage("wire: no collection in the definition".into())
+                })?;
+            let tablets = get_tablets(body, &mut j)?;
+            let from = get_string(body, &mut j)?;
+            let me = db
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .node()
+                .map(str::to_string)
+                .ok_or_else(|| Error::Plan("this node has no address".into()))?;
+            let source = Arc::new(Node::new(&from, Some(token))?);
+            let files = source.begin_move(&collection, shard, &me)?;
+            let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+            db.pull_here(&coll, &tablets, shard, Some(&source), &files)?;
+            return Ok(out);
+        }
+        _ => {}
+    }
+    let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+    match call {
+        Call::BeginMove | Call::ReadFile | Call::PullShard => unreachable!("answered above"),
+        Call::AbortMove => {
+            db.abort_move(&collection, shard);
+        }
         Call::Hello => {
             put_opt_str(&mut out, db.node());
             put_str(&mut out, env!("CARGO_PKG_VERSION"));
