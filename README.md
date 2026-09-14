@@ -314,7 +314,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.18.2 && docker tag ghcr.io/celastro/celastro:0.18.2 celastro
+docker pull ghcr.io/celastro/celastro:0.19.0 && docker tag ghcr.io/celastro/celastro:0.19.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
