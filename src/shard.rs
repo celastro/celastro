@@ -479,13 +479,6 @@ thread_local! {
     static DOCUMENTS_DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many terms `Shard::term_stats` has been asked for, summed over calls
-/// and shards, for the tests that pin what a gather does NOT re-measure: the
-/// anchor's whole value is that a second gather at the same instant asks
-/// only for the terms it is missing.
-#[cfg(test)]
-pub(crate) static TERMS_GATHERED: AtomicU64 = AtomicU64::new(0);
-
 /// A borrowed or reference-counted full-text index.
 pub enum TextHandle<'a> {
     Sealed(Arc<crate::segment::SealedText>),
@@ -1400,6 +1393,15 @@ pub struct Shard {
     pub manifest_version: u64,
     pub(crate) next_segment_id: u64,
     pub(crate) opts: ShardOpts,
+    /// How many terms `term_stats` has been asked for, summed over calls,
+    /// for the tests that pin what a gather does NOT re-measure: the
+    /// anchor's whole value is that a second gather at the same instant asks
+    /// only for the terms it is missing. Per shard, not process-wide: the
+    /// tests run as threads of one process, and a count every shard bumped
+    /// made one of them fail whenever another test gathered at the same
+    /// moment.
+    #[cfg(test)]
+    pub(crate) terms_gathered: AtomicU64,
     pub(crate) clock: Arc<Hlc>,
     dir: Option<PathBuf>,
     wal: Option<Wal>,
@@ -1454,6 +1456,8 @@ impl Shard {
             manifest_version: 0,
             next_segment_id: 1,
             opts,
+            #[cfg(test)]
+            terms_gathered: AtomicU64::new(0),
             clock,
             dir: None,
             wal: None,
@@ -2849,7 +2853,7 @@ impl Shard {
         t: Timestamp,
     ) -> Result<(u64, u64, BTreeMap<String, u64>)> {
         #[cfg(test)]
-        TERMS_GATHERED.fetch_add(terms.len() as u64, AtomicOrdering::Relaxed);
+        self.terms_gathered.fetch_add(terms.len() as u64, AtomicOrdering::Relaxed);
         let snap = self.snapshot_at(t);
         let mut df: BTreeMap<String, u64> = BTreeMap::new();
         let mut total_len = 0u64;

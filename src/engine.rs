@@ -7292,11 +7292,16 @@ mod tests {
             db.insert("other", note(&format!("o{i:04}"))).unwrap();
         }
         let ts = db.clock.peek();
-        let gathered_before =
-            crate::shard::TERMS_GATHERED.load(std::sync::atomic::Ordering::Relaxed);
+        let gathered_by_notes = |db: &Db| -> u64 {
+            db.shards("notes")
+                .unwrap()
+                .iter()
+                .map(|s| s.terms_gathered.load(std::sync::atomic::Ordering::Relaxed))
+                .sum()
+        };
+        let gathered_before = gathered_by_notes(&db);
         db.gather_stats("notes", &want(&["segments", "postings"]), ts, false).unwrap();
-        let gathered = crate::shard::TERMS_GATHERED.load(std::sync::atomic::Ordering::Relaxed)
-            - gathered_before;
+        let gathered = gathered_by_notes(&db) - gathered_before;
         // One shard, one missing term: an anchor that compared the engine-wide
         // count would find it moved and re-measure both.
         assert_eq!(gathered, 1, "writes to `other` made `notes` re-gather {gathered} terms");
