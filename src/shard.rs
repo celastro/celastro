@@ -1738,9 +1738,11 @@ impl Shard {
             // commit that a power loss still takes back. The record is framed
             // `len | crc32` and replay ends cleanly on a torn tail, so one
             // document's record is already all-or-nothing on disk; this is what
-            // makes it *on* the disk. Per document, deliberately: the unit that
-            // is promised is the document, and a sync that covered every
-            // document since the last one would be group commit.
+            // makes it *on* the disk. Per document here, because the unit that
+            // is promised is the statement and this statement is one document;
+            // `insert_many` syncs once for a statement of many, which is the
+            // same promise. A sync that covered every document since the last
+            // one, across statements, would be group commit, and is not here.
             //
             // It also sits above the mutations below rather than after them,
             // so a sync that fails returns `Err` with the in-memory shard
@@ -1763,6 +1765,68 @@ impl Shard {
         self.memtable.insert(key, ts, doc)?;
         self.maybe_flush()?;
         Ok(ts)
+    }
+
+    /// `insert`, for the documents of one statement: every document is
+    /// validated before any record is appended, every record is appended,
+    /// the log is synced ONCE, and only then is the shard's memory changed.
+    /// The promise is the statement's -- the caller acknowledges all of them
+    /// together -- so one sync covers them, and a batch of a thousand costs
+    /// one disk round trip rather than a thousand. A key that recurs within
+    /// the batch takes the one-at-a-time path, where each record's
+    /// `supersedes` is computed against the version the one before it made.
+    /// Returns the timestamps in order.
+    pub(crate) fn insert_many(&mut self, docs: Vec<Value>) -> Result<Vec<Timestamp>> {
+        let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
+            Vec::with_capacity(docs.len());
+        let mut keys = std::collections::BTreeSet::new();
+        let mut recurring = false;
+        for mut doc in docs {
+            self.coll.validate(&doc)?;
+            self.coll.coerce(&mut doc);
+            let key = sort_key(&self.coll, &doc)?;
+            self.validate_indexable(&doc)?;
+            if !keys.insert(key.clone()) {
+                recurring = true;
+            }
+            let ts = self.clock.now();
+            let prev = self.locate(&key, MAX_TS);
+            prepared.push((key, ts, doc, prev));
+        }
+        if recurring {
+            let mut out = Vec::with_capacity(prepared.len());
+            for (_, _, doc, _) in prepared {
+                out.push(self.insert(doc)?);
+            }
+            return Ok(out);
+        }
+        if let Some(w) = self.wal.as_mut() {
+            for (key, ts, doc, prev) in &prepared {
+                w.append(&WalRecord {
+                    kind: WAL_INSERT,
+                    key: key.clone(),
+                    ts: *ts,
+                    doc: Some(doc.clone()),
+                    supersedes: prev.is_some(),
+                    segment_id: 0,
+                })?;
+            }
+            // Above the mutations, as in `insert`: a sync that fails leaves
+            // the shard's memory as it was for every document of the batch.
+            w.sync()?;
+        }
+        let mut out = Vec::with_capacity(prepared.len());
+        for (key, ts, doc, prev) in prepared {
+            if let Some(p) = prev {
+                self.mark_superseded(p, ts);
+            }
+            self.coll.observe_doc(&doc);
+            self.unsealed.observe_doc(&doc);
+            self.memtable.insert(key, ts, doc)?;
+            self.maybe_flush()?;
+            out.push(ts);
+        }
+        Ok(out)
     }
 
     /// Check every index's precondition. Called before anything is durable.
@@ -4417,6 +4481,62 @@ mod tests {
     /// syscall count is identical -- it is record N reaching the platter only
     /// when record N+1 arrives, so every acknowledged write is one behind
     /// durable. Only an ordered probe can tell the two apart.
+    /// A statement of many documents is one promise, kept with one sync: the
+    /// records are all appended, then the log is synced once, then the rows
+    /// are there; a document that cannot be taken keeps every other one out
+    /// of the log; and a key that recurs in the batch is two versions in
+    /// order, as two statements would have made it.
+    #[test]
+    fn a_batch_of_inserts_is_appended_whole_and_synced_once() {
+        let dir = test_dir("walsync-batch");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        durability_probe::start();
+        s.attach_dir(&dir).unwrap();
+        let ts = s.insert_many((1..=5).map(doc).collect()).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!(ts.len(), 5);
+        assert!(ts.windows(2).all(|w| w[0] < w[1]), "{ts:?}");
+        assert_eq!(ev.count(Op::WalSync, &log), 1, "one sync for the batch: {ev:?}");
+        assert_eq!(ev.count(Op::WalAppend, &log), 5, "{ev:?}");
+        assert!(ev.ordered((Op::WalAppend, &log), (Op::WalSync, &log)), "{ev:?}");
+        for i in 1..=5 {
+            assert!(s.locate(&sort_key(&s.coll, &doc(i)).unwrap(), MAX_TS).is_some());
+        }
+
+        // A bad document in the middle: nothing of the batch reaches the log.
+        durability_probe::start();
+        let bad =
+            json::parse(r#"{"tenant_id":"t1","body":"no key at all","emb":[0.1,0.2,1.0,0.5]}"#)
+                .unwrap();
+        let e = s.insert_many(vec![doc(6), bad, doc(8)]).unwrap_err();
+        let ev = durability_probe::take();
+        assert!(e.to_string().contains("id") || e.to_string().contains("primary"), "{e}");
+        assert_eq!(ev.count(Op::WalAppend, &log), 0, "a refused batch appended: {ev:?}");
+        assert!(s.locate(&sort_key(&s.coll, &doc(6)).unwrap(), MAX_TS).is_none());
+
+        // A recurring key: the later version supersedes the earlier one.
+        let second = json::parse(
+            r#"{"id":"d0009","tenant_id":"t0","body":"the second version","emb":[0.09,4.0,1.0,0.5]}"#,
+        )
+        .unwrap();
+        let ts = s.insert_many(vec![doc(9), second]).unwrap();
+        assert_eq!(ts.len(), 2);
+        let snap = s.snapshot_at(MAX_TS);
+        let vis = crate::shard::Searchable::Mem(snap.memtable).visibility(MAX_TS);
+        let key9 = sort_key(&s.coll, &doc(9)).unwrap();
+        let live: Vec<&Value> = vis
+            .iter()
+            .map(|o| &snap.memtable.docs[o as usize])
+            .filter(|d| d.sort_key == key9)
+            .map(|d| &d.doc)
+            .collect();
+        assert_eq!(live.len(), 1, "two live versions of one key");
+        assert_eq!(live[0].get("body").and_then(|v| v.as_str()), Some("the second version"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_insert_appends_its_wal_record_and_then_makes_it_durable() {
         let dir = test_dir("walsync");

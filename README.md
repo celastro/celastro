@@ -265,8 +265,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.31.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.31.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.31.1 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.31.1 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -320,7 +320,8 @@ intersection plus per-source scoring, with no joins and no identifier
 translation; that is the mechanism behind the single-plan claim, and it is
 treated as a load-bearing invariant. Around it: immutable segments with a
 self-describing footer, a write-ahead log fsynced before a write is
-acknowledged, block-max WAND for BM25, a tiered HNSW index with SQ8 and 1-bit
+acknowledged (once per statement: a thousand documents in one `INSERT`
+cost one sync), block-max WAND for BM25, a tiered HNSW index with SQ8 and 1-bit
 codes and full-precision rerank, runtime choice between brute force,
 post-filter and filter-aware vector search, and a deterministic simulator
 that puts partitions, crashes and reordering on the coordinator-to-shard

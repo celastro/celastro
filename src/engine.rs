@@ -2181,6 +2181,52 @@ impl Db {
         Ok(ts)
     }
 
+    /// The documents of one statement: the ones this node's shards own go to
+    /// each shard as one batch -- one WAL sync per shard, not one per
+    /// document -- and the ones another node owns are forwarded one at a
+    /// time as [`insert`](Self::insert) forwards them. In statement order
+    /// within a shard; the last timestamp is what the acknowledgement names.
+    pub fn insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
+        let _deadline = self.arm_default_deadline();
+        let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        let mut last = self.last_commit;
+        for doc in docs {
+            let coll = self.catalog.get(collection)?;
+            let key = sort_key(coll, &doc)?;
+            match self.owner_of(collection, &key)? {
+                Some(url) => {
+                    let ts = self.node_conn(&url)?.insert(collection, &doc)?;
+                    self.writes += 1;
+                    self.last_commit = self.last_commit.max(ts);
+                    last = last.max(ts);
+                }
+                None => {
+                    self.refuse_if_moving(collection, &key)?;
+                    let shards = self.shards.get(collection).ok_or_else(|| {
+                        Error::Plan(format!("no shard of `{collection}` is on this node"))
+                    })?;
+                    let idx = shards
+                        .iter()
+                        .position(|s| s.owns(&key))
+                        .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
+                    here.entry(idx).or_default().push(doc);
+                }
+            }
+        }
+        for (idx, batch) in here {
+            let stamps = {
+                let shards = self.shards.get_mut(collection).expect("checked above");
+                shards[idx].insert_many(batch)?
+            };
+            for ts in stamps {
+                self.note_write(collection, ts);
+                last = last.max(ts);
+            }
+        }
+        self.maybe_run_lifecycle()?;
+        Ok(last)
+    }
+
     /// The node holding the shard that owns `key`: `None` for this one.
     fn owner_of(&self, collection: &str, key: &str) -> Result<Option<String>> {
         let Some(tablets) = self.catalog.placement.get(collection) else {
@@ -2996,9 +3042,7 @@ impl Db {
             }
             Statement::Insert(i) => {
                 let n = i.docs.len();
-                for d in i.docs {
-                    self.insert(&i.collection, d)?;
-                }
+                self.insert_many(&i.collection, i.docs)?;
                 Ok(Outcome::Ack(format!("{n} document(s) written at ts {}", self.last_commit)))
             }
             Statement::Delete(d) => {

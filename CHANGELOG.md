@@ -6,6 +6,22 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.31.1 — 2026-09-15
+
+A write-path fix, hence a patch.
+
+**A statement of many documents syncs once.** `INSERT INTO t VALUES
+(...), (...), ...` appended and `fdatasync`ed the log once per document —
+a thousand documents were a thousand disk round trips, 0.6 s on the
+box's SSD. The promise is the statement's, so the shard now validates
+every document first, appends every record, syncs once, and only then
+changes its memory (`Shard::insert_many`, `Db::insert_many`; documents
+another node owns are still forwarded one at a time). A thousand
+documents: 621 → 19 ms in a script, 880 → 16 ms over the console, one
+`fdatasync`. A key that recurs
+within one statement takes the one-at-a-time path, so its versions
+supersede each other as two statements would have.
+
 ## 0.31.0 — 2026-09-15
 
 Reads no longer take the node's one lock, hence a minor.
