@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use celastro::engine::{Db, DbOpts};
@@ -54,7 +54,7 @@ fn the_console_serves_tls_and_answers_only_a_client_that_verifies_it() {
     assert!(server.url().starts_with("https://127.0.0.1:"));
     let port = server.local_addr().port();
     let token = server.token().to_string();
-    let db = Arc::new(Mutex::new(Db::in_memory()));
+    let db = Arc::new(RwLock::new(Db::in_memory()));
     let serving = {
         let db = db.clone();
         std::thread::spawn(move || server.run(&db))
@@ -123,7 +123,7 @@ fn the_wire_serves_tls_and_a_node_without_the_ca_cannot_attach() {
     let mut opts = DbOpts::default();
     opts.node = Some(url.clone());
     opts.tls = Some(tls.clone());
-    let db = Arc::new(Mutex::new(Db::with_opts(opts)));
+    let db = Arc::new(RwLock::new(Db::with_opts(opts)));
     let stop = Arc::new(AtomicBool::new(false));
     {
         let (d, s, t) = (db.clone(), stop.clone(), tls.clone());

@@ -433,6 +433,15 @@ them first:
 - **Placement is derived, not assigned.** Every node computes the holder of a
   `minimal` index from the tablet map it already has, so no tier change costs a
   coordination round.
+- **A read holds no exclusive lock.** `Db::read` takes `&self`: what a read
+  used to write -- the statistics cache, the recall sample, the connection
+  cache -- sits behind its own small lock, the statistics a read merges
+  before planning are merged into a copy, and the index accesses it notes
+  wait for a writer (`apply_touches`) rather than being applied under the
+  read. The console and the wire hold an `RwLock<Db>`: reads share it,
+  writes and DDL take it alone. (0.31.0; until then one mutex serialised
+  every statement, and a walk at 50 ms capped a node at 12 of them a second
+  whatever the core count.)
 - **A query reaches a shard through one boundary**, `plan::service::ShardService`:
   statistics, prefix expansion, candidates, an unranked scan, payload fetches,
   the two calls of a walk, and nothing else. A shard on this node answers by direct call, a shard on

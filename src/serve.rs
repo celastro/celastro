@@ -28,9 +28,10 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 
 use crate::crypto::hex;
+use crate::sql;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -232,13 +233,14 @@ impl Server {
     /// database locked only around the statement: reading a request, parsing
     /// it, checking it and writing its answer all happen outside the lock, so
     /// a client that is slow to send or slow to read delays nobody but
-    /// itself. The statements themselves still serialise -- `Db::query` and
-    /// `Db::execute` take `&mut self`, and the engine is single-writer -- so
-    /// a node runs one statement at a time whatever the thread count; what
-    /// the threads buy is that the one statement running is never waiting on
-    /// a socket. Until 0.25.0 the loop was one thread, request and all under
-    /// the lock, which was right for a console on loopback and wrong for one
-    /// behind a Service.
+    /// itself. Reads -- a `SELECT`, an `EXPLAIN` of one -- run under the
+    /// shared side of an `RwLock` and proceed side by side on every core
+    /// (`Db::read` takes `&self`); a statement that changes something takes
+    /// the exclusive side and runs alone. Until 0.31.0 every statement took
+    /// one mutex and a node ran one at a time whatever the thread count;
+    /// until 0.25.0 the loop was one thread, request and all under the lock,
+    /// which was right for a console on loopback and wrong for one behind a
+    /// Service.
     ///
     /// A per-connection failure is logged and the loop continues. A client that
     /// hangs up mid-request, sends garbage, or trips a deadline is not a reason
@@ -253,7 +255,7 @@ impl Server {
     /// `poll(2)`, which a handler interrupts and a connection ends at once.
     /// Until 0.29.1 the wait was a 25 ms sleep, and every request paid up to
     /// that much before it was accepted.
-    pub fn run(self, db: &Mutex<Db>) -> Result<()> {
+    pub fn run(self, db: &RwLock<Db>) -> Result<()> {
         self.listener.set_nonblocking(true)?;
         let mut failures = 0u32;
         // Set by the connection that was asked to shut down; the loop reads
@@ -311,7 +313,7 @@ impl Server {
         })
     }
 
-    fn serve_one(&self, stream: TcpStream, db: &Mutex<Db>) -> std::io::Result<Next> {
+    fn serve_one(&self, stream: TcpStream, db: &RwLock<Db>) -> std::io::Result<Next> {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let stream = tls::accept(self.tls.as_ref(), stream)?;
         // The read side is armed per read, from the deadline, by `Wire::arm`.
@@ -1124,8 +1126,16 @@ impl Served {
 /// is a status code, and a SQL problem is a JSON body.
 /// The database, whoever held it last: a statement that panicked with the
 /// lock held has already been reported, and the console keeps serving.
-fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(|p| p.into_inner())
+/// The database for a read: many at once, beside no write. Poisoning is
+/// recovered from, as everywhere in the crate: a panic in one request is
+/// that request's failure, not the console's.
+fn read(db: &RwLock<Db>) -> RwLockReadGuard<'_, Db> {
+    db.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The database for a statement that changes it: alone.
+fn write(db: &RwLock<Db>) -> RwLockWriteGuard<'_, Db> {
+    db.write().unwrap_or_else(|p| p.into_inner())
 }
 
 fn answer<W: Wire>(
@@ -1133,7 +1143,7 @@ fn answer<W: Wire>(
     token: &str,
     port: u16,
     reach: Reach,
-    db: &Mutex<Db>,
+    db: &RwLock<Db>,
     dl: Deadlines,
 ) -> Served {
     let head = match read_head(io, dl.head) {
@@ -1157,8 +1167,8 @@ fn answer<W: Wire>(
     let served = match action {
         Err(r) => Served::keep(r.response()),
         Ok(Action::Reply(response)) => Served::keep(response),
-        Ok(Action::Health) => Served::keep(Response::json(health_json(&lock(db)))),
-        Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(&lock(db)))),
+        Ok(Action::Health) => Served::keep(Response::json(health_json(&read(db)))),
+        Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(&read(db)))),
         Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
     };
@@ -1174,7 +1184,12 @@ fn answer<W: Wire>(
 /// The body is read and parsed before the lock is taken, so a client that
 /// sends its statement slowly holds up nobody's; the lock covers the
 /// statement and the persist that follows it.
-fn query_response<W: Wire>(io: &mut W, head: &Head, db: &Mutex<Db>, deadline: Instant) -> Response {
+fn query_response<W: Wire>(
+    io: &mut W,
+    head: &Head,
+    db: &RwLock<Db>,
+    deadline: Instant,
+) -> Response {
     let body = match read_body(io, head.content_length, deadline) {
         Ok(b) => b,
         Err(r) => return r.response(),
@@ -1531,12 +1546,35 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// Persist is a no-op for an in-memory database, so this costs nothing where
 /// there is nothing to lose; and when it fails the client is told, because an
 /// ack that claims a durability the disk does not have is worse than an error.
-fn run_sql(db: &Mutex<Db>, sql: &str) -> Response {
+fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let started = Instant::now();
-    // Deferred work -- a backup's copy -- runs with the lock let go, so the
-    // other connections are served while it copies.
-    let outcome = {
-        let mut guard = lock(db);
+    // Parsed first, without any lock, to know which lock: a read runs under
+    // the shared one beside other reads; everything else takes the
+    // exclusive one. Parsing twice for a write is cheap; a wrong lock is
+    // not.
+    let is_read = match sql::parse(sql, &[]) {
+        Ok(stmt) => Db::is_read(&stmt),
+        Err(e) => return Response::json(error_json(&e.to_string())),
+    };
+    let outcome = if is_read {
+        let out = read(db).read(sql);
+        // An index the read faulted in counts as used, and a demoted one is
+        // promoted: that needs the write lock, taken now when nobody holds
+        // the lock, so it lands in the request that caused it; with other
+        // reads in flight it waits for the next writer instead of making
+        // this read wait for them.
+        if read(db).touches_pending() {
+            if let Ok(mut db) = db.try_write() {
+                if let Err(e) = db.apply_touches() {
+                    return Response::json(error_json(&e.to_string()));
+                }
+            }
+        }
+        out
+    } else {
+        // Deferred work -- a backup's copy -- runs with the lock let go, so
+        // the other connections are served while it copies.
+        let mut guard = write(db);
         match guard.execute(sql) {
             Ok(Outcome::Deferred(d)) => {
                 drop(guard);
@@ -1548,7 +1586,7 @@ fn run_sql(db: &Mutex<Db>, sql: &str) -> Response {
     let elapsed = started.elapsed().as_millis();
     match outcome {
         Ok(Outcome::Rows(r)) => Response::json(rows_json(&r, elapsed)),
-        Ok(Outcome::Ack(m)) => match lock(db).persist() {
+        Ok(Outcome::Ack(m)) => match write(db).persist() {
             Ok(()) => Response::json(ack_json(&m)),
             Err(e) => Response::json(error_json(&format!("{m}, but it is not on disk yet: {e}"))),
         },
@@ -1671,7 +1709,7 @@ mod tests {
     /// The same, keeping the database and the caller's marching orders.
     fn serve_request(db: &mut Db, request: &str) -> (String, Next) {
         let mut io = Cursor::new(request.as_bytes());
-        let shared = Mutex::new(std::mem::take(db));
+        let shared = RwLock::new(std::mem::take(db));
         let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
         *db = shared.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::new();
@@ -2125,7 +2163,7 @@ mod tests {
         let server = Server::bind(0).unwrap();
         let port = server.local_addr().port();
         let token = server.token().to_string();
-        let db = std::sync::Arc::new(Mutex::new(Db::in_memory()));
+        let db = std::sync::Arc::new(RwLock::new(Db::in_memory()));
         let serving = {
             let db = db.clone();
             std::thread::spawn(move || server.run(&db))
@@ -2372,7 +2410,7 @@ mod tests {
 
     #[test]
     fn a_sql_error_is_reported_inline_with_200_rather_than_as_a_protocol_failure() {
-        let db = Mutex::new(Db::in_memory());
+        let db = RwLock::new(Db::in_memory());
         let response = run_sql(&db, "SELECT FROM WHERE nonsense");
         assert_eq!(response.status, 200, "a SQL error must not become an HTTP error");
         assert_eq!(response.content_type, CT_JSON);
@@ -2381,9 +2419,46 @@ mod tests {
         assert!(parsed.get("error").and_then(|v| v.as_str()).is_some());
     }
 
+    /// Reads share the lock and writes take it alone: a read completes
+    /// while another reader holds the lock, and a write waits for that
+    /// reader to let go. With one mutex the first would deadlock and the
+    /// second would be indistinguishable from it.
+    #[test]
+    fn reads_run_beside_each_other_and_a_write_waits_for_them() {
+        let db = Arc::new(RwLock::new(Db::in_memory()));
+        assert!(run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)")
+            .body
+            .contains("\"ok\":true"));
+        assert!(run_sql(&db, "INSERT INTO items VALUES ('{\"id\":\"a\"}')")
+            .body
+            .contains("\"ok\":true"));
+        let held = read(&db);
+        // A read beside the held read: answered.
+        let rows = run_sql(&db, "SELECT id FROM items LIMIT 10");
+        assert!(rows.body.contains("\"count\":1"), "{}", rows.body);
+        // A write beside it: waits until the read is let go.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db2 = db.clone();
+        let writer = std::thread::spawn(move || {
+            let r = run_sql(&db2, "INSERT INTO items VALUES ('{\"id\":\"b\"}')");
+            tx.send(()).unwrap();
+            r
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the write ran while a read held the lock"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the write ran once the read let go");
+        assert!(writer.join().unwrap().body.contains("\"ok\":true"));
+        let rows = run_sql(&db, "SELECT id FROM items LIMIT 10");
+        assert!(rows.body.contains("\"count\":2"), "{}", rows.body);
+    }
+
     #[test]
     fn the_catalog_describes_the_collections_that_exist() {
-        let db = Mutex::new(Db::in_memory());
+        let db = RwLock::new(Db::in_memory());
         let created = run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
         assert_eq!(created.status, 200);
         let rows = run_sql(&db, "SELECT * FROM items LIMIT 10");
@@ -2392,7 +2467,7 @@ mod tests {
         assert_eq!(parsed.get("count").and_then(|v| v.as_i64()), Some(0));
 
         let parsed =
-            json::parse(&catalog_json(&lock(&db))).expect("the catalog must be valid JSON");
+            json::parse(&catalog_json(&read(&db))).expect("the catalog must be valid JSON");
         assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
         let colls = parsed.get("collections").and_then(|v| v.as_array()).unwrap();
         assert_eq!(colls.len(), 1);
@@ -2633,7 +2708,7 @@ mod tests {
         request.push_str(&format!("Content-Length: {}\r\n\r\n{sql}", sql.len()));
         let db = Db::in_memory();
         let mut io = Cursor::new(request.as_bytes());
-        let shared = Mutex::new(db);
+        let shared = RwLock::new(db);
         let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
         assert_eq!(served.response.status, 401);
         assert_eq!(io.position() as usize, request.len(), "the refused body must be drained");
@@ -2778,8 +2853,9 @@ mod tests {
         let tag = format!("celastro-serve-durable-{}", std::process::id());
         let dir = std::env::temp_dir().join(tag);
         let _ = std::fs::remove_dir_all(&dir);
-        let db =
-            Mutex::new(Db::open(&dir, crate::engine::DbOpts::default()).expect("a temp dir opens"));
+        let db = RwLock::new(
+            Db::open(&dir, crate::engine::DbOpts::default()).expect("a temp dir opens"),
+        );
         let response = run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
         let parsed = json::parse(&response.body).expect("the reply must be JSON");
         assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)), "{}", response.body);

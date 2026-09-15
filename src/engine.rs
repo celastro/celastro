@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally, Tablet};
 use crate::codec::{crc32, put_u32};
@@ -594,7 +594,23 @@ pub const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 /// the `num_docs` it is divided by must have been measured at one instant.
 type StatsTriple = (u64, u64, BTreeMap<String, u64>);
 
-#[derive(Debug)]
+/// What one read used of one collection: the paths and how.
+type Touch = (String, Vec<(String, IndexUse)>);
+
+/// The recall harness's sample of real vector queries.
+#[derive(Default)]
+struct RecallLog {
+    queries_seen: u64,
+    query_log: Vec<LoggedVectorQuery>,
+}
+
+/// A lock whose poisoning is not a reason to stop: what it guards is a
+/// cache or a log, and the worst a panic left is a stale entry.
+fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[derive(Debug, Clone)]
 struct CachedStats {
     num_docs: u64,
     total_doc_len: u64,
@@ -719,7 +735,10 @@ pub struct Db {
     dir: Option<PathBuf>,
     budget: Arc<MemtableBudget>,
     residency: Arc<ResidencyManager>,
-    stats: BTreeMap<String, CachedStats>,
+    /// The statistics cache. Behind a lock, not `&mut self`: a read fills
+    /// it, and reads run under a shared lock since 0.31.0. Held only to
+    /// look and to apply; never across a shard call.
+    stats: Mutex<BTreeMap<String, CachedStats>>,
     /// Inferred path statistics as the catalog on disk held them at the last
     /// reopen, per collection: the documents sealed into segments by then.
     ///
@@ -753,8 +772,15 @@ pub struct Db {
     collection_writes: BTreeMap<String, u64>,
     lifecycle_checked_at_writes: u64,
     activity_persisted_micros: u64,
-    query_log: Vec<LoggedVectorQuery>,
-    queries_seen: u64,
+    /// Recall sampling (§12.1), written by reads: behind a lock for the
+    /// same reason as `stats`.
+    recall: Mutex<RecallLog>,
+    /// What reads touched -- (collection, the indexes and how) -- waiting
+    /// for `apply_touches`, which needs `&mut self` (a touch can promote a
+    /// demoted index, which renames files and persists the catalog). A read
+    /// only notes; the next write, or the console right after the read,
+    /// applies.
+    touches: Mutex<Vec<Touch>>,
     /// The fault schedule every query's shard calls go through, when one is
     /// installed. See `crate::sim`.
     sim: Option<Arc<crate::sim::Sim>>,
@@ -762,7 +788,7 @@ pub struct Db {
     /// construction; `None` means this node can reach no other.
     wire_token: Option<String>,
     /// One connection per other node, opened on demand. See `crate::wire`.
-    nodes: BTreeMap<String, Arc<crate::wire::Node>>,
+    nodes: Mutex<BTreeMap<String, Arc<crate::wire::Node>>>,
     /// The nodes this process has verified since it started -- an `ATTACH
     /// NODE` that reached them and agreed on address and version. Not the
     /// catalog's list, which persists across a restart and so says nothing
@@ -807,7 +833,7 @@ impl Db {
             dir: None,
             budget,
             residency,
-            stats: BTreeMap::new(),
+            stats: Mutex::new(BTreeMap::new()),
             stats_baseline: BTreeMap::new(),
             published_catalog: None,
             writes: 0,
@@ -815,13 +841,13 @@ impl Db {
             collection_writes: BTreeMap::new(),
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
-            query_log: Vec::new(),
+            recall: Mutex::new(RecallLog::default()),
+            touches: Mutex::new(Vec::new()),
             sim: None,
             wire_token: crate::wire::token_from_env(),
-            nodes: BTreeMap::new(),
+            nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
             moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            queries_seen: 0,
             last_commit: 0,
         }
     }
@@ -1237,10 +1263,10 @@ impl Db {
         self.catalog.placement.remove(name);
         self.catalog.activity.retain(|(c, _), _| c != name);
         let prefix = cache_key(name, "");
-        self.stats.retain(|k, _| !k.starts_with(&prefix));
+        guard(&self.stats).retain(|k, _| !k.starts_with(&prefix));
         self.stats_baseline.remove(name);
         self.collection_writes.remove(name);
-        self.query_log.retain(|q| q.collection != name);
+        guard(&self.recall).query_log.retain(|q| q.collection != name);
     }
 
     /// Remove every directory a drop renamed aside and did not get to remove.
@@ -1292,7 +1318,7 @@ impl Db {
         let component = Collection::index_component(&def);
         let coll = c.clone();
         self.catalog.activity.remove(&(collection.to_string(), index.to_string()));
-        self.stats.remove(&cache_key(collection, &def.path));
+        guard(&self.stats).remove(&cache_key(collection, &def.path));
         if let Some(shards) = self.shards.get_mut(collection) {
             for s in shards.iter_mut() {
                 s.adopt_catalog(coll.clone())?;
@@ -1358,10 +1384,6 @@ impl Db {
 
     /// Fold the shards' inferred statistics into the definition before a
     /// read plans against it; what `run_select` does for its own shards.
-    pub(crate) fn absorb_for_read(&mut self, name: &str) -> Result<()> {
-        self.absorb_shard_catalogs(name)
-    }
-
     /// Put a fault schedule between every query and the shards. See
     /// `crate::sim`; `None` takes it out again.
     pub fn install_sim(&mut self, sim: Arc<crate::sim::Sim>) {
@@ -1420,8 +1442,8 @@ impl Db {
         v
     }
 
-    fn node_conn(&mut self, url: &str) -> Result<Arc<crate::wire::Node>> {
-        if let Some(n) = self.nodes.get(url) {
+    fn node_conn(&self, url: &str) -> Result<Arc<crate::wire::Node>> {
+        if let Some(n) = guard(&self.nodes).get(url) {
             return Ok(n.clone());
         }
         let n = Arc::new(crate::wire::Node::new(
@@ -1429,7 +1451,7 @@ impl Db {
             self.wire_token.as_deref(),
             self.opts.tls.clone(),
         )?);
-        self.nodes.insert(url.to_string(), n.clone());
+        guard(&self.nodes).insert(url.to_string(), n.clone());
         Ok(n)
     }
 
@@ -1667,7 +1689,7 @@ impl Db {
             )));
         }
         self.catalog.nodes.retain(|n| n != url);
-        self.nodes.remove(url);
+        guard(&self.nodes).remove(url);
         self.persist_catalog()
     }
 
@@ -2097,6 +2119,27 @@ impl Db {
     /// Sync the per-shard catalog copies with the control plane's, so that
     /// inferred path statistics accumulated on the write path are visible to
     /// planning.
+    /// The collection as planning wants it: the catalog's entry with the
+    /// statistics the shards have accumulated since it was last absorbed,
+    /// merged into a copy. What a read uses instead of
+    /// [`absorb_shard_catalogs`](Self::absorb_shard_catalogs), which writes
+    /// the merge back and so needs `&mut self`.
+    pub(crate) fn planning_collection(&self, collection: &str) -> Result<Collection> {
+        let mut merged = self.catalog.get(collection)?.clone();
+        if let Some(shards) = self.shards.get(collection) {
+            let mut tally = self.stats_baseline.get(collection).cloned().unwrap_or_default();
+            for s in shards {
+                tally.docs += s.coll.doc_count;
+                for (p, st) in &s.coll.paths {
+                    tally.paths.entry(p.clone()).or_default().merge(st);
+                }
+            }
+            merged.doc_count = tally.docs;
+            merged.paths = tally.paths;
+        }
+        Ok(merged)
+    }
+
     fn absorb_shard_catalogs(&mut self, collection: &str) -> Result<()> {
         let mut merged = self.catalog.get(collection)?.clone();
         if let Some(shards) = self.shards.get(collection) {
@@ -2343,7 +2386,7 @@ impl Db {
     /// `Shard::term_stats` documents, which a pinned `gc_horizon` makes
     /// exact again.
     pub fn gather_stats(
-        &mut self,
+        &self,
         collection: &str,
         want: &BTreeMap<String, Vec<String>>,
         ts: Timestamp,
@@ -2352,11 +2395,15 @@ impl Db {
         let coll = self.catalog.get(collection)?.clone();
         let writes = self.writes_to(collection);
         let tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
-        let taken = Taken::take(self, collection)?;
-        let sim = taken.db.sim.clone();
-        let services = services_for(&taken.shards, &tablets, &BTreeMap::new(), collection, sim);
-        let db: &mut Db = taken.db;
-        db.gather_stats_over(&services, &coll, want, ts, exact, false, &mut Vec::new(), writes)
+        let here = self.shards_here(collection);
+        let services = services_for(here, &tablets, &BTreeMap::new(), collection, self.sim.clone());
+        self.gather_stats_over(&services, &coll, want, ts, exact, false, &mut Vec::new(), writes)
+    }
+
+    /// The shards of `collection` on this node, or none: a coordinator
+    /// holding no data has no entry and that is not an error.
+    fn shards_here(&self, collection: &str) -> &[Shard] {
+        self.shards.get(collection).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// [`gather_stats`](Self::gather_stats) over an explicit set of shard
@@ -2366,7 +2413,7 @@ impl Db {
     /// written to the cache, which holds only sums measured over every shard.
     #[allow(clippy::too_many_arguments)]
     fn gather_stats_over(
-        &mut self,
+        &self,
         services: &[Box<dyn ShardService + '_>],
         coll: &Collection,
         want: &BTreeMap<String, Vec<String>>,
@@ -2472,7 +2519,7 @@ impl Db {
                 // query path.
                 let (num_docs, total_doc_len, df): StatsTriple = match fresh {
                     Some(t) => t,
-                    None => match self.stats.get(&key) {
+                    None => match guard(&self.stats).get(&key) {
                         Some(c) => (
                             c.num_docs,
                             c.total_doc_len,
@@ -2527,9 +2574,10 @@ impl Db {
     /// which was the one caller this pass was ever live for, now takes its
     /// globals from the fill's empty-slice gather, in one pass rather than
     /// two.
-    fn reset_stats_if_stale(&mut self, collection: &str, path: &str, writes: u64) {
+    fn reset_stats_if_stale(&self, collection: &str, path: &str, writes: u64) {
         let key = cache_key(collection, path);
-        let stale = match self.stats.get(&key) {
+        let mut stats = guard(&self.stats);
+        let stale = match stats.get(&key) {
             None => true,
             Some(c) => writes.saturating_sub(c.refreshed_at_writes) >= STATS_REFRESH_WRITES,
         };
@@ -2541,7 +2589,7 @@ impl Db {
         // globals measured in this one, so the reset drops every fill — and
         // `fill_order` with it, in the same statement, because the two are
         // only ever correct together.
-        self.stats.insert(
+        stats.insert(
             key,
             CachedStats {
                 num_docs: 0,
@@ -2606,7 +2654,7 @@ impl Db {
     /// the set it selects is "everything committed" whatever the number is.
     #[allow(clippy::too_many_arguments)]
     fn fill_term_stats(
-        &mut self,
+        &self,
         services: &[Box<dyn ShardService + '_>],
         collection: &str,
         path: &str,
@@ -2617,7 +2665,9 @@ impl Db {
         writes: u64,
     ) -> Result<Option<StatsTriple>> {
         let key = cache_key(collection, path);
-        let (missing, anchored, same_instant) = match self.stats.get(&key) {
+        // Looked at under the lock and let go before the gather: the shard
+        // calls below must not be made with the cache held.
+        let (missing, anchored, same_instant) = match guard(&self.stats).get(&key) {
             Some(c) => (
                 terms.iter().filter(|t| !c.doc_freq.contains_key(*t)).cloned().collect::<Vec<_>>(),
                 c.anchored,
@@ -2660,7 +2710,8 @@ impl Db {
                 terms.iter().map(|t| (t.clone(), df.get(t).copied().unwrap_or(0))).collect();
             return Ok(Some((num_docs, total_doc_len, answer)));
         }
-        let Some(c) = self.stats.get_mut(&key) else { return Ok(None) };
+        let mut stats = guard(&self.stats);
+        let Some(c) = stats.get_mut(&key) else { return Ok(None) };
         if stale_generation {
             // Dropped, not read. Both together: see `CachedStats::fill_order`.
             c.doc_freq.clear();
@@ -2728,7 +2779,81 @@ impl Db {
         // cluster that cannot be told from a hung one: two nodes each holding
         // their lock while waiting for the other would wait forever.
         let _deadline = self.arm_default_deadline();
-        self.run(stmt, sql, params, false, false)
+        // What reads noted before this statement is applied first, so a
+        // lifecycle run sees the accesses that preceded it.
+        self.apply_touches()?;
+        let out = self.run(stmt, sql, params, false, false);
+        self.apply_touches()?;
+        out
+    }
+
+    /// Whether `stmt` is answered by [`read`](Self::read): a `SELECT`, an
+    /// `EXPLAIN` of one, or either behind `LOCAL`. Everything else changes
+    /// something and takes `&mut self`.
+    pub fn is_read(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Select(_) => true,
+            Statement::Explain { inner, .. } | Statement::Local(inner) => Self::is_read(inner),
+            _ => false,
+        }
+    }
+
+    /// A read statement under a shared reference: what the console and the
+    /// wire run under a read lock, so reads proceed side by side and beside
+    /// nothing but writes. Refuses a statement that is not one
+    /// ([`is_read`](Self::is_read) says which); the caller takes the write
+    /// lock and [`execute`](Self::execute) instead. What the read noted --
+    /// index accesses -- waits in [`touches_pending`](Self::touches_pending)
+    /// for a writer.
+    pub fn read(&self, sql: &str) -> Result<Outcome> {
+        self.read_with(sql, &[])
+    }
+
+    pub fn read_with(&self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let stmt = sql::parse(sql, params)?;
+        let _deadline = self.arm_default_deadline();
+        self.run_read(stmt, sql, params)
+    }
+
+    fn run_read(&self, stmt: Statement, sql: &str, params: &[Value]) -> Result<Outcome> {
+        match stmt {
+            Statement::Select(sel) => Ok(Outcome::Rows(self.run_select(&sel, sql, params, false)?)),
+            Statement::Local(inner) => self.run_read(*inner, sql, params),
+            Statement::Explain { analyze, inner } => match *inner {
+                Statement::Select(sel) => {
+                    Ok(Outcome::Explain(self.explain_select(&sel, sql, params, analyze)?))
+                }
+                other => self.run_read(
+                    Statement::Explain { analyze, inner: Box::new(other) },
+                    sql,
+                    params,
+                ),
+            },
+            other => Err(Error::Plan(format!(
+                "`{}` is not a read; it runs under the write lock",
+                statement_kind(&other)
+            ))),
+        }
+    }
+
+    /// The rendered plan of a select, run.
+    fn explain_select(
+        &self,
+        sel: &Select,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+    ) -> Result<String> {
+        let r = self.run_select(sel, sql, params, true)?;
+        let mut text = r.explain.as_ref().map(|e| e.render()).unwrap_or_else(|| "(no plan)".into());
+        if !analyze {
+            // Without ANALYZE the timings are still printed but the query
+            // did run; say so rather than implying a cost-only estimate.
+            text.push_str(
+                "  note: this plan was executed; EXPLAIN without ANALYZE does not yet avoid execution\n",
+            );
+        }
+        Ok(text)
     }
 
     /// The default statement budget, for the entry points a caller reaches
@@ -2806,31 +2931,12 @@ impl Db {
         analyze: bool,
     ) -> Result<Outcome> {
         match stmt {
-            Statement::Explain { analyze, inner } => {
-                let inner_sql = sql.to_string();
-                match *inner {
-                    Statement::Select(sel) => {
-                        let r = self.run_select(&sel, &inner_sql, params, true)?;
-                        let text = r
-                            .explain
-                            .as_ref()
-                            .map(|e| e.render())
-                            .unwrap_or_else(|| "(no plan)".into());
-                        let mut text = text;
-                        if !analyze {
-                            // Without ANALYZE the timings are still printed but
-                            // the query did run; say so rather than implying a
-                            // cost-only estimate.
-                            text.push_str(
-                                "  note: this plan was executed; EXPLAIN without ANALYZE \
-                                 does not yet avoid execution\n",
-                            );
-                        }
-                        Ok(Outcome::Explain(text))
-                    }
-                    other => self.run_one(other, sql, params, true),
+            Statement::Explain { analyze, inner } => match *inner {
+                Statement::Select(sel) => {
+                    Ok(Outcome::Explain(self.explain_select(&sel, sql, params, analyze)?))
                 }
-            }
+                other => self.run_one(other, sql, params, true),
+            },
             Statement::CreateCollection(c) => {
                 let pk = c
                     .columns
@@ -3619,6 +3725,31 @@ impl Db {
     /// Record that a query touched these indexes. This is what "last accessed"
     /// means for an inactivity rule, and it is also what promotes an index back
     /// toward its declared tier.
+    /// A read's record of what it used: applied by [`apply_touches`](Self::apply_touches).
+    fn note_touches(&self, collection: &str, used: &[(String, IndexUse)]) {
+        if !used.is_empty() {
+            guard(&self.touches).push((collection.to_string(), used.to_vec()));
+        }
+    }
+
+    /// Whether a read has left touches for a writer to apply.
+    pub fn touches_pending(&self) -> bool {
+        !guard(&self.touches).is_empty()
+    }
+
+    /// Apply what reads noted since the last time: the access clocks, a
+    /// promotion for a demoted index that was used, the clocks persisted
+    /// if stale. Called by every statement that holds `&mut self`, and by
+    /// the console right after a read that noted something, so a fault-in
+    /// still promotes within the request that caused it.
+    pub fn apply_touches(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut *guard(&self.touches));
+        for (collection, used) in pending {
+            self.touch_indexes(&collection, &used)?;
+        }
+        Ok(())
+    }
+
     fn touch_indexes(&mut self, collection: &str, used: &[(String, IndexUse)]) -> Result<()> {
         if used.is_empty() {
             return Ok(());
@@ -3787,7 +3918,7 @@ impl Db {
     }
 
     pub fn run_select(
-        &mut self,
+        &self,
         sel: &Select,
         sql: &str,
         params: &[Value],
@@ -3801,14 +3932,13 @@ impl Db {
             sel.with.deadline_ms.or(self.opts.statement_deadline_ms)
         };
         let _deadline = crate::deadline::arm(budget);
-        self.absorb_shard_catalogs(&sel.collection)?;
         // Before the query, not after: an index the query is about to fault in
         // from cold storage counts as used even if the query then fails.
-        self.touch_indexes(&sel.collection, &index_uses(sel))?;
+        self.note_touches(&sel.collection, &index_uses(sel));
         // Read-your-writes: pin at least the last commit timestamp this client
         // observed (§6).
         let ts = self.clock.peek().max(self.last_commit);
-        let coll = self.catalog.get(&sel.collection)?.clone();
+        let coll = self.planning_collection(&sel.collection)?;
         if let Some(path) = exec::undeclared_text_path(&coll, sel) {
             return Err(Error::Plan(format!(
                 "no full-text index on `{path}`; CREATE INDEX ... USING fulltext ({path})"
@@ -3843,11 +3973,9 @@ impl Db {
             }
             remotes.insert(url, node);
         }
-        let taken = Taken::take(self, &sel.collection)?;
-        let sim = taken.db.sim.clone();
-        let services = services_for(&taken.shards, &tablets, &remotes, &sel.collection, sim);
-        let db: &mut Db = taken.db;
-        db.run_over(&coll, &services, sel, sql, params, analyze, ts, writes, partial, unreachable)
+        let here = self.shards_here(&sel.collection);
+        let services = services_for(here, &tablets, &remotes, &sel.collection, self.sim.clone());
+        self.run_over(&coll, &services, sel, sql, params, analyze, ts, writes, partial, unreachable)
     }
 
     /// The statement over an explicit set of shard services: prefix
@@ -3855,7 +3983,7 @@ impl Db {
     /// after choosing the services and the instant.
     #[allow(clippy::too_many_arguments)]
     fn run_over(
-        &mut self,
+        &self,
         coll: &Collection,
         services: &[Box<dyn ShardService + '_>],
         sel: &Select,
@@ -3887,7 +4015,7 @@ impl Db {
         for (wi, h) in hops.iter().enumerate() {
             let Expr::Hops { path, k, start, via, reverse, filters } = h else { unreachable!() };
             let (edges, index) = self.check_walk(coll, path, *k, via, filters)?;
-            self.touch_indexes(via, &[(index.path.clone(), IndexUse::Walk)])?;
+            self.note_touches(via, &[(index.path.clone(), IndexUse::Walk)]);
             // The edge collection's holders, for its instant and its shards.
             let tablets = self.catalog.placement.get(via).cloned().unwrap_or_default();
             let mut edge_unreachable: Vec<usize> = Vec::new();
@@ -3932,9 +4060,8 @@ impl Db {
                 max_fanout: sel.with.max_fanout,
             };
             let out = {
-                let taken = Taken::take(self, via)?;
-                let sim = taken.db.sim.clone();
-                let edge_services = services_for(&taken.shards, &tablets, &remotes, via, sim);
+                let edge_services =
+                    services_for(self.shards_here(via), &tablets, &remotes, via, self.sim.clone());
                 walk::walk(
                     &spec,
                     &edge_services,
@@ -4265,23 +4392,24 @@ impl Db {
     /// point of sampling *real* queries rather than synthetic ones is that
     /// recall regressions are workload-shaped: they show up on the filters and
     /// query distributions users actually have.
-    fn log_vector_queries(&mut self, sel: &Select) {
-        let mut push = |path: &str, q: &Vec<f32>| {
-            self.queries_seen += 1;
+    fn log_vector_queries(&self, sel: &Select) {
+        let push = |path: &str, q: &Vec<f32>| {
+            let mut log = guard(&self.recall);
+            log.queries_seen += 1;
             if self.opts.recall_sample_rate == 0
-                || self.queries_seen % self.opts.recall_sample_rate != 0
+                || log.queries_seen % self.opts.recall_sample_rate != 0
             {
                 return;
             }
-            self.query_log.push(LoggedVectorQuery {
+            log.query_log.push(LoggedVectorQuery {
                 collection: sel.collection.clone(),
                 path: path.to_string(),
                 query: q.clone(),
                 k: sel.limit.unwrap_or(10),
                 filter_sql: None,
             });
-            if self.query_log.len() > 4096 {
-                self.query_log.remove(0);
+            if log.query_log.len() > 4096 {
+                log.query_log.remove(0);
             }
         };
         match &sel.order {
@@ -4298,7 +4426,12 @@ impl Db {
     }
 
     pub fn logged_queries(&self, collection: &str) -> Vec<LoggedVectorQuery> {
-        self.query_log.iter().filter(|q| q.collection == collection).cloned().collect()
+        guard(&self.recall)
+            .query_log
+            .iter()
+            .filter(|q| q.collection == collection)
+            .cloned()
+            .collect()
     }
 
     pub fn persist(&mut self) -> Result<()> {
@@ -4457,31 +4590,18 @@ fn sum_term_stats(
     Ok((sum, complete))
 }
 
-/// A collection's shards, out of the map for the length of a statement and
-/// back in it afterwards, whatever the statement did -- including unwinding.
-/// Exists so that services borrowing the shards and the engine's own state
-/// (the statistics cache above all) can be held at once.
-struct Taken<'a> {
-    db: &'a mut Db,
-    name: String,
-    shards: Vec<Shard>,
-}
-
-impl<'a> Taken<'a> {
-    fn take(db: &'a mut Db, name: &str) -> Result<Taken<'a>> {
-        db.catalog.get(name)?;
-        // A collection every shard of which is on other nodes has no entry
-        // here, and that is not an error: the coordinator holds no data.
-        let shards = db.shards.remove(name).unwrap_or_default();
-        Ok(Taken { db, name: name.to_string(), shards })
-    }
-}
-
-impl Drop for Taken<'_> {
-    fn drop(&mut self) {
-        if !self.shards.is_empty() {
-            self.db.shards.insert(std::mem::take(&mut self.name), std::mem::take(&mut self.shards));
-        }
+/// The first word or two of a statement, for a message that names it.
+fn statement_kind(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::Insert(_) => "INSERT",
+        Statement::Delete(_) => "DELETE",
+        Statement::CreateCollection(_) => "CREATE COLLECTION",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::Flush { .. } => "FLUSH",
+        Statement::Compact { .. } => "COMPACT",
+        Statement::Backup { .. } => "BACKUP",
+        Statement::Restore { .. } => "RESTORE",
+        _ => "this statement",
     }
 }
 
@@ -4972,7 +5092,7 @@ mod tests {
 
         // Absolute, and every one of them is a sum the gather has to get right
         // across six units and three shards.
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             c.num_docs, 1118,
             "900 sealed rows and 300 memtable rows, less the 82 keys deleted; the deletes are \
@@ -5062,7 +5182,7 @@ mod tests {
         assert!(exact["body"].doc_freq.is_empty());
         assert_eq!(cached["body"].idf("quokka"), exact["body"].idf("quokka"));
         assert_eq!(
-            db.stats.get(&cache_key("notes", "body")).unwrap().doc_freq["quokka"],
+            guard(&db.stats).get(&cache_key("notes", "body")).unwrap().doc_freq["quokka"],
             0,
             "and the zero is in the cache, so the next query does not walk for it again"
         );
@@ -5203,7 +5323,7 @@ mod tests {
         for i in 0..250usize {
             db.delete_key("notes", &format!("a{i:04}")).unwrap();
         }
-        let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+        let at = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
         assert!(
             db.writes - at < STATS_REFRESH_WRITES,
             "no refresh point may pass: the whole point is that this is INSIDE one epoch, where \
@@ -5215,7 +5335,7 @@ mod tests {
         // unreachable for any repair keyed on the current query's terms.
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(vec!["newterm"]), ts, false).unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(c.num_docs, 250, "the globals moved with the deletes");
         assert!(
             !c.doc_freq.contains_key("alpha"),
@@ -5296,7 +5416,8 @@ mod tests {
                 }
                 let ts = db.clock.peek();
                 db.gather_stats("notes", &want, ts, false).unwrap();
-                let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+                let at =
+                    guard(&db.stats).get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
                 if points.last() != Some(&at) {
                     points.push(at);
                 }
@@ -5347,7 +5468,7 @@ mod tests {
             let want = BTreeMap::from([("body".to_string(), vec![format!("q{i:06}")])]);
             let ts = db.clock.peek();
             db.gather_stats("notes", &want, ts, false).unwrap();
-            let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+            let at = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
             if points.last() != Some(&at) {
                 points.push(at);
             }
@@ -5391,7 +5512,7 @@ mod tests {
         let old: Vec<String> = (0..3).map(|i| format!("old{i:04}")).collect();
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(old.clone()), ts, false).unwrap();
-        assert_eq!(db.stats.get(&cache_key("notes", "body")).unwrap().fill_order.len(), 3);
+        assert_eq!(guard(&db.stats).get(&cache_key("notes", "body")).unwrap().fill_order.len(), 3);
 
         // Over a refresh point, into epoch two.
         for i in 0..STATS_REFRESH_WRITES as usize {
@@ -5399,7 +5520,7 @@ mod tests {
         }
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(vec!["new0000".to_string()]), ts, false).unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             c.doc_freq.keys().cloned().collect::<Vec<_>>(),
             vec!["new0000".to_string()],
@@ -5417,7 +5538,7 @@ mod tests {
         let terms: Vec<String> = (0..n).map(|i| format!("r{i:06}")).collect();
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(terms), ts, false).unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cap is a cap in the second epoch too");
         assert_eq!(c.fill_order.len(), c.doc_freq.len(), "and the queue is still in step with it");
         assert!(
@@ -5450,7 +5571,7 @@ mod tests {
             "the double count made this `df > num_docs`, which is a negative logarithm"
         );
         assert!(g.idf("alpha") > 0.0, "and the IDF clamp fired on a term the corpus is full of");
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cap still holds");
         assert_eq!(
             c.fill_order.len(),
@@ -5506,7 +5627,7 @@ mod tests {
         // No write, so `measured_at_writes == self.writes` and the fast path
         // holds. Assert that it does, or the test could go green by taking the
         // slow branch and prove nothing about the merge.
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(c.measured_at_writes, db.writes, "the fast path is what this test is about");
         assert!(c.anchored && c.doc_freq.contains_key("alpha"));
 
@@ -5760,7 +5881,7 @@ mod tests {
         let g = db.gather_stats("notes", &want, ts, false).unwrap();
         assert_eq!(g["body"].doc_freq["zeta"], 80);
         assert_eq!(g["body"].doc_freq["dup"], 80, "already cached, and still counted once");
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             c.fill_order.iter().cloned().collect::<Vec<_>>(),
             vec!["dup".to_string(), "zeta".to_string()],
@@ -5823,7 +5944,7 @@ mod tests {
         // real collection-wide count, which is what makes the weight the same
         // in every unit that scores it.
         db.query("SELECT id FROM notes WHERE text_match(body, 'alph*') LIMIT 5").unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert!(c.anchored, "the globals were measured, and `num_docs == 0` cannot say so");
         assert_eq!(c.num_docs, 200);
         assert_eq!(
@@ -5895,7 +6016,7 @@ mod tests {
                 .map(|r| r.key.clone())
                 .collect();
             rows.sort();
-            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
             let got = (c.num_docs, c.total_doc_len, c.doc_freq.clone(), rows);
             let _ = fs::remove_dir_all(&dir);
             got
@@ -5971,7 +6092,7 @@ mod tests {
         let dir = tmp("expansion-zero-df");
         let mut db = dead_run(&dir, "", 1000, 600);
         db.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5").unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         let dead: Vec<&String> =
             c.doc_freq.iter().filter(|(_, &d)| d == 0).map(|(t, _)| t).collect();
         assert!(dead.is_empty(), "terms no live document holds, in a pinned expansion: {dead:?}");
@@ -6278,7 +6399,10 @@ mod tests {
         db.execute("FLUSH notes").unwrap();
         // Warm the cache with the ten-document corpus.
         db.query("SELECT id FROM notes WHERE text_match(body, 'graph') LIMIT 5").unwrap();
-        assert!(db.stats.contains_key(&cache_key("notes", "body")), "the fixture warmed nothing");
+        assert!(
+            guard(&db.stats).contains_key(&cache_key("notes", "body")),
+            "the fixture warmed nothing"
+        );
         db.execute(
             "CREATE LIFECYCLE POLICY cool ON notes FOR (notes_body) \
              MOVE TO cached AFTER 1 hour OF INACTIVITY",
@@ -6293,7 +6417,10 @@ mod tests {
         assert!(db.execute("SHOW CATALOG notes").is_err());
         assert!(!dir.join("collections").join("notes").exists(), "the files were left behind");
         assert!(!dropping_dir(&dir, "notes").exists(), "the directory was left aside");
-        assert!(db.stats.keys().all(|k| !k.starts_with("notes/")), "the statistics were kept");
+        assert!(
+            guard(&db.stats).keys().all(|k| !k.starts_with("notes/")),
+            "the statistics were kept"
+        );
         assert!(db.catalog.activity.keys().all(|(c, _)| c != "notes"), "the clocks were kept");
         let e = db.execute("DROP COLLECTION notes").unwrap_err().to_string();
         assert!(e.contains("no such collection"), "{e}");
@@ -6393,7 +6520,7 @@ mod tests {
         db.execute("FLUSH notes").unwrap();
         let text = "SELECT id FROM notes WHERE text_match(body, 'graph') LIMIT 10";
         assert_eq!(db.query(text).unwrap().rows.len(), 4);
-        assert!(db.stats.contains_key(&cache_key("notes", "body")));
+        assert!(guard(&db.stats).contains_key(&cache_key("notes", "body")));
         db.execute(
             "CREATE LIFECYCLE POLICY cool ON notes FOR (notes_body) \
              MOVE TO cached AFTER 1 hour OF INACTIVITY",
@@ -6415,7 +6542,10 @@ mod tests {
         }
         let e = db.query(text).unwrap_err().to_string();
         assert!(e.contains("no full-text index on"), "the planner still used it: {e}");
-        assert!(!db.stats.contains_key(&cache_key("notes", "body")), "the statistics were kept");
+        assert!(
+            !guard(&db.stats).contains_key(&cache_key("notes", "body")),
+            "the statistics were kept"
+        );
         assert!(!db.catalog.activity.contains_key(&("notes".into(), "notes_body".into())));
         assert!(db.catalog.get("notes").unwrap().index_by_name("notes_body").is_none());
         let emb = "SELECT id FROM notes ORDER BY embedding <=> [1.0, 1.0] LIMIT 2";
@@ -6501,7 +6631,7 @@ mod tests {
 
         // And the cached entry is the exact gather's own numbers, for the
         // expansion's terms rather than for nothing.
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             c.doc_freq,
             BTreeMap::from([("alpha".to_string(), 514u64), ("alphabet".to_string(), 86)]),
@@ -6555,7 +6685,7 @@ mod tests {
                 .iter()
                 .map(|r| r.key.clone())
                 .collect::<Vec<_>>();
-            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
             let got = (c.num_docs, c.doc_freq.clone(), ranked);
             let _ = fs::remove_dir_all(&dir);
             got
@@ -6795,7 +6925,11 @@ mod tests {
         // The message stays exactly where it was: this declines to NAME the
         // path, it does not move the refusal to the coordinator.
         assert!(e.contains("no full-text index on"), "{e}");
-        assert!(db.stats.is_empty(), "a failed query retained {} entries", db.stats.len());
+        assert!(
+            guard(&db.stats).is_empty(),
+            "a failed query retained {} entries",
+            guard(&db.stats).len()
+        );
 
         // A prefix on an unindexed path is out of the budget too, since the
         // budget counts expansions that get paid for.
@@ -6804,12 +6938,12 @@ mod tests {
         let sql = format!("SELECT id FROM notes WHERE {} LIMIT 5", many.join(" OR "));
         let e = db.query(&sql).unwrap_err().to_string();
         assert!(e.contains("no full-text index on"), "not the prefix budget: {e}");
-        assert!(db.stats.is_empty(), "{} entries", db.stats.len());
+        assert!(guard(&db.stats).is_empty(), "{} entries", guard(&db.stats).len());
 
         // The indexed path still works and still caches, which is the control.
         let r = db.query("SELECT id FROM notes WHERE text_match(body, 'zed') LIMIT 5").unwrap();
         assert_eq!(r.rows.len(), 1);
-        assert_eq!(db.stats.len(), 1, "the one path that has an index");
+        assert_eq!(guard(&db.stats).len(), 1, "the one path that has an index");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6836,7 +6970,7 @@ mod tests {
         // the expansion is still resolved globally, only the gather is skipped.
         assert_eq!(r.rows.len(), 88, "the coordinator's global cut, not a per-unit one");
         assert_eq!(r.truncated_prefixes.len(), 1, "{:?}", r.truncated_prefixes);
-        let c = db.stats.get(&key).unwrap();
+        let c = guard(&db.stats).get(&key).unwrap().clone();
         assert_eq!(c.doc_freq.get("zed"), Some(&600), "the positive clause is still gathered");
         let a: Vec<&String> = c.doc_freq.keys().filter(|t| t.starts_with('a')).collect();
         assert!(a.is_empty(), "frequencies nothing can read: {} of them", a.len());
@@ -6851,14 +6985,14 @@ mod tests {
         let r =
             db2.query("SELECT id FROM notes WHERE text_match(body, '-a*') LIMIT 100000").unwrap();
         assert_eq!(r.rows.len(), 88, "the global cut, not each unit's own");
-        assert!(db2.stats.get(&cache_key("notes", "body")).unwrap().doc_freq.is_empty());
+        assert!(guard(&db2.stats).get(&cache_key("notes", "body")).unwrap().doc_freq.is_empty());
 
         // And the positive spelling still gathers, which is the control: this
         // turns on the leaf's sign, not on prefixes as a class.
         let dir3 = tmp("negated-expansion-control");
         let mut db3 = cap_fixture(&dir3, 600);
         db3.query("SELECT id FROM notes WHERE text_match(body, 'a*') LIMIT 5").unwrap();
-        let c = db3.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db3.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             c.doc_freq.keys().filter(|t| t.starts_with('a')).count(),
             PREFIX_EXPANSION_LIMIT,
@@ -7056,8 +7190,14 @@ mod tests {
         assert_eq!(b["body"].avg_doc_len, 4.0, "four words of body");
         assert_eq!(t["title"].avg_doc_len, 1.0, "one of title — and not the average of both");
 
-        assert_eq!(db.stats.get(&cache_key("notes", "body")).unwrap().doc_freq["alpha"], 100);
-        assert_eq!(db.stats.get(&cache_key("notes", "title")).unwrap().doc_freq["alpha"], 10);
+        assert_eq!(
+            guard(&db.stats).get(&cache_key("notes", "body")).unwrap().doc_freq["alpha"],
+            100
+        );
+        assert_eq!(
+            guard(&db.stats).get(&cache_key("notes", "title")).unwrap().doc_freq["alpha"],
+            10
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -7123,7 +7263,7 @@ mod tests {
         }
         db.execute("FLUSH notes").unwrap();
         db.execute("COMPACT notes").unwrap();
-        let at = db.stats.get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
+        let at = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().refreshed_at_writes;
         assert!(
             db.writes - at < STATS_REFRESH_WRITES,
             "the second gather has to be a FILL inside the epoch the first one anchored, not a \
@@ -7298,7 +7438,7 @@ mod tests {
         }
         assert_eq!(g.idf("alpha").to_bits(), e.idf("alpha").to_bits(), "and so the weight agrees");
 
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(c.doc_freq.len(), STATS_TERM_CAP, "the cache is capped");
         assert_eq!(c.fill_order.len(), STATS_TERM_CAP, "and the eviction order with it");
         assert_eq!(c.num_docs, 40, "the globals are untouched by the eviction");
@@ -7542,7 +7682,7 @@ mod tests {
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(&["segments"]), ts, false).unwrap();
         let before = {
-            let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+            let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
             (c.refreshed_at_writes, c.measured_at_writes, c.num_docs, c.anchored)
         };
         assert!(before.3, "the first gather did not anchor");
@@ -7564,7 +7704,7 @@ mod tests {
         // One shard, one missing term: an anchor that compared the engine-wide
         // count would find it moved and re-measure both.
         assert_eq!(gathered, 1, "writes to `other` made `notes` re-gather {gathered} terms");
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert_eq!(
             (c.refreshed_at_writes, c.num_docs, c.anchored),
             (before.0, before.2, true),
@@ -7579,7 +7719,7 @@ mod tests {
         }
         let ts = db.clock.peek();
         db.gather_stats("notes", &want(&["segments"]), ts, false).unwrap();
-        let c = db.stats.get(&cache_key("notes", "body")).unwrap();
+        let c = guard(&db.stats).get(&cache_key("notes", "body")).unwrap().clone();
         assert!(c.refreshed_at_writes > before.0, "writes to `notes` did not end its epoch");
     }
 

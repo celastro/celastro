@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::catalog::{Catalog, Collection, Tablet};
@@ -926,14 +926,14 @@ impl ShardService for Remote {
 /// under the database's lock, as a console request does.
 pub fn serve(
     listener: TcpListener,
-    db: Arc<Mutex<Db>>,
+    db: Arc<RwLock<Db>>,
     token: String,
     stop: Arc<AtomicBool>,
     tls: Option<Arc<Tls>>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let token = Arc::new(token);
-    let moves = db.lock().unwrap_or_else(|p| p.into_inner()).moves();
+    let moves = db.read().unwrap_or_else(|p| p.into_inner()).moves();
     loop {
         if stop.load(Ordering::Relaxed) || crate::signal::shutdown_requested() {
             return Ok(());
@@ -973,7 +973,7 @@ type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
 
 fn serve_connection(
     mut s: Box<dyn Stream>,
-    db: &Mutex<Db>,
+    db: &RwLock<Db>,
     moves: &Moves,
     token: &str,
     stop: &AtomicBool,
@@ -1037,7 +1037,33 @@ impl Drop for Serving {
     }
 }
 
-fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
+/// The lock a call holds: shared for a read, exclusive for the rest. Both
+/// read as `&Db`; only the exclusive one hands out `&mut Db`.
+enum Held<'a> {
+    Read(std::sync::RwLockReadGuard<'a, Db>),
+    Write(std::sync::RwLockWriteGuard<'a, Db>),
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = Db;
+    fn deref(&self) -> &Db {
+        match self {
+            Held::Read(g) => g,
+            Held::Write(g) => g,
+        }
+    }
+}
+
+impl Held<'_> {
+    fn exclusive(&mut self) -> &mut Db {
+        match self {
+            Held::Write(g) => g,
+            Held::Read(_) => unreachable!("a call that changes the node holds the exclusive lock"),
+        }
+    }
+}
+
+fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
     let _serving = Serving;
     let mut i = 0;
@@ -1097,7 +1123,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
             let list = match pinned {
                 Some(m) if m.to == to => m.list()?,
                 _ => {
-                    let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut db = db.write().unwrap_or_else(|p| p.into_inner());
                     db.begin_move(&collection, shard, &to)?
                 }
             };
@@ -1119,7 +1145,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
             let tablets = get_tablets(body, &mut j)?;
             let from = get_string(body, &mut j)?;
             let (me, tls) = {
-                let g = db.lock().unwrap_or_else(|p| p.into_inner());
+                let g = db.read().unwrap_or_else(|p| p.into_inner());
                 (
                     g.node()
                         .map(str::to_string)
@@ -1129,17 +1155,38 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
             };
             let source = Arc::new(Node::new(&from, Some(token), tls)?);
             let files = source.begin_move(&collection, shard, &me)?;
-            let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+            let mut db = db.write().unwrap_or_else(|p| p.into_inner());
             db.pull_here(&coll, &tablets, shard, Some(&source), &files)?;
             return Ok(out);
         }
         _ => {}
     }
-    let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
+    // The shard reads a coordinator sends -- statistics, candidates, a scan,
+    // documents, a hop -- take the shared lock and run beside each other
+    // and beside this node's own reads; everything that changes something
+    // takes the exclusive one.
+    let read_call = matches!(
+        call,
+        Call::Hello
+            | Call::Counters
+            | Call::TermStats
+            | Call::PrefixTerms
+            | Call::Candidates
+            | Call::Scan
+            | Call::Documents
+            | Call::Get
+            | Call::Expand
+            | Call::Present
+    );
+    let mut db = if read_call {
+        Held::Read(db.read().unwrap_or_else(|p| p.into_inner()))
+    } else {
+        Held::Write(db.write().unwrap_or_else(|p| p.into_inner()))
+    };
     match call {
         Call::BeginMove | Call::ReadFile | Call::PullShard => unreachable!("answered above"),
         Call::AbortMove => {
-            db.abort_move(&collection, shard);
+            db.exclusive().abort_move(&collection, shard);
         }
         Call::Hello => {
             put_opt_str(&mut out, db.node());
@@ -1152,11 +1199,11 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
         }
         Call::Insert => {
             let doc = get_value(body, &mut 0)?;
-            put_ts(&mut out, db.insert_here(&collection, doc)?);
+            put_ts(&mut out, db.exclusive().insert_here(&collection, doc)?);
         }
         Call::Delete => {
             let key = get_string(body, &mut 0)?;
-            put_bool(&mut out, db.delete_key_here(&collection, &key)?);
+            put_bool(&mut out, db.exclusive().delete_key_here(&collection, &key)?);
         }
         Call::Statement => {
             let mut j = 0;
@@ -1168,7 +1215,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                         .into(),
                 ));
             }
-            let text = match db.execute_with(&sql, &params)?.finished()? {
+            let text = match db.exclusive().execute_with(&sql, &params)?.finished()? {
                 crate::engine::Outcome::Ack(m) => m,
                 other => format!("{other:?}"),
             };
@@ -1183,7 +1230,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                     Error::Storage("wire: no collection in the definition".into())
                 })?;
             let tablets = get_tablets(body, &mut j)?;
-            db.adopt_collection(coll, tablets)?;
+            db.exclusive().adopt_collection(coll, tablets)?;
         }
         Call::TermStats
         | Call::PrefixTerms
@@ -1196,8 +1243,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
             // Reads see the same statistics a local statement would: the
             // inferred path classes are folded in before planning, as
             // `Db::run_select` does for its own shards.
-            db.absorb_for_read(&collection)?;
-            let coll = db.collection(&collection)?.clone();
+            let coll = db.planning_collection(&collection)?;
             let shards = db.shards(&collection)?;
             let Some(sh) = shards.iter().find(|s| s.index == shard) else {
                 return Err(Error::Plan(format!(

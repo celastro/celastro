@@ -185,9 +185,9 @@ stops it after a clean save.
 load balancer: the console then answers the token in `CELASTRO_TOKEN` (yours,
 at least sixteen printable bytes, the same at every node), accepts whatever
 `Host` routed to it, and requires a browser's `Origin` to be that host.
-Connections are served at once, up to sixty-four; statements still serialise
-per node, since the engine is single-writer. `/api/health` names the node
-that answered.
+Connections are served at once, up to sixty-four, and reads run side by
+side on every core; a statement that changes something runs alone, since
+the engine is single-writer. `/api/health` names the node that answered.
 
 ## Encryption in transit
 
@@ -265,8 +265,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.30.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.30.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.31.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.31.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

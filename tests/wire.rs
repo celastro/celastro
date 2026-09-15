@@ -5,7 +5,7 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::plan::exec::QueryResult;
@@ -24,7 +24,7 @@ fn dir(tag: &str) -> PathBuf {
 /// A node: a database with an address, served on a loopback port.
 struct Node {
     url: String,
-    db: Arc<Mutex<Db>>,
+    db: Arc<RwLock<Db>>,
     stop: Arc<AtomicBool>,
     dir: PathBuf,
 }
@@ -36,7 +36,7 @@ impl Node {
         let dir = dir(tag);
         let mut opts = DbOpts::default();
         opts.node = Some(url.clone());
-        let db = Arc::new(Mutex::new(Db::open(&dir, opts).unwrap()));
+        let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
@@ -46,7 +46,7 @@ impl Node {
     }
 
     fn exec(&self, sql: &str) -> celastro::Result<Outcome> {
-        self.db.lock().unwrap().execute(sql)
+        self.db.write().unwrap().execute(sql)
     }
 
     fn ack(&self, sql: &str) -> String {
@@ -57,16 +57,16 @@ impl Node {
     }
 
     fn query(&self, sql: &str) -> celastro::Result<QueryResult> {
-        self.db.lock().unwrap().query(sql)
+        self.db.write().unwrap().query(sql)
     }
 
     fn local_shards(&self, collection: &str) -> Vec<usize> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.write().unwrap();
         db.shards(collection).unwrap().iter().map(|s| s.index).collect()
     }
 
     fn docs_here(&self, collection: &str) -> usize {
-        let db = self.db.lock().unwrap();
+        let db = self.db.write().unwrap();
         let ts = db.now_ts();
         db.shards(collection).unwrap().iter().map(|s| s.num_docs(ts)).sum()
     }
@@ -182,11 +182,11 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
             a.ack("FLUSH items");
             one.execute("FLUSH items").unwrap();
         }
-        via.db.lock().unwrap().insert("items", doc(i)).unwrap();
+        via.db.write().unwrap().insert("items", doc(i)).unwrap();
         one.insert("items", doc(i)).unwrap();
     }
     for key in ["t0\u{1}doc-003", "t1\u{1}doc-031", "t2\u{1}doc-071"] {
-        assert!(b.db.lock().unwrap().delete_key("items", key).unwrap(), "{key}");
+        assert!(b.db.write().unwrap().delete_key("items", key).unwrap(), "{key}");
         assert!(one.delete_key("items", key).unwrap());
     }
     assert_eq!((a.docs_here("items"), b.docs_here("items"), c.docs_here("items")), (29, 29, 29));
@@ -238,7 +238,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
     assert!(!m.contains("and on"), "{m}");
     // A row in a memtable when the index is dropped is sealed without it
     // and answers no rows for that path until compaction, on both sides.
-    c.db.lock().unwrap().insert("items", doc(90)).unwrap();
+    c.db.write().unwrap().insert("items", doc(90)).unwrap();
     one.insert("items", doc(90)).unwrap();
     let m = a.ack("DROP INDEX items_body ON items");
     assert!(m.contains("and on"), "{m}");
@@ -268,7 +268,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
             i % 3
         ))
         .unwrap();
-        b.db.lock().unwrap().insert("items", d.clone()).unwrap();
+        b.db.write().unwrap().insert("items", d.clone()).unwrap();
         one.insert("items", d).unwrap();
     }
     for q in [QUERIES[0], QUERIES[6]] {
@@ -279,7 +279,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
     let e = a.exec(&format!("DETACH NODE '{}'", b.url)).unwrap_err().to_string();
     assert!(e.contains("holds 1 shard(s); move them first: MOVE SHARD 1 OF items TO"), "{e}");
     // And an export needs every shard here.
-    let e = match a.db.lock().unwrap().export_collection("items") {
+    let e = match a.db.write().unwrap().export_collection("items") {
         Err(e) => e.to_string(),
         Ok(_) => panic!("an export of a spread collection was accepted"),
     };
@@ -294,7 +294,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
         let listener = TcpListener::bind(a_url.trim_start_matches("tcp://")).unwrap();
         let mut opts = DbOpts::default();
         opts.node = Some(a_url.clone());
-        let db = Arc::new(Mutex::new(Db::open(&a_dir, opts).unwrap()));
+        let db = Arc::new(RwLock::new(Db::open(&a_dir, opts).unwrap()));
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
@@ -337,7 +337,7 @@ fn a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter() {
     );
     a.ack(INDEXES[0]);
     for i in 0..20usize {
-        a.db.lock().unwrap().insert("items", doc(i)).unwrap();
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
     }
     let all = a.query("SELECT id FROM items LIMIT 100").unwrap();
     assert_eq!(all.rows.len(), 20);
@@ -354,7 +354,7 @@ fn a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter() {
     assert_eq!(r.missing, vec!["shard 1"]);
     assert_eq!(r.rows.len(), 7, "a's own tenant only: every third document");
     assert!(r.rows.iter().all(|row| row.key.starts_with("t0\u{1}")));
-    let e = a.db.lock().unwrap().insert("items", doc(1)).unwrap_err().to_string();
+    let e = a.db.write().unwrap().insert("items", doc(1)).unwrap_err().to_string();
     assert!(e.contains(&b_url), "a write to the dead node's shard names it: {e}");
 
     // The wrong token, and the wrong version, are refused by name.
@@ -438,7 +438,7 @@ fn a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answ
             one.execute("FLUSH items").unwrap();
             one.execute("FLUSH cites").unwrap();
         }
-        via.db.lock().unwrap().insert("items", doc(i)).unwrap();
+        via.db.write().unwrap().insert("items", doc(i)).unwrap();
         one.insert("items", doc(i)).unwrap();
         for (j, step) in [1usize, 3, 11].iter().enumerate() {
             let e = celastro::json::parse(&format!(
@@ -447,11 +447,11 @@ fn a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answ
                 (i + step) % 90
             ))
             .unwrap();
-            via.db.lock().unwrap().insert("cites", e.clone()).unwrap();
+            via.db.write().unwrap().insert("cites", e.clone()).unwrap();
             one.insert("cites", e).unwrap();
         }
     }
-    assert!(b.db.lock().unwrap().delete_key("items", "t1\u{1}doc-013").unwrap());
+    assert!(b.db.write().unwrap().delete_key("items", "t1\u{1}doc-013").unwrap());
     assert!(one.delete_key("items", "t1\u{1}doc-013").unwrap());
 
     let walks = [
@@ -542,10 +542,10 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
             a.ack("FLUSH items");
             one.execute("FLUSH items").unwrap();
         }
-        [&a, &b, &c][i % 3].db.lock().unwrap().insert("items", doc(i)).unwrap();
+        [&a, &b, &c][i % 3].db.write().unwrap().insert("items", doc(i)).unwrap();
         one.insert("items", doc(i)).unwrap();
     }
-    assert!(b.db.lock().unwrap().delete_key("items", "t1\u{1}doc-031").unwrap());
+    assert!(b.db.write().unwrap().delete_key("items", "t1\u{1}doc-031").unwrap());
     assert!(one.delete_key("items", "t1\u{1}doc-031").unwrap());
     // Exact statistics on both sides: what a move has to keep is the rows
     // and their order, and the cached statistics' refresh points differ
@@ -589,7 +589,7 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
     assert!(e.contains(&format!("MOVE SHARD 2 OF items TO '{}'", b.url)), "{e}");
     agree("after 1 -> c", &mut one, &[&a, &b, &c]);
     // Writes to the moved shard's keys route to c now, through any node.
-    b.db.lock().unwrap().insert("items", doc(91)).unwrap();
+    b.db.write().unwrap().insert("items", doc(91)).unwrap();
     one.insert("items", doc(91)).unwrap();
     assert_eq!(c.docs_here("items"), 30 + 29 + 1 - 1 + 1, "shards 1 and 2, plus doc-091 in t1");
     agree("after a write", &mut one, &[&a, &b, &c]);
@@ -616,12 +616,12 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
 
     // A pinned shard refuses writes naming the move, and takes them again
     // once the pin is let go.
-    let files = b.db.lock().unwrap().begin_move("items", 0, &c.url).unwrap();
+    let files = b.db.write().unwrap().begin_move("items", 0, &c.url).unwrap();
     assert!(files.iter().any(|(n, _)| n == "MANIFEST"), "{files:?}");
-    let e = a.db.lock().unwrap().insert("items", doc(93)).unwrap_err().to_string();
+    let e = a.db.write().unwrap().insert("items", doc(93)).unwrap_err().to_string();
     assert!(e.contains("shard 0 of `items` is moving to") && e.contains(&c.url), "{e}");
-    b.db.lock().unwrap().abort_move("items", 0);
-    a.db.lock().unwrap().insert("items", doc(93)).unwrap();
+    b.db.write().unwrap().abort_move("items", 0);
+    a.db.write().unwrap().insert("items", doc(93)).unwrap();
     one.insert("items", doc(93)).unwrap();
     agree("after the aborted move", &mut one, &[&a, &b, &c]);
 
@@ -648,7 +648,7 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
         let listener = TcpListener::bind(c_url.trim_start_matches("tcp://")).unwrap();
         let mut opts = DbOpts::default();
         opts.node = Some(c_url.clone());
-        let db = Arc::new(Mutex::new(Db::open(&c_dir, opts).unwrap()));
+        let db = Arc::new(RwLock::new(Db::open(&c_dir, opts).unwrap()));
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {

@@ -29,7 +29,7 @@ use celastro::tls::Tls;
 use celastro::value::Value;
 use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 /// The command did what it was asked.
 const EXIT_OK: i32 = 0;
@@ -778,7 +778,7 @@ fn serve(
     // outlive the process.
     // The console and the wire share the database under one lock; the wire
     // is served from its own thread, stopped when the console stops.
-    let shared = Arc::new(Mutex::new(std::mem::replace(db, Db::in_memory())));
+    let shared = Arc::new(RwLock::new(std::mem::replace(db, Db::in_memory())));
     let stop = Arc::new(AtomicBool::new(false));
     if let Some(bind) = shard_bind {
         let Some(token) = celastro::wire::token_from_env() else {
@@ -828,7 +828,7 @@ fn serve(
     stop.store(true, Ordering::Relaxed);
     // Whatever stopped the console, the last writes are on the disk before
     // the process ends.
-    if let Err(e) = shared.lock().unwrap_or_else(|p| p.into_inner()).persist() {
+    if let Err(e) = shared.write().unwrap_or_else(|p| p.into_inner()).persist() {
         eprintln!("celastro-cli: could not save at exit: {e}");
     }
     match outcome {
@@ -844,9 +844,9 @@ const ATTACH_ENV: &str = "CELASTRO_ATTACH";
 /// Attach every peer, retrying each until it answers or the node stops. A
 /// peer that is this node's own address is skipped, so the same list can be
 /// handed to every member of a cluster.
-fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
+fn attach_peers(db: &RwLock<Db>, stop: &AtomicBool, peers: &[String]) {
     let (me, tls) = {
-        let g = db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = db.read().unwrap_or_else(|p| p.into_inner());
         (g.node().map(str::to_string), g.tls())
     };
     let token = celastro::wire::token_from_env();
@@ -864,7 +864,7 @@ fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
             let reachable = celastro::wire::Node::new(url, token.as_deref(), tls.clone())
                 .and_then(|n| n.hello());
             let r = reachable.and_then(|_| {
-                db.lock()
+                db.write()
                     .unwrap_or_else(|p| p.into_inner())
                     .execute(&format!("ATTACH NODE '{}'", url.replace('\'', "''")))
             });

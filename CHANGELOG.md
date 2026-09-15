@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.31.0 — 2026-09-15
+
+Reads no longer take the node's one lock, hence a minor.
+
+**Reads run side by side.** `Db::read` (and `read_with`) answer a
+`SELECT`, an `EXPLAIN` of one, or either behind `LOCAL` under `&self`;
+`Db::is_read` says which statements those are. The console and the wire
+hold an `RwLock<Db>`: reads share it and proceed on every core, a
+statement that changes something takes it alone. What a read used to
+write moved behind its own lock -- the statistics cache, the recall
+sample, the cache of connections to other nodes -- the per-shard
+statistics a read merges before planning are merged into a copy rather
+than into the catalog, and the index accesses a read notes are applied
+by the next writer or by the console right after the read
+(`Db::apply_touches`, `touches_pending`), so a fault-in still promotes a
+demoted index within the request that caused it. `Db::execute`,
+`query` and the rest keep their signatures. Measured on four cores
+against 50k documents at sixteen clients, before → after: point lookups
+887 → 1,195 req/s, BM25 top ten 278 → 609, vector top ten 227 → 542,
+hybrid 151 → 471, a two-hop walk with a hybrid rerank 13 → 56 req/s
+(p50 1,053 → 205 ms) — the four cores at last.
+
+**`crypto` owns its primitives.** SHA-256, HMAC-SHA-256 and `hex` moved
+from the S3 signer into `crypto`, where the TLS key schedule finds them
+without reaching up; the same program byte for byte.
+
 ## 0.30.0 — 2026-09-15
 
 Backups, and the archived tier on any mount, hence a minor.

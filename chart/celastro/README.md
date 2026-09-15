@@ -131,8 +131,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.30.0 .
-kind load docker-image celastro:0.30.0        # for a kind cluster
+docker build -t celastro:0.31.0 .
+kind load docker-image celastro:0.31.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -199,7 +199,7 @@ peer that is down does not get every pod restarted.
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro-cli tls init`, naming every pod, both Services and `localhost` |
 | `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` (Ed25519) is emitted for it |
-| `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because the console answers one request at a time |
+| `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because a probe waits behind a statement that changes something |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
 
 The archive endpoint is plain HTTP (the TLS covers the wire and the
