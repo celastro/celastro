@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.23.1 — 2026-09-15
+
+A walk got cheaper again and nothing else changed, hence a patch.
+
+**A walk's liveness check is a merge.** The keys a hop found are checked
+against an unpartitioned node collection by one pass of the sorted frontier
+over each segment's sorted keys, galloping, instead of a binary search per
+key; and the coordinator keeps its frontier, seen, present and answer sets
+as sorted vectors merged in one pass each, instead of ordered sets of owned
+strings. No answer, plan line or cap changes; the `check` time the plan
+prints per hop does, by a factor of four to five on the measured hub walks
+(41.7 to 119.2 ms down to 6.1 to 33.1 at the second hop), and the walks
+with it (75 to 224 ms down to 22 to 108). docs/design.md has the
+measurement and what the coordinator still spends.
+
 ## 0.23.0 — 2026-09-14
 
 A cluster from a chart, hence a minor.

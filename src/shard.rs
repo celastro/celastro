@@ -1593,6 +1593,45 @@ impl Shard {
         self.locate(key, t).is_some()
     }
 
+    /// Which of `keys` -- sorted and distinct -- are visible at `t`, one
+    /// flag per key: the answer [`Shard::contains`] gives each key, reached
+    /// by a merge instead of a lookup per key. The keys are walked against
+    /// each segment's sorted keys in one pass, galloping, so a frontier far
+    /// smaller than a segment costs the frontier and the logarithm of the
+    /// gaps rather than a binary search per key over pointer-chased strings.
+    /// A segment holds one version per key, so the merge's hit is the hit
+    /// `find` would make, and it is visible or not by the same bitmap the
+    /// scatter reads. The memtable and its frozen predecessors are maps and
+    /// stay a probe per key; after a flush they are empty.
+    pub fn present_sorted(&self, keys: &[String], t: Timestamp) -> Vec<bool> {
+        debug_assert!(keys.windows(2).all(|w| w[0] < w[1]), "keys are sorted and distinct");
+        let mut out: Vec<bool> = keys
+            .iter()
+            .map(|k| {
+                self.memtable.find_at(k, t).is_some()
+                    || self.frozen.iter().any(|f| f.find_at(k, t).is_some())
+            })
+            .collect();
+        for h in &self.segments {
+            let seg_keys = &h.segment.ordinals.keys;
+            let mut vis: Option<Bitmap> = None;
+            let mut pos = 0usize;
+            for (i, key) in keys.iter().enumerate() {
+                if out[i] {
+                    continue;
+                }
+                pos = gallop(seg_keys, pos, key);
+                if pos == seg_keys.len() {
+                    break;
+                }
+                if seg_keys[pos] == *key && vis.get_or_insert_with(|| h.visibility(t)).get(pos) {
+                    out[i] = true;
+                }
+            }
+        }
+        out
+    }
+
     fn locate(&self, key: &str, t: Timestamp) -> Option<Loc> {
         if let Some(ord) = self.memtable.find_at(key, t) {
             return Some(Loc::Mem(ord));
@@ -2925,6 +2964,28 @@ impl Shard {
     }
 }
 
+/// The first index at or after `from` whose key is not below `target`, or
+/// `keys.len()`: a gallop from `from` -- steps doubling until one lands at
+/// or past the target -- then a binary search inside the last step. A run
+/// of targets that all fall between two keys costs a comparison each, and a
+/// target far ahead costs the logarithm of the distance, not of the segment.
+fn gallop(keys: &[String], from: usize, target: &str) -> usize {
+    let n = keys.len();
+    if from >= n || keys[from].as_str() >= target {
+        return from;
+    }
+    let (mut lo, mut step) = (from, 1usize);
+    let hi = loop {
+        let hi = lo.saturating_add(step).min(n);
+        if hi == n || keys[hi].as_str() >= target {
+            break hi;
+        }
+        lo = hi;
+        step *= 2;
+    };
+    lo + 1 + keys[lo + 1..hi].partition_point(|k| k.as_str() < target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2985,6 +3046,62 @@ mod tests {
         let d = std::env::temp_dir().join(format!("celastro-{label}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_merged_liveness_check_agrees_with_a_lookup_per_key_under_updates_and_deletes() {
+        // Versions of one key spread over two segments and the memtable --
+        // updated across a flush, deleted before one, deleted after its
+        // update -- and keys nothing holds, so that a merge taking a
+        // segment's dead version for a hit, or stopping at the first
+        // segment, or losing its place after a miss, disagrees with
+        // `contains` somewhere.
+        let mut s = shard();
+        for i in 0..60 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.delete(&format!("t0{KEY_SEP}d0003")).unwrap();
+        s.flush().unwrap();
+        let t_first = s.clock.peek();
+        for i in 30..90 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.delete(&format!("t1{KEY_SEP}d0031")).unwrap();
+        s.flush().unwrap();
+        for i in 80..100 {
+            s.insert(doc(i)).unwrap();
+        }
+        s.delete(&format!("t2{KEY_SEP}d0095")).unwrap();
+        assert_eq!(s.segments.len(), 2);
+        assert!(!s.memtable.is_empty());
+        let mut keys: Vec<String> =
+            (0..110).map(|i| format!("t{}{KEY_SEP}d{i:04}", i % 3)).collect();
+        keys.push(format!("t9{KEY_SEP}d0000"));
+        keys.push(String::new());
+        keys.sort();
+        keys.dedup();
+        for t in [t_first, s.clock.peek()] {
+            let flags = s.present_sorted(&keys, t);
+            assert_eq!(flags.len(), keys.len());
+            for (k, f) in keys.iter().zip(&flags) {
+                assert_eq!(*f, s.contains(k, t), "key {k:?} at {t:?}");
+            }
+        }
+        let now = s.clock.peek();
+        let at = |k: &str| keys.iter().position(|x| x == k).unwrap();
+        let flags = s.present_sorted(&keys, now);
+        assert!(!flags[at(&format!("t0{KEY_SEP}d0003"))], "deleted before the first flush");
+        assert!(!flags[at(&format!("t1{KEY_SEP}d0031"))], "deleted after its update");
+        assert!(flags[at(&format!("t1{KEY_SEP}d0040"))], "updated across the flush");
+        assert!(flags[at(&format!("t2{KEY_SEP}d0089"))], "updated across the flush");
+        assert!(flags[at(&format!("t0{KEY_SEP}d0099"))], "in the memtable");
+        assert!(!flags[at(&format!("t2{KEY_SEP}d0095"))], "deleted in the memtable");
+        assert!(!flags[at(&format!("t0{KEY_SEP}d0105"))], "never inserted");
+        assert!(
+            !flags[at("")] && !flags[at(&format!("t9{KEY_SEP}d0000"))],
+            "below and above every key"
+        );
+        assert_eq!(flags.iter().filter(|f| **f).count(), 97);
     }
 
     #[test]

@@ -669,9 +669,61 @@ segment over pointer-chased strings, about 4 µs a key — and the coordinator
 keeps its frontiers as ordered sets of owned strings. A merge of the sorted
 frontier against each segment's sorted keys, and sorted vectors in place of
 the sets, would take both down; neither changes an answer, a plan line or a
-test, and neither is taken until a walk of this shape is somebody's.
+test. The next section is that.
+
+### What it costs with the check as a merge, measured
+
+Measured on 2026-09-15 on 0.23.1 against 0.23.0, on one box, with the
+corpus regenerated from the same seed and loaded with the adjacency index
+declared before the load, so every segment carries the region; same twenty
+statements, same driver, best of five, ten runs each. Every statement
+returned the same rows and the same frontiers on both versions, identical
+across the ten runs. The box is not the one the three earlier sections
+were measured on, which is why 0.23.0's numbers here are not theirs: the
+comparison that matters is within this section.
+
+The liveness check of an unpartitioned node collection is now one pass of
+the sorted frontier over each segment's sorted keys — a gallop from the
+last hit, so a frontier far smaller than a segment costs the frontier and
+the logarithm of the gaps — against the visibility bitmap the scatter
+reads anyway; and the coordinator's frontier, seen, present and answer
+sets are sorted vectors, each step over them one merge.
+
+Outgoing walks, 17 to 27 documents: unchanged, 28 to 31 ms fused with the
+walk at 0.7 to 1.2 ms of it. Incoming walks from the ten most-cited
+documents, 18,147 to 43,861 documents: the walk in the plan 75 to 224 ms
+on 0.23.0, 22 to 108 ms on 0.23.1; fused, 97 to 247 ms against 64 to 160,
+with the statement without the walk at 26 to 32 ms on both. Per hop, the
+check at hop 1 (7,180 keys at most) 5.6 to 15.4 ms down to 1.4 to 2.8, and
+at hop 2 (up to 36,681 keys) 41.7 to 119.2 ms down to 6.1 to 33.1 — a
+factor of four to five, from about 3 µs a key to about 0.7; expand
+unchanged. The coordinator's own time — the walk less its hops' expand
+and check — 15 to 59 ms down to 4 to 44. The largest, 43,861 keys: hop 1
+expands one key in 2.4 ms and checks 7,180 keys in 2.7 ms; hop 2 expands
+7,180 keys over 77,767 edges in 34 ms and checks 36,681 keys in 27 ms; the
+walk is 103 ms against 217, and the fused statement over the key set 32
+ms, as before.
+
+What the coordinator keeps, an instrumented run of that largest walk says,
+is mostly the sort: the 77,767 `to`s hop 2 returns arrive as 7,180 sorted
+runs of about eleven, and sorting and deduplicating them to the 36,681
+distinct keys is 32 ms; the merges after the check, which clone the
+36,681 keys that go on twice — once for the frontier, once for the answer
+— are 18 ms in that run; the difference against the seen set 4 ms. A hash
+pass to distinct the `to`s before the sort would sort half as many, and a
+frontier borrowed from the answer would save a clone; neither is taken
+until a walk of this shape is somebody's, and both are recorded here so
+the next measurement starts from the number that is left.
 
 ### Shipped
+
+The third slice, in 0.23.1: the liveness check of an unpartitioned node
+collection as one galloping merge per segment (`Shard::present_sorted`),
+and the coordinator's sets as sorted vectors merged in one pass each. No
+answer, plan line or surface changed. The tests:
+`shard::tests::a_merged_liveness_check_agrees_with_a_lookup_per_key_under_updates_and_deletes`,
+`plan::walk::tests::the_sorted_set_merges_agree_with_ordered_sets`, and
+every test of the first two slices unchanged.
 
 The second slice, in 0.21.0: the adjacency region — one sorted
 value-to-ordinals map per column the index names, in every segment sealed

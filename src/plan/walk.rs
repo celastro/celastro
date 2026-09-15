@@ -13,11 +13,17 @@
 //! exactly as it does for an `IN`, and the hybrid intersection is untouched.
 //!
 //! The walk is deterministic and layout-independent: pairs are sorted,
-//! frontiers are sets, and both caps cut lexicographically, so the answer
-//! at one shard is the answer at six. A cut is reported on the response and
-//! in the plan, per hop, never applied quietly.
+//! frontiers are sorted and distinct, and both caps cut lexicographically,
+//! so the answer at one shard is the answer at six. A cut is reported on
+//! the response and in the plan, per hop, never applied quietly.
+//!
+//! Every set the coordinator keeps -- the frontier, the keys seen, the keys
+//! present, the answer -- is a sorted vector, and every operation on them
+//! is one merge pass: a hub's second hop carries tens of thousands of keys,
+//! and an ordered set of owned strings spent more on them than the shards
+//! did on the hop.
 
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
 use std::time::Instant;
 
 use crate::catalog::{Collection, IndexDef, IndexKind};
@@ -158,11 +164,12 @@ pub(crate) fn expand_on(shard: &Shard, req: &ExpandRequest<'_>) -> Result<HopExp
 /// The shard's half of the liveness check: which of `keys` are primary
 /// keys of a document visible at `ts`, sorted and distinct.
 ///
-/// An unpartitioned collection's sort key is its primary key, so each key
-/// is one lookup in the memtable's map and one binary search per segment,
-/// which is the shard's own `get` without the decode. A partitioned
-/// collection sorts by `(partition, key)` and a walk carries bare keys, so
-/// it is a scan of the key column against the set.
+/// An unpartitioned collection's sort key is its primary key, so the keys,
+/// sorted, are merged against each segment's sorted keys in one pass
+/// ([`Shard::present_sorted`]) -- the shard's own `get` without the decode,
+/// and without a search per key. A partitioned collection sorts by
+/// `(partition, key)` and a walk carries bare keys, so it is a scan of the
+/// key column against the set.
 pub(crate) fn present_on(
     shard: &Shard,
     coll: &Collection,
@@ -170,10 +177,15 @@ pub(crate) fn present_on(
     ts: Timestamp,
 ) -> Result<Vec<String>> {
     if coll.partition_key.is_none() {
-        let mut out: Vec<String> = keys.iter().filter(|k| shard.contains(k, ts)).cloned().collect();
-        out.sort();
-        out.dedup();
-        return Ok(out);
+        // The coordinator sends them sorted; a caller that did not pays a
+        // sort here rather than a wrong answer.
+        let mut sorted = keys.to_vec();
+        if !sorted.windows(2).all(|w| w[0] < w[1]) {
+            sorted.sort();
+            sorted.dedup();
+        }
+        let flags = shard.present_sorted(&sorted, ts);
+        return Ok(sorted.into_iter().zip(flags).filter(|(_, p)| *p).map(|(k, _)| k).collect());
     }
     let lit = Value::Array(keys.iter().map(|k| Value::Str(k.clone())).collect());
     let snap = shard.snapshot_at(ts);
@@ -279,9 +291,10 @@ pub fn walk(
     let mut missing = Vec::new();
     let mut cuts = Vec::new();
     let mut hops = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    seen.insert(spec.start.to_string());
-    let mut answer: BTreeSet<String> = BTreeSet::new();
+    // Sorted and distinct, every one of them, so that each step below is a
+    // merge and the frontier reaches the shards in key order.
+    let mut seen: Vec<String> = vec![spec.start.to_string()];
+    let mut answer: Vec<String> = Vec::new();
     let mut frontier: Vec<String> = vec![spec.start.to_string()];
     // A partitioned node collection is keyed `(partition, key)`, and a walk
     // carries bare keys, so its tablet map cannot prune a check; every shard
@@ -343,13 +356,12 @@ pub fn walk(
             }
         }
         let edges = pairs.len();
-        let mut new: Vec<String> = pairs
-            .into_iter()
-            .map(|(_, to)| to)
-            .filter(|to| !seen.contains(to))
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
+        // The pairs are sorted by `(from, to)`, so the `to`s are sorted runs,
+        // one per `from`, which the sort below finds and merges.
+        let mut new: Vec<String> = pairs.into_iter().map(|(_, to)| to).collect();
+        new.sort();
+        new.dedup();
+        let mut new = difference(new, &seen);
         let found = new.len();
         if let Some(n) = spec.max_frontier {
             if new.len() > n {
@@ -364,7 +376,7 @@ pub fn walk(
         // Which of the new keys are live nodes at `ts`. A key nothing
         // reachable could confirm is absent.
         let t_check = Instant::now();
-        let mut present: BTreeSet<String> = BTreeSet::new();
+        let mut present: Vec<String> = Vec::new();
         for s in node_services {
             let mine: Vec<String> = if prune {
                 new.iter().filter(|k| s.may_hold(k)).cloned().collect()
@@ -378,7 +390,7 @@ pub fn walk(
                 continue;
             }
             match s.present(&mine, ts) {
-                Ok(p) => present.extend(p),
+                Ok(p) => present = union(present, p),
                 Err(Error::Deadline(e)) => {
                     if !partial {
                         return Err(Error::Deadline(e));
@@ -389,10 +401,11 @@ pub fn walk(
                 Err(e) => return Err(e),
             }
         }
-        let dangling = new.iter().filter(|k| !present.contains(*k)).count();
-        seen.extend(new.iter().cloned());
-        frontier = new.into_iter().filter(|k| present.contains(k)).collect();
-        answer.extend(frontier.iter().cloned());
+        let live = intersection(&new, &present);
+        let dangling = new.len() - live.len();
+        seen = union(seen, new);
+        answer = union(answer, live.clone());
+        frontier = live;
         hops.push(HopExplain {
             hop,
             expanded,
@@ -406,7 +419,7 @@ pub fn walk(
             scanned,
         });
     }
-    let keys: Vec<String> = answer.into_iter().collect();
+    let keys = answer;
     let explain = WalkExplain {
         label: spec.label.clone(),
         index: spec.index.name.clone(),
@@ -482,6 +495,101 @@ pub fn check_edge_filter(edges: &Collection, e: &Expr) -> Result<()> {
                  their AND/OR/NOT; text_match, a distance and a nested walk are not",
                 edges.name
             )))
+        }
+    }
+}
+
+/// `a ∪ b` for sorted, distinct inputs, one pass; a key in both appears
+/// once.
+fn union(a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    if b.is_empty() {
+        return a;
+    }
+    if a.is_empty() {
+        return b;
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut a = a.into_iter().peekable();
+    let mut b = b.into_iter().peekable();
+    while let (Some(x), Some(y)) = (a.peek(), b.peek()) {
+        match x.cmp(y) {
+            Ordering::Less => out.push(a.next().expect("peeked")),
+            Ordering::Greater => out.push(b.next().expect("peeked")),
+            Ordering::Equal => {
+                out.push(a.next().expect("peeked"));
+                b.next();
+            }
+        }
+    }
+    out.extend(a);
+    out.extend(b);
+    out
+}
+
+/// `a \ b` for sorted, distinct inputs, one pass.
+fn difference(a: Vec<String>, b: &[String]) -> Vec<String> {
+    let mut j = 0;
+    a.into_iter()
+        .filter(|x| {
+            while j < b.len() && b[j].as_str() < x.as_str() {
+                j += 1;
+            }
+            !(j < b.len() && b[j] == *x)
+        })
+        .collect()
+}
+
+/// `a ∩ b` for sorted, distinct inputs, one pass, as owned keys.
+fn intersection(a: &[String], b: &[String]) -> Vec<String> {
+    let mut j = 0;
+    a.iter()
+        .filter(|x| {
+            while j < b.len() && b[j].as_str() < x.as_str() {
+                j += 1;
+            }
+            j < b.len() && b[j] == **x
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn keys(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// The merges replace ordered sets; a merge that lost its place after a
+    /// miss, dropped a tail, or kept a duplicate would change a frontier.
+    #[test]
+    fn the_sorted_set_merges_agree_with_ordered_sets() {
+        let cases = [
+            ("", ""),
+            ("a", ""),
+            ("", "a"),
+            ("a b c", "a b c"),
+            ("a c e g", "b d f h"),
+            ("a b c d", "c d e f"),
+            ("b", "a c"),
+            ("a c", "b"),
+            ("p000001 p000010 p000100", "p000010 p000011 p000100 p000101"),
+        ];
+        for (x, y) in cases {
+            let (a, b) = (keys(x), keys(y));
+            let sa: BTreeSet<String> = a.iter().cloned().collect();
+            let sb: BTreeSet<String> = b.iter().cloned().collect();
+            let want = |it: BTreeSet<&String>| it.into_iter().cloned().collect::<Vec<_>>();
+            assert_eq!(union(a.clone(), b.clone()), want(sa.union(&sb).collect()), "{x:?} ∪ {y:?}");
+            assert_eq!(
+                difference(a.clone(), &b),
+                want(sa.difference(&sb).collect()),
+                "{x:?} \\ {y:?}"
+            );
+            assert_eq!(intersection(&a, &b), want(sa.intersection(&sb).collect()), "{x:?} ∩ {y:?}");
         }
     }
 }
