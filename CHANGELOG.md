@@ -6,6 +6,33 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.29.0 — 2026-09-15
+
+The chart makes its own TLS material again and the TLS verifies what other
+issuers sign, hence a minor.
+
+**RSA and ECDSA chains are verified.** The node's own certificate is still
+Ed25519, but the CA above it, any intermediate, and a server the node dials
+as a client may sign with RSA (PKCS#1 v1.5 or PSS, SHA-256) or ECDSA P-256:
+`crypto::bignum`, `crypto::rsa` and `crypto::p256`, public-key operations
+only, pinned against openssl's output under `tests/pki`. A cert-manager CA
+that is RSA now works, so long as the `Certificate` asks an Ed25519 key.
+
+**`celastro-cli tls secret <SECRET> <NAME> [<NAMES>] [<DAYS>]`** is `tls
+init` for a pod: it reads the service account, asks the cluster's API for
+the Secret, and writes one of type `kubernetes.io/tls` with fresh material
+when there is none. The API is reached over the crate's own TLS, verified
+as `kubernetes.default.svc` — the reason the paragraph above exists — and
+the client now answers a `CertificateRequest`, which every API server
+sends, with the empty `Certificate` the RFC asks for.
+
+**The chart's `tls.enabled` without a source** no longer refuses: a
+pre-install and pre-upgrade hook Job runs `tls secret` with a
+ServiceAccount that may get and create Secrets in the namespace, and the
+Secret it wrote outlives the release until deleted. `tls.days` is back for
+that path. `tls.existingSecret` and `tls.certManager.issuerRef` are as they
+were.
+
 ## 0.28.0 — 2026-09-15
 
 The TLS is in the tree and the crate is back at zero dependencies, hence a

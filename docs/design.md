@@ -1040,10 +1040,16 @@ are never written anywhere.
 **The TLS is in the tree, and this is what it is.** `src/crypto` holds
 SHA-512, HKDF, ChaCha20-Poly1305, the 25519 field, X25519, Ed25519, DER,
 PEM and X.509, and `crypto::tls13` the record layer and both sides of the
-handshake: TLS 1.3 only, one suite, one group, one signature scheme,
-server authentication only, no resumption, 0-RTT, client certificates,
-HelloRetryRequest or key update. A stock client speaks that subset; an
-Ed25519 certificate is the one thing it asks of an issuer. Every primitive
+handshake: TLS 1.3 only, one suite, one group, Ed25519 for the node's
+own signature, server authentication only, no resumption, 0-RTT, client
+certificates, HelloRetryRequest or key update. A stock client speaks that
+subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
+is wider than signing: chains and CertificateVerify from RSA (PKCS#1 v1.5
+and PSS, SHA-256) and ECDSA P-256 are accepted (0.29.0; `bignum`, `rsa`,
+`p256`, public-key operations only, so no timing concern), which is what
+lets `celastro-cli tls secret` reach a cluster's API, whose certificate
+no cluster issues as Ed25519 and which asks for a client certificate (the
+client answers with an empty one, as the RFC has it). Every primitive
 is pinned against its RFC or FIPS vectors, the key schedule against RFC
 8448's trace, the whole against itself over loopback and against a stock
 client on kind. What "constant-time" means here: nothing branches on or
@@ -1054,9 +1060,7 @@ to keep that -- there is no `black_box` in the floor's `std` -- so the code
 keeps it by having no branch to remove. It was written for a crate that
 takes no dependency, by the user's decision after rustls had shipped
 behind a feature and been withdrawn; it is unaudited, and the README says
-so. What would move it forward: RSA and ECDSA verification of chains
-another issuer signed (public-key operations, no timing concern), and the
-archive client over the same stream.
+so. What would move it forward: the archive client over the same stream.
 
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
@@ -1251,7 +1255,7 @@ src/
   engine.rs harness.rs           Db facade, recall harness
   serve.rs serve/                the console: loopback by default, --bind for a network
   wire.rs sim.rs                 the wire between nodes; the seeded fault simulator
-  tls.rs                         encryption in transit, behind the `tls` feature
+  tls.rs crypto/                 encryption in transit: the TLS 1.3 and its primitives
   signal.rs deadline.rs          SIGTERM for PID 1; the per-statement deadline
   bin/celastro.rs                REPL, script runner, demo
   bin/celastro-cli.rs            serve, exec, run, repl, demo, catalog, health, export, import
@@ -1259,6 +1263,6 @@ tests/
   integration.rs                 end-to-end behaviour
   tiering.rs                     tiers, residency, lifecycle policies
   wire.rs                        three nodes in one process, every node answering what one does
-  tls.rs                         the console and the wire over TLS (with the feature)
-  tls/                           a test CA and a `localhost` certificate
+  tls.rs                         the console and the wire over TLS
+  pki/                           RSA and P-256 chains and signatures from openssl
 ```

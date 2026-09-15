@@ -1,19 +1,45 @@
-//! X.509 for Ed25519 chains, RFC 5280 as far as a node needs it: parse a
-//! certificate, verify a leaf against a CA by signature, validity, issuer
-//! and name, and build a CA and a leaf for `celastro-cli tls init`. Every
-//! other algorithm is refused by name; a chain another issuer signed is a
-//! later phase.
+//! X.509, RFC 5280 as far as a node needs it: parse a certificate, verify
+//! a leaf against a CA by signature, validity, issuer and name, and build
+//! a CA and a leaf for `celastro-cli tls init`. A node's own certificate is
+//! Ed25519, the one scheme this crate signs with; a chain another issuer
+//! signed may be RSA (PKCS#1 v1.5, SHA-256) or ECDSA P-256 (SHA-256) at any
+//! link, since those are only verified.
 
 use crate::error::{Error, Result};
 
+use super::bignum::Big;
 use super::der::{self, BIT_STRING, BOOLEAN, INTEGER, OCTET_STRING, OID, SEQUENCE, SET};
-use super::{ed25519, pem, random};
+use super::{ed25519, p256, pem, random, rsa};
 
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// 1.2.840.113549.1.1.1, rsaEncryption; 1.2.840.113549.1.1.11, sha256WithRSAEncryption.
+const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+/// 1.2.840.10045.2.1, id-ecPublicKey; 1.2.840.10045.3.1.7, prime256v1;
+/// 1.2.840.10045.4.3.2, ecdsa-with-SHA256.
+const OID_EC: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+/// A subject's public key, by algorithm.
+#[derive(Debug, Clone)]
+pub enum PublicKey {
+    Ed25519([u8; 32]),
+    Rsa(rsa::PublicKey),
+    P256(p256::PublicKey),
+}
+
+/// How a certificate is signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigAlg {
+    Ed25519,
+    RsaSha256,
+    EcdsaSha256,
+}
 
 fn bad(what: &str) -> Error {
     Error::Plan(format!("certificate: {what}"))
@@ -32,9 +58,9 @@ pub struct Certificate {
     /// Seconds since the epoch.
     pub not_before: i64,
     pub not_after: i64,
-    /// The Ed25519 public key; any other algorithm is refused at parse.
-    pub public_key: [u8; 32],
-    signature: [u8; 64],
+    pub public_key: PublicKey,
+    sig_alg: SigAlg,
+    signature: Vec<u8>,
     pub dns_names: Vec<String>,
     pub ip_addresses: Vec<Vec<u8>>,
     pub is_ca: bool,
@@ -49,17 +75,19 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     let (_, tbs_body, after_tbs) = der::read(cert)?;
     let tbs_len = cert.len() - after_tbs.len();
     let tbs = cert[..tbs_len].to_vec();
-    let (sig_alg, after_alg) = der::expect(after_tbs, SEQUENCE)?;
-    expect_ed25519_algorithm(sig_alg)?;
+    let (sig_alg_der, after_alg) = der::expect(after_tbs, SEQUENCE)?;
+    let sig_alg = signature_algorithm(sig_alg_der)?;
     let (sig_bits, after_sig) = der::expect(after_alg, BIT_STRING)?;
     if !after_sig.is_empty() {
         return Err(bad("bytes after the signature"));
     }
-    if sig_bits.len() != 65 || sig_bits[0] != 0 {
+    if sig_bits.is_empty() || sig_bits[0] != 0 {
+        return Err(bad("a signature with unused bits"));
+    }
+    let signature = sig_bits[1..].to_vec();
+    if sig_alg == SigAlg::Ed25519 && signature.len() != 64 {
         return Err(bad("an Ed25519 signature is 64 bytes"));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&sig_bits[1..]);
 
     // TBSCertificate.
     let (version, rest) = der::optional(tbs_body, 0xa0)?;
@@ -71,7 +99,9 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     }
     let (_serial, rest) = der::expect(rest, INTEGER)?;
     let (tbs_alg, rest) = der::expect(rest, SEQUENCE)?;
-    expect_ed25519_algorithm(tbs_alg)?;
+    if signature_algorithm(tbs_alg)? != sig_alg {
+        return Err(bad("the signed part names another signature algorithm than the signature"));
+    }
     let (_, issuer_body, after_issuer) = der::read(rest)?;
     let issuer = rest[..rest.len() - after_issuer.len()].to_vec();
     let _ = issuer_body;
@@ -81,14 +111,7 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     let (_, _subject_body, after_subject) = der::read(rest)?;
     let subject = rest[..rest.len() - after_subject.len()].to_vec();
     let (spki, rest) = der::expect(after_subject, SEQUENCE)?;
-    let (spki_alg, spki_rest) = der::expect(spki, SEQUENCE)?;
-    expect_ed25519_algorithm(spki_alg)?;
-    let (key_bits, _) = der::expect(spki_rest, BIT_STRING)?;
-    if key_bits.len() != 33 || key_bits[0] != 0 {
-        return Err(bad("an Ed25519 public key is 32 bytes"));
-    }
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&key_bits[1..]);
+    let public_key = public_key(spki)?;
     let mut dns_names = Vec::new();
     let mut ip_addresses = Vec::new();
     let mut is_ca = false;
@@ -131,6 +154,7 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
         not_before,
         not_after,
         public_key,
+        sig_alg,
         signature,
         dns_names,
         ip_addresses,
@@ -141,12 +165,64 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
 fn expect_ed25519_algorithm(alg: &[u8]) -> Result<()> {
     let (oid, _) = der::expect(alg, OID)?;
     if oid != der::ED25519_OID {
-        return Err(bad(
-            "only Ed25519 keys and signatures are supported by this build; the certificate uses \
-             another algorithm",
-        ));
+        return Err(bad("only an Ed25519 key is read here; this one is another algorithm"));
     }
     Ok(())
+}
+
+/// The signature algorithm an `AlgorithmIdentifier` names, of the three
+/// this build verifies.
+fn signature_algorithm(alg: &[u8]) -> Result<SigAlg> {
+    let (oid, _) = der::expect(alg, OID)?;
+    match oid {
+        o if o == der::ED25519_OID => Ok(SigAlg::Ed25519),
+        o if o == OID_RSA_SHA256 => Ok(SigAlg::RsaSha256),
+        o if o == OID_ECDSA_SHA256 => Ok(SigAlg::EcdsaSha256),
+        _ => Err(bad("the signature algorithm is not one this build verifies (Ed25519, \
+             sha256WithRSAEncryption, ecdsa-with-SHA256)")),
+    }
+}
+
+/// A `SubjectPublicKeyInfo` of the three kinds this build reads.
+fn public_key(spki: &[u8]) -> Result<PublicKey> {
+    let (alg, rest) = der::expect(spki, SEQUENCE)?;
+    let (oid, alg_rest) = der::expect(alg, OID)?;
+    let (key_bits, _) = der::expect(rest, BIT_STRING)?;
+    if key_bits.is_empty() || key_bits[0] != 0 {
+        return Err(bad("a public key with unused bits"));
+    }
+    let key = &key_bits[1..];
+    match oid {
+        o if o == der::ED25519_OID => {
+            if key.len() != 32 {
+                return Err(bad("an Ed25519 public key is 32 bytes"));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(key);
+            Ok(PublicKey::Ed25519(k))
+        }
+        o if o == OID_RSA => {
+            let (seq, _) = der::expect(key, SEQUENCE)?;
+            let (n, seq_rest) = der::expect(seq, INTEGER)?;
+            let (e, _) = der::expect(seq_rest, INTEGER)?;
+            let n = Big::from_be_bytes(n);
+            let e = Big::from_be_bytes(e);
+            if n.bits() < 2048 || n.bits() > 8192 || e.is_zero() {
+                return Err(bad("an RSA key outside 2048 to 8192 bits, or with no exponent"));
+            }
+            Ok(PublicKey::Rsa(rsa::PublicKey { n, e }))
+        }
+        o if o == OID_EC => {
+            let (curve, _) = der::expect(alg_rest, OID)?;
+            if curve != OID_P256 {
+                return Err(bad("an EC key on a curve other than P-256"));
+            }
+            let pk = p256::PublicKey::from_uncompressed(key)
+                .ok_or_else(|| bad("a P-256 key that is not an uncompressed point on the curve"))?;
+            Ok(PublicKey::P256(pk))
+        }
+        _ => Err(bad("the public key is not one this build reads (Ed25519, RSA, P-256)")),
+    }
 }
 
 /// A `Time`: UTCTime `YYMMDDHHMMSSZ` or GeneralizedTime `YYYYMMDDHHMMSSZ`,
@@ -184,7 +260,34 @@ impl Certificate {
     /// the signed part good. The CA's own `basicConstraints` must say CA
     /// unless it is the trust anchor itself, which the caller decides.
     pub fn signed_by(&self, ca: &Certificate) -> bool {
-        self.issuer == ca.subject && ed25519::verify(&ca.public_key, &self.tbs, &self.signature)
+        if self.issuer != ca.subject {
+            return false;
+        }
+        match (&self.sig_alg, &ca.public_key) {
+            (SigAlg::Ed25519, PublicKey::Ed25519(pk)) => {
+                let mut sig = [0u8; 64];
+                if self.signature.len() != 64 {
+                    return false;
+                }
+                sig.copy_from_slice(&self.signature);
+                ed25519::verify(pk, &self.tbs, &sig)
+            }
+            (SigAlg::RsaSha256, PublicKey::Rsa(pk)) => {
+                pk.verify_pkcs1_sha256(&self.tbs, &self.signature)
+            }
+            (SigAlg::EcdsaSha256, PublicKey::P256(pk)) => {
+                pk.verify_sha256_der(&self.tbs, &self.signature)
+            }
+            _ => false,
+        }
+    }
+
+    /// The Ed25519 key, when that is what the subject holds.
+    pub fn ed25519_key(&self) -> Option<&[u8; 32]> {
+        match &self.public_key {
+            PublicKey::Ed25519(k) => Some(k),
+            _ => None,
+        }
     }
 
     /// Valid at `now` (seconds since the epoch).
@@ -482,7 +585,7 @@ mod tests {
         // The keys round-trip through PKCS#8.
         let key_der = pem::decode_all(&m.key, "PRIVATE KEY").unwrap().remove(0);
         let kp = KeyPair::from_pkcs8_der(&key_der).unwrap();
-        assert_eq!(kp.public, leaf.public_key);
+        assert_eq!(Some(&kp.public), leaf.ed25519_key());
         // A certificate of another algorithm is refused by name: the same
         // leaf with its key's OID changed to one this build does not read.
         let mut other_alg = leaf_der.clone();
@@ -490,6 +593,56 @@ mod tests {
         let pos = other_alg.windows(5).position(|w| w == ed).unwrap();
         other_alg[pos..pos + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
         let e = parse(&other_alg).unwrap_err();
-        assert!(e.to_string().contains("only Ed25519"), "{e}");
+        assert!(e.to_string().contains("not one this build"), "{e}");
+    }
+
+    fn pki(name: &str) -> String {
+        std::fs::read_to_string(format!("{}/tests/pki/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// Chains another issuer signed: an RSA-2048 CA and a P-256 CA, made by
+    /// openssl, each signing an Ed25519 leaf; and the two signature schemes
+    /// TLS 1.3 asks of such servers, over a known message.
+    #[test]
+    fn rsa_and_p256_chains_and_signatures_from_openssl_verify() {
+        let now = crate::time::now_micros() / 1_000_000;
+        for (ca_file, leaf_file, alg) in [
+            ("rsa-ca.crt", "leaf-by-rsa.crt", SigAlg::RsaSha256),
+            ("ec-ca.crt", "leaf-by-ec.crt", SigAlg::EcdsaSha256),
+        ] {
+            let ca = parse(&pem::decode_all(&pki(ca_file), "CERTIFICATE").unwrap()[0]).unwrap();
+            let leaf = parse(&pem::decode_all(&pki(leaf_file), "CERTIFICATE").unwrap()[0]).unwrap();
+            assert_eq!(leaf.sig_alg, alg, "{leaf_file}");
+            assert!(leaf.ed25519_key().is_some(), "the leaf is Ed25519");
+            assert!(ca.is_ca && ca.signed_by(&ca), "{ca_file} signs itself");
+            assert!(leaf.signed_by(&ca), "{leaf_file} by {ca_file}");
+            verify_chain(std::slice::from_ref(&leaf), std::slice::from_ref(&ca), "localhost", now)
+                .unwrap();
+            verify_chain(std::slice::from_ref(&leaf), std::slice::from_ref(&ca), "127.0.0.1", now)
+                .unwrap();
+            let mut tampered = leaf.clone();
+            let i = tampered.tbs.len() / 2;
+            tampered.tbs[i] ^= 1;
+            assert!(!tampered.signed_by(&ca), "a changed signed part is refused");
+        }
+        let msg = std::fs::read(format!("{}/tests/pki/msg", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let spki_der = pem::decode_all(&pki("rsa-pub.pem"), "PUBLIC KEY").unwrap().remove(0);
+        let (spki, _) = der::expect(&spki_der, SEQUENCE).unwrap();
+        let rsa_pub = match public_key(spki).unwrap() {
+            PublicKey::Rsa(k) => k,
+            other => panic!("{other:?}"),
+        };
+        let pss = pem::base64_decode(pki("pss.sig.b64").trim()).unwrap();
+        assert!(rsa_pub.verify_pss_sha256(&msg, &pss));
+        assert!(!rsa_pub.verify_pss_sha256(b"another message", &pss));
+        assert!(!rsa_pub.verify_pkcs1_sha256(&msg, &pss), "a PSS signature is not a v1.5 one");
+        let ec_ca = parse(&pem::decode_all(&pki("ec-ca.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
+        let ec_pub = match &ec_ca.public_key {
+            PublicKey::P256(k) => k.clone(),
+            other => panic!("{other:?}"),
+        };
+        let ecdsa = pem::base64_decode(pki("ecdsa.sig.b64").trim()).unwrap();
+        assert!(ec_pub.verify_sha256_der(&msg, &ecdsa));
+        assert!(!ec_pub.verify_sha256_der(b"another message", &ecdsa));
     }
 }

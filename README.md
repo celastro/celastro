@@ -207,10 +207,13 @@ stay: a certificate says which node is talking, the token says it may.
 that fit.
 
 **The TLS is in the tree and unaudited.** It is TLS 1.3 only, one cipher
-suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange and **Ed25519
-certificates only** — a certificate from another algorithm is refused by
-name, so material from cert-manager needs `privateKey.algorithm: Ed25519`.
-No resumption, no client certificates, no HelloRetryRequest. Every primitive
+suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange, and the node's
+own certificate is **Ed25519** — material from cert-manager needs
+`privateKey.algorithm: Ed25519`. The CA above it, and any intermediate, may
+be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256) or ECDSA P-256; as a
+client the node also accepts servers signing with those, which is how it
+reaches a Kubernetes API. No resumption, no client certificates, no
+HelloRetryRequest. Every primitive
 is pinned against its RFC vectors and the key schedule against RFC 8448, and
 the code branches on no secret, but nobody outside this repository has
 reviewed it; that is the price of zero dependencies, chosen knowingly. The
@@ -260,8 +263,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.28.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.28.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.29.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.29.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

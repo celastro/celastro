@@ -21,6 +21,8 @@ use super::{ed25519, random, x25519};
 const SUITE_CHACHA: u16 = 0x1303;
 const GROUP_X25519: u16 = 0x001d;
 const SIG_ED25519: u16 = 0x0807;
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 const VERSION_13: u16 = 0x0304;
 const LEGACY_VERSION: u16 = 0x0303;
 const MAX_PLAINTEXT: usize = 1 << 14;
@@ -35,6 +37,7 @@ const HS_SERVER_HELLO: u8 = 2;
 const HS_NEW_SESSION_TICKET: u8 = 4;
 const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HS_CERTIFICATE: u8 = 11;
+const HS_CERTIFICATE_REQUEST: u8 = 13;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
 const HS_KEY_UPDATE: u8 = 24;
@@ -471,9 +474,13 @@ impl TlsStream {
         groups.extend_from_slice(&2u16.to_be_bytes());
         groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
         extension(&mut exts, EXT_SUPPORTED_GROUPS, &groups);
+        // Ed25519 for our own peers; RSA-PSS and ECDSA P-256 for a server
+        // whose certificate another issuer signed, such as a cluster's API.
         let mut sigs = Vec::new();
-        sigs.extend_from_slice(&2u16.to_be_bytes());
+        sigs.extend_from_slice(&6u16.to_be_bytes());
         sigs.extend_from_slice(&SIG_ED25519.to_be_bytes());
+        sigs.extend_from_slice(&SIG_ECDSA_SECP256R1_SHA256.to_be_bytes());
+        sigs.extend_from_slice(&SIG_RSA_PSS_RSAE_SHA256.to_be_bytes());
         extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sigs);
         let mut ks = Vec::new();
         let mut entry = Vec::new();
@@ -513,7 +520,19 @@ impl TlsStream {
         if ty != HS_ENCRYPTED_EXTENSIONS {
             return Err(err("expected EncryptedExtensions"));
         }
-        let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        // A server that accepts client certificates asks for one here; a
+        // Kubernetes API server always does. The answer is an empty
+        // Certificate carrying its context, sent before our Finished.
+        let (mut ty, mut body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        let mut request_context: Option<Vec<u8>> = None;
+        if ty == HS_CERTIFICATE_REQUEST {
+            let n = *body.first().ok_or_else(|| err("a malformed CertificateRequest"))? as usize;
+            if body.len() < 1 + n {
+                return Err(err("a malformed CertificateRequest"));
+            }
+            request_context = Some(body[1..1 + n].to_vec());
+            (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        }
         if ty != HS_CERTIFICATE {
             return Err(err("expected the server's Certificate"));
         }
@@ -525,17 +544,35 @@ impl TlsStream {
         if ty != HS_CERTIFICATE_VERIFY {
             return Err(err("expected CertificateVerify"));
         }
-        if body.len() < 4 || u16::from_be_bytes([body[0], body[1]]) != SIG_ED25519 {
-            return Err(err("the server signed with an algorithm this build does not verify"));
-        }
-        let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
-        if sig_len != 64 || body.len() != 4 + 64 {
+        if body.len() < 4 {
             return Err(err("a malformed CertificateVerify"));
         }
-        let mut sig = [0u8; 64];
-        sig.copy_from_slice(&body[4..]);
+        let scheme = u16::from_be_bytes([body[0], body[1]]);
+        let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+        if body.len() != 4 + sig_len {
+            return Err(err("a malformed CertificateVerify"));
+        }
+        let sig = &body[4..];
         let content = verify_content(true, &th_before_cv);
-        if !ed25519::verify(&chain[0].public_key, &content, &sig) {
+        let ok = match (scheme, &chain[0].public_key) {
+            (SIG_ED25519, x509::PublicKey::Ed25519(pk)) if sig.len() == 64 => {
+                let mut s = [0u8; 64];
+                s.copy_from_slice(sig);
+                ed25519::verify(pk, &content, &s)
+            }
+            (SIG_RSA_PSS_RSAE_SHA256, x509::PublicKey::Rsa(pk)) => {
+                pk.verify_pss_sha256(&content, sig)
+            }
+            (SIG_ECDSA_SECP256R1_SHA256, x509::PublicKey::P256(pk)) => {
+                pk.verify_sha256_der(&content, sig)
+            }
+            _ => {
+                return Err(err(
+                    "the server signed with a scheme this build does not verify for its key",
+                ))
+            }
+        };
+        if !ok {
             return Err(err("the server's CertificateVerify does not verify"));
         }
         let th_before_fin = sha256(&transcript);
@@ -552,7 +589,16 @@ impl TlsStream {
         let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
         // Middlebox compatibility: a CCS before our first encrypted record.
         self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
-        let fin = finished_verify(&c_hs, &th_server_fin);
+        if let Some(context) = request_context {
+            let mut empty = vec![context.len() as u8];
+            empty.extend_from_slice(&context);
+            empty.extend_from_slice(&[0, 0, 0]);
+            self.write_handshake(HS_CERTIFICATE, &empty, &mut transcript)?;
+        }
+        // Our Finished covers our (empty) Certificate too; the application
+        // keys above do not, by the RFC's key schedule.
+        let th_client_fin = sha256(&transcript);
+        let fin = finished_verify(&c_hs, &th_client_fin);
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         self.read_keys = Some(Keys::from_secret(&s_ap));
         self.write_keys = Some(Keys::from_secret(&c_ap));

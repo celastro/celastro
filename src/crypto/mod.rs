@@ -18,13 +18,16 @@
 // primitives are reached by their tests alone.
 #![allow(dead_code)]
 
+pub mod bignum;
 pub mod chacha20poly1305;
 pub mod der;
 pub mod ed25519;
 pub mod fe25519;
 pub mod hkdf;
+pub mod p256;
 pub mod pem;
 pub mod random;
+pub mod rsa;
 pub mod sc25519;
 pub mod sha2;
 pub mod tls13;

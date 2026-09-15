@@ -1,10 +1,84 @@
 {{- if and .Values.tls.enabled (not .Values.tls.existingSecret) (not .Values.tls.certManager.issuerRef.name) }}
-{{- fail "tls.enabled needs the material: tls.existingSecret (a Secret with tls.crt, tls.key and ca.crt made by `celastro-cli tls init`) or tls.certManager.issuerRef.name; the chart cannot make Ed25519 certificates itself" }}
+{{- /* Neither a Secret of the user's nor cert-manager: a Job runs the
+       binary's own generator inside the cluster and writes the Secret
+       through the API, once -- a Secret already there is kept, so an
+       upgrade keeps the material the pods hold. Hooks, so the Secret exists
+       before the StatefulSet mounts it; the account, role and binding are
+       hooks too, ahead of the Job by weight. */ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "celastro.fullname" . }}-tls
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "celastro.fullname" . }}-tls
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "celastro.fullname" . }}-tls
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-9"
+    helm.sh/hook-delete-policy: before-hook-creation
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "celastro.fullname" . }}-tls
+roleRef:
+  kind: Role
+  name: {{ include "celastro.fullname" . }}-tls
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "celastro.fullname" . }}-tls
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: {{ include "celastro.fullname" . }}-tls
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+      containers:
+        - name: tls
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["tls", "secret", {{ include "celastro.tlsSecretName" . | quote }}, {{ include "celastro.fullname" . | quote }}, {{ include "celastro.tlsNames" . | quote }}, {{ .Values.tls.days | toString | quote }}]
 {{- end }}
 {{- if and .Values.tls.enabled .Values.tls.certManager.issuerRef.name }}
 # cert-manager fills the Secret and renews it; the pods read the files at
 # start, so a renewal reaches a pod at its next restart. Ed25519, because
-# the binary's TLS verifies no other algorithm.
+# the binary's TLS signs with nothing else.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:

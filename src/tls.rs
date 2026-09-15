@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,11 @@ pub struct Material {
     pub ca_key: String,
     pub cert: String,
     pub key: String,
+}
+
+/// Standard base64, for a Secret's data.
+pub fn base64(data: &[u8]) -> String {
+    crate::crypto::pem::base64_encode(data)
 }
 
 /// A self-signed Ed25519 CA and a certificate for `name` carrying `dns`
@@ -126,8 +131,12 @@ impl Tls {
             return Err(read_err("key", &key, "no PRIVATE KEY block (PKCS#8) in the file"));
         };
         let pair = x509::KeyPair::from_pkcs8_der(key_der).map_err(|e| read_err("key", &key, e))?;
-        if pair.public != leaf.public_key {
-            return Err(Error::Plan("the TLS certificate and key do not go together".into()));
+        if leaf.ed25519_key() != Some(&pair.public) {
+            return Err(Error::Plan(
+                "the TLS certificate and key do not go together: the certificate's key must be the \
+                 Ed25519 key given (a chain another issuer signed may be RSA or P-256 above it)"
+                    .into(),
+            ));
         }
         let ca_text = read("CA", &ca)?;
         let mut anchors = Vec::new();
@@ -171,6 +180,81 @@ impl Stream for crate::crypto::tls13::TlsStream {
     fn shutdown_write(&mut self) -> io::Result<()> {
         self.close_notify()
     }
+}
+
+/// One HTTPS/1.1 request over this crate's TLS: `method` `path` at `addr`
+/// (`host:port`), the server verified against the CA in `ca_pem` as
+/// `server_name`, a bearer token, an optional JSON body. The status and the
+/// body come back; a chunked body is joined. What `celastro-cli tls secret`
+/// uses to reach a cluster's API from inside a pod.
+pub fn https_request(
+    addr: &str,
+    server_name: &str,
+    ca_pem: &str,
+    method: &str,
+    path: &str,
+    bearer: &str,
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    use crate::crypto::tls13::{ClientSide, TlsStream};
+    use crate::crypto::{pem, x509};
+    let mut anchors = Vec::new();
+    for der in pem::decode_all(ca_pem, "CERTIFICATE")? {
+        anchors.push(x509::parse(&der)?);
+    }
+    if anchors.is_empty() {
+        return Err(Error::Plan("no certificate in the CA given".into()));
+    }
+    let addr = addr
+        .to_socket_addrs()
+        .map_err(Error::Io)?
+        .next()
+        .ok_or_else(|| Error::Plan(format!("{addr} resolves to nothing")))?;
+    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(Error::Io)?;
+    sock.set_read_timeout(Some(Duration::from_secs(30))).map_err(Error::Io)?;
+    sock.set_write_timeout(Some(Duration::from_secs(30))).map_err(Error::Io)?;
+    let mut s = TlsStream::client(sock, ClientSide { anchors: &anchors, host: server_name });
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {server_name}\r\nAuthorization: Bearer {bearer}\r\n\
+         Accept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(request.as_bytes()).map_err(Error::Io)?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).map_err(Error::Io)?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, rest) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| Error::Plan("the server's answer has no header end".into()))?;
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Plan(format!("the server's answer has no status: {head}")))?;
+    let chunked = head.lines().any(|l| {
+        l.to_ascii_lowercase().starts_with("transfer-encoding:")
+            && l.to_ascii_lowercase().contains("chunked")
+    });
+    let body = if chunked { dechunk(rest) } else { rest.to_string() };
+    Ok((status, body))
+}
+
+/// The pieces of a chunked body, joined.
+fn dechunk(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some((size_line, after)) = rest.split_once("\r\n") {
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
+        if size == 0 || after.len() < size {
+            break;
+        }
+        out.push_str(&after[..size]);
+        rest = after[size..].strip_prefix("\r\n").unwrap_or("");
+    }
+    out
 }
 
 /// `sock`, encrypted by `tls` when there is one: the one call every listener

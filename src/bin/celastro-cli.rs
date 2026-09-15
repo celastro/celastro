@@ -70,6 +70,9 @@ COMMANDS:
   tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
                              write a CA and a certificate for NAME (and NAMES, comma-separated
                              DNS names and IP addresses) into DIR, valid DAYS days (3650)
+  tls secret <SECRET> <NAME> [<NAMES>] [<DAYS>]
+                             the same material as the Secret SECRET, through the cluster's API
+                             from inside a pod; a Secret already there is left as it is
   help                       this
   version                    print the version
 
@@ -177,6 +180,14 @@ enum Cmd {
     /// `tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: a CA and a certificate.
     TlsInit {
         dir: PathBuf,
+        name: String,
+        names: Vec<String>,
+        days: i64,
+    },
+    /// `tls secret <SECRET> <NAME> [<NAMES>] [<DAYS>]`: the same, written as
+    /// a Secret through the cluster's API from inside a pod.
+    TlsSecret {
+        secret: String,
         name: String,
         names: Vec<String>,
         days: i64,
@@ -311,6 +322,30 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "catalog" => Cmd::Catalog,
         "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached },
         "tls" => match rest.first().map(String::as_str) {
+            Some("secret") if rest.len() >= 3 && rest.len() <= 5 => {
+                let names: Vec<String> = rest
+                    .get(3)
+                    .map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let days = match rest.get(4) {
+                    Some(d) => match d.parse::<i64>() {
+                        Ok(n) if n > 0 => n,
+                        _ => {
+                            return Cli::Usage(format!(
+                                "`tls secret` wants a positive number of days, not `{d}`"
+                            ))
+                        }
+                    },
+                    None => 3650,
+                };
+                Cmd::TlsSecret { secret: rest[1].clone(), name: rest[2].clone(), names, days }
+            }
             Some("init") if rest.len() >= 3 && rest.len() <= 5 => {
                 let names: Vec<String> = rest
                     .get(3)
@@ -329,7 +364,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 return Cli::Usage(
                     "`tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: write a CA and a certificate for NAME \
                      into DIR; NAMES is a comma-separated list of DNS names and IP addresses the \
-                     certificate also carries, DAYS the validity (3650)"
+                     certificate also carries, DAYS the validity (3650). `tls secret <SECRET> <NAME> \
+                     [<NAMES>] [<DAYS>]`: the same material, written as the Secret SECRET through \
+                     the cluster's API from inside a pod"
                         .to_string(),
                 )
             }
@@ -472,6 +509,9 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::TlsInit { dir, name, names, days } = cmd {
         return tls_init(&dir, &name, &names, days, json);
     }
+    if let Cmd::TlsSecret { secret, name, names, days } = cmd {
+        return tls_secret(&secret, &name, &names, days, json);
+    }
     let mut opts = db_opts();
     opts.tls = tls.clone();
     let mut db = match &dir {
@@ -497,7 +537,9 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             EXIT_OK
         }
         Cmd::Health { .. } => unreachable!("answered before the database was opened"),
-        Cmd::TlsInit { .. } => unreachable!("answered before the database was opened"),
+        Cmd::TlsInit { .. } | Cmd::TlsSecret { .. } => {
+            unreachable!("answered before the database was opened")
+        }
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
             Ok(export) => match export.write_to(&to) {
                 Ok(()) => {
@@ -824,7 +866,9 @@ fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
 /// CA's key is written beside them for a later certificate and is not read
 /// by anything). The certificate names `name`, every entry of `names`, and
 /// `localhost` with 127.0.0.1, which the health probe needs.
-fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> i32 {
+/// The names a certificate for `name` carries: `name`, `names` as DNS names
+/// or IP addresses, and `localhost` with 127.0.0.1 for the health probe.
+fn certificate_names(name: &str, names: &[String]) -> (Vec<String>, Vec<std::net::IpAddr>) {
     let mut dns: Vec<String> = vec![name.to_string(), "localhost".to_string()];
     let mut ips: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().expect("a literal")];
     for n in names {
@@ -842,6 +886,105 @@ fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> 
             }
         }
     }
+    (dns, ips)
+}
+
+/// `tls secret`: what the chart's Job runs. The pod's service account (its
+/// token, the cluster's CA and the namespace, under
+/// `/var/run/secrets/kubernetes.io/serviceaccount`) reaches the API at
+/// `KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`, verified as
+/// `kubernetes.default.svc` over this crate's TLS -- which is what the
+/// cluster's RSA or P-256 certificate is verified for. A Secret already
+/// present is kept, so an upgrade keeps the material the pods hold.
+fn tls_secret(secret: &str, name: &str, names: &[String], days: i64, json: bool) -> i32 {
+    const SA: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+    let read = |f: &str| std::fs::read_to_string(format!("{SA}/{f}"));
+    let (token, ca, namespace) = match (read("token"), read("ca.crt"), read("namespace")) {
+        (Ok(t), Ok(c), Ok(n)) => (t.trim().to_string(), c, n.trim().to_string()),
+        _ => {
+            return fail(
+                json,
+                &format!("no service account under {SA}; `tls secret` runs inside a pod"),
+            )
+        }
+    };
+    let host = std::env::var("KUBERNETES_SERVICE_HOST").unwrap_or_default();
+    let port: u16 =
+        std::env::var("KUBERNETES_SERVICE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
+    if host.is_empty() {
+        return fail(json, "KUBERNETES_SERVICE_HOST is not set; `tls secret` runs inside a pod");
+    }
+    let addr = format!("{host}:{port}");
+    let path = format!("/api/v1/namespaces/{namespace}/secrets");
+    let api = |method: &str, path: &str, body: Option<&str>| {
+        celastro::tls::https_request(
+            &addr,
+            "kubernetes.default.svc",
+            &ca,
+            method,
+            path,
+            &token,
+            body,
+        )
+    };
+    let name_json = json::to_string(&Value::Str(secret.to_string()));
+    match api("GET", &format!("{path}/{secret}"), None) {
+        Ok((200, _)) => {
+            if json {
+                println!(r#"{{"ok":true,"kind":"tls","secret":{name_json},"created":false}}"#);
+            } else {
+                println!("the Secret {namespace}/{secret} is already there; leaving it as it is");
+            }
+            return EXIT_OK;
+        }
+        Ok((404, _)) => {}
+        Ok((status, body)) => {
+            return fail(
+                json,
+                &format!("reading the Secret: the API answered {status}: {}", body.trim()),
+            )
+        }
+        Err(e) => return fail(json, &format!("reaching the API at {addr}: {e}")),
+    }
+    let (dns, ips) = certificate_names(name, names);
+    let material = match celastro::tls::make_material(name, &dns, &ips, days) {
+        Ok(m) => m,
+        Err(e) => return fail(json, &format!("could not make the certificates: {e}")),
+    };
+    let b64 = |s: &str| celastro::tls::base64(s.as_bytes());
+    let body = format!(
+        r#"{{"apiVersion":"v1","kind":"Secret","metadata":{{"name":{name_json}}},"type":"kubernetes.io/tls","data":{{"tls.crt":"{}","tls.key":"{}","ca.crt":"{}"}}}}"#,
+        b64(&material.cert),
+        b64(&material.key),
+        b64(&material.ca_cert)
+    );
+    match api("POST", &path, Some(&body)) {
+        Ok((201, _)) | Ok((409, _)) => {
+            if json {
+                println!(
+                    r#"{{"ok":true,"kind":"tls","secret":{name_json},"created":true,"names":{}}}"#,
+                    json::to_string(&Value::Array(
+                        dns.iter().map(|n| Value::Str(n.clone())).collect()
+                    ))
+                );
+            } else {
+                println!(
+                    "wrote the Secret {namespace}/{secret}: a certificate for {} valid {days} days, \
+                     signed by a CA of its own",
+                    dns.join(", ")
+                );
+            }
+            EXIT_OK
+        }
+        Ok((status, body)) => {
+            fail(json, &format!("writing the Secret: the API answered {status}: {}", body.trim()))
+        }
+        Err(e) => fail(json, &format!("reaching the API at {addr}: {e}")),
+    }
+}
+
+fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> i32 {
+    let (dns, ips) = certificate_names(name, names);
     let material = match celastro::tls::make_material(name, &dns, &ips, days) {
         Ok(m) => m,
         Err(e) => return fail(json, &format!("could not make the certificates: {e}")),
@@ -1713,6 +1856,44 @@ mod tests {
         match parse(&["--attached", "2", "serve"]) {
             Cli::Usage(msg) => assert!(msg.contains("--attached")),
             other => panic!("`--attached` outside health must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_secret_parses_like_tls_init_and_wants_a_pod_around_it() {
+        match parse(&["tls", "secret", "celastro-tls", "celastro", "a.example,10.0.0.1", "30"]) {
+            Cli::Run { cmd: Cmd::TlsSecret { secret, name, names, days }, .. } => {
+                assert_eq!(
+                    (secret.as_str(), name.as_str(), names, days),
+                    (
+                        "celastro-tls",
+                        "celastro",
+                        vec!["a.example".to_string(), "10.0.0.1".to_string()],
+                        30
+                    )
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["tls", "secret", "s", "n"]) {
+            Cli::Run { cmd: Cmd::TlsSecret { names, days, .. }, .. } => {
+                assert!(names.is_empty());
+                assert_eq!(days, 3650);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse(&["tls", "secret", "s"]), Cli::Usage(_)));
+        assert!(matches!(parse(&["tls", "secret", "s", "n", "", "-1"]), Cli::Usage(_)));
+        let (dns, ips) = certificate_names(
+            "c",
+            &["B.example".to_string(), "10.0.0.1".to_string(), "c".to_string()],
+        );
+        assert_eq!(dns, vec!["c", "localhost", "b.example"]);
+        assert_eq!(ips.len(), 2);
+        // Outside a pod there is no service account, and the command says so
+        // before touching the network.
+        if !std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists() {
+            assert_eq!(tls_secret("s", "n", &[], 1, false), EXIT_FAIL);
         }
     }
 

@@ -1,0 +1,5 @@
+Material for the tests of RSA and ECDSA verification, made once with openssl:
+an RSA-2048 CA and a P-256 CA, each self-signed with SHA-256; an Ed25519 leaf
+for `localhost` signed by each; the RSA CA's public key; and, over `msg`, an
+RSA-PSS signature (SHA-256, salt 32) and an ECDSA signature (SHA-256, DER).
+The keys are not here; nothing depends on them.
