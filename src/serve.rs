@@ -1186,7 +1186,7 @@ fn query_response<W: Wire>(io: &mut W, head: &Head, db: &Mutex<Db>, deadline: In
         Err(r) => return r.response(),
     };
     match sql_from_body(&body) {
-        Ok(sql) => run_sql(&mut lock(db), &sql),
+        Ok(sql) => run_sql(db, &sql),
         Err(r) => r.response(),
     }
 }
@@ -1537,18 +1537,32 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// Persist is a no-op for an in-memory database, so this costs nothing where
 /// there is nothing to lose; and when it fails the client is told, because an
 /// ack that claims a durability the disk does not have is worse than an error.
-fn run_sql(db: &mut Db, sql: &str) -> Response {
+fn run_sql(db: &Mutex<Db>, sql: &str) -> Response {
     let started = Instant::now();
-    let outcome = db.execute(sql);
+    // Deferred work -- a backup's copy -- runs with the lock let go, so the
+    // other connections are served while it copies.
+    let outcome = {
+        let mut guard = lock(db);
+        match guard.execute(sql) {
+            Ok(Outcome::Deferred(d)) => {
+                drop(guard);
+                d.finish()
+            }
+            other => other,
+        }
+    };
     let elapsed = started.elapsed().as_millis();
     match outcome {
         Ok(Outcome::Rows(r)) => Response::json(rows_json(&r, elapsed)),
-        Ok(Outcome::Ack(m)) => match db.persist() {
+        Ok(Outcome::Ack(m)) => match lock(db).persist() {
             Ok(()) => Response::json(ack_json(&m)),
             Err(e) => Response::json(error_json(&format!("{m}, but it is not on disk yet: {e}"))),
         },
         Ok(Outcome::Explain(t)) => Response::json(text_json("explain", &t)),
         Ok(Outcome::Recall(r)) => Response::json(text_json("recall", &r.render())),
+        Ok(Outcome::Deferred(_)) => {
+            Response::json(error_json("deferred work returned deferred work"))
+        }
         Err(e) => Response::json(error_json(&e.to_string())),
     }
 }
@@ -2364,8 +2378,8 @@ mod tests {
 
     #[test]
     fn a_sql_error_is_reported_inline_with_200_rather_than_as_a_protocol_failure() {
-        let mut db = Db::in_memory();
-        let response = run_sql(&mut db, "SELECT FROM WHERE nonsense");
+        let db = Mutex::new(Db::in_memory());
+        let response = run_sql(&db, "SELECT FROM WHERE nonsense");
         assert_eq!(response.status, 200, "a SQL error must not become an HTTP error");
         assert_eq!(response.content_type, CT_JSON);
         let parsed = json::parse(&response.body).expect("the error must still be JSON");
@@ -2375,15 +2389,16 @@ mod tests {
 
     #[test]
     fn the_catalog_describes_the_collections_that_exist() {
-        let mut db = Db::in_memory();
-        let created = run_sql(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
+        let db = Mutex::new(Db::in_memory());
+        let created = run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
         assert_eq!(created.status, 200);
-        let rows = run_sql(&mut db, "SELECT * FROM items LIMIT 10");
+        let rows = run_sql(&db, "SELECT * FROM items LIMIT 10");
         let parsed = json::parse(&rows.body).unwrap();
         assert_eq!(parsed.get("kind").and_then(|v| v.as_str()), Some("rows"), "{}", rows.body);
         assert_eq!(parsed.get("count").and_then(|v| v.as_i64()), Some(0));
 
-        let parsed = json::parse(&catalog_json(&db)).expect("the catalog must be valid JSON");
+        let parsed =
+            json::parse(&catalog_json(&lock(&db))).expect("the catalog must be valid JSON");
         assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
         let colls = parsed.get("collections").and_then(|v| v.as_array()).unwrap();
         assert_eq!(colls.len(), 1);
@@ -2769,8 +2784,9 @@ mod tests {
         let tag = format!("celastro-serve-durable-{}", std::process::id());
         let dir = std::env::temp_dir().join(tag);
         let _ = std::fs::remove_dir_all(&dir);
-        let mut db = Db::open(&dir, crate::engine::DbOpts::default()).expect("a temp dir opens");
-        let response = run_sql(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
+        let db =
+            Mutex::new(Db::open(&dir, crate::engine::DbOpts::default()).expect("a temp dir opens"));
+        let response = run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)");
         let parsed = json::parse(&response.body).expect("the reply must be JSON");
         assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)), "{}", response.body);
         // The manifest is written by `persist` and by nothing on the CREATE

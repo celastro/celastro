@@ -82,12 +82,16 @@ persistence:
   # Empty means the cluster's default StorageClass.
   storageClass: ""
 
-# The `archived` tier. With no endpoint the tier is a directory inside the
-# data volume, which is what the pod gets by default. With one it is an
-# S3-compatible bucket reached over plain HTTP (the binary carries no TLS),
-# and the credentials come from a Secret with the keys AWS_ACCESS_KEY_ID and
-# AWS_SECRET_ACCESS_KEY: name an existing one, or give the pair here and the
-# chart makes one.
+# The `archived` tier, and where backups go. With nothing set the tier is a
+# directory inside the data volume, which is what the pod gets by default.
+# `existingClaim` names a ReadWriteMany claim -- an NFS volume, typically --
+# mounted at `mountPath` on every pod: the tier lives in `<mountPath>/tier`
+# and backups under `<mountPath>/backups`. With an endpoint the tier is an
+# S3-compatible bucket instead, reached over plain HTTP (the archive client
+# carries no TLS), the credentials from a Secret with the keys
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY: name an existing one, or give
+# the pair here and the chart makes one; a claim named as well then carries
+# the backups only.
 archive:
   endpoint: ""
   bucket: ""
@@ -96,6 +100,17 @@ archive:
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
+  existingClaim: ""
+  mountPath: /archive
+
+# Backups: a CronJob that sends `BACKUP TO '<to>'` to every pod's console on
+# the schedule. `to` is a name under `<mountPath>/backups` on the claim
+# (the default, `nightly`), or `s3://bucket/prefix` through the archive's
+# endpoint and credentials. Each pod backs up the shards it holds; restore
+# with `RESTORE FROM` on an empty node, as the README says.
+backup:
+  schedule: ""
+  to: nightly
 
 probes:
   periodSeconds: 10

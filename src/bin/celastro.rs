@@ -221,11 +221,12 @@ fn split_statements(text: &str) -> Vec<String> {
 
 fn run_one(db: &mut Db, sql: &str) -> Result<()> {
     let t0 = std::time::Instant::now();
-    match db.execute(sql)? {
+    match db.execute(sql)?.finished()? {
         Outcome::Ack(m) => println!("{m}"),
         Outcome::Explain(text) => print!("{text}"),
         Outcome::Recall(r) => print!("{}", r.render()),
         Outcome::Rows(r) => print_rows(&r),
+        Outcome::Deferred(_) => unreachable!("finished above"),
     }
     println!("({:.2} ms)", t0.elapsed().as_secs_f64() * 1000.0);
     Ok(())

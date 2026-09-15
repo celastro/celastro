@@ -93,6 +93,31 @@ statement they coordinate over its shards fails naming the shard (`did not
 answer`), `WITH (partial_results)` being the opt-in to an answer without it.
 A client that retries rides it out; measured below.
 
+### Backups, and the archived tier on a mount
+
+```
+helm install celastro chart/celastro --set replicas=3 --set archive.existingClaim=celastro-nfs --set backup.schedule="0 3 * * *"
+```
+
+`archive.existingClaim` is a ReadWriteMany claim — an NFS volume is the
+usual one — mounted at `/archive` on every pod. The `archived` tier moves
+its segments into `/archive/tier` (unless `archive.endpoint` names a
+bucket, which then keeps the tier), and `BACKUP TO` writes under
+`/archive/backups`: `CELASTRO_BACKUP_DIR` is set there, so a statement
+from the console can name `nightly` and nothing outside it. With a
+schedule, a CronJob runs one container per pod, each sending `BACKUP TO
+'<backup.to>'` to that pod's console (over TLS when `tls.enabled`), so
+every pod backs up the shards it holds; the first run copies everything,
+later runs only the segments that are new. `backup.to` may also be
+`s3://bucket/prefix`, through the archive's endpoint and credentials. To
+restore, start an empty release (a new name, or the same one with its
+volumes gone), mount the same claim, and run on each pod — `celastro-cli
+send` from a pod with the token, or the console UI — `RESTORE FROM
+'nightly'`: every pod backs up under its own address, so a pod restores
+what its namesake wrote (`NODE 'tcp://<pod>.<release>:9000'` for another
+one's), and a pod that held shards `0` and `2` restores those. The pods
+have no NFS client of their own: the claim is the cluster's.
+
 ## Install
 
 The chart pulls `ghcr.io/celastro/celastro:<appVersion>`, the image each
@@ -106,8 +131,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.29.1 .
-kind load docker-image celastro:0.29.1        # for a kind cluster
+docker build -t celastro:0.30.0 .
+kind load docker-image celastro:0.30.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -168,6 +193,8 @@ peer that is down does not get every pod restarted.
 | `archive.bucket`, `archive.prefix`, `archive.region` | empty | the bucket, and optional key prefix and region |
 | `archive.existingSecret` | empty | a `Secret` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` |
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
+| `archive.existingClaim`, `archive.mountPath` | empty, `/archive` | a ReadWriteMany claim (NFS, typically) mounted on every pod: the `archived` tier in `<mountPath>/tier` unless a bucket is configured, backups under `<mountPath>/backups` |
+| `backup.schedule`, `backup.to` | empty, `nightly` | with a schedule, a CronJob sends `BACKUP TO '<to>'` to every pod's console: a name under the claim's `backups`, or `s3://bucket/prefix` |
 | `tls.enabled` | `false` | the wire and the console over TLS 1.3, one Ed25519 certificate per release, every pod verified against one CA; without the next two, a hook Job makes the material once |
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro-cli tls init`, naming every pod, both Services and `localhost` |
@@ -246,3 +273,17 @@ built from the tree at the time:
   49 seconds, the checks passed, no restarts. The first build of the Job
   failed every attempt with "expected the server's Certificate": the API
   server sends a `CertificateRequest`, which the client now answers.
+- **Backups and the tier on NFS** (chart 0.8.0, celastro 0.30.0): an NFS
+  server in the kind cluster, a ReadWriteMany claim on it as
+  `archive.existingClaim`, TLS on, `backup.schedule` set. Three pods ready
+  with `CELASTRO_ARCHIVE_DIR=/archive/tier` and `CELASTRO_BACKUP_DIR=
+  /archive/backups`; 3,000 documents over three shards; the text index
+  moved to `archived` put one segment per non-empty shard on the mount
+  (`nfs4`) and the text query still answered all 3,000. The CronJob run by
+  hand: three containers, each pod's console answering `BACKUP TO
+  'nightly'` for the shard it holds; a second run copied 0 segments. The
+  release uninstalled with its volumes, a fresh one installed on the same
+  claim, `RESTORE FROM 'nightly'` sent to each pod: each restored its own
+  node's backup, 3,000 rows and the text query back, no restarts. The
+  first build shared one `LATEST` between pods and every pod restored the
+  last writer's shard, which is why backups are per node now.

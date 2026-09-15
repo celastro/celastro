@@ -12,9 +12,15 @@
 //! crate takes no dependencies, so the endpoint is plain HTTP -- a MinIO on
 //! the same host, or a TLS-terminating proxy in front of a real bucket;
 //! multipart upload, because a segment is one `PUT` and the size that would
-//! need multipart is far past the segment cap; and listing, so an object a
-//! failed publication left behind is not reclaimed the way a local orphan
-//! is. Each of those is a later entry, not a gap this one hides.
+//! need multipart is far past the segment cap. Listing (`ListObjectsV2`)
+//! arrived with backups, which need to say what a destination holds; the
+//! tier still never lists, so an object a failed publication left behind
+//! is not reclaimed the way a local orphan is.
+//!
+//! [`DirStore`] is the same surface over a directory: the archived tier on
+//! any mount -- NFS is the case it was written for -- and the destination
+//! of a backup. It publishes each object the way the shards publish their
+//! files (a temporary, an fsync, a rename, the directory's fsync).
 //!
 //! Everything under this module is in-tree for the same reason the rest of
 //! the crate is: SHA-256 and HMAC for the signature, a small HTTP/1.1 client
@@ -37,7 +43,8 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// The four operations the archive tier needs, and no more.
+/// The four operations the archive tier needs, and the listing a backup
+/// needs.
 pub trait ObjectStore: Send + Sync + fmt::Debug {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     /// `len` bytes from `off`. Short reads are errors, not partial answers.
@@ -46,14 +53,20 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     /// The object's size, or `None` when there is no such object.
     fn size(&self, key: &str) -> Result<Option<u64>>;
     fn delete(&self, key: &str) -> Result<()>;
+    /// Every key under `prefix`, sorted.
+    fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 /// Where the archive lives. `endpoint` is `host:port` of an S3-compatible
-/// server reached over plain HTTP; `None` keeps the local directory.
+/// server reached over plain HTTP; `dir` a directory on any mount; neither
+/// keeps the shard-local directory.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArchiveOpts {
     pub endpoint: Option<String>,
+    /// A directory that stands behind the same trait as the bucket: the
+    /// tier on an NFS mount, or on a disk that is not the data volume.
+    pub dir: Option<std::path::PathBuf>,
     pub bucket: String,
     /// Prepended to every key. `""` or `"celastro/"`.
     pub prefix: String,
@@ -157,6 +170,7 @@ impl S3Store {
         &self,
         method: &str,
         key: &str,
+        query: &str,
         range: Option<(u64, u64)>,
         body: &[u8],
     ) -> Result<Response> {
@@ -181,12 +195,13 @@ impl S3Store {
             SERVICE,
             method,
             &path,
-            "",
+            query,
             &headers,
             &payload_hash,
             &date,
         );
-        let mut req = format!("{method} {path} HTTP/1.1\r\n");
+        let target = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+        let mut req = format!("{method} {target} HTTP/1.1\r\n");
         for (k, v) in &headers {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -210,7 +225,7 @@ impl S3Store {
 
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let r = self.request("PUT", key, None, bytes)?;
+        let r = self.request("PUT", key, "", None, bytes)?;
         if r.status == 200 {
             Ok(())
         } else {
@@ -222,7 +237,7 @@ impl ObjectStore for S3Store {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let r = self.request("GET", key, Some((off, len)), &[])?;
+        let r = self.request("GET", key, "", Some((off, len)), &[])?;
         if r.status != 206 && r.status != 200 {
             return Err(self.fail("GET", key, &r));
         }
@@ -236,7 +251,7 @@ impl ObjectStore for S3Store {
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let r = self.request("GET", key, None, &[])?;
+        let r = self.request("GET", key, "", None, &[])?;
         if r.status == 200 {
             Ok(r.body)
         } else {
@@ -245,7 +260,7 @@ impl ObjectStore for S3Store {
     }
 
     fn size(&self, key: &str) -> Result<Option<u64>> {
-        let r = self.request("HEAD", key, None, &[])?;
+        let r = self.request("HEAD", key, "", None, &[])?;
         match r.status {
             200 => {
                 r.header("content-length").and_then(|v| v.parse::<u64>().ok()).map(Some).ok_or_else(
@@ -258,12 +273,200 @@ impl ObjectStore for S3Store {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let r = self.request("DELETE", key, None, &[])?;
+        let r = self.request("DELETE", key, "", None, &[])?;
         if r.status == 204 || r.status == 200 || r.status == 404 {
             Ok(())
         } else {
             Err(self.fail("DELETE", key, &r))
         }
+    }
+
+    /// `ListObjectsV2`, page by page. The reply is XML; the keys are what
+    /// is between `<Key>` and `</Key>`, unescaped, and a truncated page
+    /// names the token the next one continues from.
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            // The canonical query is sorted by parameter name, and the
+            // signature covers it, so it is built in that order.
+            let mut query = String::new();
+            if let Some(t) = &token {
+                query.push_str(&format!("continuation-token={}&", query_encode(t)));
+            }
+            query.push_str("list-type=2");
+            if !prefix.is_empty() {
+                query.push_str(&format!("&prefix={}", query_encode(prefix)));
+            }
+            let r = self.request("GET", "", &query, None, &[])?;
+            if r.status != 200 {
+                return Err(self.fail("LIST", prefix, &r));
+            }
+            let text = String::from_utf8_lossy(&r.body);
+            keys.extend(xml_values(&text, "Key").into_iter().map(|k| xml_unescape(&k)));
+            let truncated = xml_values(&text, "IsTruncated").first().map(|v| v == "true");
+            token = match truncated {
+                Some(true) => xml_values(&text, "NextContinuationToken")
+                    .into_iter()
+                    .next()
+                    .map(|t| xml_unescape(&t)),
+                _ => None,
+            };
+            if token.is_none() {
+                break;
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+}
+
+/// The text of every `<tag>...</tag>` in `xml`, in order.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let after = &rest[i + open.len()..];
+        let Some(j) = after.find(&close) else { break };
+        out.push(after[..j].to_string());
+        rest = &after[j + close.len()..];
+    }
+    out
+}
+
+/// The five XML entities, which is all a key can carry.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// A query value: everything but the unreserved characters is encoded,
+/// `/` included, which is where it differs from [`uri_encode`].
+fn query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// A directory as an object store. Keys are relative paths under the root
+/// with `/` between components; an object is published as the shards
+/// publish their files, so a reader on the same mount sees a whole object
+/// or none, and a crash leaves at most a `.tmp` beside it, which the
+/// listing skips. Written for an NFS mount, where those semantics hold
+/// because the rename is one request to the server; on a local disk it is
+/// the archived tier off the data volume.
+#[derive(Debug, Clone)]
+pub struct DirStore {
+    root: std::path::PathBuf,
+}
+
+impl DirStore {
+    pub fn new(root: &std::path::Path) -> Result<DirStore> {
+        std::fs::create_dir_all(root)
+            .map_err(|e| Error::Storage(format!("archive directory {}: {e}", root.display())))?;
+        Ok(DirStore { root: root.to_path_buf() })
+    }
+
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// The path a key names, which stays under the root: a key with an
+    /// empty, `.` or `..` component, or an absolute one, is refused.
+    fn path(&self, key: &str) -> Result<std::path::PathBuf> {
+        let bad = key.is_empty()
+            || key.starts_with('/')
+            || key.split('/').any(|c| c.is_empty() || c == "." || c == "..");
+        if bad {
+            return Err(Error::Storage(format!("archive: `{key}` is not a key")));
+        }
+        Ok(self.root.join(key))
+    }
+
+    fn walk(&self, dir: &std::path::Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let key = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if entry.file_type()?.is_dir() {
+                self.walk(&entry.path(), &key, out)?;
+            } else if !name.ends_with(".tmp") {
+                out.push(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ObjectStore for DirStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let p = self.path(key)?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::shard::atomic_write(&p, bytes)
+    }
+
+    fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Seek, SeekFrom};
+        let p = self.path(key)?;
+        let mut f = std::fs::File::open(&p)
+            .map_err(|e| Error::Storage(format!("archive: GET {key}: {e}")))?;
+        f.seek(SeekFrom::Start(off))?;
+        let mut out = vec![0u8; len as usize];
+        f.read_exact(&mut out)
+            .map_err(|e| Error::Storage(format!("archive: GET {key} bytes {off}+{len}: {e}")))?;
+        Ok(out)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let p = self.path(key)?;
+        std::fs::read(&p).map_err(|e| Error::Storage(format!("archive: GET {key}: {e}")))
+    }
+
+    fn size(&self, key: &str) -> Result<Option<u64>> {
+        let p = self.path(key)?;
+        match std::fs::metadata(&p) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Storage(format!("archive: HEAD {key}: {e}"))),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let p = self.path(key)?;
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Storage(format!("archive: DELETE {key}: {e}"))),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        self.walk(&self.root, "", &mut out)?;
+        out.retain(|k| k.starts_with(prefix));
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -547,6 +750,53 @@ pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("celastro-dirstore-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The directory store is the trait over files: an object is a file
+    /// under the root, published whole, read whole or by range, sized,
+    /// deleted, listed by prefix with `.tmp` leftovers skipped -- and a
+    /// key cannot climb out of the root.
+    #[test]
+    fn a_directory_store_holds_objects_as_published_files() {
+        let root = temp("ops");
+        let s = DirStore::new(&root).unwrap();
+        assert_eq!(s.size("a/b/one").unwrap(), None);
+        s.put("a/b/one", b"hello world").unwrap();
+        s.put("a/two", b"22").unwrap();
+        std::fs::write(root.join("a").join("junk.tmp"), b"x").unwrap();
+        assert_eq!(s.get("a/b/one").unwrap(), b"hello world");
+        assert_eq!(s.get_range("a/b/one", 6, 5).unwrap(), b"world");
+        assert!(s.get_range("a/b/one", 6, 50).is_err(), "a short read is an error");
+        assert_eq!(s.size("a/b/one").unwrap(), Some(11));
+        assert_eq!(s.list("a/").unwrap(), vec!["a/b/one".to_string(), "a/two".to_string()]);
+        assert_eq!(s.list("a/b").unwrap(), vec!["a/b/one".to_string()]);
+        s.delete("a/two").unwrap();
+        s.delete("a/two").unwrap();
+        assert_eq!(s.size("a/two").unwrap(), None);
+        assert!(s.get("a/two").is_err());
+        for bad in ["", "/etc/passwd", "a/../x", "./a", "a//b"] {
+            assert!(s.put(bad, b"x").is_err(), "{bad} must be refused");
+        }
+        assert!(!root.join("a").join("b").join("one.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_replies_are_read_by_tag_and_unescaped() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>t&amp;1</NextContinuationToken>\
+                   <Contents><Key>a/b&lt;c</Key></Contents><Contents><Key>a/d</Key></Contents></ListBucketResult>";
+        assert_eq!(xml_values(xml, "Key"), vec!["a/b&lt;c", "a/d"]);
+        assert_eq!(xml_unescape("a/b&lt;c"), "a/b<c");
+        assert_eq!(xml_values(xml, "IsTruncated"), vec!["true"]);
+        assert_eq!(xml_unescape(&xml_values(xml, "NextContinuationToken")[0]), "t&1");
+        assert_eq!(query_encode("a/b c"), "a%2Fb%20c");
+    }
 
     /// FIPS 180-4's two vectors and the empty message, whose digest is also
     /// the `x-amz-content-sha256` of every bodiless request.

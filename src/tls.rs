@@ -182,19 +182,28 @@ impl Stream for crate::crypto::tls13::TlsStream {
     }
 }
 
-/// One HTTPS/1.1 request over this crate's TLS: `method` `path` at `addr`
-/// (`host:port`), the server verified against the CA in `ca_pem` as
-/// `server_name`, a bearer token, an optional JSON body. The status and the
-/// body come back; a chunked body is joined. What `celastro-cli tls secret`
-/// uses to reach a cluster's API from inside a pod.
+/// One HTTP/1.1 request: the method, the path, extra headers, an optional
+/// JSON body. `Host`, `Accept`, `Content-Type`, `Content-Length` and
+/// `Connection: close` are added.
+pub struct HttpRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub headers: &'a [(&'a str, &'a str)],
+    pub body: Option<&'a str>,
+}
+
+/// One HTTPS/1.1 request over this crate's TLS at `addr` (`host:port`),
+/// the server verified against the CA in `ca_pem` as `server_name`,
+/// `timeout` on the connect and each read (zero: no bound on the reads).
+/// The status and the body come back; a chunked body is joined. What
+/// `celastro-cli tls secret` uses to reach a cluster's API from inside a
+/// pod, and `celastro-cli send` a console over TLS.
 pub fn https_request(
     addr: &str,
     server_name: &str,
     ca_pem: &str,
-    method: &str,
-    path: &str,
-    bearer: &str,
-    body: Option<&str>,
+    req: &HttpRequest<'_>,
+    timeout: Duration,
 ) -> Result<(u16, String)> {
     use crate::crypto::tls13::{ClientSide, TlsStream};
     use crate::crypto::{pem, x509};
@@ -205,26 +214,66 @@ pub fn https_request(
     if anchors.is_empty() {
         return Err(Error::Plan("no certificate in the CA given".into()));
     }
-    let addr = addr
+    let sock = dial(addr, timeout)?;
+    let mut s = TlsStream::client(sock, ClientSide { anchors: &anchors, host: server_name });
+    let request = http_text(server_name, req);
+    s.write_all(request.as_bytes()).map_err(Error::Io)?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).map_err(Error::Io)?;
+    parse_response(&raw)
+}
+
+/// The same request in the clear, for a console that serves plain HTTP.
+pub fn http_request(
+    addr: &str,
+    host: &str,
+    req: &HttpRequest<'_>,
+    timeout: Duration,
+) -> Result<(u16, String)> {
+    let mut sock = dial(addr, timeout)?;
+    let request = http_text(host, req);
+    sock.write_all(request.as_bytes()).map_err(Error::Io)?;
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).map_err(Error::Io)?;
+    parse_response(&raw)
+}
+
+fn dial(addr: &str, timeout: Duration) -> Result<TcpStream> {
+    let resolved = addr
         .to_socket_addrs()
         .map_err(Error::Io)?
         .next()
         .ok_or_else(|| Error::Plan(format!("{addr} resolves to nothing")))?;
-    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(Error::Io)?;
-    sock.set_read_timeout(Some(Duration::from_secs(30))).map_err(Error::Io)?;
-    sock.set_write_timeout(Some(Duration::from_secs(30))).map_err(Error::Io)?;
-    let mut s = TlsStream::client(sock, ClientSide { anchors: &anchors, host: server_name });
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {server_name}\r\nAuthorization: Bearer {bearer}\r\n\
-         Accept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+    // A zero timeout means no bound on the reads (a backup answers when it
+    // is done), never a connect that gives up at once.
+    let connect = if timeout.is_zero() {
+        Duration::from_secs(10)
+    } else {
+        timeout.min(Duration::from_secs(10))
+    };
+    let sock = TcpStream::connect_timeout(&resolved, connect).map_err(Error::Io)?;
+    let io = if timeout.is_zero() { None } else { Some(timeout) };
+    sock.set_read_timeout(io).map_err(Error::Io)?;
+    sock.set_write_timeout(io).map_err(Error::Io)?;
+    Ok(sock)
+}
+
+fn http_text(host: &str, req: &HttpRequest<'_>) -> String {
+    let body = req.body.unwrap_or("");
+    let mut text = format!("{} {} HTTP/1.1\r\nHost: {host}\r\n", req.method, req.path);
+    for (k, v) in req.headers {
+        text.push_str(&format!("{k}: {v}\r\n"));
+    }
+    text.push_str(&format!(
+        "Accept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
-    );
-    s.write_all(request.as_bytes()).map_err(Error::Io)?;
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).map_err(Error::Io)?;
-    let text = String::from_utf8_lossy(&raw).to_string();
+    ));
+    text
+}
+
+fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
+    let text = String::from_utf8_lossy(raw).to_string();
     let (head, rest) = text
         .split_once("\r\n\r\n")
         .ok_or_else(|| Error::Plan("the server's answer has no header end".into()))?;

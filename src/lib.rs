@@ -69,6 +69,7 @@
 //! everything that writes or touches storage is crate-private, so that a
 //! precondition documented on a read is the crate's own to keep.
 
+pub mod backup;
 pub mod bitmap;
 pub mod catalog;
 pub mod codec;

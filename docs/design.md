@@ -409,10 +409,12 @@ mode, and says what it is not. A collection's shards can be spread over nodes an
 holder can coordinate, but each shard has exactly one holder and a statement
 that changes the catalog reaches the holders one by one, reporting the ones it
 did not reach. The
-`archived` tier is an S3-compatible object store when one is configured and a
-local directory that stands in for one when not; the client is in-tree and
-plain HTTP: the TLS (0.28.0) encrypts the wire and the console, not the
-archive client, yet.
+`archived` tier is an S3-compatible object store when one is configured, a
+directory on any mount when one is named (`CELASTRO_ARCHIVE_DIR`; the same
+trait, so NFS is the cluster's business), and the shard-local directory
+otherwise; the client is in-tree and plain HTTP: the TLS (0.28.0) encrypts
+the wire and the console, not the archive client, yet. Backups (0.30.0)
+go through the same trait: `BACKUP TO` and `RESTORE FROM` in `backup.rs`.
 
 The *boundaries* those attach to are real, and that is the point of having built
 them first:
@@ -1216,6 +1218,7 @@ guarantee:
 | a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
+| a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro-cli send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
 | the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |
 | a health probe measures the database, needs no token, and stays behind the Host check | `serve::tests::the_health_probe_needs_no_token_and_reports_the_database`, `serve::tests::the_probe_tells_serving_from_unwell_from_absent` (the client half: serving, unwell and absent are three answers), `celastro-cli::tests::health_takes_a_port_and_nothing_else`; the chart itself is verified by hand against a `kind` cluster, as its README records |
 | a copy is the source at its pinned instant, absent or complete, and adoptable elsewhere | `engine::tests::a_copy_is_the_source_at_its_pinned_instant_whatever_happens_after` (three shards, sealed and memtable rows, deletes on both; inserts, deletes, updates, a flush and a compaction between the pin and the write; the copy answers the source's pinned rows byte for byte and the source no longer does), `engine::tests::an_interrupted_copy_leaves_no_destination_to_open_by_mistake`, `engine::tests::an_import_adds_the_collection_to_another_instance`, `celastro-cli::tests::export_and_import_take_their_arguments_and_no_more` |
@@ -1256,6 +1259,7 @@ src/
   serve.rs serve/                the console: loopback by default, --bind for a network
   wire.rs sim.rs                 the wire between nodes; the seeded fault simulator
   tls.rs crypto/                 encryption in transit: the TLS 1.3 and its primitives
+  backup.rs                      BACKUP TO and RESTORE FROM over the object store trait
   signal.rs deadline.rs          SIGTERM for PID 1; the per-statement deadline
   bin/celastro.rs                REPL, script runner, demo
   bin/celastro-cli.rs            serve, exec, run, repl, demo, catalog, health, export, import

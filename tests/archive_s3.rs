@@ -115,6 +115,23 @@ fn serve(
     let key = path.strip_prefix("/b/").unwrap_or("").to_string();
     requests.lock().unwrap().push(format!("{method} {key}"));
     let mut objects = objects.lock().unwrap();
+    // `ListObjectsV2`: `GET /b/?list-type=2&prefix=...`, one page.
+    if method == "GET" && key.starts_with('?') {
+        let prefix = key[1..]
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("prefix="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        let mut keys: Vec<&String> = objects.keys().filter(|k| k.starts_with(&prefix)).collect();
+        keys.sort();
+        let mut xml = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
+        for k in keys {
+            xml.push_str(&format!("<Contents><Key>{}</Key></Contents>", k.replace('&', "&amp;")));
+        }
+        xml.push_str("</ListBucketResult>");
+        reply(&mut s, 200, "OK", xml.as_bytes(), false);
+        return;
+    }
     match method.as_str() {
         "PUT" => {
             objects.insert(key, body);
@@ -143,6 +160,24 @@ fn serve(
         }
         _ => reply(&mut s, 405, "Method Not Allowed", b"", false),
     }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 <= b.len() - 1 + 1 {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn opts(fake: &FakeS3) -> DbOpts {
@@ -392,4 +427,71 @@ fn an_https_endpoint_is_refused_with_the_reason() {
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake-secret");
     let e = Db::open(&dir("https"), o).err().map(|e| e.to_string()).unwrap();
     assert!(e.contains("plain http") && e.contains("TLS"), "{e}");
+}
+
+/// The same tier over a directory: `CELASTRO_ARCHIVE_DIR` names it, the
+/// objects are files under the same keys, and a database with nothing
+/// local reopens from them. An NFS mount is a directory to the binary.
+#[test]
+fn the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them() {
+    let store = dir("dirstore");
+    let d = dir("dirdb");
+    let mut o = DbOpts::default();
+    o.archive.dir = Some(store.clone());
+    o.archive.prefix = "celastro/".into();
+    let mut db = Db::open(&d, o.clone()).unwrap();
+    setup(&mut db, 60);
+    let segments = d.join("collections").join("items").join("shard-0000").join("segments");
+    assert!(count(&segments) >= 1);
+    archive_all(&mut db);
+    assert_eq!(count(&segments), 0, "the local files went to the store");
+    let objects = celastro::objstore::DirStore::new(&store).unwrap();
+    let keys =
+        celastro::objstore::ObjectStore::list(&objects, "celastro/items/shard-0000/").unwrap();
+    assert!(!keys.is_empty(), "{keys:?}");
+    drop(db);
+    let mut db = Db::open(&d, o).unwrap();
+    let rows = db.query("SELECT id FROM items WHERE text_match(body, 'number') LIMIT 100").unwrap();
+    assert_eq!(rows.rows.len(), 60);
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A backup to `s3://` goes through the archive's endpoint and credentials
+/// with the bucket the destination names; a restore from it lists what is
+/// there through `ListObjectsV2` when asked for an instant it lacks.
+#[test]
+fn a_backup_to_a_bucket_restores_from_it() {
+    let fake = FakeS3::start();
+    let d = dir("s3backup-src");
+    let mut db = open(&d, opts(&fake)).unwrap();
+    setup(&mut db, 40);
+    let ack = match db.execute("BACKUP TO 's3://b/nightly'").unwrap().finished().unwrap() {
+        celastro::engine::Outcome::Ack(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert!(ack.starts_with("backup "), "{ack}");
+    let ts: u64 = ack.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert!(
+        fake.keys().iter().any(|k| k == &format!("nightly/nodes/local/backups/{ts:020}/BACKUP")),
+        "{:?}",
+        fake.keys()
+    );
+    assert!(fake.keys().iter().any(|k| k.starts_with("nightly/pool/items/shard-0000/")));
+    let e = db.execute("RESTORE FROM 's3://b/nightly' AS OF 7").unwrap_err().to_string();
+    assert!(e.contains("empty database"), "{e}");
+    let d2 = dir("s3backup-dst");
+    let mut db2 = open(&d2, opts(&fake)).unwrap();
+    let e = db2.execute("RESTORE FROM 's3://b/nightly' AS OF 7").unwrap_err().to_string();
+    assert!(e.contains(&format!("complete backups there: {ts}")), "{e}");
+    let ack = match db2.execute("RESTORE FROM 's3://b/nightly'").unwrap() {
+        celastro::engine::Outcome::Ack(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert!(ack.contains("1 collection(s), 1 shard(s)"), "{ack}");
+    let rows =
+        db2.query("SELECT id FROM items WHERE text_match(body, 'number') LIMIT 100").unwrap();
+    assert_eq!(rows.rows.len(), 40);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d2);
 }

@@ -165,6 +165,7 @@ language, no unbounded paths, no analytics.
 | `catalog` | collections and their indexes |
 | `health [--port N] [--attached N]` | exit 0 if a console is serving — and has verified `N` peers; a container's probes |
 | `export <COLLECTION> <DIR>`, `import <DIR>` | copy a collection as of an instant, without stopping the source; adopt one |
+| `send <URL> <SQL>` | one statement to a running console, the token from `CELASTRO_TOKEN` — what a backup CronJob runs |
 | `version` | |
 
 `--dir <DIR>` opens a persistent database; `--json` makes every command's
@@ -251,8 +252,9 @@ crosses the wire.
 `chart/celastro` runs one pod or a cluster: a `StatefulSet` whose pods attach
 each other, `console.expose` for a Service that spreads clients over the
 pods, `tls.enabled` for certificates the chart makes once (or yours, or
-cert-manager's), and `archive.*` for an S3 bucket behind the `archived`
-tier. Its [README](chart/celastro/README.md) records what was verified and
+cert-manager's), `archive.*` for an S3 bucket or an NFS claim behind the
+`archived` tier, and `backup.schedule` for a CronJob that backs every pod
+up to that claim or a bucket. Its [README](chart/celastro/README.md) records what was verified and
 how.
 
 ```
@@ -263,8 +265,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.29.1 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.29.1 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.30.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.30.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -275,11 +277,39 @@ ownership, the REPL's stdin, what each flag costs.
 ## The archived tier
 
 An index moved to the `archived` tier leaves local storage — a directory
-beside the segments by default, or an S3-compatible bucket named by
-`CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP), `CELASTRO_ARCHIVE_BUCKET`
-and the `AWS_*` credentials, read from the environment at open and never
-written anywhere. Any store that speaks S3's `PUT`, ranged `GET`, `HEAD` and
-`DELETE` with Signature Version 4 will do.
+beside the segments by default, a directory on any mount named by
+`CELASTRO_ARCHIVE_DIR` (an NFS volume is the case it was written for), or
+an S3-compatible bucket named by `CELASTRO_ARCHIVE_ENDPOINT` (`host:port`,
+plain HTTP), `CELASTRO_ARCHIVE_BUCKET` and the `AWS_*` credentials, read
+from the environment at open and never written anywhere. Any store that
+speaks S3's `PUT`, ranged `GET`, `HEAD`, `DELETE` and `ListObjectsV2` with
+Signature Version 4 will do.
+
+## Backups
+
+```sql
+BACKUP TO '/mnt/backups/nightly';          -- or 's3://bucket/prefix'
+RESTORE FROM '/mnt/backups/nightly';       -- into an empty --dir; AS OF <ts> for an older one
+```
+
+`BACKUP TO` pins every shard this node holds at one instant and copies it
+to a directory (any mount) or a bucket (through the archive's endpoint and
+credentials, the bucket the destination names). Sealed segments go into a
+pool under the destination once — a second backup copies only the segments
+that are new — and each backup owns its catalog, manifests, delete logs and
+the rows that were still in memory, plus a record naming every object it
+needs. The copy runs after the statement let go of the node's lock, so
+other statements are answered meanwhile. `RESTORE FROM` takes the newest
+complete backup, or the one `AS OF` the instant `BACKUP` reported, verifies
+every object is there at its recorded size, and only then writes; the
+shards come back placed on the restoring node. Each node backs up under
+its own name (`CELASTRO_NODE`, or `local`), so a cluster's pods share one
+destination and each restores its own; `NODE '<address>'` takes another
+node's. With `CELASTRO_BACKUP_DIR`
+set, a bare name resolves under it and no path may leave it — what a
+console reachable over a network should have. A cluster is backed up node
+by node; `celastro-cli send <URL> "BACKUP TO '…'"` sends the statement to
+a running console, which is what the chart's CronJob runs on every pod.
 
 ## How it works
 

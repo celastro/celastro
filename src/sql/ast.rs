@@ -52,6 +52,19 @@ pub enum Statement {
     DropLifecyclePolicy {
         name: String,
     },
+    /// `BACKUP TO '<path or s3://bucket/prefix>'` -- the shards this node
+    /// holds, pinned at one instant, copied incrementally.
+    Backup {
+        to: String,
+    },
+    /// `RESTORE FROM '<path or s3://bucket/prefix>' [NODE '<address>'] [AS OF
+    /// <ts>]` -- into an empty database, this node's newest complete backup
+    /// (or the named node's), or the one at `ts`.
+    Restore {
+        from: String,
+        node: Option<String>,
+        as_of: Option<u64>,
+    },
     /// `DROP COLLECTION <name>` — the collection, its files, its objects in
     /// the store, and everything recorded against it. Irreversible.
     DropCollection {

@@ -190,6 +190,42 @@ impl<'a> Parser<'a> {
         if self.eat_kw("REBALANCE") {
             return Ok(Statement::Rebalance { collection: self.ident()? });
         }
+        if self.eat_kw("BACKUP") {
+            self.expect_kw("TO")?;
+            return Ok(Statement::Backup { to: self.destination()? });
+        }
+        if self.eat_kw("RESTORE") {
+            self.expect_kw("FROM")?;
+            let from = self.destination()?;
+            let node = if self.eat_kw("NODE") {
+                match self.literal()? {
+                    Value::Str(s) => Some(s),
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "NODE wants the address a node backed up as, like 'tcp://host:port', not {}",
+                            crate::json::to_string(&other)
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            let as_of = if self.eat_kw("AS") {
+                self.expect_kw("OF")?;
+                match self.literal()? {
+                    Value::Int(n) if n >= 0 => Some(n as u64),
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "AS OF wants a backup's instant, the integer BACKUP reported, not {}",
+                            crate::json::to_string(&other)
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(Statement::Restore { from, node, as_of });
+        }
         if self.eat_kw("EXPLAIN") {
             let analyze = self.eat_kw("ANALYZE");
             // A prefix that recurses into `statement` is recursive descent like
@@ -662,6 +698,17 @@ impl<'a> Parser<'a> {
             return Err(Error::Sql("a lifecycle policy needs at least one MOVE TO rule".into()));
         }
         Ok(Statement::CreateLifecyclePolicy(LifecycleDecl { name, collection, indexes, rules }))
+    }
+
+    /// A backup destination: a quoted path or `s3://bucket/prefix`.
+    fn destination(&mut self) -> Result<String> {
+        match self.literal()? {
+            Value::Str(s) if !s.trim().is_empty() => Ok(s),
+            other => Err(Error::Sql(format!(
+                "a backup destination is a string like '/mnt/backups' or 's3://bucket/prefix', not {}",
+                crate::json::to_string(&other)
+            ))),
+        }
     }
 
     fn insert(&mut self) -> Result<Statement> {
@@ -1417,6 +1464,36 @@ fn cap_option(key: &str, v: Value) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_and_restore_take_a_destination_and_restore_an_instant() {
+        match parse("BACKUP TO '/mnt/backups'", &[]).unwrap() {
+            Statement::Backup { to } => assert_eq!(to, "/mnt/backups"),
+            other => panic!("{other:?}"),
+        }
+        match parse("restore from 's3://b/p' node 'tcp://a:1' as of 42", &[]).unwrap() {
+            Statement::Restore { from, node, as_of } => {
+                assert_eq!(
+                    (from.as_str(), node.as_deref(), as_of),
+                    ("s3://b/p", Some("tcp://a:1"), Some(42))
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("RESTORE FROM 'nightly'", &[]).unwrap() {
+            Statement::Restore { from, node, as_of } => {
+                assert_eq!((from.as_str(), node, as_of), ("nightly", None, None))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse("RESTORE FROM 'x' NODE 3", &[]).unwrap_err().to_string().contains("NODE"));
+        assert!(parse("BACKUP TO 7", &[]).unwrap_err().to_string().contains("destination"));
+        assert!(parse("RESTORE FROM '/x' AS OF 'now'", &[])
+            .unwrap_err()
+            .to_string()
+            .contains("AS OF"));
+        assert!(parse("BACKUP '/x'", &[]).is_err());
+    }
 
     fn sel(sql: &str, params: &[Value]) -> Select {
         match parse(sql, params).unwrap() {

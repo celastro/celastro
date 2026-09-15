@@ -1,0 +1,56 @@
+{{- if .Values.backup.schedule }}
+{{- /* One container per pod: each pod backs up the shards it holds, and the
+       image has no shell to loop in. `send` speaks to the pod's own console
+       by its stable name, over TLS when the release has it. */ -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "celastro.fullname" . }}-backup
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+          {{- if .Values.tls.enabled }}
+          volumes:
+            - name: tls
+              secret:
+                secretName: {{ include "celastro.tlsSecretName" . }}
+          {{- end }}
+          containers:
+            {{- range $i := until (int .Values.replicas) }}
+            - name: pod-{{ $i }}
+              image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $.Values.image.pullPolicy }}
+              args:
+                - send
+                - "{{ if $.Values.tls.enabled }}https{{ else }}http{{ end }}://{{ include "celastro.fullname" $ }}-{{ $i }}.{{ include "celastro.fullname" $ }}:{{ $.Values.port }}"
+                - "BACKUP TO '{{ $.Values.backup.to | replace "'" "''" }}'"
+              env:
+                - name: CELASTRO_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "celastro.consoleSecretName" $ }}
+                      key: CELASTRO_TOKEN
+                {{- if $.Values.tls.enabled }}
+                - name: CELASTRO_TLS_CA
+                  value: /tls/ca.crt
+              volumeMounts:
+                - name: tls
+                  mountPath: /tls
+                  readOnly: true
+                {{- end }}
+            {{- end }}
+{{- end }}

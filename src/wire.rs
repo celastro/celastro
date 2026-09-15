@@ -1168,7 +1168,7 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                         .into(),
                 ));
             }
-            let text = match db.execute_with(&sql, &params)? {
+            let text = match db.execute_with(&sql, &params)?.finished()? {
                 crate::engine::Outcome::Ack(m) => m,
                 other => format!("{other:?}"),
             };

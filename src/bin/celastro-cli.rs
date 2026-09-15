@@ -73,6 +73,9 @@ COMMANDS:
   tls secret <SECRET> <NAME> [<NAMES>] [<DAYS>]
                              the same material as the Secret SECRET, through the cluster's API
                              from inside a pod; a Secret already there is left as it is
+  send <URL> <SQL>           one statement to the console at URL (http:// or https://, the CA
+                             from CELASTRO_TLS_CA), the token from CELASTRO_TOKEN; prints the
+                             console's answer, exit 1 when it says ok:false
   help                       this
   version                    print the version
 
@@ -191,6 +194,12 @@ enum Cmd {
         name: String,
         names: Vec<String>,
         days: i64,
+    },
+    /// `send <URL> <SQL>`: one statement to a running console, with the
+    /// token in `CELASTRO_TOKEN`.
+    Send {
+        url: String,
+        sql: String,
     },
 }
 
@@ -321,6 +330,16 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
         "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached },
+        "send" => match rest.len() {
+            2 => Cmd::Send { url: rest[0].clone(), sql: rest[1].clone() },
+            _ => {
+                return Cli::Usage(
+                    "`send <URL> <SQL>`: one statement to the console at URL (http:// or https://), \
+                     the token from CELASTRO_TOKEN"
+                        .to_string(),
+                )
+            }
+        },
         "tls" => match rest.first().map(String::as_str) {
             Some("secret") if rest.len() >= 3 && rest.len() <= 5 => {
                 let names: Vec<String> = rest
@@ -499,6 +518,11 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     // directory does not support.
     // Certificates, when the environment names them, before anything
     // listens or dials: a half-set or unreadable one stops the command here.
+    // `send` needs no TLS material of its own: the CA it verifies a console by
+    // is CELASTRO_TLS_CA alone, and it answers before the environment is read.
+    if let Cmd::Send { url, sql } = cmd {
+        return send(&url, &sql, json);
+    }
     let tls = match Tls::from_env() {
         Ok(t) => t.map(Arc::new),
         Err(e) => return fail(json, &e.to_string()),
@@ -537,7 +561,7 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             EXIT_OK
         }
         Cmd::Health { .. } => unreachable!("answered before the database was opened"),
-        Cmd::TlsInit { .. } | Cmd::TlsSecret { .. } => {
+        Cmd::TlsInit { .. } | Cmd::TlsSecret { .. } | Cmd::Send { .. } => {
             unreachable!("answered before the database was opened")
         }
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
@@ -861,6 +885,80 @@ fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
     }
 }
 
+/// `send`: one statement to a console, the way the chart's backup CronJob
+/// runs `BACKUP TO` on each pod. The answer is the console's JSON, printed
+/// as it came (`--json`) or as its message; the exit code follows `ok`.
+/// There is no timeout on the read: a backup answers when it is done.
+fn send(url: &str, sql: &str, json: bool) -> i32 {
+    let Some(token) = std::env::var("CELASTRO_TOKEN").ok().filter(|t| !t.is_empty()) else {
+        return fail(json, "CELASTRO_TOKEN is not set; `send` needs the console's token");
+    };
+    let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(r), _) => (true, r),
+        (_, Some(r)) => (false, r),
+        _ => return fail(json, &format!("`{url}` is not an http:// or https:// URL")),
+    };
+    let host_port = rest.split('/').next().unwrap_or("").trim_end_matches('/');
+    if host_port.is_empty() {
+        return fail(json, &format!("`{url}` names no host"));
+    }
+    let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:{DEFAULT_PORT}")
+    };
+    let body = json::to_string(&Value::obj(vec![("sql".to_string(), Value::Str(sql.to_string()))]));
+    let headers = [("X-Celastro-Token", token.as_str())];
+    let req = celastro::tls::HttpRequest {
+        method: "POST",
+        path: "/api/query",
+        headers: &headers,
+        body: Some(&body),
+    };
+    let answer = if https {
+        let ca = match std::env::var("CELASTRO_TLS_CA").ok().map(std::fs::read_to_string) {
+            Some(Ok(ca)) => ca,
+            Some(Err(e)) => return fail(json, &format!("CELASTRO_TLS_CA: {e}")),
+            None => {
+                return fail(
+                    json,
+                    "an https:// console needs CELASTRO_TLS_CA, the CA to verify it by",
+                )
+            }
+        };
+        celastro::tls::https_request(&addr, host, &ca, &req, Duration::ZERO)
+    } else {
+        celastro::tls::http_request(&addr, host, &req, Duration::ZERO)
+    };
+    let (status, text) = match answer {
+        Ok(a) => a,
+        Err(e) => return fail(json, &format!("reaching {url}: {e}")),
+    };
+    let parsed = json::parse(&text).ok();
+    let ok = parsed.as_ref().and_then(|v| v.get("ok")).and_then(Value::as_bool).unwrap_or(false);
+    if json {
+        println!("{}", text.trim());
+    } else {
+        let message = parsed
+            .as_ref()
+            .and_then(|v| v.get("message").or_else(|| v.get("error")).or_else(|| v.get("text")))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| text.trim().to_string());
+        if ok {
+            println!("{message}");
+        } else {
+            eprintln!("error: {message} (HTTP {status})");
+        }
+    }
+    if ok && (200..300).contains(&status) {
+        EXIT_OK
+    } else {
+        EXIT_FAIL
+    }
+}
+
 /// `tls init`: a self-signed CA and a certificate it signed, as the four PEM
 /// files `serve` reads through `CELASTRO_TLS_CERT`, `_KEY` and `_CA` (the
 /// CA's key is written beside them for a later certificate and is not read
@@ -916,15 +1014,20 @@ fn tls_secret(secret: &str, name: &str, names: &[String], days: i64, json: bool)
     }
     let addr = format!("{host}:{port}");
     let path = format!("/api/v1/namespaces/{namespace}/secrets");
+    let bearer = format!("Bearer {token}");
     let api = |method: &str, path: &str, body: Option<&str>| {
+        let req = celastro::tls::HttpRequest {
+            method,
+            path,
+            headers: &[("Authorization", bearer.as_str())],
+            body,
+        };
         celastro::tls::https_request(
             &addr,
             "kubernetes.default.svc",
             &ca,
-            method,
-            path,
-            &token,
-            body,
+            &req,
+            Duration::from_secs(30),
         )
     };
     let name_json = json::to_string(&Value::Str(secret.to_string()));
@@ -1080,7 +1183,7 @@ fn open_in_browser(url: &str) -> io::Result<()> {
 /// crash: it is reported, and the exit code carries it to the caller.
 fn statement(db: &mut Db, sql: &str, json: bool) -> i32 {
     let t0 = Instant::now();
-    let outcome = db.execute(sql);
+    let outcome = db.execute(sql).and_then(Outcome::finished);
     let took = t0.elapsed();
     match outcome {
         Ok(o) => {
@@ -1128,7 +1231,7 @@ fn script_json(db: &mut Db, stmts: &[String]) -> i32 {
     let mut code = EXIT_OK;
     for stmt in stmts {
         let t0 = Instant::now();
-        let outcome = db.execute(stmt);
+        let outcome = db.execute(stmt).and_then(Outcome::finished);
         let took = t0.elapsed();
         match outcome {
             Ok(o) => results.push(outcome_json(&o, took)),
@@ -1350,6 +1453,7 @@ fn print_outcome(o: &Outcome, d: Duration) {
         Outcome::Explain(t) => print!("{t}"),
         Outcome::Recall(r) => print!("{}", r.render()),
         Outcome::Rows(r) => print_rows(r),
+        Outcome::Deferred(_) => unreachable!("finished before it is printed"),
     }
     println!("({:.2} ms)", millis(d));
 }
@@ -1547,6 +1651,7 @@ fn outcome_json(o: &Outcome, d: Duration) -> Value {
         Outcome::Explain(t) => tagged_json("explain", "text", t),
         Outcome::Recall(r) => tagged_json("recall", "text", &r.render()),
         Outcome::Rows(r) => rows_json(r, d),
+        Outcome::Deferred(_) => unreachable!("finished before it is rendered"),
     }
 }
 
@@ -1650,6 +1755,8 @@ fn db_opts() -> DbOpts {
         o.archive.prefix = var("CELASTRO_ARCHIVE_PREFIX").unwrap_or_default();
         o.archive.region = var("CELASTRO_ARCHIVE_REGION").unwrap_or_default();
     }
+    o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
+    o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
     o
 }
 
@@ -1772,7 +1879,7 @@ fn demo_doc(i: usize, dims: usize, centroids: &[Vec<f32>], rng: &mut Rng) -> Val
 /// One demonstrated statement: a heading, the SQL, and what came back.
 fn demo_step(db: &mut Db, json: bool, out: &mut Vec<Value>, title: &str, sql: &str) -> Result<()> {
     let t0 = Instant::now();
-    let outcome = db.execute(sql)?;
+    let outcome = db.execute(sql)?.finished()?;
     let took = t0.elapsed();
     if json {
         out.push(demo_step_json(title, sql, &outcome, took));
@@ -1857,6 +1964,19 @@ mod tests {
             Cli::Usage(msg) => assert!(msg.contains("--attached")),
             other => panic!("`--attached` outside health must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_takes_a_url_and_one_statement_and_wants_the_token() {
+        match parse(&["send", "http://c:8787", "BACKUP TO '/b'"]) {
+            Cli::Run { cmd: Cmd::Send { url, sql }, .. } => {
+                assert_eq!((url.as_str(), sql.as_str()), ("http://c:8787", "BACKUP TO '/b'"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse(&["send", "http://c:8787"]), Cli::Usage(_)));
+        std::env::remove_var("CELASTRO_TOKEN");
+        assert_eq!(send("http://127.0.0.1:1", "SELECT 1", false), EXIT_FAIL);
     }
 
     #[test]

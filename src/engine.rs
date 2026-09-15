@@ -161,6 +161,12 @@ pub struct DbOpts {
     /// endpoint the local `archive/` directory that stands in for one. The
     /// credentials are read from the environment at open, never stored.
     pub archive: crate::objstore::ArchiveOpts,
+    /// Where `BACKUP TO '<name>'` and `RESTORE FROM '<name>'` resolve a
+    /// relative name, and the one directory an absolute path may point
+    /// into when it is set: a console that takes SQL from the network
+    /// should not be a way to write anywhere on the node. Unset, only
+    /// absolute paths and `s3://` destinations are taken.
+    pub backup_dir: Option<PathBuf>,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -189,6 +195,7 @@ impl Default for DbOpts {
             placement: Placement::default(),
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
             archive: crate::objstore::ArchiveOpts::default(),
+            backup_dir: None,
             node: None,
             tls: None,
         }
@@ -205,12 +212,29 @@ pub struct CollectionExport {
     shards: Vec<ExportShard>,
 }
 
-struct ExportShard {
-    range: (Option<String>, Option<String>),
-    sealed: Vec<Arc<SegmentHandle>>,
-    deletes: Vec<(u64, Option<Vec<u8>>)>,
-    fresh: Option<(u64, Vec<u8>)>,
-    manifest: Vec<u8>,
+pub(crate) struct ExportShard {
+    pub(crate) range: (Option<String>, Option<String>),
+    pub(crate) sealed: Vec<Arc<SegmentHandle>>,
+    pub(crate) deletes: Vec<(u64, Option<Vec<u8>>)>,
+    pub(crate) fresh: Option<(u64, Vec<u8>)>,
+    pub(crate) manifest: Vec<u8>,
+}
+
+/// The bytes of a sealed segment wherever they are: a file, a byte buffer,
+/// or an object in the store.
+pub(crate) fn handle_bytes(h: &SegmentHandle) -> Result<Vec<u8>> {
+    Ok(match h.segment.source() {
+        SegmentSource::File(p) | SegmentSource::Archive(p) => fs::read(&p)?,
+        SegmentSource::Bytes(b) => b.as_ref().clone(),
+        SegmentSource::Remote { store, key, .. } => store.get(&key)?,
+    })
+}
+
+/// `RANGE` as it is written: the low bound, a newline, the high bound, an
+/// absent bound empty.
+pub(crate) fn range_file(range: &(Option<String>, Option<String>)) -> Vec<u8> {
+    let (lo, hi) = range;
+    format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default()).into_bytes()
 }
 
 impl CollectionExport {
@@ -265,11 +289,7 @@ impl CollectionExport {
                     .as_bytes(),
             )?;
             for h in &sh.sealed {
-                let bytes = match h.segment.source() {
-                    SegmentSource::File(p) | SegmentSource::Archive(p) => fs::read(&p)?,
-                    SegmentSource::Bytes(b) => b.as_ref().clone(),
-                    SegmentSource::Remote { store, key, .. } => store.get(&key)?,
-                };
+                let bytes = handle_bytes(h)?;
                 let name = format!("{:016x}.seg", h.id());
                 crate::shard::atomic_write(&sdir.join("segments").join(name), &bytes)?;
             }
@@ -297,7 +317,7 @@ impl CollectionExport {
 /// its delete logs as they stand, the rows still in memory sealed into one
 /// fresh segment, and a manifest naming all of it. What a collection export
 /// writes to disk and what a move sends across the wire.
-fn export_shard(
+pub(crate) fn export_shard(
     coll: &Collection,
     s: &Shard,
     ts: Timestamp,
@@ -638,6 +658,34 @@ pub enum Outcome {
     Rows(QueryResult),
     Explain(String),
     Recall(crate::harness::RecallReport),
+    /// Work the statement left for after the caller's lock is released:
+    /// [`Deferred::finish`] runs it and gives the real outcome. `BACKUP`
+    /// answers with one, so that a node copying gigabytes to a store is not
+    /// a node that refuses every other statement meanwhile.
+    Deferred(Deferred),
+}
+
+/// What a statement pinned under the lock and copies without it. Holds the
+/// segment handles it reads, so a compaction that retires one cannot unlink
+/// the file before the copy has it.
+pub struct Deferred(Box<dyn FnOnce() -> Result<Outcome> + Send>);
+
+impl Deferred {
+    pub(crate) fn new(f: impl FnOnce() -> Result<Outcome> + Send + 'static) -> Deferred {
+        Deferred(Box::new(f))
+    }
+
+    /// Run the work. The caller holds no database lock here, and nothing
+    /// the work does needs one.
+    pub fn finish(self) -> Result<Outcome> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deferred(..)")
+    }
 }
 
 impl Outcome {
@@ -647,6 +695,18 @@ impl Outcome {
             Outcome::Ack(m) => Err(Error::Plan(format!("statement returned no rows: {m}"))),
             Outcome::Explain(_) => Err(Error::Plan("statement returned a plan, not rows".into())),
             Outcome::Recall(_) => Err(Error::Plan("statement returned a recall report".into())),
+            Outcome::Deferred(_) => {
+                Err(Error::Plan("statement returned deferred work, not rows".into()))
+            }
+        }
+    }
+
+    /// The outcome with any deferred work done: what a caller that does not
+    /// hold the database lock across statements calls before it looks.
+    pub fn finished(self) -> Result<Outcome> {
+        match self {
+            Outcome::Deferred(d) => d.finish(),
+            other => Ok(other),
         }
     }
 }
@@ -770,12 +830,22 @@ impl Db {
     /// shard's manifest, then replaying each WAL.
     pub fn open(dir: &Path, opts: DbOpts) -> Result<Db> {
         opts.placement.validate()?;
-        let archive = match opts.archive.endpoint {
-            Some(_) => Some(crate::objstore::ArchiveHandle {
+        let archive = match (&opts.archive.endpoint, &opts.archive.dir) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Storage(
+                    "archive: an endpoint and a directory are both configured; the tier lives in one place"
+                        .into(),
+                ))
+            }
+            (Some(_), None) => Some(crate::objstore::ArchiveHandle {
                 store: Arc::new(crate::objstore::S3Store::from_env(&opts.archive)?),
                 prefix: opts.archive.prefix.clone(),
             }),
-            None => None,
+            (None, Some(d)) => Some(crate::objstore::ArchiveHandle {
+                store: Arc::new(crate::objstore::DirStore::new(d)?),
+                prefix: opts.archive.prefix.clone(),
+            }),
+            (None, None) => None,
         };
         let mut db = Db::with_opts(opts);
         db.archive = archive;
@@ -934,6 +1004,127 @@ impl Db {
             shards.push(export_shard(&coll, s, ts, self.opts.build)?);
         }
         Ok(CollectionExport { name: name.to_string(), ts, catalog, shards })
+    }
+
+    /// `BACKUP TO '<dest>'`: every shard this node holds, pinned at one
+    /// instant under the lock, then copied to the destination without it
+    /// (the answer is [`Outcome::Deferred`]). A directory on any mount, or
+    /// `s3://bucket/prefix` reached through the archive's endpoint and
+    /// credentials. Only the segment files the destination lacks are
+    /// written, so a second backup of a database that did not change copies
+    /// nothing but its record. See `crate::backup` for the layout.
+    pub fn backup(&mut self, dest: &str) -> Result<Outcome> {
+        if self.dir.is_none() {
+            return Err(Error::Plan("BACKUP needs a persistent database (--dir)".into()));
+        }
+        let target =
+            crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), dest)?;
+        let ts = self.clock.peek().max(self.last_commit);
+        let names: Vec<String> = self.catalog.collections.keys().cloned().collect();
+        for name in &names {
+            self.absorb_shard_catalogs(name)?;
+        }
+        let catalog = self.persisted_catalog().encode();
+        let mut colls: crate::backup::Exported = Vec::new();
+        for name in names {
+            let coll = self.catalog.get(&name)?.clone();
+            let mut shards = Vec::new();
+            for s in self.shards(&name)? {
+                let index = shard_index(s.dir(), &name)?;
+                shards.push((index, export_shard(&coll, s, ts, self.opts.build)?));
+            }
+            colls.push((name, shards));
+        }
+        let node = self.opts.node.clone().unwrap_or_default();
+        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, colls)))
+    }
+
+    /// `RESTORE FROM '<src>' [AS OF <ts>]`: the newest complete backup at
+    /// the source, or the one pinned at `ts`, into this database, which has
+    /// to be empty. Every object the backup's record names is verified to
+    /// be there at its recorded size before a byte is written; the shards
+    /// come back placed on this node. The backup is this node's own --
+    /// `CELASTRO_NODE`, or `local` -- unless `NODE '<address>'` names
+    /// another's, which is how a pod restores what a pod of another name
+    /// wrote.
+    pub fn restore(
+        &mut self,
+        src: &str,
+        node: Option<&str>,
+        as_of: Option<u64>,
+    ) -> Result<Outcome> {
+        let Some(dir) = self.dir.clone() else {
+            return Err(Error::Plan("RESTORE needs a persistent database (--dir)".into()));
+        };
+        if !self.catalog.collections.is_empty() {
+            return Err(Error::Plan(format!(
+                "RESTORE needs an empty database; this one has {} collection(s)",
+                self.catalog.collections.len()
+            )));
+        }
+        let target =
+            crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), src)?;
+        let here = self.opts.node.clone().unwrap_or_default();
+        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), as_of)?;
+        let mut catalog = fetched.catalog.clone();
+        let mut shards_restored = 0usize;
+        let mut bytes = 0u64;
+        let mut elsewhere: Vec<String> = Vec::new();
+        for (name, shards) in &fetched.collections {
+            let dest = dir.join("collections").join(name);
+            if dest.exists() {
+                return Err(Error::Storage(format!(
+                    "RESTORE: {} already exists; the database is not empty",
+                    dest.display()
+                )));
+            }
+            let tmp = dir.join("collections").join(format!("{name}.restore.tmp"));
+            let _ = fs::remove_dir_all(&tmp);
+            for (index, files) in shards {
+                let sdir = tmp.join(format!("shard-{index:04}"));
+                bytes += crate::backup::write_shard(&target, &sdir, files)?;
+                shards_restored += 1;
+            }
+            crate::shard::sync_dir(&tmp)?;
+            fs::rename(&tmp, &dest)?;
+            #[cfg(test)]
+            crate::shard::durability_probe::note_rename(&dest);
+            crate::shard::sync_dir(&dir.join("collections"))?;
+            // The shards that came back are here now, whatever node held
+            // them; a tablet the backup did not carry keeps its holder and
+            // is reported, because this node cannot answer for it.
+            if let Some(tablets) = catalog.placement.get_mut(name) {
+                for (i, t) in tablets.iter_mut().enumerate() {
+                    if shards.iter().any(|(index, _)| *index == i) {
+                        t.node = here.clone();
+                    } else {
+                        elsewhere.push(format!("shard {i} of `{name}` on {}", t.node));
+                    }
+                }
+            }
+        }
+        catalog.nodes = self.catalog.nodes.clone();
+        self.catalog = catalog;
+        let names: Vec<String> = self.catalog.collections.keys().cloned().collect();
+        for name in &names {
+            self.attach_collection(&dir, name)?;
+            self.absorb_shard_catalogs(name)?;
+        }
+        self.persist_catalog()?;
+        let mut msg = format!(
+            "restored backup {} of node `{}` from {}: {} collection(s), {shards_restored} shard(s), {bytes} bytes",
+            fetched.ts,
+            crate::backup::node_slug(node.unwrap_or(&here)),
+            target.display,
+            names.len()
+        );
+        if !elsewhere.is_empty() {
+            msg.push_str(&format!(
+                "; not in this backup, still placed where it was: {}",
+                elsewhere.join(", ")
+            ));
+        }
+        Ok(Outcome::Ack(msg))
     }
 
     /// Adopt a collection written by [`CollectionExport::write_to`] into
@@ -2793,6 +2984,8 @@ impl Db {
                 let n = self.flush(&collection)?;
                 Ok(Outcome::Ack(format!("{n} shard(s) flushed")))
             }
+            Statement::Backup { to } => self.backup(&to),
+            Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
             Statement::Compact { collection } => {
                 let n = self.compact(&collection)?;
                 Ok(Outcome::Ack(format!("{n} compaction job(s) run")))
@@ -4162,6 +4355,15 @@ fn cache_key(collection: &str, path: &str) -> String {
 /// defect wearing the opposite disguise, and it used to be read as success:
 /// an `unwrap_or_default()` turned it into `""`, which splits into ONE empty
 /// part, and a shard with no bounds owns every key. It has to fail here.
+/// The tablet index a shard directory's name carries: `shard-0003` is 3.
+fn shard_index(dir: Option<&Path>, name: &str) -> Result<usize> {
+    dir.and_then(|d| d.file_name())
+        .and_then(|f| f.to_str())
+        .and_then(|f| f.strip_prefix("shard-"))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| Error::Storage(format!("a shard of `{name}` has no directory to name it")))
+}
+
 fn read_range(sdir: &Path, i: usize, name: &str) -> Result<(Option<String>, Option<String>)> {
     let ranges = fs::read_to_string(sdir.join("RANGE"))
         .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?;

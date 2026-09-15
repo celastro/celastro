@@ -84,6 +84,14 @@ spec:
             - name: CELASTRO_ARCHIVE_REGION
               value: {{ .Values.archive.region | quote }}
             {{- end }}
+            {{- if .Values.archive.existingClaim }}
+            {{- if not .Values.archive.endpoint }}
+            - name: CELASTRO_ARCHIVE_DIR
+              value: {{ printf "%s/tier" .Values.archive.mountPath | quote }}
+            {{- end }}
+            - name: CELASTRO_BACKUP_DIR
+              value: {{ printf "%s/backups" .Values.archive.mountPath | quote }}
+            {{- end }}
           {{- if .Values.archive.endpoint }}
           envFrom:
             - secretRef:
@@ -126,6 +134,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.archive.existingClaim }}
+            - name: archive
+              mountPath: {{ .Values.archive.mountPath | quote }}
+            {{- end }}
             {{- if .Values.tls.enabled }}
             - name: tls
               mountPath: /tls
@@ -135,11 +147,18 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- if .Values.tls.enabled }}
+      {{- if or .Values.tls.enabled .Values.archive.existingClaim }}
       volumes:
+        {{- if .Values.tls.enabled }}
         - name: tls
           secret:
             secretName: {{ include "celastro.tlsSecretName" . }}
+        {{- end }}
+        {{- if .Values.archive.existingClaim }}
+        - name: archive
+          persistentVolumeClaim:
+            claimName: {{ .Values.archive.existingClaim | quote }}
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

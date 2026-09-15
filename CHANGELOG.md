@@ -6,6 +6,35 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.30.0 — 2026-09-15
+
+Backups, and the archived tier on any mount, hence a minor.
+
+**`BACKUP TO '<dir or s3://bucket/prefix>'`** copies the shards this node
+holds, pinned at one instant, to a directory or a bucket: sealed segments
+into a pool once (a second backup copies only the new ones), and per
+backup the catalog, manifests, delete logs, the rows that were in memory,
+and a record naming every object; `LATEST` names the newest complete one.
+The statement pins under the lock and copies after it — a new
+`Outcome::Deferred`, which the console, the CLI and the wire finish once
+the lock is let go — so a node backing up keeps answering. **`RESTORE
+FROM '<src>' [NODE '<address>'] [AS OF <ts>]`** into an empty `--dir`
+verifies every object at its recorded size before it writes, and places
+the shards on the restoring node; each node backs up under its own name,
+so a cluster's pods share a destination and each restores its own. `CELASTRO_BACKUP_DIR` confines the paths a statement may
+name. **`celastro-cli send <URL> <SQL>`** carries a statement to a running
+console over http or https (`CELASTRO_TOKEN`, `CELASTRO_TLS_CA`).
+
+**`CELASTRO_ARCHIVE_DIR`** puts the `archived` tier in a directory on any
+mount — an NFS volume — behind the same `ObjectStore` trait as the bucket
+(`DirStore`: temp, fsync, rename, directory fsync per object), and the
+trait gained `list` (`ListObjectsV2` on S3).
+
+**The chart** (0.8.0) takes `archive.existingClaim`, an RWX claim mounted
+at `archive.mountPath` (`/archive`) that carries the tier (unless a bucket
+is configured) and the backups, and `backup.schedule` with `backup.to`, a
+CronJob that sends `BACKUP TO` to every pod's console.
+
 ## 0.29.1 — 2026-09-15
 
 A latency fix, hence a patch.

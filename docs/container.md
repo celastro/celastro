@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.29.1
+docker pull ghcr.io/celastro/celastro:0.30.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -155,6 +155,12 @@ answer executes nothing. The Helm chart uses it for both probes.
 make the `archived` tier an S3-compatible bucket instead of a directory in the
 volume. Pass them with `-e`; the credentials are never written to the data
 directory.
+
+`CELASTRO_ARCHIVE_DIR` puts the `archived` tier in a directory instead — a
+mounted NFS volume, say — and `CELASTRO_BACKUP_DIR` is where `BACKUP TO
+'<name>'` and `RESTORE FROM '<name>'` resolve a bare name, and the only
+directory a path in those statements may point into; both are read at
+open.
 
 ## The console binds loopback, and `-p` therefore cannot reach it
 
