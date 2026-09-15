@@ -270,7 +270,10 @@ requires a browser's `Origin` to be that host. It is plain HTTP; keep it
 inside a network you trust or behind an ingress that terminates TLS. Any node
 coordinates a statement over every node's shards, and `/api/health` names
 the node that answered, so a client behind a balancer can see its requests
-spread.
+spread. Connections are served at once, up to sixty-four, with the database
+locked only around the statement; the statements themselves serialise per
+node, because the engine is single-writer — a node runs one at a time, and
+the threads see to it that the one running never waits on a socket.
 
 ## Copying a collection
 
@@ -388,7 +391,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.24.0 && docker tag ghcr.io/celastro/celastro:0.24.0 celastro
+docker pull ghcr.io/celastro/celastro:0.25.0 && docker tag ghcr.io/celastro/celastro:0.25.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

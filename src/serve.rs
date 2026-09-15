@@ -27,7 +27,8 @@
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -64,7 +65,7 @@ const MAX_HEADERS: usize = 64;
 /// These are deadlines and not per-read timeouts, and the difference is the
 /// whole point. `SO_RCVTIMEO` bounds one `recv`, so a client that sends a
 /// single byte just before each timeout expires restarts the clock forever and
-/// holds this single-threaded loop open without a token, without a route and
+/// holds one of the connection threads open without a token, without a route and
 /// without ever finishing a request. Every read re-arms the socket with the
 /// time that is actually left, so the exchange is bounded by the clock rather
 /// than by the client's willingness to dribble.
@@ -81,6 +82,11 @@ const MAX_DRAIN: u64 = 4 * MAX_BODY as u64;
 /// many of those in a row it tolerates before giving up. See `accept_backoff`.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_ACCEPT_FAILURES: u32 = 40;
+
+/// Connections served at once. Past this the listener stops accepting and
+/// the kernel's backlog holds the rest; a thread per connection is what a
+/// stalled client costs, and sixty-four of them is a limit, not a pool.
+const MAX_CONNECTIONS: usize = 64;
 
 // ---------------------------------------------------------------- the server
 
@@ -192,12 +198,17 @@ impl Server {
 
     /// Serve until a shutdown is requested. Returns `Ok(())` on clean shutdown.
     ///
-    /// One request at a time, single-threaded, deliberately. `Db::query` and
-    /// `Db::execute` take `&mut self`, so a worker pool would have to put the
-    /// database behind a `Mutex` and would then serialise on that mutex
-    /// anyway — the threads would buy nothing but the bugs. This is a local
-    /// console, not a server: a slow query blocks the UI until it finishes, and
-    /// that is the accepted trade.
+    /// A thread per connection, at most [`MAX_CONNECTIONS`] of them, and the
+    /// database locked only around the statement: reading a request, parsing
+    /// it, checking it and writing its answer all happen outside the lock, so
+    /// a client that is slow to send or slow to read delays nobody but
+    /// itself. The statements themselves still serialise -- `Db::query` and
+    /// `Db::execute` take `&mut self`, and the engine is single-writer -- so
+    /// a node runs one statement at a time whatever the thread count; what
+    /// the threads buy is that the one statement running is never waiting on
+    /// a socket. Until 0.25.0 the loop was one thread, request and all under
+    /// the lock, which was right for a console on loopback and wrong for one
+    /// behind a Service.
     ///
     /// A per-connection failure is logged and the loop continues. A client that
     /// hangs up mid-request, sends garbage, or trips a deadline is not a reason
@@ -213,21 +224,36 @@ impl Server {
         const POLL: Duration = Duration::from_millis(25);
         self.listener.set_nonblocking(true)?;
         let mut failures = 0u32;
-        loop {
-            if crate::signal::shutdown_requested() {
+        // Set by the connection that was asked to shut down; the loop reads
+        // it between accepts, and the scope waits for the connections in
+        // flight before `run` returns and the caller persists.
+        let stop = AtomicBool::new(false);
+        let active = AtomicUsize::new(0);
+        let server = &self;
+        std::thread::scope(|scope| loop {
+            if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
                 return Ok(());
             }
-            match self.listener.accept() {
+            if active.load(AtomicOrdering::Acquire) >= MAX_CONNECTIONS {
+                std::thread::sleep(POLL);
+                continue;
+            }
+            match server.listener.accept() {
                 Ok((s, _)) => {
                     failures = 0;
                     // The listener's flag is not inherited on every platform
                     // and must not be here: a connection is served blocking.
                     s.set_nonblocking(false)?;
-                    match self.serve_one(s, db) {
-                        Ok(Next::Serve) => {}
-                        Ok(Next::Stop) => return Ok(()),
-                        Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
-                    }
+                    active.fetch_add(1, AtomicOrdering::AcqRel);
+                    let (active, stop) = (&active, &stop);
+                    scope.spawn(move || {
+                        match server.serve_one(s, db) {
+                            Ok(Next::Serve) => {}
+                            Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
+                            Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
+                        }
+                        active.fetch_sub(1, AtomicOrdering::AcqRel);
+                    });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
                 Err(e) => {
@@ -248,7 +274,7 @@ impl Server {
                     }
                 }
             }
-        }
+        })
     }
 
     fn serve_one(&self, stream: TcpStream, db: &Mutex<Db>) -> std::io::Result<Next> {
@@ -256,12 +282,9 @@ impl Server {
         // The read side is armed per read, from the deadline, by `Wire::arm`.
         let deadlines = Deadlines::from_now();
         let mut io = BufReader::new(stream);
-        // Under the lock for the whole request, as the wire's calls are: the
-        // engine is single-threaded and the lock is what serialises the two.
-        let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-        let served =
-            answer(&mut io, &self.token, self.addr.port(), self.reach, &mut guard, deadlines);
-        drop(guard);
+        // The lock is taken inside `answer`, around the statement and nothing
+        // else; the socket is never read or written under it.
+        let served = answer(&mut io, &self.token, self.addr.port(), self.reach, db, deadlines);
         let socket = io.get_mut();
         served.response.write_to(socket)?;
         socket.flush()?;
@@ -1072,12 +1095,18 @@ impl Served {
 
 /// Read one request and produce one response. Never fails: a protocol problem
 /// is a status code, and a SQL problem is a JSON body.
+/// The database, whoever held it last: a statement that panicked with the
+/// lock held has already been reported, and the console keeps serving.
+fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
+    db.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn answer<W: Wire>(
     io: &mut W,
     token: &str,
     port: u16,
     reach: Reach,
-    db: &mut Db,
+    db: &Mutex<Db>,
     dl: Deadlines,
 ) -> Served {
     let head = match read_head(io, dl.head) {
@@ -1101,8 +1130,8 @@ fn answer<W: Wire>(
     let served = match action {
         Err(r) => Served::keep(r.response()),
         Ok(Action::Reply(response)) => Served::keep(response),
-        Ok(Action::Health) => Served::keep(Response::json(health_json(db))),
-        Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(db))),
+        Ok(Action::Health) => Served::keep(Response::json(health_json(&lock(db)))),
+        Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(&lock(db)))),
         Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
     };
@@ -1115,13 +1144,16 @@ fn answer<W: Wire>(
     }
 }
 
-fn query_response<W: Wire>(io: &mut W, head: &Head, db: &mut Db, deadline: Instant) -> Response {
+/// The body is read and parsed before the lock is taken, so a client that
+/// sends its statement slowly holds up nobody's; the lock covers the
+/// statement and the persist that follows it.
+fn query_response<W: Wire>(io: &mut W, head: &Head, db: &Mutex<Db>, deadline: Instant) -> Response {
     let body = match read_body(io, head.content_length, deadline) {
         Ok(b) => b,
         Err(r) => return r.response(),
     };
     match sql_from_body(&body) {
-        Ok(sql) => run_sql(db, &sql),
+        Ok(sql) => run_sql(&mut lock(db), &sql),
         Err(r) => r.response(),
     }
 }
@@ -1595,7 +1627,9 @@ mod tests {
     /// The same, keeping the database and the caller's marching orders.
     fn serve_request(db: &mut Db, request: &str) -> (String, Next) {
         let mut io = Cursor::new(request.as_bytes());
-        let served = answer(&mut io, "tok", PORT, Reach::Loopback, db, wide());
+        let shared = Mutex::new(std::mem::take(db));
+        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
+        *db = shared.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::new();
         served.response.write_to(&mut out).expect("a Vec never fails to be written to");
         (String::from_utf8(out).expect("responses are utf-8"), served.next)
@@ -2036,6 +2070,54 @@ mod tests {
     /// that is up but not well answers false, and a port with nothing on it
     /// is an error rather than a false -- different answers for a
     /// supervisor.
+    /// Behind a Service every pod is one console; a client that opens a
+    /// connection and sends nothing must not be the statement everybody
+    /// else waits behind. The idle connection's head deadline (two seconds)
+    /// is longer than this test allows the other request (one), so a loop
+    /// that served one connection at a time fails it.
+    #[test]
+    fn an_idle_connection_does_not_delay_another_clients_statement() {
+        use std::io::{Read, Write};
+        let server = Server::bind(0).unwrap();
+        let port = server.local_addr().port();
+        let token = server.token().to_string();
+        let db = std::sync::Arc::new(Mutex::new(Db::in_memory()));
+        let serving = {
+            let db = db.clone();
+            std::thread::spawn(move || server.run(&db))
+        };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let idle = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        // Sends nothing, stays open.
+        let started = Instant::now();
+        let mut busy = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        busy.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = format!(
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        busy.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        busy.read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the statement waited {:?} behind an idle connection",
+            started.elapsed()
+        );
+        assert!(HEAD_DEADLINE > Duration::from_secs(1), "the test's bound is inside the deadline");
+        drop(idle);
+        let mut stop = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let shutdown = format!(
+            "POST /api/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Celastro-Token: {token}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stop.write_all(shutdown.as_bytes()).unwrap();
+        let mut raw = String::new();
+        let _ = stop.read_to_string(&mut raw);
+        assert!(raw.starts_with("HTTP/1.1 200 "), "{raw}");
+        serving.join().unwrap().unwrap();
+    }
+
     #[test]
     fn the_probe_tells_serving_from_unwell_from_absent() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2416,7 +2498,7 @@ mod tests {
     fn a_client_that_dribbles_forever_is_cut_off_by_the_deadline() {
         // `SO_RCVTIMEO` bounds one `recv`, not the request, so a byte sent
         // every fourteen seconds against a fifteen-second timeout holds this
-        // single-threaded loop open for as long as the client likes — with no
+        // connection thread open for as long as the client likes — with no
         // token, no route and no request ever completed. Any web page can do
         // it. The deadline is absolute, so the dribble does not extend it.
         let mut wire = Dribble::new(Duration::from_millis(2));
@@ -2504,9 +2586,10 @@ mod tests {
         let mut request = String::from("POST /api/query?t=nope HTTP/1.1\r\nHost: localhost\r\n");
         request.push_str("Content-Type: application/json\r\n");
         request.push_str(&format!("Content-Length: {}\r\n\r\n{sql}", sql.len()));
-        let mut db = Db::in_memory();
+        let db = Db::in_memory();
         let mut io = Cursor::new(request.as_bytes());
-        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &mut db, wide());
+        let shared = Mutex::new(db);
+        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
         assert_eq!(served.response.status, 401);
         assert_eq!(io.position() as usize, request.len(), "the refused body must be drained");
 

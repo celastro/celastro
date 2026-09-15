@@ -6,6 +6,24 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.25.0 — 2026-09-15
+
+The console serves connections at once, hence a minor.
+
+**A thread per connection, the lock around the statement.** The console
+used to serve one connection at a time on one thread with the database
+locked for the whole request, which was right for a console on loopback
+and wrong for one behind a Service: a client slow to send or to read
+stalled every other. Now each connection has a thread, at most sixty-four
+at once (the listener stops accepting past that and the kernel's backlog
+holds the rest), and the database is locked only around the statement and
+the persist that follows it — reading the request, parsing, the guards and
+writing the answer all happen outside it. Statements still serialise per
+node: the engine is single-writer, so a node runs one statement at a time
+whatever the thread count; what the threads buy is that the one running
+is never waiting on a socket. Pinned by a test over a real listener: an
+idle connection does not delay another client's statement.
+
 ## 0.24.0 — 2026-09-15
 
 The console can serve a cluster's clients, hence a minor.
