@@ -14,7 +14,7 @@ replicas: 1
 # one, give one here, or leave both empty and the chart generates one and
 # keeps it across upgrades.
 wire:
-  port: 9000
+  port: 2352
   token: ""
   existingSecret: ""
 

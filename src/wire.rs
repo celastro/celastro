@@ -68,6 +68,10 @@ use crate::value::Value;
 pub const WIRE_VERSION: u8 = 4;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
+/// The port a node serves its shards on when none is given: `tcp://host`
+/// means `tcp://host:2352`, and `--shard-bind ADDR` means `ADDR:2352`.
+/// Until 0.35.0 every example said 9000 and no default existed.
+pub const DEFAULT_WIRE_PORT: u16 = 2352;
 const MAX_FRAME: u32 = 256 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a dial that fails outright -- a name that does not resolve, a
@@ -158,13 +162,23 @@ impl Call {
 /// to the wire by mistake.
 pub fn parse_url(url: &str) -> Result<String> {
     let Some(rest) = url.strip_prefix("tcp://") else {
-        return Err(Error::Plan(format!("a node address is `tcp://host:port`, not `{url}`")));
+        return Err(Error::Plan(format!("a node address is `tcp://host[:port]`, not `{url}`")));
     };
     match rest.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {
             Ok(rest.to_string())
         }
-        _ => Err(Error::Plan(format!("a node address is `tcp://host:port`, not `{url}`"))),
+        Some(_) => Err(Error::Plan(format!("a node address is `tcp://host[:port]`, not `{url}`"))),
+        None if !rest.is_empty() => Ok(with_default_port(rest)),
+        None => Err(Error::Plan(format!("a node address is `tcp://host[:port]`, not `{url}`"))),
+    }
+}
+
+/// `host:port` as given, or `host:2352` for a bare host.
+pub fn with_default_port(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((_, port)) if port.parse::<u16>().is_ok() => addr.to_string(),
+        _ => format!("{addr}:{DEFAULT_WIRE_PORT}"),
     }
 }
 
@@ -1496,11 +1510,16 @@ mod tests {
 
     #[test]
     fn addresses_are_tcp_host_port_and_nothing_else() {
-        assert_eq!(parse_url("tcp://127.0.0.1:9000").unwrap(), "127.0.0.1:9000");
+        assert_eq!(parse_url("tcp://127.0.0.1:2352").unwrap(), "127.0.0.1:2352");
         assert_eq!(parse_url("tcp://db-b:9000").unwrap(), "db-b:9000");
-        for bad in ["http://127.0.0.1:9000", "tcp://127.0.0.1", "tcp://:9000", "127.0.0.1:9000"] {
+        assert_eq!(parse_url("tcp://db-b").unwrap(), "db-b:2352", "the port defaults");
+        for bad in
+            ["http://127.0.0.1:2352", "tcp://:2352", "127.0.0.1:2352", "tcp://", "tcp://db-b:x"]
+        {
             assert!(parse_url(bad).is_err(), "{bad}");
         }
+        assert_eq!(with_default_port("0.0.0.0"), "0.0.0.0:2352");
+        assert_eq!(with_default_port("0.0.0.0:9000"), "0.0.0.0:9000");
     }
 
     #[test]

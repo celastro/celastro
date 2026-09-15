@@ -186,6 +186,12 @@ pub struct Hnsw {
     /// `1/e^level`, so a map beats a dense array by orders of magnitude.
     upper: Vec<BTreeMap<u32, Vec<u32>>>,
     node_level: Vec<u8>,
+    /// The distance beside each link, kept only while building: when a
+    /// neighbour's list overflows and is pruned, the candidates' distances
+    /// are here rather than measured again (one per link, per insertion,
+    /// before 0.35.0). Empty once the build returns and never serialised.
+    dist0: Vec<f32>,
+    upper_d: Vec<BTreeMap<u32, Vec<f32>>>,
 }
 
 impl Hnsw {
@@ -199,6 +205,8 @@ impl Hnsw {
             deg0: Vec::new(),
             upper: Vec::new(),
             node_level: Vec::new(),
+            dist0: Vec::new(),
+            upper_d: Vec::new(),
         }
     }
 
@@ -219,6 +227,43 @@ impl Hnsw {
             &self.link0[base..base + self.deg0[id as usize] as usize]
         } else {
             self.upper.get(level - 1).and_then(|m| m.get(&id)).map(|v| v.as_slice()).unwrap_or(&[])
+        }
+    }
+
+    /// The links of `id` at `level` with the distances the build stored.
+    fn neighbors_with(&self, level: usize, id: u32) -> Vec<Cand> {
+        let ids = self.neighbors(level, id);
+        let ds: &[f32] = if level == 0 {
+            let base = id as usize * self.params.m0;
+            &self.dist0[base..base + ids.len()]
+        } else {
+            self.upper_d
+                .get(level - 1)
+                .and_then(|m| m.get(&id))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        };
+        ids.iter().zip(ds).map(|(&n, &d)| Cand { d, id: n }).collect()
+    }
+
+    /// `set_neighbors`, with each link's distance kept beside it.
+    fn set_neighbors_with(&mut self, level: usize, id: u32, ns: &[Cand]) {
+        let ids: Vec<u32> = ns.iter().map(|c| c.id).collect();
+        self.set_neighbors(level, id, &ids);
+        if level == 0 {
+            let m0 = self.params.m0;
+            let base = id as usize * m0;
+            let n = ns.len().min(m0);
+            for (k, c) in ns.iter().take(n).enumerate() {
+                self.dist0[base + k] = c.d;
+            }
+        } else {
+            while self.upper_d.len() < level {
+                self.upper_d.push(BTreeMap::new());
+            }
+            let mut v: Vec<f32> = ns.iter().map(|c| c.d).collect();
+            v.truncate(self.params.m);
+            self.upper_d[level - 1].insert(id, v);
         }
     }
 
@@ -246,6 +291,7 @@ impl Hnsw {
         let mut g = Hnsw::empty(params);
         g.count = count;
         g.link0 = vec![0u32; count * params.m0];
+        g.dist0 = vec![0.0f32; count * params.m0];
         g.deg0 = vec![0u16; count];
         g.node_level = vec![0u8; count];
 
@@ -283,21 +329,23 @@ impl Hnsw {
                 let found = g.search_layer_build(&cur_ep, params.ef_construction, l, &d_to);
                 let m = if l == 0 { params.m0 } else { params.m };
                 let selected = g.select_neighbors(&found, m, dist);
-                g.set_neighbors(l, id, &selected);
-                for &n in &selected {
-                    let mut ns = g.neighbors(l, n).to_vec();
-                    if !ns.contains(&id) {
-                        ns.push(id);
+                g.set_neighbors_with(l, id, &selected);
+                for c in &selected {
+                    // The reverse link, with the distance already measured:
+                    // the metric is symmetric, and the build keeps every
+                    // link's distance beside it.
+                    let n = c.id;
+                    let mut ns = g.neighbors_with(l, n);
+                    if !ns.iter().any(|x| x.id == id) {
+                        ns.push(Cand { d: c.d, id });
                     }
                     if ns.len() > m {
                         // Re-select rather than truncate: dropping the farthest
                         // neighbour blindly is what turns a navigable graph into
                         // a set of disconnected clusters.
-                        let cands: Vec<Cand> =
-                            ns.iter().map(|&x| Cand { d: dist(n, x), id: x }).collect();
-                        ns = g.select_neighbors(&cands, m, dist);
+                        ns = g.select_neighbors(&ns, m, dist);
                     }
-                    g.set_neighbors(l, n, &ns);
+                    g.set_neighbors_with(l, n, &ns);
                 }
                 cur_ep = found.iter().map(|c| c.id).collect();
                 if cur_ep.is_empty() {
@@ -309,6 +357,8 @@ impl Hnsw {
                 g.entry = id;
             }
         }
+        g.dist0 = Vec::new();
+        g.upper_d = Vec::new();
         g
     }
 
@@ -383,30 +433,28 @@ impl Hnsw {
         cands: &[Cand],
         m: usize,
         dist: &dyn Fn(u32, u32) -> f32,
-    ) -> Vec<u32> {
+    ) -> Vec<Cand> {
         let mut sorted = cands.to_vec();
         sorted.sort();
-        let mut kept: Vec<u32> = Vec::with_capacity(m);
-        for c in sorted {
+        let mut kept: Vec<Cand> = Vec::with_capacity(m);
+        for c in &sorted {
             if kept.len() >= m {
                 break;
             }
-            let good = kept.iter().all(|&k| dist(c.id, k) > c.d);
+            let good = kept.iter().all(|k| dist(c.id, k.id) > c.d);
             if good {
-                kept.push(c.id);
+                kept.push(*c);
             }
         }
         // Backfill with the nearest rejected candidates rather than return a
         // short list; an under-connected node is a recall hole.
         if kept.len() < m {
-            let mut sorted2 = cands.to_vec();
-            sorted2.sort();
-            for c in sorted2 {
+            for c in &sorted {
                 if kept.len() >= m {
                     break;
                 }
-                if !kept.contains(&c.id) {
-                    kept.push(c.id);
+                if !kept.iter().any(|k| k.id == c.id) {
+                    kept.push(*c);
                 }
             }
         }
@@ -653,7 +701,18 @@ impl Hnsw {
             }
             upper.push(layer);
         }
-        Ok(Hnsw { params, count, entry, max_level, link0, deg0, upper, node_level })
+        Ok(Hnsw {
+            params,
+            count,
+            entry,
+            max_level,
+            link0,
+            deg0,
+            upper,
+            node_level,
+            dist0: Vec::new(),
+            upper_d: Vec::new(),
+        })
     }
 }
 

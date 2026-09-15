@@ -6,6 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.35.0 — 2026-09-15
+
+The wire's port, and the second half of the build speed; hence a minor.
+
+**The wire's default port is 2352.** `tcp://host` means `tcp://host:2352`
+in every address (`CELASTRO_NODE`, `ATTACH NODE`, `MOVE SHARD`,
+`CELASTRO_ATTACH`), `serve --shard-bind ADDR` binds `ADDR:2352`, and the
+chart's `wire.port` defaults to it; a port given explicitly is used as it
+is. Until now every example said 9000 and no default existed
+(`wire::DEFAULT_WIRE_PORT`, `wire::with_default_port`).
+
+**The distance kernels use AVX2 and FMA where the CPU has them**
+(`std::arch`, detected once at first use; the portable loop elsewhere),
+and the HNSW build keeps each link's distance beside it, so pruning an
+overflowing neighbour list measures nothing twice. `COMPACT` over 50,000
+vectors 115 → 94 s; recall on the harness identical (0.865 mean, 0.60
+worst over 100 replayed queries). The build is bound by the cache
+misses of some 35,000 random vector reads per inserted node, not by
+arithmetic: a prefetch a loop ahead changed nothing and was not kept.
+Scores can differ in their last bits between machines with and without
+FMA; every claim the crate pins is within one process.
+
 ## 0.34.0 — 2026-09-15
 
 What a lost node costs, narrowed; hence a minor.

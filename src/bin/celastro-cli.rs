@@ -57,7 +57,7 @@ USAGE:
 COMMANDS:
   serve [--port N] [--open]  serve the browser UI on 127.0.0.1
         [--bind ADDR]            or on ADDR, answering the token in CELASTRO_TOKEN
-        [--shard-bind ADDR:PORT] and this node's shards to other nodes
+        [--shard-bind ADDR[:PORT]] and this node's shards to other nodes (port 2352)
   exec <SQL>                 run one statement and print the result
   run <FILE>                 run a script of statements
   repl                       interactive session on stdin
@@ -99,8 +99,9 @@ terminal does not cost committed writes.
 
 A node in a cluster is started with CELASTRO_NODE=tcp://host:port, its address
 in every placement map, and CELASTRO_WIRE_TOKEN, the secret every node shares;
-`serve --shard-bind ADDR:PORT` then serves its shards to the others, and
-CELASTRO_ATTACH=tcp://a:9000,tcp://b:9000 names the peers it attaches as they
+`serve --shard-bind ADDR[:PORT]` then serves its shards to the others (2352 when
+no port is given, in addresses too), and CELASTRO_ATTACH=tcp://a,tcp://b:2352
+names the peers it attaches as they
 come up, its own address skipped, so every node of a cluster can be given the
 same list. ATTACH NODE, CREATE COLLECTION ... WITH (nodes = [...]), MOVE SHARD,
 REBALANCE and LOCAL are the statements that go with it; docs/design.md has the
@@ -798,6 +799,7 @@ fn serve(
                 &format!("--shard-bind needs {} in the environment", celastro::wire::TOKEN_ENV),
             );
         };
+        let bind = celastro::wire::with_default_port(&bind);
         let listener = match TcpListener::bind(&bind) {
             Ok(l) => l,
             Err(e) => return fail(json, &format!("could not bind {bind} for the wire: {e}")),

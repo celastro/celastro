@@ -23,7 +23,7 @@ CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
 ```
 
 Raising `replicas` adds attached nodes; `REBALANCE notes` moves shards onto
-them, `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:9000'` moves one
+them, `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:2352'` moves one
 by hand. Lowering `replicas` strands the shards on the removed pods' volumes:
 move them off first. The wire is plain TCP with the shared token inside the
 cluster network, encrypted with `tls.enabled` (below).
@@ -116,7 +116,7 @@ restore, start an empty release (a new name, or the same one with its
 volumes gone), mount the same claim, and run on each pod — `celastro-cli
 send` from a pod with the token, or the console UI — `RESTORE FROM
 'nightly'`: every pod backs up under its own address, so a pod restores
-what its namesake wrote (`NODE 'tcp://<pod>.<release>:9000'` for another
+what its namesake wrote (`NODE 'tcp://<pod>.<release>:2352'` for another
 one's), and a pod that held shards `0` and `2` restores those. The pods
 have no NFS client of their own: the claim is the cluster's.
 
@@ -133,8 +133,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.34.0 .
-kind load docker-image celastro:0.34.0        # for a kind cluster
+docker build -t celastro:0.35.0 .
+kind load docker-image celastro:0.35.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -194,7 +194,7 @@ changelog; those need every pod restarted together
 |---|---|---|
 | `image.repository`, `image.tag` | `ghcr.io/celastro/celastro`, the chart's `appVersion` | the image; `pullPolicy` is `IfNotPresent` |
 | `replicas` | `1` | pods; more than one is a cluster of nodes |
-| `wire.port` | `9000` | the port pods serve their shards on to each other |
+| `wire.port` | `2352` | the port pods serve their shards on to each other |
 | `wire.token`, `wire.existingSecret` | empty | the shared token, or a `Secret` with the key `CELASTRO_WIRE_TOKEN`; both empty generates one, kept across upgrades |
 | `port` | `8787` | the console's port inside the pod |
 | `console.expose` | `false` | serve the console on every interface, one token at every pod, behind the Service `<release>-console` |

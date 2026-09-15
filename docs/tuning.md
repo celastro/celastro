@@ -70,7 +70,7 @@ the shape it was built with.
 | `CELASTRO_VECTOR_QUANTIZER` | `sq8` | The compact code the graph is searched with: `sq8` (one byte a dimension) or `one-bit` (a bit a dimension, eight times smaller, coarser). Full-precision rerank follows either. |
 | `CELASTRO_HNSW_M` | `16` | Neighbours per node above the bottom layer. More: better recall, more memory per vector, slower build. |
 | `CELASTRO_HNSW_M0` | `32` | Neighbours per node on the bottom layer. |
-| `CELASTRO_HNSW_EF_CONSTRUCTION` | `200` | The beam at build time. More: better graph, slower build. The build is where a vector collection's CPU goes: at 200, a 16,384-node graph over 128 dimensions takes 34 s on one core (0.33.1; 85 s before it) and `COMPACT` over 50,000 vectors around 115 s, two thirds of it distance evaluations -- some 35,000 per node inserted. Halving it roughly halves both; measure recall with `MEASURE RECALL` before settling. |
+| `CELASTRO_HNSW_EF_CONSTRUCTION` | `200` | The beam at build time. More: better graph, slower build. The build is where a vector collection's CPU goes: at 200, a 16,384-node graph over 128 dimensions takes 33 s on one core (85 s before 0.33.1) and `COMPACT` over 50,000 vectors 94 s (0.35.0; 247 s before 0.33.1), most of it distance evaluations -- some 35,000 per node inserted, each a cache miss on a random vector, which is why wider SIMD did little and fewer evaluations is the lever. Halving it roughly halves both; measure recall with `MEASURE RECALL` before settling. |
 | `CELASTRO_FLAT_TIER_MAX` | `4096` | Segments with this many vectors or fewer are searched brute force rather than through a graph: exact, and faster than a graph at this size. |
 
 ## What is not a knob

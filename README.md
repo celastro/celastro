@@ -226,14 +226,14 @@ Each node is its own process and directory, started with an address and the
 secret every node shares, serving its shards to the others:
 
 ```
-CELASTRO_NODE=tcp://10.0.0.2:9000 CELASTRO_WIRE_TOKEN=... celastro-cli --dir ./data serve --shard-bind 0.0.0.0:9000
+CELASTRO_NODE=tcp://10.0.0.2:2352 CELASTRO_WIRE_TOKEN=... celastro-cli --dir ./data serve --shard-bind 0.0.0.0
 ```
 
 ```sql
-ATTACH NODE 'tcp://10.0.0.3:9000';
+ATTACH NODE 'tcp://10.0.0.3';               -- port 2352 unless given
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
   PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per node
-MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:9000';
+MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';
 REBALANCE notes;
 ```
 
@@ -270,8 +270,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.34.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.34.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.35.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.35.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

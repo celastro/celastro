@@ -13,8 +13,134 @@
 
 use crate::catalog::Metric;
 
+/// `dot` and `l2_squared` dispatch once, at first use, on what the CPU has:
+/// AVX2 with FMA when `x86_64` has them, the portable four-lane loop
+/// otherwise. The two round differently -- FMA rounds a multiply-add once
+/// where the portable loop rounds twice, and eight lanes sum in another
+/// order -- so a score can differ in its last bits between machines. Every
+/// claim the crate pins is within one process, where the function is one.
+#[cfg(target_arch = "x86_64")]
+mod avx {
+    use std::arch::x86_64::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// 0 not yet asked, 1 absent, 2 present.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+
+    #[inline]
+    pub fn available() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => {
+                let ok = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+                STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+                ok
+            }
+        }
+    }
+
+    /// The eight lanes of an accumulator, summed.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_hadd_ps(s, s);
+        let s = _mm_hadd_ps(s, s);
+        _mm_cvtss_f32(s)
+    }
+
+    /// # Safety
+    /// The caller has checked `available()`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut i = 0;
+        // Two accumulators over sixteen elements, so the two fused adds do
+        // not wait on each other.
+        while i + 16 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 8)),
+                _mm256_loadu_ps(pb.add(i + 8)),
+                acc1,
+            );
+            i += 16;
+        }
+        while i + 8 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            i += 8;
+        }
+        let mut s = hsum(_mm256_add_ps(acc0, acc1));
+        while i < n {
+            s += a[i] * b[i];
+            i += 1;
+        }
+        s
+    }
+
+    /// # Safety
+    /// The caller has checked `available()`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let d0 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+            let d1 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)));
+            acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+            i += 16;
+        }
+        while i + 8 <= n {
+            let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+            acc0 = _mm256_fmadd_ps(d, d, acc0);
+            i += 8;
+        }
+        let mut s = hsum(_mm256_add_ps(acc0, acc1));
+        while i < n {
+            let d = a[i] - b[i];
+            s += d * d;
+            i += 1;
+        }
+        s
+    }
+}
+
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::available() {
+            // SAFETY: `available` checked avx2 and fma on this CPU.
+            return unsafe { avx::dot(a, b) };
+        }
+    }
+    dot_scalar(a, b)
+}
+
+#[inline]
+pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::available() {
+            // SAFETY: `available` checked avx2 and fma on this CPU.
+            return unsafe { avx::l2_squared(a, b) };
+        }
+    }
+    l2_squared_scalar(a, b)
+}
+
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     // Four accumulators over chunks of four, then the tail: the same
     // operations in the same order as the indexed loop this replaces, so
@@ -41,7 +167,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[inline]
-pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+fn l2_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len().min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
@@ -144,6 +270,27 @@ pub fn present(metric: Metric, d: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// The vector kernel and the portable loop agree to rounding, at every
+    /// length that exercises a sixteen-, eight- and tail-element path.
+    #[test]
+    fn the_vector_kernel_agrees_with_the_portable_loop() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 20_000) as f32 / 10_000.0 - 1.0
+        };
+        for n in [1usize, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 100, 128, 129, 384, 1536] {
+            let a: Vec<f32> = (0..n).map(|_| next()).collect();
+            let b: Vec<f32> = (0..n).map(|_| next()).collect();
+            let (d, ds) = (super::dot(&a, &b), super::dot_scalar(&a, &b));
+            assert!((d - ds).abs() <= 1e-4 * (1.0 + ds.abs()), "dot n={n}: {d} vs {ds}");
+            let (l, ls) = (super::l2_squared(&a, &b), super::l2_squared_scalar(&a, &b));
+            assert!((l - ls).abs() <= 1e-4 * (1.0 + ls.abs()), "l2 n={n}: {l} vs {ls}");
+        }
+    }
+
     use super::*;
 
     #[test]
