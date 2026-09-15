@@ -45,7 +45,11 @@ test that pins it.
 | runtime filtered-search selection | `vector::VectorStore::choose` | brute force / post-filter / ACORN-style |
 | `COLLAPSE BY` | `plan::exec` | with `k` amplification |
 | rank fusion, coordinator only | `plan::fusion` | RRF and weighted linear |
-| a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF`, `expand` and `present` on `ShardService` |
+| a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF` as a filter or a `hops(...)` source; `expand` and `present` on `ShardService` |
+| the wire between nodes, a shard's move | `wire`, `engine` "moves" | length-prefixed frames of the crate's codec, a shared token, one holder per shard |
+| encryption in transit, behind the `tls` feature | `tls` | rustls streams under the wire and the console; `CELASTRO_TLS_*` |
+| the console and its guards | `serve` | a token on every request, loopback or `--bind`, a thread per connection |
+| a seeded fault schedule on the shard boundary | `sim` | drops, restarts, reorder; "a fault can shorten an answer only by saying so" |
 | scatter-gather, query-then-fetch | `plan::exec` | shards return `(pk, source, raw score)` |
 | global term statistics | `engine::Db::gather_stats` | cached approximate, or exact two-phase |
 | size-tiered compaction with a hard cap | `compaction` | dead-ratio, tier and format-upgrade triggers |
@@ -328,8 +332,8 @@ switch, so the statement is re-run). `REBALANCE c` is the moves that put
 shard `i` on the `i`-th node in attach order, and `DETACH NODE` of a node
 holding shards refuses with that plan.
 
-Not built yet, by decision: replication, so a node that is down is a shard
-that is down; and a chart for more than one pod.
+Not built, by decision: replication, so a node that is down is a shard that
+is down.
 
 **The deterministic simulator states what a transport has to keep, before
 there is one.** `celastro::sim` puts a seeded fault schedule on the
@@ -444,29 +448,22 @@ leaves dead rows behind for each shard to collect on its own schedule.
 
 ## Graph-constrained hybrid search
 
-This section is the design for an edge, made before any code, so that the
-questions it raises were answered where they constrain each other and not one
-at a time in the tree. It is the result of a design pass on 2026-09-14, and
-the first slice — everything in *Shipped* below — was built against it the
-same day. Where the code settled a detail the design left open, the decision
-says so.
+The design for an edge, made before any code (a design pass on 2026-09-14)
+so that its questions were answered where they constrain each other; the
+slices in *Shipped* below were built against it, and where the code settled
+a detail the design left open, the decision says so.
 
 **The query.** *Documents within `k` hops of node `x`, matching text `t`,
 nearest to vector `v`, under structured predicate `p`* — the shape retrieval
-over a citation graph takes, and the one every engine that offers it evaluates
-as separate index lookups joined afterwards. celastro's load-bearing idea is
-that every index produces sets in the segment's ordinal space and hybrid
-candidate generation is bitmap intersection. If a `k`-hop neighbourhood can be
-made an ordinal set, it intersects with the other three for free, and the
-claim "one plan, one process, bit-identical across shard counts" extends to
-it.
+over a citation graph takes. If a `k`-hop neighbourhood can be made an
+ordinal set, it intersects with the other three sources for free, and "one
+plan, bit-identical across shard counts" extends to it.
 
 **What this is not.** Not a graph database: no pattern language, no unbounded
-paths, no shortest path, no centrality or community detection (batch
-analytics, not a query plan), no index-free adjacency. Immutable segments
-cannot chase pointers; adjacency is an index rebuilt at compaction, and a deep
-walk pays a probe per hop. The win is the fused query and the bounded
-behaviour, not the hop, and the README says so.
+paths, no shortest path, no centrality (batch analytics, not a query plan),
+no index-free adjacency. Immutable segments cannot chase pointers; adjacency
+is an index rebuilt at compaction, and a deep walk pays a probe per hop. The
+win is the fused query and the bounded behaviour, not the hop.
 
 ### Decisions
 
@@ -563,23 +560,18 @@ behaviour, not the hop, and the README says so.
 
 ### What it cost before the walk, measured
 
-Measured on 2026-09-14, on the crate before the walk existed, with the graph
-step done the only way it could be done then — as client round trips — so
-that the number the first slice had to beat was written down before the
-slice existed. The
-corpus: 50,000 documents of 20 words each from a 2,000-word vocabulary drawn
-Zipf-like, a 128-dimensional embedding per document in 64 clusters, and
-249,950 citation edges, every document citing five earlier ones by
-preferential attachment, so the graph has hubs: the most-cited document has
-7,717 citers. Two collections, `papers` with a full-text and a cosine vector
-index and `cites` with secondary indexes on `src` and `dst`. Twenty
-statements, each *within 2 hops of x, matching one common word, nearest to
-v, top 10*, run as three statements: the first hop by secondary index, the
-second hop as `WHERE src IN (...)` over the first hop's keys, and the fused
-statement as `WHERE id IN (...frontier...) AND text_match(...) ORDER BY
-embedding <=> [...] LIMIT 10`. Every timing is the best of five over the
-console's HTTP API in one process; every fused statement was run ten times
-and returned identical rows every time.
+Measured on 2026-09-14, before the walk existed, with the graph step done as
+client round trips, so the number the first slice had to beat was written
+down first. The corpus, used by every section after this one: 50,000
+documents of 20 words from a 2,000-word Zipf-like vocabulary, a
+128-dimensional embedding each in 64 clusters, and 249,950 citation edges by
+preferential attachment, so the graph has hubs (the most-cited document has
+7,717 citers). Twenty statements, *within 2 hops of x, matching one common
+word, nearest to v, top 10*, ten from hubs; here run as three statements
+each (a hop by secondary index, a hop by `WHERE src IN (...)`, and the fused
+statement with the frontier as an `IN` list). Every timing is the best of
+five over the console's HTTP API; every fused statement returned identical
+rows over ten runs, here and in every section below.
 
 Outgoing walks — what `x` cites and what those cite — reach 17 to 27
 documents. The three statements cost 96 to 100 ms together, 27 to 31 ms for
@@ -593,36 +585,23 @@ most-cited documents — what cites `x` and what cites those — reach 18,147 to
 whole frontier as literals and takes 34 to 75 ms, against 26 to 30 ms for the
 same statement without the graph filter.
 
-Those are the numbers after a fix the first run of this measurement found.
-On the crate as it was, the same hub walks cost 5.0 to 17.8 seconds — the
-second hop 3.0 to 12.4 s and the fused statement 1.9 to 5.3 s — because an
-`IN` list was evaluated per document against every literal; it is one scan
-against a set now, and the measurement is what pinned the fix.
+Those are the numbers after a fix this measurement found: an `IN` list was
+evaluated per document against every literal, and the same hub walks cost
+5.0 to 17.8 seconds; it is one scan against a set now.
 
-Three things follow. The fused evaluation is not where the remaining cost is:
-matching a 44,000-key neighbourhood inside the text-and-vector statement
-costs 10 to 45 ms over the statement without it, so decision 3 — the
-frontier as keys until the last hop, then one key-set-to-bitmap pass per
-segment — starts from a pass that is already cheap. What is left is the key
-set travelling: out of the database as rows and back in as literals, two
-round trips of up to 44,000 keys, 200 to 700 ms on a loopback connection and
-more on a network. The slice keeps the frontier inside the plan, so the number
-it has to show is a hub walk within a few times the statement without the
-walk, with nothing crossing the client. Second, a two-hop neighbourhood of a
-hub is most of the corpus: `max_frontier` will bind on real graphs at small
-`k`, which is why a cut that says so is part of the design and not an option
-on it. Third, every fused statement returned identical rows across ten runs,
-before and after the fix, which is the property the slice has to keep across
-shard counts.
+What follows: matching a 44,000-key neighbourhood inside the statement costs
+10 to 45 ms, so decision 3 starts from a pass that is already cheap, and the
+cost left is the key set travelling out and back as literals — 200 to 700 ms
+on loopback. A two-hop neighbourhood of a hub is most of the corpus, so
+`max_frontier` will bind on real graphs at small `k`, which is why a cut that
+says so is part of the design.
 
 ### What it costs with the walk in the plan, measured
 
-Measured on 2026-09-14 on the slice as shipped, same box, same corpus, same
-twenty statements, each now one statement: `WHERE id WITHIN 2 HOPS OF x VIA
-cites [REVERSE] AND text_match(body, t) ORDER BY embedding <=> v LIMIT 10`,
-best of five over the console's HTTP API, ten runs each. Every statement
-returned exactly the rows the three-statement version returned, and
-identical rows across the ten runs.
+Measured on 2026-09-14 on the first slice, same box and corpus, the twenty
+statements each one statement now: `WHERE id WITHIN 2 HOPS OF x VIA cites
+[REVERSE] AND text_match(body, t) ORDER BY embedding <=> v LIMIT 10`. Every
+statement returned exactly the rows the three-statement version had.
 
 Outgoing walks, 17 to 27 documents: 53 to 56 ms fused, against 96 to 100
 ms as three statements and 26 to 32 ms for the statement without the walk.
@@ -639,19 +618,16 @@ over 77,767 edges in 128 ms and checks 36,681 keys in 155 ms; the fused
 statement over the 43,861-key set then costs 30 ms, the same as it did with
 the keys as literals.
 
-So the slice did what it was for — nothing crosses the client, the answer is
-the same, and the two round trips of up to 44,000 keys are gone — and the
-number it had to beat next was its own: a hub walk was six to seventeen
-times the statement without the walk, and the plan said where. Expand was a
-column scan per unit, not a probe; the check built the key set once per
-unit rather than once per call.
+So nothing crosses the client and the answer is the same; what was left was
+the slice's own: a hub walk six to seventeen times the statement without it,
+because expand was a column scan per unit rather than a probe and the check
+built its key set once per unit.
 
 ### What it costs with the region, measured
 
-Measured on 2026-09-14 on 0.21.0, same box, same corpus, same twenty
-statements, after `COMPACT cites` had rewritten both segments with the
-adjacency region (2.4 s for 249,950 edges). Every statement returned the
-same rows as both earlier runs, identical across ten runs.
+Measured on 2026-09-14 on 0.21.0, same box and corpus, after `COMPACT
+cites` had rewritten both segments with the adjacency region (2.4 s for
+249,950 edges). Every statement returned the same rows as before.
 
 Outgoing walks: 26 to 31 ms fused, which is the statement without the walk
 (26 to 33 ms); the walk itself is 0.9 to 2.0 ms — two probes and two
@@ -664,34 +640,24 @@ checks 7,180 keys in 21 ms; hop 2 expands 7,180 keys over 77,767 edges in
 the hops' sum and the walk's 320 ms; the fused statement over the key set
 is 32 ms, as before.
 
-So the probe did what it was for: an outgoing walk now costs what the
-statement without it costs, and a hub walk is bounded by the edges it
-follows and the keys it checks, not by the corpus. What is left is
-proportional to the neighbourhood, and the plan says where: the liveness
-check is one lookup per key — a memtable map probe and a binary search per
-segment over pointer-chased strings, about 4 µs a key — and the coordinator
-keeps its frontiers as ordered sets of owned strings. A merge of the sorted
-frontier against each segment's sorted keys, and sorted vectors in place of
-the sets, would take both down; neither changes an answer, a plan line or a
-test. The next section is that.
+So an outgoing walk costs what the statement without it costs, and a hub
+walk is bounded by the edges it follows and the keys it checks. What was
+left was proportional to the neighbourhood: a liveness check of one lookup
+per key (about 4 µs over pointer-chased strings) and a coordinator keeping
+its frontiers as ordered sets of owned strings. The next section is the
+merge that replaced both.
 
 ### What it costs with the check as a merge, measured
 
-Measured on 2026-09-15 on 0.23.1 against 0.23.0, on one box, with the
-corpus regenerated from the same seed and loaded with the adjacency index
-declared before the load, so every segment carries the region; same twenty
-statements, same driver, best of five, ten runs each. Every statement
-returned the same rows and the same frontiers on both versions, identical
-across the ten runs. The box is not the one the three earlier sections
-were measured on, which is why 0.23.0's numbers here are not theirs: the
-comparison that matters is within this section.
+Measured on 2026-09-15, 0.23.1 against 0.23.0 on one box (not the earlier
+sections' box, so 0.23.0's numbers here are not theirs), the corpus
+regenerated from the same seed with the adjacency index declared before the
+load. Every statement returned the same rows and frontiers on both versions.
 
-The liveness check of an unpartitioned node collection is now one pass of
-the sorted frontier over each segment's sorted keys — a gallop from the
-last hit, so a frontier far smaller than a segment costs the frontier and
-the logarithm of the gaps — against the visibility bitmap the scatter
-reads anyway; and the coordinator's frontier, seen, present and answer
-sets are sorted vectors, each step over them one merge.
+The liveness check of an unpartitioned node collection is one galloping pass
+of the sorted frontier over each segment's sorted keys, against the
+visibility bitmap the scatter reads anyway; and the coordinator's frontier,
+seen, present and answer sets are sorted vectors, each step one merge.
 
 Outgoing walks, 17 to 27 documents: unchanged, 28 to 31 ms fused with the
 walk at 0.7 to 1.2 ms of it. Incoming walks from the ten most-cited
@@ -708,16 +674,12 @@ expands one key in 2.4 ms and checks 7,180 keys in 2.7 ms; hop 2 expands
 walk is 103 ms against 217, and the fused statement over the key set 32
 ms, as before.
 
-What the coordinator keeps, an instrumented run of that largest walk says,
-is mostly the sort: the 77,767 `to`s hop 2 returns arrive as 7,180 sorted
-runs of about eleven, and sorting and deduplicating them to the 36,681
-distinct keys is 32 ms; the merges after the check, which clone the
-36,681 keys that go on twice — once for the frontier, once for the answer
-— are 18 ms in that run; the difference against the seen set 4 ms. A hash
-pass to distinct the `to`s before the sort would sort half as many, and a
-frontier borrowed from the answer would save a clone; neither is taken
-until a walk of this shape is somebody's, and both are recorded here so
-the next measurement starts from the number that is left.
+What the coordinator keeps is mostly the sort, an instrumented run of that
+walk says: the 77,767 `to`s hop 2 returns, sorted and deduplicated to 36,681
+keys, 32 ms; the merges after the check, cloning those keys twice, 18 ms;
+the difference against the seen set, 4 ms. A hash pass before the sort and
+a frontier borrowed from the answer would take both down; neither is taken
+until a walk of this shape is somebody's.
 
 ### Shipped
 
@@ -1042,15 +1004,17 @@ adopts one into another instance the same way. No `gc_horizon` is pinned:
 the entry that planned this expected to need one, but a handle's `Arc` is
 what keeps a file, and the files are what is copied.
 
-**A deployment is one pod, and its probes ask the database.** The Helm chart
-is a `StatefulSet` of one, with `replicas: 1` as a fact and not a value,
-because there is no cluster: two pods would be two unrelated databases. The
-readiness and liveness probes run `celastro-cli health` inside the pod, which
-asks the console for `/api/health`; that path is served without the token, by
-decision, and its answer is produced by reading the catalog, so it measures
-the database and not the process. The console is reached with
-`kubectl port-forward`, which connects inside the pod's namespace and so
-reaches a loopback bind that a published port never could.
+**A deployment's probes ask the database, and ready means attached.** The
+chart's probes run `celastro-cli health` inside the pod, which asks the
+console for `/api/health` — served without the token, by decision, and
+answered by reading the catalog, so it measures the database and not the
+process. With more than one pod the readiness probe adds `--attached
+replicas-1`: a pod is routed to only once it has verified every peer since it
+started, because a statement it coordinates reaches the shards it does not
+hold through them. The peers are dialled outside the database lock, which a
+verification found the hard way: dialled under it, a peer not yet up held
+every probe behind a five-second connect timeout and the pod failed its own
+liveness check.
 
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
@@ -1076,12 +1040,11 @@ are never written anywhere.
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
 running `serve` could only be stopped by the ten-second SIGKILL or by
-`--init`. `std` has no signal API and the crate takes no dependencies, so the
-handler is one `extern "C"` declaration and one atomic store, and the accept
-loop polls the listener rather than blocking on it, because a blocking accept
-is restarted after the handler runs. Only `serve` installs it: at a REPL a
-handled Ctrl-C would be swallowed by the restarted read. The route is
-recorded in `src/signal.rs`.
+`--init`. `std` has no signal API, so the handler is one `extern "C"`
+declaration and one atomic store, and the accept loop polls the listener
+rather than blocking on it, because a blocking accept is restarted after the
+handler runs. Only `serve` installs it: at a REPL a handled Ctrl-C would be
+swallowed by the restarted read. The route is recorded in `src/signal.rs`.
 
 **Durability is unix-shaped, and every mover is inside it.** The guarantee
 rests on fsyncing the directory a rename landed in, which is a POSIX
@@ -1265,10 +1228,16 @@ src/
   sql/                           lexer, parser, AST
   plan/                          coordinator, fusion, EXPLAIN
   engine.rs harness.rs           Db facade, recall harness
-  serve.rs serve/                the local browser console, loopback-only
+  serve.rs serve/                the console: loopback by default, --bind for a network
+  wire.rs sim.rs                 the wire between nodes; the seeded fault simulator
+  tls.rs                         encryption in transit, behind the `tls` feature
+  signal.rs deadline.rs          SIGTERM for PID 1; the per-statement deadline
   bin/celastro.rs                REPL, script runner, demo
-  bin/celastro-cli.rs            serve, exec, run, repl, demo, catalog
+  bin/celastro-cli.rs            serve, exec, run, repl, demo, catalog, health, export, import
 tests/
   integration.rs                 end-to-end behaviour
   tiering.rs                     tiers, residency, lifecycle policies
+  wire.rs                        three nodes in one process, every node answering what one does
+  tls.rs                         the console and the wire over TLS (with the feature)
+  tls/                           a test CA and a `localhost` certificate
 ```

@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.27.1 — 2026-09-15
+
+Documentation only, hence a patch: the crate's page carries the README.
+
+**Leaner documentation.** Every document trimmed in place — the README
+for a first reader (what it is, the quick start, each surface in a
+paragraph, where the rest lives), the container guide, the chart's README
+(its verification history as one list), SECURITY (which now describes the
+network bind and TLS as they are) and the design notes (the graph
+measurements tightened, the layout completed with the wire, the simulator
+and the `tls` module). Stale statements corrected on the way: the console
+"offers no flag" to leave loopback, the chart is "one pod", the crate
+"takes no dependencies", "moving a shard" is not here.
+
 ## 0.27.0 — 2026-09-15
 
 Encryption in transit, behind a feature, and the first dependency, hence a

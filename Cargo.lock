@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "celastro"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "rustls",
  "rustls-pki-types",

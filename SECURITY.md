@@ -20,10 +20,10 @@ backported fixes to earlier tags.
 
 ## The two trust boundaries
 
-celastro is an embedded, single-node engine, and for the library and the two
-REPLs the interesting boundary is **untrusted input**, not untrusted callers.
-`celastro-cli serve` adds a second boundary: it is a real HTTP listener that
-executes arbitrary SQL, so there the caller is untrusted too.
+For the library and the two REPLs the boundary is **untrusted input**, not
+untrusted callers. `celastro-cli serve` adds a second: an HTTP listener that
+executes arbitrary SQL, so there the caller is untrusted too — on loopback by
+default, on a network with `--bind`, and over TLS with the `tls` feature.
 
 ### Untrusted input
 
@@ -37,34 +37,39 @@ executes arbitrary SQL, so there the caller is untrusted too.
   check is in scope.
 - **MVCC visibility.** Any way to read a version a snapshot should not see.
 
-### The browser console (`celastro-cli serve`)
+### The console (`celastro-cli serve`)
 
-The console binds `127.0.0.1` only, on port 8787 by default, and is guarded by a
-per-run token from `/dev/urandom` presented as `?t=` or `X-Celastro-Token`.
-Everything behind that token is a SQL prompt, so anything that reaches the
+On loopback the console is guarded by a per-run token from `/dev/urandom`
+(`?t=` or `X-Celastro-Token`), a `Host` allow-list and a same-origin check;
+with `--bind` it answers the operator's token from `CELASTRO_TOKEN` and the
+`Host` allow-list gives way to the token, a browser's `Origin` having to be
+the `Host` it named; with certificates it serves TLS 1.3 and verifies peers.
+Everything behind the token is a SQL prompt, so anything that reaches the
 executor without it is a serious finding:
 
-- **Reaching `/query` or `/exec` without a valid token**, by any route.
-- **Token recovery.** Any way for a page, or a local process that cannot
-  already read the console's own output, to learn or narrow the token. The
-  comparison is constant-time by construction; a timing signal in it counts.
-- **DNS rebinding.** The `Host` allow-list admits only `localhost`,
-  `127.0.0.1` and `[::1]`. A `Host` that gets past it is in scope.
+- **Reaching `/api/query` without a valid token**, by any route, on either
+  bind.
+- **Token recovery.** Any way for a page, or a process that cannot already
+  read the console's own output or environment, to learn or narrow the token.
+  The comparison is constant-time by construction; a timing signal counts.
+- **DNS rebinding** on loopback: a `Host` past `localhost`, `127.0.0.1` and
+  `[::1]`. On a network bind, an `Origin` other than the request's own `Host`
+  that gets a state-changing request through.
 - **Cross-origin requests.** State-changing requests require an `Origin` that
   is ours or absent, `Sec-Fetch-Site: same-origin` when present, and
-  `application/json`. A cross-origin page that reaches the executor anyway —
-  through a form post, a preflight-free content type, or a header the parser
-  treats differently from the browser — is in scope.
-- **HTTP parsing.** The server is hand-rolled on `std::net::TcpListener`.
-  Request smuggling, header injection into a response, duplicate `Content-Length`
-  or `Host` handling, and anything that desynchronises the connection are in
-  scope.
-- **XSS in the console page.** The page renders documents straight out of the
-  database and builds every node with `textContent`. A stored document that
-  executes script in the console is in scope.
-- **Bypassing the limits.** The 1 MiB body cap and the absolute per-request
-  deadline are what keep a single-threaded loop from being held open. A request
-  that evades either is in scope.
+  `application/json`. A cross-origin page that reaches the executor anyway is
+  in scope.
+- **HTTP parsing.** The server is hand-rolled on `std::net`. Request
+  smuggling, header injection, duplicate `Content-Length` or `Host` handling
+  and anything that desynchronises a connection are in scope.
+- **XSS in the console page.** The page builds every node with `textContent`;
+  a stored document that executes script in it is in scope.
+- **Bypassing the limits.** The 1 MiB body cap, the per-request deadline and
+  the connection cap are what keep the listener from being held open. A
+  request that evades one is in scope.
+- **TLS.** With the `tls` feature: a peer accepted without a chain to the
+  CA, a name the certificate does not carry accepted, or a plain connection
+  served where TLS was configured.
 
 ## What is not in scope
 
@@ -75,9 +80,9 @@ executor without it is a serious finding:
   browser's history is inside the boundary by design, not past it.
 - **That `serve` executes arbitrary SQL.** That is the feature. The question is
   only ever whether something reached it without the token.
-- **Deliberately exposing the console.** It binds loopback and offers no flag to
-  do otherwise; putting a reverse proxy or an SSH tunnel in front of it is a
-  decision about your network, not a defect in this one.
+- **Exposing the console deliberately.** `--bind` is a documented decision
+  about your network with the token as its guard; so is a reverse proxy or an
+  SSH tunnel in front of the loopback bind.
 - Resource exhaustion from queries the caller is authorised to run. There is no
   query governor, and that is a known absence rather than a vulnerability.
 - Missing features listed under "What is deliberately not here" in the README.

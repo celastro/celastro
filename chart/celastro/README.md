@@ -1,14 +1,11 @@
 # celastro
 
 celastro on Kubernetes: a `StatefulSet` of `replicas` pods, each with its
-data directory on its own `PersistentVolumeClaim`. One pod is a database.
-More than one is a cluster: each pod is a node with a stable address inside
-the headless service, serves its shards to the others on the wire port, and
-attaches every other pod as it comes up, so a collection created `WITH
-(splits = [...])` at any of them is spread one shard per pod, in pod order,
-and any pod takes any statement for it. There is no replication between the
-pods -- a shard has exactly one holder -- so a pod that is down is its
-shards down until it is back on its volume.
+data on its own `PersistentVolumeClaim`. One pod is a database. More than one
+is a cluster: each pod attaches the others as it comes up, a collection
+created `WITH (splits = [...])` at any of them is spread one shard per pod,
+and any pod takes any statement for it. There is no replication — a shard has
+one holder — so a pod that is down is its shards down until it is back.
 
 ## A cluster
 
@@ -16,23 +13,20 @@ shards down until it is back on its volume.
 helm install celastro chart/celastro --set replicas=3
 ```
 
-Every pod is started with `CELASTRO_NODE=tcp://<pod>.<service>:9000`, the
-shared token from a `Secret` the chart generates once and keeps across
-upgrades (or `wire.existingSecret`), and `CELASTRO_ATTACH` naming every
-pod's address; each attaches the others, retrying until they answer, and
-logs `attached tcp://...` for each. Then, over a port-forward to any pod:
+Every pod is started with its address, the wire token from a `Secret` the
+chart generates once and keeps across upgrades (or `wire.existingSecret`),
+and the list of its peers, which it attaches as they answer. Then, at any pod:
 
 ```sql
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
   PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per pod
 ```
 
-Raising `replicas` later adds attached nodes; `REBALANCE notes` moves shards
-onto them, and `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:9000'`
-moves one by hand. Lowering `replicas` strands the shards on the removed
-pods' volumes: move them off first, then scale down. The wire is plain TCP
-with the shared token, inside the cluster network only, and encrypted when
-`tls.enabled` is set (below).
+Raising `replicas` adds attached nodes; `REBALANCE notes` moves shards onto
+them, `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:9000'` moves one
+by hand. Lowering `replicas` strands the shards on the removed pods' volumes:
+move them off first. The wire is plain TCP with the shared token inside the
+cluster network, encrypted with `tls.enabled` (below).
 
 Clients reach a cluster through the console, exposed:
 
@@ -40,18 +34,14 @@ Clients reach a cluster through the console, exposed:
 helm install celastro chart/celastro --set replicas=3 --set console.expose=true
 ```
 
-Every pod then binds the console on all interfaces and answers one token from
-the `Secret` `celastro-console` (generated once and kept across upgrades, or
-`console.token`, or `console.existingSecret`), and the Service
-`celastro-console` — a cluster IP, not headless — spreads requests over the
-ready pods. The spread is per request, because the console closes every
-connection after one request; a DNS name that resolved to every pod would
-have handed each client the same first address. Any pod coordinates a
-statement over every pod's shards, and `/api/health` names the pod that
-answered. Plain HTTP with the token as the only guard: keep the Service
-inside a network you trust, put an ingress that terminates TLS in front of
-it (`console.service.type` is what an ingress or a cloud balancer wants), or
-set `tls.enabled`.
+Every pod then serves the console on all interfaces with one token from the
+`Secret` `celastro-console` (generated once and kept, or `console.token`, or
+`console.existingSecret`), and the Service `celastro-console` — a cluster IP,
+not headless — spreads requests over the ready pods, per request, because
+the console closes every connection after one. `/api/health` names the pod
+that answered. Plain HTTP with the token as the only guard: keep the Service
+inside a network you trust, put an ingress in front of it
+(`console.service.type`), or set `tls.enabled`.
 
 ### Encryption in transit
 
@@ -60,8 +50,8 @@ helm install celastro chart/celastro --set replicas=3 --set console.expose=true 
 ```
 
 Every pod then serves the wire and the console over TLS 1.3 with one
-certificate and verifies every other pod against one CA. Where the material
-comes from, in order of precedence:
+certificate and verifies every other pod against one CA. The material, in
+order of precedence:
 
 - `tls.certManager.issuerRef.name`: the chart emits a cert-manager
   `Certificate` for that issuer, and the issuer fills the Secret and renews it
@@ -80,30 +70,27 @@ Clients verify the console against `ca.crt` from that Secret, as the notes
 say. The tokens stay in force with TLS on; the archive endpoint stays plain
 HTTP.
 
-A pod that is down is its shards down, and so is a pod that has just come
-back, for a little longer: a restarted pod has a new address, and the other
-pods reach it by a name whose old answer they may hold for the cluster DNS
-TTL (30 seconds on a kubeadm cluster). Until it expires, a statement one of
-them coordinates over that pod's shards fails naming the shard and the node
-(`did not answer`), and `WITH (partial_results)` is the opt-in to an answer
-without it. The pod itself, once ready, answers everything. A client that
-retries a failed statement rides it out; measured below.
+A pod that has just restarted has a new address, and the other pods may hold
+the old one for the cluster DNS TTL (30 seconds on kubeadm); until then a
+statement they coordinate over its shards fails naming the shard (`did not
+answer`), `WITH (partial_results)` being the opt-in to an answer without it.
+A client that retries rides it out; measured below.
 
 ## Install
 
 The chart pulls `ghcr.io/celastro/celastro:<appVersion>`, the image each
-release publishes from the tagged tree (see the repository's `Dockerfile`).
+release publishes from the tagged tree.
 
 ```
 helm install celastro chart/celastro
 ```
 
-To run an image of your own instead, build one and put it where the cluster
-can pull it, or load it into a local cluster, then point the chart at it:
+For an image of your own, build it, put it where the cluster can pull it (or
+load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.27.0 .
-kind load docker-image celastro:0.27.0        # for a kind cluster
+docker build -t celastro:0.27.1 .
+kind load docker-image celastro:0.27.1        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -111,12 +98,10 @@ helm install celastro chart/celastro --set image.repository=celastro
 
 ## Reaching the console
 
-Unless `console.expose` is on, the console binds `127.0.0.1` inside the pod,
-by design: it executes SQL, and a bind reachable from the network would be a
-remote shell. Nothing routes to it, and the chart's first `Service` is
-headless. It is reached with `kubectl port-forward`, which connects inside
-the pod's network namespace, and the URL, token included, is printed on the
-pod's stdout at every start:
+Unless `console.expose` is on, the console binds `127.0.0.1` inside the pod
+(it executes SQL; a bind reachable from the network would be a remote shell)
+and is reached with `kubectl port-forward`, the URL with its token being
+printed on the pod's stdout at every start:
 
 ```
 kubectl logs celastro-0 | grep '^http'
@@ -134,21 +119,15 @@ prints say the same with the release's names filled in.
 
 ## Probes
 
-Both probes run `/celastro-cli --port 8787 health` inside the pod. The image
-has no shell and no curl, and a probe from outside the pod could not reach a
-loopback bind, so the binary asks the console itself. The console answers
-`/api/health` only after reading its catalog, so a process that is up with a
-database it could not open is not ready; the path needs no token, because a
-probe cannot know one, and it executes nothing. With more than one replica
-the readiness probe adds `--attached <replicas-1>`: a pod is ready only once
-it has verified every other pod since it started, so the console Service
-never routes a statement to a pod that cannot yet reach the shards it does
-not hold. For that the headless Service publishes a pod's address before
-the pod is ready (`publishNotReadyAddresses`): a pod attaches its peers by
-name, so with the default — a name that resolves only once its pod is ready
-— no pod could reach any other until that other was ready, and none would
-be. Liveness stays the plain `health`, so a peer that is down does not get
-every pod restarted.
+Both probes run `/celastro-cli --port 8787 health` inside the pod: the image
+has no shell and no curl, and the binary asks the console itself, over TLS
+when it is on. The answer comes from the database, so a process up with a
+database it could not open is not ready; the path needs no token. With more
+than one replica the readiness probe adds `--attached <replicas-1>`, so a pod
+is routed to only once it has verified every other pod since it started —
+which needs the headless Service to publish a pod's address before it is
+ready, or no pod could reach another. Liveness stays the plain `health`, so a
+peer that is down does not get every pod restarted.
 
 ## Stopping
 
@@ -179,87 +158,52 @@ every pod restarted.
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because the console answers one request at a time |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
 
-The endpoint is plain HTTP because the binary carries no TLS: point it at a
-MinIO in the cluster, or at a TLS-terminating proxy in front of a bucket.
+The archive endpoint is plain HTTP (the `tls` feature covers the wire and
+the console, not that client): point it at a store in the cluster, or at a
+TLS-terminating proxy in front of a bucket.
 
 ## What was verified, and how
 
-Against a `kind` cluster (Kubernetes via kind v0.24, Helm v3.16), with the
-image built from the tree at the commit that added this chart:
+All against a `kind` cluster (kind v0.24, Helm v3.16), each with an image
+built from the tree at the time:
 
-- `helm lint` passes.
-- `helm install --wait` reached `Running`, `READY 1/1`, in 9 seconds; the
-  claim bound to a 1 GiB volume.
-- Over `kubectl port-forward`, a collection was created and a document
-  inserted through `/api/query`; `/api/health` answered without a token and
-  reported one collection.
-- `kubectl delete pod celastro-0` returned at once, because `serve` handled
-  the SIGTERM; the replacement pod became ready, and `/api/catalog` and a
-  `SELECT` over the forwarded port returned the collection and the row.
-- `helm upgrade --wait` with a changed probe period completed in 5 seconds,
-  rolled the pod, and the row was still there.
-- The pod's events show both probes as configured and no warnings.
-
-And again on 2026-09-14 with the chart at appVersion 0.17.0 and nothing
-loaded into the cluster by hand: `helm install --wait` pulled
-`ghcr.io/celastro/celastro:0.17.0` from the registry anonymously (the pod's
-events show the pull, 1 MB, in under three seconds), the pod reached
-`READY 1/1`, and `/api/health` over the forwarded port reported version
-0.17.0.
-
-The cluster, on 2026-09-14 with the chart at 0.3.0 and an image built from
-the tree: `helm install --set replicas=3 --wait` had three pods `READY 1/1`
-in 11 seconds, and every pod logged `attached` for both others within 40
-seconds of the install (pod DNS resolves a few seconds after start, which
-the retry covers). Over a port-forward to pod 0: a collection created `WITH
-(splits = ['t1', 't2'])` answered "3 shard(s) on" the three pod addresses,
-two indexes reached every holder, ninety documents inserted through pod 0
-landed on their owners, a hybrid statement and a partition-scoped one
-answered across the pods and `EXPLAIN ANALYZE` listed all three shards, a
-`MOVE SHARD` between two pods and a `REBALANCE` back both completed with
-the rows intact. `kubectl delete pod celastro-1` came back ready and
-re-attached its peers in 3 seconds, and its tenant answered through pod 0.
-`helm upgrade --set replicas=4 --wait` rolled the pods in 33 seconds, kept
-the generated token, and the fourth pod was attached by the others.
-
-Not verified: a real `StorageClass` other than kind's, and the `archive`
-values against a bucket in the cluster. The client behind them is tested
-against an in-process S3 in the crate's own tests.
-
-The exposed console, on 2026-09-15 with the chart at 0.4.0 and an image
-built from the tree: `helm install --set replicas=3 --set
-console.expose=true --wait` had three pods `READY 1/1` in 19 seconds, the
-readiness probe holding each until it had attached the other two (the
-events show `0 of 2 other node(s) attached so far` on the way). From a
-client pod, through `celastro-console`: no token 401, a wrong token 401,
-`/api/health` without a token 200, a `POST` with a foreign `Origin` 403 and
-with the Service's own 200; 90 health requests answered by the three pods
-29, 30 and 31 times; a collection created `WITH (splits = ['t1', 't2'])`
-through the Service answered "3 shard(s) on" the three pods, thirty
-documents inserted and read back 30 rows on twelve statements answered by
-all three pods, and `EXPLAIN ANALYZE` listed three shards. `helm upgrade
---wait` with a changed probe period rolled the pods and kept the token; in
-the window after it, 3 statements failed over 16.8 seconds with `shard 0
-of items on tcp://celastro-0... did not answer` before ten in a row
-succeeded — the restarted pod's old address, held by the others until the
-cluster DNS TTL ran out — and health requests were again answered by all
-three pods.
-
-Encryption in transit, on 2026-09-15 with the chart at 0.5.0 and an image
-built from the tree with the `tls` feature: `helm install --set replicas=3
---set console.expose=true --set tls.enabled=true --wait` had three pods
-`READY 1/1` in 49 seconds with no restarts (an earlier build had one per
-pod: the peers were dialled under the database lock and the liveness probe
-timed out behind it). The generated certificate carried eleven names. From
-a client pod, with `ca.crt` from the Secret: `/api/health` over TLS,
-verified as `celastro-console`; the name `elsewhere.example` refused by the
-client; plain HTTP answered with a TLS alert and no status line; a
-handshake to `celastro-0.celastro:9000` completed as TLSv1.3
-`TLS_AES_256_GCM_SHA384` with a certificate naming the pod and `localhost`;
-a spread collection created and thirty rows read back through the TLS
-console. `helm upgrade` kept the certificate. The same checks passed with
-the generated material copied to a Secret of another name and
-`tls.existingSecret`, and with cert-manager v1.16 issuing from a CA
-`ClusterIssuer` through `tls.certManager.issuerRef` (the `Certificate`
-Ready, the issuer `lab-ca`). Rendered without `tls.enabled`, the manifests
-contain no TLS at all.
+- **One pod** (the chart's first release): `helm lint` clean; `helm install
+  --wait` ready in 9 seconds on a 1 GiB claim; a collection and a row through
+  a port-forward; `/api/health` without a token reporting one collection;
+  `kubectl delete pod` returned at once (`serve` handled SIGTERM) and the
+  replacement answered the row; `helm upgrade --wait` with a changed probe
+  period rolled the pod in 5 seconds with the row intact; no warning events.
+- **The registry** (0.17.0): a bare install pulled the image from
+  `ghcr.io/celastro/celastro` anonymously, 1 MB in under three seconds.
+- **The cluster** (chart 0.3.0): `--set replicas=3` ready in 11 seconds,
+  every pod attached to both others; a collection `WITH (splits = ['t1',
+  't2'])` on the three pods, ninety documents landing on their owners, hybrid
+  and partition-scoped statements answered across pods with `EXPLAIN ANALYZE`
+  listing all three shards, a `MOVE SHARD` and a `REBALANCE` back with the
+  rows intact; a deleted pod back and re-attached in 3 seconds; `--set
+  replicas=4` rolled in 33 seconds, kept the token, and the fourth pod was
+  attached. Not verified: a `StorageClass` other than kind's, and the
+  `archive` values against a real bucket (the client is tested against an
+  in-process S3 in the crate).
+- **The exposed console** (chart 0.4.0): three pods ready in 19 seconds,
+  readiness holding each until it had attached the others. From a client pod
+  through `celastro-console`: no token 401, wrong token 401, health without a
+  token 200, a foreign `Origin` 403 and the Service's own 200; 90 health
+  requests answered 29/30/31 by the three pods; a spread collection created
+  and thirty rows read back through the Service from all three pods. An
+  upgrade rolled the pods and kept the token; in the window after it, 3
+  statements failed over 16.8 seconds (`shard 0 ... did not answer`: the
+  restarted pod's old address, held until the DNS TTL ran out) before ten in
+  a row succeeded.
+- **Encryption in transit** (chart 0.5.0): three pods ready in 49 seconds
+  with no restarts (an earlier build had one per pod: peers dialled under the
+  database lock, the liveness probe timing out behind it). The generated
+  certificate carried eleven names. From a client pod with `ca.crt` from the
+  Secret: health over TLS verified as `celastro-console`, `elsewhere.example`
+  refused by the client, plain HTTP answered with a TLS alert, a handshake to
+  `celastro-0.celastro:9000` as TLSv1.3 `TLS_AES_256_GCM_SHA384` with a
+  certificate naming the pod and `localhost`, thirty rows through the TLS
+  console. An upgrade kept the certificate; the same checks passed with the
+  material under `tls.existingSecret` and with cert-manager v1.16 issuing
+  from a CA `ClusterIssuer`. Rendered without `tls.enabled`, the manifests
+  contain no TLS.

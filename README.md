@@ -1,34 +1,29 @@
 # celastro
 
-A hybrid document database. Structured SQL, BM25 full-text, vector similarity
-and a bounded graph walk are four first-class retrieval modes evaluated in a
-**single query plan**, rather than orchestrated across separate services.
-
-Written in Rust with **minimal dependencies**: none outside `std` unless the
-`tls` feature is on, and then rustls and what it brings, nothing else. The
-bitmaps, term dictionary, block-max postings, quantizers, HNSW
+A hybrid document database: structured SQL, BM25 full-text, vector similarity
+and a bounded graph walk are four retrieval modes evaluated in **one query
+plan**, not orchestrated across services. Rust, **minimal dependencies** —
+none outside `std` unless the `tls` feature is on, and then rustls and what
+it brings. Everything else, from the bitmaps and postings to the HNSW index
+and the SQL front end, is in the tree.
 
 ```sh
-cargo install celastro        # the `celastro` REPL and the `celastro-cli` tool
+cargo install celastro        # `celastro-cli`, and the older `celastro` REPL
 ```
 
-**Status.** Single node, with multiple shards in one process and explicit
-key-range splits; shards can be spread over nodes. Immutable segments, size-tiered compaction under a hard
-segment cap, MVCC with snapshot reads, tiered vector indexes, runtime
-filtered-search strategy selection, storage tiers with lifecycle policies, and
-`EXPLAIN ANALYZE` over all of it. Replication, consensus and cross-shard
-transactions are not here — see
-[What is deliberately not here](https://github.com/celastro/celastro/blob/main/docs/design.md#what-is-deliberately-not-here).
-
-Releases and what changes between them are in [CHANGELOG.md](https://github.com/celastro/celastro/blob/main/CHANGELOG.md).
-
----
+**Status.** Single-writer nodes; a collection's shards can be spread over
+nodes, moved between them, and any node coordinates a statement over all of
+them. Immutable segments, MVCC snapshot reads, size-tiered compaction, tiered
+vector indexes, storage tiers with lifecycle policies, and `EXPLAIN ANALYZE`
+over all of it. No replication, consensus or cross-shard transactions — see
+[What is deliberately not here](docs/design.md#what-is-deliberately-not-here).
+Releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
-Put this in `quickstart.sql`. Documents are JSON; the collection declares the
-primary key and any typed columns, an index declares how a path is searched,
-and the SELECT list picks the fields that come back.
+Documents are JSON. A collection declares the primary key and any typed
+columns, an index declares how a path is searched, and the SELECT list picks
+the fields that come back. Put this in `quickstart.sql`:
 
 ```sql
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT);
@@ -53,6 +48,7 @@ SELECT id, topic FROM notes
 ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf')
 LIMIT 3;
 ```
+
 
 Run it against a directory, so the data is there next time:
 
@@ -90,31 +86,13 @@ n3  | 0.015873 | n3 | storage
 3 row(s)
 ```
 
+
 `key` is the row's primary key and `score` or `distance` its rank, whichever
-the query produced; the rest of the columns are the SELECT list. A distance in
-`WHERE` selects rows and ranks nothing, in the same units the `distance`
-column shows: for cosine an identical vector lands within floating-point
-rounding of zero, so exact match is a small threshold; for L2 it is `<= 0`.
-
-`DROP INDEX notes_body ON notes` withdraws an index and `DROP COLLECTION
-notes` removes a collection with its files and, if it had an archived tier,
-its objects in the store. Both are refused while a lifecycle policy names
-what they would drop, and neither can be undone.
-
-Every write is on the disk before it is acknowledged, so the collection is
-there in the next process:
-
-```
-$ celastro-cli --dir ./data exec "SELECT * FROM notes WHERE text_match(body, 'compaction')"
-key | body                                             | embedding         | id | topic
-----+--------------------------------------------------+-------------------+----+--------
-n4  | Compaction merges segments and drops dead versi… | [0.0,0.0,0.1,0.9] | n4 | storage
-1 row(s)
-```
-
-`EXPLAIN ANALYZE` in front of any query prints the plan that ran: which shards
-were scanned, which vector strategy was picked from the measured selectivity,
-and where the fusion happened.
+the query produced. A distance in `WHERE` is a filter in the units the
+`distance` column shows (cosine: exact match is a small threshold; L2: `<= 0`).
+Every write is on the disk before it is acknowledged. `EXPLAIN ANALYZE` in
+front of any query prints the plan that ran — shards scanned, the vector
+strategy chosen from measured selectivity, and where the fusion happened:
 
 ```
 $ celastro-cli --dir ./data exec "EXPLAIN ANALYZE SELECT * FROM notes ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf') LIMIT 3"
@@ -130,42 +108,23 @@ Query plan  (snapshot ts=7328898005345050624, limit=3, k'=100)
   total: 0.04 ms
 ```
 
-A prefix such as `text_match(body, 'comp*')` names the first 512 matching
-dictionary terms, and a query whose prefix matched more says so with a
-`TRUNCATED` line. That cap is a per-collection setting:
 
-```sql
-ALTER COLLECTION notes SET (prefix_expansion = 2048);
-```
+`celastro-cli demo` builds a 400-document corpus over three shards in memory
+and walks through the same ideas at a size where the plan has choices to
+make.
 
-It is a trade rather than a free win. The work is one posting cursor per
-expanded term in every segment, so a wide prefix at 2048 costs roughly seven
-times what it costs at 512 while the recall it buys grows sub-linearly; and a
-statement may name at most `4096 / prefix_expansion` distinct prefixes, eight
-at the default and two at 2048, because 4096 is the size of the statistics
-cache each indexed path keeps and is also the ceiling.
-
-A `DELETE` whose `text_match` prefix was cut is refused and nothing is
-deleted, because a cut predicate selects documents other than the ones it
-describes. There is no flag to run it anyway. Delete by key, raise the
-collection's `prefix_expansion` if its vocabulary fits under the ceiling, or
-spell the prefix as narrower pieces, each of which deletes exactly what it
-names.
-
-Two limits a document can meet: nesting deeper than 128 containers is refused
-on the way in, and a field whose name contains a dot is unreachable by a path
-expression, because `a.b` always means the nested path. Both refusals say so.
-
-`celastro-cli demo` builds a 400-document corpus across three shards and walks
-through the same ideas at a size where the plan has choices to make. It runs in
-memory and needs nothing.
-
----
+Three things worth knowing early. A prefix such as `text_match(body,
+'comp*')` expands to at most `prefix_expansion` dictionary terms (512; a
+per-collection setting), and an answer that was cut says so with a
+`TRUNCATED` line — a `DELETE` whose predicate was cut is refused outright.
+Documents nest at most 128 deep, and a field whose name contains a dot is
+unreachable by a path. `DROP INDEX` and `DROP COLLECTION` are final. The
+[design notes](docs/design.md) have the reasoning behind each.
 
 ## Walking a graph
 
 An edge is a document in a collection of its own that points into a node
-collection, and a walk is a filter beside the others:
+collection, and a walk is a filter beside the others, or a fusion source:
 
 ```sql
 CREATE COLLECTION papers (id TEXT PRIMARY KEY);
@@ -181,114 +140,59 @@ WHERE id WITHIN 2 HOPS OF 'p1' VIA cites AND text_match(body, 'retrieval')
 ORDER BY embedding <=> [0.5,0.5,0.0,0.0] LIMIT 10;
 ```
 
+
 `WITHIN k HOPS OF` selects every node reachable in one to `k` hops, the start
-excluded (`OR id = 'p1'` puts it back). `VIA cites` follows edges from `src`
-to `dst`, the order the adjacency index was declared in; `VIA cites REVERSE`
-follows them the other way, and a collection created `WITH (undirected =
-true)` follows both. `VIA cites WHERE kind = 'cites'` applies a structured
-filter on the edge collection at every hop; a compound one goes in
-parentheses, and `WHERE kind = 'a' THEN WHERE kind = 'b'` gives each hop its
-own, one per hop. The walk is resolved before the rest of the plan runs and
-the neighbourhood joins the text and vector sets as one more bitmap, so the
-answer is the same at any number of shards, and an edge collection can be
-spread over nodes like any other.
-
-A walk can rank as well as filter: `ORDER BY hybrid(text_match(body,
-'retrieval'), hops(id WITHIN 3 HOPS OF 'p1' VIA cites))` is one more fusion
-source, each node scored by the hop it was first reached at, so nearer
-nodes rank higher beside the text and vector scores under either method.
-On its own it is refused — a walk alone is the filter.
-
-`k` is required, and two caps bound what a hub can cost: `WITH (max_fanout =
-N)` follows at most `N` edges out of one node, `WITH (max_frontier = N)`
-keeps at most `N` of the keys a hop found. Either cut keeps the
-lexicographically first and says so, on the response as a `CUT` line and in
-`EXPLAIN ANALYZE`, which shows every hop: keys expanded, edges followed, new
-keys, dangling edges (a `dst` that names no live document is skipped and
-counted) and the frontier that goes on. An adjacency index is a
-value-to-ordinals map per column in every segment sealed after it, probed
-per key at each hop; a segment sealed before it is scanned until compaction
-rewrites it, which `COMPACT` does, and the plan counts such units. It is
-tiered like any index; a walk that finds it below `cached` is refused naming
-the tier, since a walk reads it at every hop.
-
-This is not a graph database: no pattern language, no unbounded paths, no
-shortest path, no centrality. It is the neighbourhood as a filter, fused with
-the other three modes in one plan.
-
----
+excluded. `VIA cites` follows edges `src` → `dst`; `REVERSE` follows them the
+other way, and a collection created `WITH (undirected = true)` follows both.
+`VIA cites WHERE kind = 'cites'` filters the edges at every hop, `WHERE a THEN
+WHERE b` gives each hop its own. `ORDER BY hybrid(text_match(body, 'x'),
+hops(id WITHIN 3 HOPS OF 'p1' VIA cites))` ranks by hop distance beside the
+other sources instead. `k` is required; `WITH (max_fanout = N)` and `WITH
+(max_frontier = N)` bound what a hub can cost, and a cut says so on the
+response and in the plan. The walk runs before the rest of the plan and the
+neighbourhood joins the other sets as one more bitmap, so the answer is the
+same at any number of shards or nodes. Not a graph database: no pattern
+language, no unbounded paths, no analytics.
 
 ## The command line
 
-`celastro-cli` is the tool. Without `--dir` the database is in memory, which is
-what `demo` needs and what makes `exec` usable with nothing on disk.
+`celastro-cli` is the tool. Without `--dir` the database is in memory.
 
 | command | what it does |
 |---|---|
-| `serve [--port N] [--open]` | the browser console, on `127.0.0.1` only |
-| `exec <SQL>` | run one statement and print the result |
-| `run <FILE>` | run a script of statements |
-| `repl` | interactive session on stdin |
-| `demo` | build a small hybrid corpus and show it working |
-| `catalog` | list collections and their indexes |
-| `health [--port N] [--attached N]` | exit 0 if a console is serving on that port — and, with `--attached`, has verified `N` other nodes since it started; a container's probes |
-| `version` | print the version |
+| `serve [--port N] [--bind ADDR] [--open]` | the console: on loopback, or on a network with `--bind` |
+| `exec <SQL>`, `run <FILE>`, `repl` | one statement, a script, an interactive session |
+| `demo` | the guided tour, in memory |
+| `catalog` | collections and their indexes |
+| `health [--port N] [--attached N]` | exit 0 if a console is serving — and has verified `N` peers; a container's probes |
+| `export <COLLECTION> <DIR>`, `import <DIR>` | copy a collection as of an instant, without stopping the source; adopt one |
+| `version` | |
 
-| global flag | |
-|---|---|
-| `--dir <DIR>` | open a persistent database (default: in memory) |
-| `--json` | machine-readable output on stdout, for every command, failures included |
+`--dir <DIR>` opens a persistent database; `--json` makes every command's
+output machine-readable, failures included. Statements end with `;` or a
+blank line. Exit codes: 0, 1 a runtime or SQL error, 2 a usage error.
 
-Statements end with `;` or a blank line. Exit codes: 0 success, 1 a runtime or
-SQL error, 2 a usage error.
+## The console
 
-`celastro` is the original REPL and script runner, kept because its interface
-is in use: `celastro --dir ./data`, `celastro --file setup.sql`,
-`celastro --demo`.
+`celastro-cli --dir ./data serve` prints a URL with a token on stdout and
+serves a browser console on `127.0.0.1:8787`: SQL, the catalog, `EXPLAIN
+ANALYZE` rendered. The endpoint executes arbitrary SQL, so on loopback three
+guards sit in front of it — the bind, a `Host` check against DNS rebinding,
+and a per-run token every request needs. `POST /api/shutdown` with the token
+stops it after a clean save.
 
-## The browser console
-
-```
-$ celastro-cli --dir ./data serve
-celastro-cli serving on 127.0.0.1:8787 — Ctrl-C, SIGTERM or POST /api/shutdown to stop
-The token in that URL is the only thing protecting this database. Anyone who can
-read this terminal, this process's environment or its command line can use it, and
-the server answers every request that carries it. Treat the URL as a password, and
-stop the server when you are done.
-http://127.0.0.1:8787/?t=fdd2b8856f798668b6f29478e4f1fd5b
-```
-
-Open the URL. The console runs SQL against the database, shows the catalog,
-and renders `EXPLAIN ANALYZE` output. Only the URL is on stdout, so
-`celastro-cli serve | xargs xdg-open` works, and `--open` does the same
-without the pipe.
-
-It binds loopback unless told otherwise: the endpoint executes arbitrary
-SQL, so a bind reachable from the network is a remote shell. Three guards sit
-in front of it — the loopback bind, a `Host` check against DNS rebinding, and
-a per-run token — and every request needs the token. `POST /api/shutdown`
-with the token stops the server after a clean save. The console, like the
-CLI, saves after every statement that changed something.
-
-`serve --bind 0.0.0.0` is the one way onto a network, for nodes behind a
-Service or a load balancer: the console then answers the token in
-`CELASTRO_TOKEN` — yours, at least sixteen printable bytes, the same at every
-node — instead of a per-run one, accepts whatever `Host` routed to it, and
-requires a browser's `Origin` to be that host. It is plain HTTP; keep it
-inside a network you trust or behind an ingress that terminates TLS — or
-give it certificates, below. Any node
-coordinates a statement over every node's shards, and `/api/health` names
-the node that answered, so a client behind a balancer can see its requests
-spread. Connections are served at once, up to sixty-four, with the database
-locked only around the statement; the statements themselves serialise per
-node, because the engine is single-writer — a node runs one at a time, and
-the threads see to it that the one running never waits on a socket.
+`serve --bind 0.0.0.0` puts it on a network, for nodes behind a Service or a
+load balancer: the console then answers the token in `CELASTRO_TOKEN` (yours,
+at least sixteen printable bytes, the same at every node), accepts whatever
+`Host` routed to it, and requires a browser's `Origin` to be that host.
+Connections are served at once, up to sixty-four; statements still serialise
+per node, since the engine is single-writer. `/api/health` names the node
+that answered.
 
 ## Encryption in transit
 
-Off by default. A build with the `tls` feature — the published image is one,
-`cargo build --features tls` makes another — reads three files from the
-environment, all PEM, all three or none:
+Off by default. A build with the `tls` feature — the published image is one —
+reads three PEM files from the environment, all three or none:
 
 ```
 CELASTRO_TLS_CERT=/tls/tls.crt   # this node's certificate chain, leaf first
@@ -296,211 +200,111 @@ CELASTRO_TLS_KEY=/tls/tls.key    # its private key
 CELASTRO_TLS_CA=/tls/ca.crt      # the CA every node's certificate chains to
 ```
 
-With them the console and the wire serve TLS 1.3 (rustls, the crate's one
-dependency), every peer is verified against the CA by the name it was dialled
-— a pod's, in a cluster — and `celastro-cli health` verifies its own console
-as `localhost`, which the certificate has to name. The tokens stay: a
-certificate says which node is talking, the token says it may. A build
-without the feature refuses to start with the variables set rather than serve
-plain and say nothing. The chart's `tls.enabled` does all of this with a CA
-and certificate it makes once, a Secret of yours, or a cert-manager
-`Certificate`. The archive client to an S3 store is still plain HTTP.
-
-## Copying a collection
-
-A collection is copied as of an instant, without stopping the source:
-
-```
-celastro-cli --dir ./data export notes ./notes-copy       # a database directory of its own
-celastro-cli --dir ./elsewhere import ./notes-copy         # adopted beside what is there
-```
-
-The export pins a snapshot, copies the segment files it names, copies each
-delete log as it stands, and seals the rows still in
-memory into one segment of the copy's own; writes that land on the source
-meanwhile do not reach it. The destination is written under a temporary name
-and renamed into place at the end, so it is either absent or complete. The
-copy opens as a database on its own, or `import` adopts it into another one.
-
-## Kubernetes
-
-`chart/celastro` is a Helm chart for one instance or a cluster: a
-`StatefulSet` of `replicas` pods, each with its data directory on its own
-`PersistentVolumeClaim`. With more than one, the pods attach each other as
-they come up and a collection created with splits is spread one shard per
-pod; `REBALANCE` moves shards onto pods added later. Its probes run the binary
-itself, `celastro-cli health`, which asks the console inside the pod whether
-it is serving and has its catalog. The console binds loopback, so it is
-reached with `kubectl port-forward` and the URL printed in the pod's log. The
-`archived` tier can be pointed at a bucket through the chart's `archive`
-values, with the credentials in a `Secret`.
-
-```
-helm install celastro chart/celastro
-kubectl logs celastro-0 | grep '^http'
-kubectl port-forward celastro-0 8787:8787
-```
-
-The chart's README says what was verified and how.
+With them the console and the wire serve TLS 1.3, every peer is verified
+against the CA by the name it was dialled, and `celastro-cli health` verifies
+its own console as `localhost`, which the certificate has to name. The tokens
+stay: a certificate says which node is talking, the token says it may. A
+build without the feature refuses to start with the variables set. The
+archive client to an S3 store is still plain HTTP.
 
 ## Two or more nodes
 
-A collection's shards can be spread over nodes, one shard per node at most,
-and every node holding a shard can take any statement for it. Each node is
-its own process with its own directory, started with an address and the
-secret every node shares, and serving its shards to the others:
+Each node is its own process and directory, started with an address and the
+secret every node shares, serving its shards to the others:
 
 ```
 CELASTRO_NODE=tcp://10.0.0.2:9000 CELASTRO_WIRE_TOKEN=... celastro-cli --dir ./data serve --shard-bind 0.0.0.0:9000
 ```
 
-Then, on one node:
-
 ```sql
 ATTACH NODE 'tcp://10.0.0.3:9000';
-ATTACH NODE 'tcp://10.0.0.4:9000';
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
-  PARTITION BY (tenant) WITH (splits = ['m', 't']);            -- three shards, one per node
-CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
+  PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per node
+MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:9000';
+REBALANCE notes;
 ```
 
-Shard `i` goes to the `i`-th node named in `WITH (nodes = [...])`, wrapping,
-or to this node and the attached ones in turn when none are named. Every
-holder gets the same definition and the same placement map, so an `INSERT`,
-a `DELETE`, a `SELECT` or a `CREATE INDEX` issued at any of them reaches the
-right shards: writes are forwarded to the shard's owner and acknowledged
-after it acknowledged, queries fan out and are fused at the node that took
-them, and DDL and `FLUSH` run on every holder. A statement prefixed with
-`LOCAL` runs on the node it is given to and nowhere else, which is how a node
-a forwarded statement did not reach is repaired. A node that does not answer
-is a deadline at the coordinator, with `WITH (partial_results)` naming its
-shard, the same rule as for a slow shard.
+Shard `i` goes to the `i`-th attached node, wrapping (or the `i`-th of `WITH
+(nodes = [...])`). Every holder carries the same definition and placement,
+so a statement issued at any of them reaches the right shards: writes are
+forwarded to the owner and acknowledged after it acknowledged, queries fan
+out and fuse where they arrived, DDL runs on every holder, and `LOCAL`
+prefixes a statement to one node only. A node that does not answer is a
+deadline at the coordinator, with `WITH (partial_results)` naming its shard.
+A shard moves without stopping the collection, its files being all that
+crosses the wire.
 
-A shard moves between nodes without stopping the collection:
+## Kubernetes and containers
 
-```sql
-MOVE SHARD 1 OF notes TO 'tcp://10.0.0.4:9000';
-REBALANCE notes;          -- shard i to the i-th node in attach order, as a CREATE places them
-DETACH NODE 'tcp://10.0.0.3:9000';   -- refused while it holds a shard, naming the moves that would empty it
-```
-
-The source pins the shard at an instant and refuses writes to it naming the
-move, the target pulls the files and opens them, then every holder is told
-the new map — the target first, the source last, which drops its copy only
-then. Reads of the shard are answered throughout. A holder the map did not
-reach is named with the `LOCAL PLACE SHARD ...` that repairs it. Nothing
-crosses the wire but the shard's files, so a move costs their size.
-
-The wire is plain TCP with a shared token unless certificates are given (see
-"Encryption in transit" below): for a network you
-trust.
-
-## The archived tier and an object store
-
-An index moved to the `archived` tier leaves local storage. By default that
-means a directory beside the segments that stands in for object storage. Point
-it at an S3-compatible store instead and the segment is `PUT` there as one
-object, read back by ranged `GET`s when a query needs it, and deleted when a
-compaction retires it:
+`chart/celastro` runs one pod or a cluster: a `StatefulSet` whose pods attach
+each other, `console.expose` for a Service that spreads clients over the
+pods, `tls.enabled` for certificates the chart makes once (or yours, or
+cert-manager's), and `archive.*` for an S3 bucket behind the `archived`
+tier. Its [README](chart/celastro/README.md) records what was verified and
+how.
 
 ```
-export CELASTRO_ARCHIVE_ENDPOINT=127.0.0.1:9000   # host:port, plain HTTP
-export CELASTRO_ARCHIVE_BUCKET=celastro
-export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
-celastro-cli --dir ./data serve
+helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true
 ```
 
-Any server that speaks S3's `PUT`, `GET`, `HEAD` and `DELETE` with Signature
-Version 4 will do; MinIO is the one this was written against. The endpoint is
-plain HTTP because the crate carries no TLS: run MinIO on the same host, or a
-TLS-terminating proxy in front of a real bucket. The credentials are read from
-the environment at open and never written anywhere.
-
-## Running in a container
-
-Each release publishes `ghcr.io/celastro/celastro:<version>`: a statically
-linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
-running as root. The `Dockerfile` builds the same image from the tree.
+Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
+`celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.27.0 && docker tag ghcr.io/celastro/celastro:0.27.0 celastro
-docker run --rm celastro demo                                            # in memory
-docker volume create celastro-data
-docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
-docker run --rm --network host -v celastro-data:/data celastro --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.27.1 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.27.1 --dir /data serve
 ```
 
-`serve` needs `--network host`, because a published port cannot reach a
-loopback bind. It handles SIGTERM and SIGINT itself, so `docker stop` ends it
-promptly with the database saved. Bind mounts, ownership, the REPL's stdin
-behaviour and what each of those flags costs are in
-[docs/container.md](https://github.com/celastro/celastro/blob/main/docs/container.md).
+`serve` needs `--network host` (a published port cannot reach a loopback
+bind) or `--bind` with a token; it handles SIGTERM, so `docker stop` ends it
+saved. [docs/container.md](docs/container.md) has the rest: volumes and
+ownership, the REPL's stdin, what each flag costs.
 
----
+## The archived tier
 
-## What it is
+An index moved to the `archived` tier leaves local storage — a directory
+beside the segments by default, or an S3-compatible bucket named by
+`CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP), `CELASTRO_ARCHIVE_BUCKET`
+and the `AWS_*` credentials, read from the environment at open and never
+written anywhere. Any store that speaks S3's `PUT`, ranged `GET`, `HEAD` and
+`DELETE` with Signature Version 4 will do.
+
+## How it works
 
 Inside a segment every document has a compact `u32` ordinal, and every index
-type — structured predicates, text matching, vector search, visibility —
-produces sets in that same space. Hybrid candidate generation is therefore
-bitmap intersection plus per-source scoring, with no joins and no identifier
-translation. That is the mechanism behind the single-pass claim, and it is
-treated as a load-bearing invariant.
-
-Around it: immutable segments with a self-describing footer, size-tiered
-compaction, MVCC with snapshot reads, a write-ahead log that is fsynced before
-a write is acknowledged (the directory fsync behind that guarantee is a POSIX
-operation, so off unix the guarantee is best-effort), block-max WAND for BM25,
-a tiered HNSW index with SQ8
-and 1-bit codes and full-precision rerank, runtime selection between brute
-force, post-filter and filter-aware vector search, and storage tiers with
-lifecycle policies.
-
-What is deliberately not here: everything that needs more than one process
-— consensus and replication, follower reads, two-phase commit across shards,
-dynamic shard split and merge — and a graph database's pattern language and
-analytics, of which only the bounded walk above is a retrieval mode. The boundaries those attach to are built
-and tested — including a deterministic simulator that puts partitions,
-crashes and reordering on the coordinator-to-shard boundary and checks that a
-fault can shorten an answer only by saying so — but the distributed pieces
-are not.
-
-The whole of it — the ordinal-space invariant, where things live in the tree,
-tiers and residency, the design notes with their measurements, the worked
-query, and the map from each stated guarantee to the test that pins it — is in
-[docs/design.md](https://github.com/celastro/celastro/blob/main/docs/design.md).
-
----
+type — structured predicates, text, vectors, adjacency, visibility —
+produces sets in that space. Hybrid candidate generation is bitmap
+intersection plus per-source scoring, with no joins and no identifier
+translation; that is the mechanism behind the single-plan claim, and it is
+treated as a load-bearing invariant. Around it: immutable segments with a
+self-describing footer, a write-ahead log fsynced before a write is
+acknowledged, block-max WAND for BM25, a tiered HNSW index with SQ8 and 1-bit
+codes and full-precision rerank, runtime choice between brute force,
+post-filter and filter-aware vector search, and a deterministic simulator
+that puts partitions, crashes and reordering on the coordinator-to-shard
+boundary. The whole of it, with its measurements and the map from each
+guarantee to the test that pins it, is in [docs/design.md](docs/design.md).
 
 ## Building and testing
 
 ```
 cargo build --release
-cargo test --release
+cargo test && cargo test --features tls
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-No dependencies outside `std` without the `tls` feature, and Rust 1.75 or
-later. A change also has to build on that floor, with and without the
-feature (`cargo test --features tls` runs the TLS tests too), and must not
-rewrite `Cargo.lock`. These are gates, but nothing in this repository runs
-them for you.
-
-Every test is named after the failure it prevents, not the feature it covers.
-A test that passes with the behaviour it names removed is worse than no test.
+Rust 1.75 or later, with and without the feature; a change must not rewrite
+`Cargo.lock`. Every test is named after the failure it prevents.
 
 ## Contributing, security, licence
 
-Issues are welcome and wanted; pull requests are not accepted, for reasons
+Issues are welcome; pull requests are not accepted, for reasons
 [CONTRIBUTING.md](CONTRIBUTING.md) sets out. Vulnerabilities go through
 [SECURITY.md](SECURITY.md), never a public issue.
 
-[GNU Affero General Public License v3.0](LICENSE). You may use, modify,
-self-host and redistribute this freely. If you run a modified version as a
-network service, the AGPL requires you to offer that version's source to its
-users, which is the reason for choosing it.
-
-Copyright (C) 2026 celastro; the notice is in [COPYRIGHT](COPYRIGHT), and it
-names one holder because contributions are not accepted (see
-[CONTRIBUTING.md](CONTRIBUTING.md)).
+[GNU Affero General Public License v3.0](LICENSE): use, modify, self-host and
+redistribute it freely; run a modified version as a network service and the
+AGPL requires you to offer that version's source to its users, which is why
+it was chosen. Copyright (C) 2026 celastro; the notice is in
+[COPYRIGHT](COPYRIGHT).

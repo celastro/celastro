@@ -1,36 +1,29 @@
 # Running in a container
 
-`Dockerfile` at the repository root builds the image in two stages: a musl
-toolchain compiles one statically linked binary, and the image that ships is
-`FROM scratch`. It carries `celastro-cli` — the full command-line tool: `serve`,
-`exec`, `run`, `repl`, `demo`, `catalog` — a copy of the licence, and nothing
-else.
+`Dockerfile` builds the image in two stages: a musl toolchain compiles one
+statically linked `celastro-cli` with the `tls` feature, and the image that
+ships is `FROM scratch` — the binary, the licence, the copyright notice, and
+nothing else.
 
 Each release publishes the image as `ghcr.io/celastro/celastro:<version>`,
 with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.27.0
+docker pull ghcr.io/celastro/celastro:0.27.1
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
 ```
 
-The image holds five things of its own: the binary, `LICENSE`, `COPYRIGHT`,
-the `/data` directory and the `.keep` that makes it exist; everything else
-`docker export` lists (`.dockerenv`, `dev/`, `etc/`, `proc/`, `sys/`) is the
-runtime's, made for every container and empty. The binary, the licence and
-the notice are root-owned and not writable by the user the image runs as, on
-purpose: a process able to overwrite its own executable has a capability with
-no legitimate use. UID 65532 owns the data directory and nothing else. No
-shell, no libc, no package manager, nothing to patch, and nothing running as
-root.
-
-The image is a few megabytes. The compiler is pinned and the binary
-reproduces byte for byte, so the binary's size is the stable number; what
-`docker images` and `docker image inspect` print depends on the image store
-and is not reproducible to the byte, so do not hold them to one.
+The image holds the binary, `LICENSE`, `COPYRIGHT` and an empty `/data`;
+everything else `docker export` lists is the runtime's. The binary and the
+two notices are root-owned and not writable by the user the image runs as: a
+process able to overwrite its own executable has a capability with no
+legitimate use. UID 65532 owns `/data` and nothing else. No shell, no libc,
+no package manager, nothing running as root. The image is a few megabytes;
+the binary reproduces byte for byte and its size is the stable number, what
+`docker images` prints is not.
 
 `docker run --read-only` works — `demo` and a volume-backed `exec` both complete
 under it — because nothing is written outside the data directory.
@@ -57,14 +50,12 @@ Exit 0, no error, nothing wrong — but not what anyone meant to run.
 | `docker run -t celastro` | a pty with nobody on it: blocks forever |
 | `docker run -it celastro` | the interactive session |
 
-`-t` without `-i` is the trap. It does not exit; it waits on a terminal that
-will never send anything, and because the REPL handles no signals (only
-`serve` does -- see below) `docker stop` waits out the full ten-second grace
-period and then kills it: exit 137.
+`-t` without `-i` is the trap: it waits on a terminal that never sends
+anything, and since only `serve` handles signals, `docker stop` waits out the
+ten-second grace period and kills it (exit 137).
 
-With a volume, the entrypoint is bare so global flags precede the verb. `-i` is
-what lets the statements below arrive on stdin; `-it` is the same session typed
-by hand:
+The entrypoint is bare, so global flags precede the verb; `-i` lets a script
+arrive on stdin:
 
 ```
 $ docker volume create celastro-data
@@ -83,11 +74,8 @@ celastro> 1 document(s) written at ts 7327891161097814016
 celastro> $
 ```
 
-The prompt is written before each read, so a piped session prints it ahead of
-the answer to the statement it just read, and the last prompt has nothing behind
-it — the shell's own prompt lands on the same line.
-
-A collection created in the first container is there in the second:
+(The prompt is written before each read, so a piped session prints it ahead
+of each answer.) A collection created in one container is there in the next:
 
 ```
 $ docker run --rm -v celastro-data:/data celastro --dir /data exec 'SELECT id, note FROM m'
@@ -113,9 +101,8 @@ so `-v celastro-data:/data` needs no preparation: UID 65532 owns it and can
 write.
 
 A **bind mount** is not seeded. Docker creates a missing host directory as
-`root:root`, and 65532 cannot write there. The failure is two lines, and the
-first one arrives on the first statement, because `CREATE COLLECTION` persists
-the catalog as it runs rather than at close:
+`root:root`, which 65532 cannot write, and the failure arrives on the first
+statement, because the catalog is persisted as it changes:
 
 ```
 $ docker run --rm -v "$PWD/data:/data" celastro --dir /data exec 'CREATE COLLECTION notes (id TEXT PRIMARY KEY)'
@@ -125,23 +112,17 @@ $ ls -ldn ./data
 drwxr-xr-x 2 0 0 4096 Sep 10 10:25 ./data
 ```
 
-Exit 1, and the directory Docker made is there, owned by root. Every session
-saves as it closes, so a container that only read still exits 1 on a data
-directory it cannot write. Both fixes below start from the state
-above — a `./data` that Docker has already created as `root:root` — and both
-therefore start with `sudo`, because that directory is root's and changing a
-file's owner is privileged on Linux. Either one is enough:
+Every session saves as it closes, so even a container that only read exits 1
+on a directory it cannot write. Either fix is enough; both start with `sudo`
+only because Docker already made the directory root's:
 
 | fix | prepare, once | then run | files land owned by |
 |---|---|---|---|
 | run as yourself | `sudo chown "$(id -u):$(id -g)" ./data` | `docker run --user "$(id -u):$(id -g)" -v "$PWD/data:/data" …` | you |
 | hand the directory to the image's UID | `sudo chown 65532:65532 ./data` | `docker run -v "$PWD/data:/data" …` | 65532 |
 
-The first `sudo` is only the cost of having let Docker create the directory.
-Create it yourself and it is already yours, and the `--user` flag alone is
-enough with no privilege anywhere — the `sudo rm` below only undoes the
-directory Docker made, and a reader who never let it be created starts at the
-`mkdir`:
+Create the directory yourself and it is already yours, and `--user` alone is
+enough with no privilege anywhere:
 
 ```
 $ sudo rm -rf ./data
@@ -150,62 +131,44 @@ $ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/data:/data" celastro --dir
 collection `notes` created with 1 shard(s)
 ```
 
-`--user` alone against a directory Docker made is not a fix: your UID cannot
-write a `root:root` directory any more than 65532 can, and the failure is the
-same two lines. The `chown` is the part that does the work; the `--user` only
-decides whose name ends up on the files.
-
-Nothing in celastro resolves a UID to a name, and the image has no `passwd`
-file to resolve it in, so `--user` may name any pair of numbers.
+`--user` alone against a directory Docker made is not a fix: the `chown` does
+the work, `--user` only decides whose name ends up on the files. The image
+has no `passwd` file and nothing in celastro resolves a UID, so `--user` may
+name any pair of numbers.
 
 ## A probe from inside the image
 
-`celastro-cli health` asks the console on `--port` whether it is serving, and
-exits 0 only for a 200 that says so. It exists because a container's probe
-cannot be anything else here: the image has no shell and no curl, and the
-console binds loopback, which a probe from outside the pod cannot reach. The
-answer comes from the database -- the console reads its catalog to produce it
--- so a process that is up with a database it could not open is not healthy.
-`/api/health` is the one path served without the token, by decision: a probe
-cannot know a token printed at start, and the answer executes nothing and
-names only the version and the collection count. It stays behind the `Host`
-check. The Helm chart under `chart/` uses it for both probes.
+`celastro-cli health` asks the console on `--port` whether it is serving —
+over TLS when the certificates are in the environment — and exits 0 only for
+a 200 that says so; `--attached N` also requires `N` peers verified since
+start, for a readiness probe. It exists because the image has no shell and no
+curl and the console binds loopback. The answer comes from the database, so a
+process up with a database it could not open is not healthy. `/api/health` is
+the one path served without the token: a probe cannot know one, and the
+answer executes nothing. The Helm chart uses it for both probes.
 
 ## The archived tier can live in an object store
 
 `CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP) and
 `CELASTRO_ARCHIVE_BUCKET`, with `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY`, make the `archived` tier an S3-compatible bucket
-rather than a directory in the volume. `CELASTRO_ARCHIVE_PREFIX` and
-`CELASTRO_ARCHIVE_REGION` are optional. Pass them with `-e`; the credentials
-reach the process through its environment and are never written to the data
-directory. The endpoint must be reachable from the container's network
-namespace, which under `--network host` is the host's.
+`AWS_SECRET_ACCESS_KEY` (`CELASTRO_ARCHIVE_PREFIX` and `_REGION` optional),
+make the `archived` tier an S3-compatible bucket instead of a directory in the
+volume. Pass them with `-e`; the credentials are never written to the data
+directory.
 
 ## The console binds loopback, and `-p` therefore cannot reach it
 
-`celastro-cli serve` puts a browser console on `127.0.0.1` and on nothing else
-unless `--bind` says otherwise (see the end of this section). `Server::bind`
-in `src/serve.rs` states why:
-
-> 127.0.0.1 and nothing else: never 0.0.0.0, never `::`, never a name that might
-> resolve to a routable address. This endpoint executes arbitrary SQL, so a bind
-> reachable from the LAN is a remote code execution surface, not a convenience.
-
-A second guard sits behind the first: `host_is_local` accepts only `localhost`,
-`127.0.0.1` and `[::1]`, each with an optional port, and refuses everything
-else. That one is aimed at DNS rebinding — a page can point a name it controls
-at 127.0.0.1 and the browser will treat the replies as same-origin, which a
-loopback bind does nothing about and a `Host` check does. A per-run token from
-`/dev/urandom` is the third. Observed against a running console: no token → 401;
-a valid token with `Host: evil.example` → 403.
+By default `celastro-cli serve` puts the console on `127.0.0.1` and nothing
+else: the endpoint executes arbitrary SQL, so a bind reachable from a network
+is a remote shell, and three guards sit in front of it — the loopback bind, a
+`Host` allow-list against DNS rebinding (`localhost`, `127.0.0.1`, `[::1]`),
+and a per-run token from `/dev/urandom`. Observed: no token → 401; a valid
+token with `Host: evil.example` → 403.
 
 **`docker run -p` cannot reach a loopback bind.** A published port forwards to
-the container's *external* interface; the console is listening on the
-container's loopback, which is a different interface inside the same namespace.
-The symptom is not a refusal, which is the confusing part: publishing the port
-is enough for the connection to be accepted on the host, and the failure only
-arrives after the handshake, when the forward finds nothing at the other end:
+the container's external interface; the console listens on its loopback. The
+symptom is not a refusal: the connection is accepted on the host and reset
+when the forward finds nothing at the other end:
 
 ```
 $ cid=$(docker run -d -p 8787:8787 -v celastro-data:/data celastro --dir /data serve)
@@ -214,19 +177,16 @@ $ curl -sv http://127.0.0.1:8787/
 * Recv failure: Connection reset by peer
 ```
 
-Nothing reached the accept loop: the container's log has no `connection
-dropped` line. Do not answer this by binding `0.0.0.0`. That bind is the thing
-the design removed, and a published SQL console is a published shell.
-
-That container is still holding host port 8787, so it has to go before anything
-else can bind it:
+Two ways out: `--network host` for a console on this machine, or `--bind`
+with a token (and certificates) for one on a network, below. That container
+still holds host port 8787, so it has to go first:
 
 ```
 $ docker rm -f "$cid" >/dev/null
 ```
 
-**`--network host` is the supported way**, because it makes the host's loopback
-and the container's the same interface:
+**`--network host`** makes the host's loopback and the container's one
+interface:
 
 ```
 $ docker run --rm --network host -v celastro-data:/data celastro --dir /data serve
@@ -238,37 +198,24 @@ stop the server when you are done.
 http://127.0.0.1:8787/?t=fdd2b8856f798668b6f29478e4f1fd5b
 ```
 
-Only the URL is on stdout — pipe the command and you get that line and
-nothing else. The banner and the warning are diagnostics on stderr, and the
-two streams' order on a terminal is not fixed.
-
-That URL, token included, is what to `curl` or open. Ctrl-C in the terminal
-holding the command ends the server, saved and exit 0: `serve` handles SIGINT
-and SIGTERM itself, as the banner says. It can also be stopped from a second
-terminal, which is how a browser session ends it:
+Only the URL is on stdout; the banner is stderr. Ctrl-C ends the server
+saved, exit 0, and so does a `POST` from a second terminal:
 
 ```
 $ curl -s -X POST 'http://127.0.0.1:8787/api/shutdown?t=fdd2b8856f798668b6f29478e4f1fd5b'
 {"ok":true,"kind":"ack","message":"shutting down"}
 ```
 
-The container exits 0 with the database closed properly, and the terminal that
-was holding it comes back.
+What `--network host` costs: no network namespace of its own, so `--port`
+collides on the host like a host process, any process on the host with the
+token can reach the console, and it is a Linux mode (Docker Desktop offers it
+only as a setting you turn on).
 
-What `--network host` costs, plainly: the container gets no network namespace of
-its own. It shares the host's interfaces and its port space, so `--port` binds
-on the host and collides like a host process; any process on the host —
-including any other `--network host` container — can reach the console if it has
-the token; and it is a Linux mode — Docker Desktop offers host networking on
-macOS and Windows only as a setting you turn on deliberately. That is the trade,
-and it is a real one: the alternative is not a safer bind, it is running the
-console outside the container against the same directory, or not running it.
-
-**`--bind 0.0.0.0` is the deliberate exception**, for nodes behind a Service
-or a load balancer. It needs `CELASTRO_TOKEN` in the environment — at least
-sixteen printable bytes, the same at every node — and with it the console
-answers on every interface, so `-p 8787:8787` reaches it and the `Host` check
-gives way to the token:
+**`--bind 0.0.0.0`** is for a console on a network — nodes behind a Service or
+a load balancer. It needs `CELASTRO_TOKEN` in the environment, at least
+sixteen printable bytes, the same at every node; the console then answers on
+every interface, `-p 8787:8787` reaches it, and the `Host` check gives way to
+the token:
 
 ```
 $ docker run -d -p 8787:8787 -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef \
@@ -276,27 +223,23 @@ $ docker run -d -p 8787:8787 -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef 
 $ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0.1:8787/api/health
 ```
 
-Plain HTTP, and the token is the only guard: a network you trust, or an
-ingress that terminates TLS in front of it. The chart's `console.expose` is
-this, with the token in a `Secret` and a Service over the pods.
+Plain HTTP unless the image is also given certificates: mount them and set
+`CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM)
+and the console and the wire serve TLS 1.3, with the CA verifying every peer.
+The chart's `console.expose` and `tls.enabled` are these two, with the token
+and the certificates in Secrets and a Service over the pods.
 
 ## `panic = "abort"` makes the container the unit of recovery
 
-`[profile.release]` sets `panic = "abort"` — "a reachable panic is a bug, not a
-recoverable condition". There is no unwind, no `catch_unwind` boundary and no
-cleanup path: the process ends where it stands, and from outside the container
-that is a process that was running and then was not. What would be a caught
-exception elsewhere is a container exit here, so the restart policy is the
-error handling.
+`[profile.release]` sets `panic = "abort"`: a reachable panic is a bug, the
+process ends where it stands, and the restart policy is the error handling.
 
-`serve` handles SIGTERM and SIGINT itself -- an in-tree binding to
-`signal(2)`, the route being recorded in `src/signal.rs` -- so as PID 1 it
-receives the signal a supervisor sends and ends the accept loop; the caller
-then saves and exits 0. The other verbs install no handler: the REPL because a
-handled Ctrl-C would be swallowed by a restarted read at a terminal, and the
-one-shot verbs because a job that is killed is a job that stops. PID 1 with a
-default disposition does not receive the signal at all, which is what the
-ten seconds below are:
+`serve` handles SIGTERM and SIGINT itself (an in-tree `signal(2)` binding,
+`src/signal.rs`), so as PID 1 it receives the signal, ends the accept loop,
+saves and exits 0. The other verbs install no handler — a REPL's handled
+Ctrl-C would be swallowed by the restarted read, and a killed job is a job
+that stops — and PID 1 with a default disposition does not receive the signal
+at all, which is what the ten seconds below are:
 
 | stopping it | observed |
 |---|---|
@@ -305,17 +248,10 @@ ten seconds below are:
 | `docker stop`, `repl`, container started with `--init` | under a second, exit 143 |
 | `POST /api/shutdown` (`serve` only) | immediate, exit 0, closed cleanly |
 
-So `serve` needs nothing; an interactive `repl` left running as PID 1 wants
-`--init`, or expect its stop to take ten seconds.
-
-Being killed abruptly is survivable. `serve` persists after every statement that
-changed something: two statements through the console, then
-`docker kill --signal=KILL`, then a fresh container over the same volume, and
-the row was there. A restart resumes from the last committed statement, not from
-the last clean shutdown.
-
-`--restart on-failure` is the policy that fits: a panic exits non-zero, and
-`on-failure:N` bounds the retries. Give it a bound, and use it only on `serve`.
-The one-shot verbs are jobs, not services — `exec` against an unwritable
-directory under `--restart on-failure:3` was dutifully restarted three times
-before Docker gave up, and `--restart always` would have retried it forever.
+Being killed abruptly is survivable: every statement that changed something
+was persisted before it was acknowledged, so a restart resumes from the last
+committed statement (verified with `docker kill --signal=KILL` and a fresh
+container over the same volume). `--restart on-failure:N` fits `serve` — a
+panic exits non-zero — and only `serve`: the one-shot verbs are jobs, and an
+`exec` against an unwritable directory under `on-failure:3` was dutifully
+restarted three times.

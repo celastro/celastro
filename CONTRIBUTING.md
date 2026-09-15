@@ -4,8 +4,8 @@ Issues are welcome and wanted. Pull requests are not accepted.
 
 ## Please open issues
 
-The most valuable thing anyone outside the project can contribute is a precise
-bug report. Specifically:
+The most valuable contribution from outside the project is a precise bug
+report:
 
 - **Wrong results.** A query that returns something the SQL semantics say it
   should not, ideally with the smallest corpus that shows it.
@@ -17,13 +17,13 @@ bug report. Specifically:
 - **Documentation that is wrong**, as opposed to absent. The README describes
   invariants; if the code disagrees with it, one of the two is a bug.
 
-Feature requests and design discussion belong in issues too. Say what you want
-to be true and why; that is a conversation worth having.
+Feature requests and design discussion belong in issues too: say what you
+want to be true and why.
 
 ## Why pull requests are not accepted
 
-This is not a judgement about the quality of anyone's patches, and it is not a
-soft "no" that becomes yes for a good enough diff. It is structural:
+Not a judgement of anyone's patches, and not a soft "no" that a good enough
+diff turns into yes. It is structural:
 
 - **The invariants are load-bearing and only partly written down.** Inside a
   segment every index type produces sets in the same `u32` ordinal space. A
