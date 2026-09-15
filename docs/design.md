@@ -333,7 +333,15 @@ shard `i` on the `i`-th node in attach order, and `DETACH NODE` of a node
 holding shards refuses with that plan.
 
 Not built, by decision: replication, so a node that is down is a shard that
-is down.
+is down -- and only that shard (0.34.0): the counters call every statement
+opens with does not fail the statement when a holder is silent; the
+statement fails at the first shard call it makes to that node, which a
+predicate that pins the key to a live shard never makes. A text query is
+the exception by design: its scores come from every holder's term
+statistics, so it is refused or, under `partial_results`, served from the
+rest and says so. Measured on kind with five pods and one scaled away:
+what was every statement failing became the lost shard's statements
+failing.
 
 **The deterministic simulator states what a transport has to keep, before
 there is one.** `celastro::sim` puts a seeded fault schedule on the

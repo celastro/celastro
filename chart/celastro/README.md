@@ -87,8 +87,10 @@ Clients verify the console against `ca.crt` from the Secret, as the notes
 say. The tokens stay in force
 with TLS on; the archive endpoint stays plain HTTP.
 
-A pod that has just restarted has a new address, and the other pods may hold
-the old one for the cluster DNS TTL (30 seconds on kubeadm); until then a
+A pod that has just restarted has a new address; a dial that fails is
+retried for two seconds, which covers a restart, and the other pods may
+still hold the old address for the cluster DNS TTL (30 seconds on
+kubeadm) or a name scaled away for its negative-cache time; until then a
 statement they coordinate over its shards fails naming the shard (`did not
 answer`), `WITH (partial_results)` being the opt-in to an answer without it.
 A client that retries rides it out; measured below.
@@ -131,8 +133,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.33.1 .
-kind load docker-image celastro:0.33.1        # for a kind cluster
+docker build -t celastro:0.34.0 .
+kind load docker-image celastro:0.34.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -170,6 +172,16 @@ is routed to only once it has verified every other pod since it started —
 which needs the headless Service to publish a pod's address before it is
 ready, or no pod could reach another. Liveness stays the plain `health`, so a
 peer that is down does not get every pod restarted.
+
+## Upgrading
+
+`helm upgrade` with a new `image.tag` rolls the pods one by one; a pod
+on the new version attaches the old ones as it comes up (0.34.0 -- until
+then the attach refused a different version and the rollout stalled at
+the first pod), and the wire's own version is what decides whether two
+versions speak. A release that bumps the wire version says so in the
+changelog; those need every pod restarted together
+(`updateStrategy: OnDelete`, delete them all).
 
 ## Stopping
 
@@ -288,6 +300,19 @@ built from the tree at the time:
   node's backup, 3,000 rows and the text query back, no restarts. The
   first build shared one `LATEST` between pods and every pod restored the
   last writer's shard, which is why backups are per node now.
+- **A lost node of five** (celastro 0.34.0): five pods, a collection
+  split five ways, 5,000 rows, a backup per node on the NFS claim. A pod
+  scaled away: a scan without `partial_results` fails in 1.7 s naming the
+  shard and the node, with it answers 4,003 rows and names `shard 2`; a
+  point lookup on a live shard answers without `partial_results` (it
+  failed until 0.34.0, on the counters call); an insert into the lost
+  shard fails at once, one into a live shard succeeds; DDL applies on the
+  four holders and names the fifth. The pod back: ready in 5 s, reachable
+  after the DNS negative-cache time (23 s). A pod deleted and recreated:
+  6 of 59 scans failed over the 40 s around it. A pod lost with its
+  volume: back empty in 20 s, `RESTORE FROM 'nightly'` on it brings its
+  shard back. The rolling upgrade from the previous image stalled at the
+  first pod until the attach stopped refusing a different crate version.
 - **Ingest under a memory limit** (celastro 0.33.0): the binary of the
   image, 300 statements of 1,000 documents (50,000 with text and 128-d
   vectors, 250,000 edges) in a cgroup with `MemoryMax`. With the old

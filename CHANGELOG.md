@@ -6,6 +6,43 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.34.0 — 2026-09-15
+
+What a lost node costs, narrowed; hence a minor.
+
+**A lost node costs its shards and nothing else.** Every statement opens
+with a counters call to every holder (the read-your-writes instant and
+the statistics epoch); until now a holder that did not answer it failed
+the statement, whatever the statement was about. The call's failure is
+no longer the statement's: without `partial_results` the statement goes
+on and fails at the first shard call it makes to that node, so a
+statement that never asks the lost shards -- a primary-key equality on a
+`splits` collection now prunes to the owning shard, as a partition-key
+equality always did -- answers. A text query needs every holder's term
+statistics and is refused or partial as before. The refusal names the
+node and the call for a per-node call, and the shard for a shard call;
+it used to say "shard 0" for `counters`, the placeholder that call is
+sent with.
+
+**A rolling upgrade rolls.** Attaching a peer refused a different crate
+version, so the first pod of a new version could attach none of the old
+ones, was never ready (`--attached replicas-1`), and the StatefulSet's
+rollout stopped there -- found while upgrading a five-pod cluster on
+kind. The wire version each frame carries is the compatibility that
+matters and is still checked; the crate versions may differ.
+
+**A node that is coming back is dialled again.** A dial that fails -- a
+name that does not resolve, a port that refuses -- is retried with
+backoff for two seconds, within the statement's deadline, before the node
+counts as gone -- once per node per two seconds, so a dead node costs a
+statement one window and not one per call it makes; a pod restarting no
+longer costs the statements that arrive while it binds. On kind, a pod
+deleted and recreated cost 6 of 59 scans over the 40 s around it; a
+pod scaled away and back stays unreachable for the cluster DNS's
+negative-cache time (23 s measured), which the retry is not meant to
+cover. A name the cluster's DNS has cached as absent is
+not covered, and is not meant to be.
+
 ## 0.33.1 — 2026-09-15
 
 A performance fix, hence a patch.

@@ -44,7 +44,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, Collection, Tablet};
 use crate::codec::*;
@@ -70,6 +70,13 @@ pub const WIRE_VERSION: u8 = 4;
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 const MAX_FRAME: u32 = 256 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a dial that fails outright -- a name that does not resolve, a
+/// port that refuses -- is retried with backoff before the node is given up
+/// on for this call, within what is left of the statement's deadline. Two
+/// seconds covers a pod that is restarting; it does not cover a name the
+/// cluster's DNS has cached as absent (thirty seconds on kube-dns), and is
+/// not meant to: a dead node has to fail statements, not stall them.
+const DIAL_RETRY: Duration = Duration::from_secs(2);
 /// How long the listener is waited on before `stop` and the shutdown flag
 /// are read again; a connection ends the wait at once (`signal::wait_readable`).
 const ACCEPT_WAIT: Duration = Duration::from_millis(100);
@@ -507,6 +514,10 @@ pub struct Node {
     /// What the connection is wrapped in and verified by, when the process
     /// has certificates; plain TCP otherwise.
     tls: Option<Arc<Tls>>,
+    /// When a dial last gave up, so the next calls within `DIAL_RETRY` of
+    /// it fail at once instead of each retrying for the whole window: a
+    /// dead node costs a statement one window, not one per call it makes.
+    dial_failed: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for Node {
@@ -533,7 +544,14 @@ impl Node {
                 ))
             })?
             .to_string();
-        Ok(Node { url: url.to_string(), addr, token, stream: Mutex::new(None), tls })
+        Ok(Node {
+            url: url.to_string(),
+            addr,
+            token,
+            stream: Mutex::new(None),
+            tls,
+            dial_failed: Mutex::new(None),
+        })
     }
 
     pub fn url(&self) -> &str {
@@ -582,15 +600,41 @@ impl Node {
         loop {
             attempt += 1;
             if guard.is_none() {
-                match self.connect() {
-                    Ok(s) => *guard = Some(s),
-                    Err(e) => {
-                        return Err(Error::Deadline(format!(
-                            "shard {shard} of `{collection}` on {} did not answer `{}` ({e}); use \
-                             WITH (partial_results) to opt in to incomplete answers",
-                            self.url,
-                            call.name()
-                        )))
+                // A dial that fails is retried with backoff for `DIAL_RETRY`
+                // (and never past the statement's deadline): a pod that is
+                // coming back refuses for a moment and then answers.
+                let dial_started = Instant::now();
+                let recently_failed = self
+                    .dial_failed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some_and(|t| t.elapsed() < DIAL_RETRY);
+                let mut backoff = Duration::from_millis(100);
+                loop {
+                    match self.connect() {
+                        Ok(s) => {
+                            *self.dial_failed.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                            *guard = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let left = crate::deadline::remaining_ms()
+                                .map(Duration::from_millis)
+                                .unwrap_or(DIAL_RETRY);
+                            let spent = dial_started.elapsed();
+                            if recently_failed || spent + backoff >= DIAL_RETRY.min(left) {
+                                *self.dial_failed.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    Some(Instant::now());
+                                return Err(Error::Deadline(self.refusal(
+                                    call,
+                                    collection,
+                                    shard,
+                                    &format!("({e})"),
+                                )));
+                            }
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(Duration::from_millis(800));
+                        }
                     }
                 }
             }
@@ -615,16 +659,30 @@ impl Node {
                         } else {
                             format!("({e})")
                         };
-                        return Err(Error::Deadline(format!(
-                            "shard {shard} of `{collection}` on {} did not answer `{}` {why}; use \
-                             WITH (partial_results) to opt in to incomplete answers",
-                            self.url,
-                            call.name()
-                        )));
+                        return Err(Error::Deadline(self.refusal(call, collection, shard, &why)));
                     }
                 }
             }
         }
+    }
+
+    /// The one message for a node that did not answer. A per-node call --
+    /// `counters`, `hello`, a forwarded statement -- names the node and the
+    /// call; a shard call names the shard too. Until 0.34.0 every refusal
+    /// said "shard 0", the placeholder a per-node call is sent with.
+    fn refusal(&self, call: Call, collection: &str, shard: usize, why: &str) -> String {
+        let per_node =
+            matches!(call, Call::Hello | Call::Counters | Call::Statement | Call::CreateCollection);
+        let what = if per_node {
+            format!("{} did not answer `{}`", self.url, call.name())
+        } else {
+            format!(
+                "shard {shard} of `{collection}` on {} did not answer `{}`",
+                self.url,
+                call.name()
+            )
+        };
+        format!("{what} {why}; use WITH (partial_results) to opt in to incomplete answers")
     }
 
     pub fn hello(&self) -> Result<Hello> {

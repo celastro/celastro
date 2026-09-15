@@ -472,7 +472,6 @@ fn walk_text_match(e: &Expr, negated: bool, f: &mut impl FnMut(&str, &str, bool)
 /// over the whole collection spends the cap on terms no document the statement
 /// can return holds.
 pub(crate) fn partition_constraint(coll: &Collection, e: Option<&Expr>) -> Option<String> {
-    let pk = coll.partition_key.as_ref()?;
     fn find(e: &Expr, pk: &str) -> Option<Value> {
         match e {
             Expr::Compare { path, op: CmpOp::Eq, lit } if path == pk => Some(lit.clone()),
@@ -484,7 +483,13 @@ pub(crate) fn partition_constraint(coll: &Collection, e: Option<&Expr>) -> Optio
     // A value that cannot be rendered as a key cannot match any document, but
     // declining to prune is always safe, so a rendering failure just means the
     // query fans out.
-    find(e?, pk).and_then(|v| partition_prefix(&v).ok())
+    match &coll.partition_key {
+        Some(pk) => find(e?, pk).and_then(|v| partition_prefix(&v).ok()),
+        // No partition key: the sort key is the primary key itself, so an
+        // equality on it pins the statement to the one shard whose range
+        // holds that key (0.34.0). A whole key is its own prefix.
+        None => find(e?, &coll.primary_key).and_then(|v| crate::shard::key_component(&v).ok()),
+    }
 }
 
 pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {

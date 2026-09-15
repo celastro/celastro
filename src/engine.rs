@@ -1650,14 +1650,13 @@ impl Db {
                 )))
             }
         }
-        if hello.version != env!("CARGO_PKG_VERSION") {
-            return Err(Error::Plan(format!(
-                "the node at {url} runs celastro {}, this one {}; the wire needs the same version \
-                 on both",
-                hello.version,
-                env!("CARGO_PKG_VERSION")
-            )));
-        }
+        // The hello came back over a frame the peer checked against its
+        // wire version, and that is the compatibility that matters: two
+        // crate versions with one wire version speak. Until 0.34.0 the crate
+        // versions had to be equal, which made a rolling upgrade impossible
+        // -- the first pod on the new version could attach nobody, was
+        // never ready, and the rollout never moved.
+        let _ = &hello.version;
         self.attached.insert(url.to_string());
         if !self.catalog.nodes.iter().any(|n| n == url) {
             self.catalog.nodes.push(url.to_string());
@@ -4016,6 +4015,14 @@ impl Db {
         let mut writes = self.writes_to(&sel.collection);
         let mut unreachable: Vec<usize> = Vec::new();
         let mut remotes: BTreeMap<String, Arc<crate::wire::Node>> = BTreeMap::new();
+        // Every holder's counters, for the read-your-writes instant and the
+        // statistics epoch. A holder that does not answer here is not yet
+        // the statement's failure: under `partial_results` its shards are
+        // missing from here on; without it the statement goes on, and fails
+        // at the first shard call it makes to that node -- so a statement
+        // that never asks the lost node's shards answers (a key the
+        // predicate pins to a live shard, a partition on a live shard).
+        // Until 0.34.0 the counters call itself failed every statement.
         for url in self.holders(&sel.collection) {
             let node = self.node_conn(&url)?;
             match node.counters(&sel.collection) {
@@ -4023,14 +4030,12 @@ impl Db {
                     ts = ts.max(t);
                     writes += w;
                 }
-                Err(Error::Deadline(e)) => {
-                    if !partial {
-                        return Err(Error::Deadline(e));
-                    }
+                Err(Error::Deadline(_)) if partial => {
                     unreachable.extend(
                         tablets.iter().enumerate().filter(|(_, t)| t.node == url).map(|(i, _)| i),
                     );
                 }
+                Err(Error::Deadline(_)) => {}
                 Err(e) => return Err(e),
             }
             remotes.insert(url, node);
@@ -4086,10 +4091,8 @@ impl Db {
                 let node = self.node_conn(&url)?;
                 match node.counters(via) {
                     Ok((t, _)) => ts = ts.max(t),
-                    Err(Error::Deadline(e)) => {
-                        if !partial {
-                            return Err(Error::Deadline(e));
-                        }
+                    Err(Error::Deadline(_)) if !partial => {}
+                    Err(Error::Deadline(_)) => {
                         for (i, t) in tablets.iter().enumerate() {
                             if t.node == url {
                                 edge_unreachable.push(i);
@@ -7627,6 +7630,40 @@ mod tests {
         assert!(again.is_ok(), "{:?}", again.err());
         drop(again);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// On a collection split by key with no partition key, an equality on
+    /// the primary key asks the one shard whose range holds it; EXPLAIN
+    /// shows the others pruned.
+    #[test]
+    fn a_primary_key_equality_prunes_to_the_owning_shard() {
+        let mut db = Db::in_memory();
+        db.execute(
+            "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['g', 'p'])",
+        )
+        .unwrap();
+        for (i, k) in ["a1", "h1", "t1"].iter().enumerate() {
+            db.insert(
+                "items",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(k.to_string())),
+                    ("n".into(), Value::Int(i as i64)),
+                ]),
+            )
+            .unwrap();
+        }
+        let r = db.query("SELECT id FROM items WHERE id = 'h1' LIMIT 1").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let plan = match db
+            .execute("EXPLAIN ANALYZE SELECT id FROM items WHERE id = 'h1' LIMIT 1")
+            .unwrap()
+        {
+            Outcome::Explain(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.matches("PRUNED").count(), 2, "{plan}");
+        let r = db.query("SELECT id FROM items WHERE n = 1 LIMIT 5").unwrap();
+        assert_eq!(r.rows.len(), 1, "a predicate that is not on the key still fans out");
     }
 
     #[test]

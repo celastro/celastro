@@ -243,7 +243,12 @@ so a statement issued at any of them reaches the right shards: writes are
 forwarded to the owner and acknowledged after it acknowledged, queries fan
 out and fuse where they arrived, DDL runs on every holder, and `LOCAL`
 prefixes a statement to one node only. A node that does not answer is a
-deadline at the coordinator, with `WITH (partial_results)` naming its shard.
+deadline at the coordinator, with `WITH (partial_results)` naming its shard;
+a statement that never asks the lost node's shards — a key the predicate
+pins to a live shard, a partition on one — answers without it, while a
+text query, scored against every holder's statistics, needs them all. A
+node that is coming back is dialled again for two seconds before it
+counts as gone.
 A shard moves without stopping the collection, its files being all that
 crosses the wire.
 
@@ -265,8 +270,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.33.1 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.33.1 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.34.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.34.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

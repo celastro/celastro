@@ -31,9 +31,15 @@ struct Node {
 
 impl Node {
     fn start(tag: &str) -> Node {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Node::start_at(tag, 0, None)
+    }
+
+    /// A node on a given port with a given directory: what a node that
+    /// comes back after a restart is -- the same address, the same data.
+    fn start_at(tag: &str, port: u16, reuse: Option<PathBuf>) -> Node {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let url = format!("tcp://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let dir = dir(tag);
+        let dir = reuse.unwrap_or_else(|| dir(tag));
         let mut opts = DbOpts::default();
         opts.node = Some(url.clone());
         let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
@@ -662,4 +668,105 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
     for d in [&a.dir, &b.dir, &c.dir, &one_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// A lost node costs its shards and nothing else. Three nodes, a collection
+/// split three ways by key, the third node gone: a statement whose
+/// predicate pins the key to a live shard answers without
+/// `partial_results`; one that needs the lost shard fails naming that
+/// shard and the node (not "shard 0", the placeholder the per-node
+/// counters call is sent with); with `partial_results` the scan names the
+/// missing shard.
+#[test]
+fn a_statement_that_never_asks_the_lost_shard_answers_without_partial_results() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("lost-a");
+    let b = Node::start("lost-b");
+    let c = Node::start("lost-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    // Shard 0: keys below `g` (on a); shard 1: `g`..`p` (on b); shard 2: `p` and up (on c).
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['g', 'p'])");
+    a.ack("CREATE INDEX items_body ON items USING fulltext (body)");
+    for (i, prefix) in
+        ["a", "h", "t"].iter().enumerate().flat_map(|(k, p)| (0..5).map(move |i| (i + k * 5, *p)))
+    {
+        let d = Value::obj(vec![
+            ("id".into(), Value::Str(format!("{prefix}{i:04}"))),
+            ("n".into(), Value::Int(i as i64)),
+            ("body".into(), Value::Str(format!("row {i}"))),
+        ]);
+        a.db.write().unwrap().insert("items", d).unwrap();
+    }
+    assert_eq!(a.query("SELECT id FROM items LIMIT 100").unwrap().rows.len(), 15);
+
+    let c_url = c.url.clone();
+    drop(c);
+    settle();
+    // A key on a's own shard: no need for c, no need for partial_results.
+    let r = a.query("SELECT id FROM items WHERE id = 'a0000' LIMIT 1").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert!(r.missing.is_empty());
+    // A key on b's shard, asked at a: the same.
+    let r = a.query("SELECT id FROM items WHERE id = 'h0005' LIMIT 1").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    // A key on c's shard: refused, naming shard 2 and c.
+    let e = a.query("SELECT id FROM items WHERE id = 't0010' LIMIT 1").unwrap_err().to_string();
+    assert!(e.contains("shard 2") && e.contains(&c_url), "{e}");
+    assert!(!e.contains("shard 0"), "the per-node placeholder leaked: {e}");
+    // A scan needs every shard: refused without partial_results, short with it.
+    let e = a.query("SELECT id FROM items LIMIT 100").unwrap_err().to_string();
+    assert!(e.contains(&c_url) && !e.contains("shard 0"), "{e}");
+    let r = a.query("SELECT id FROM items LIMIT 100 WITH (partial_results)").unwrap();
+    assert_eq!(r.missing, vec!["shard 2"]);
+    assert_eq!(r.rows.len(), 10);
+    // A text query is scored against every holder's term statistics, so
+    // even one pinned to a live shard needs the lost node: refused without
+    // partial_results (naming the shard the statistics call failed on),
+    // answered from the rest with it.
+    let e = a
+        .query("SELECT id FROM items WHERE id = 'a0001' AND text_match(body, 'row') LIMIT 5")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("shard 2") && e.contains("term_stats"), "{e}");
+    let r = a
+        .query(
+            "SELECT id FROM items WHERE id = 'a0001' AND text_match(body, 'row') LIMIT 5 \
+             WITH (partial_results)",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.missing, vec!["shard 2"]);
+}
+
+/// A node that comes back is reached: its port refuses for a moment and
+/// the dial retries within the statement's deadline instead of failing the
+/// statement at the first refusal.
+#[test]
+fn a_node_that_comes_back_within_the_dial_retry_is_reached() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("back-a");
+    let b = Node::start("back-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL) PARTITION BY (tenant) WITH (splits = ['t1'])");
+    for i in 0..12usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    assert_eq!(a.query("SELECT id FROM items LIMIT 100").unwrap().rows.len(), 12);
+    let port: u16 = b.url.rsplit(':').next().unwrap().parse().unwrap();
+    let b_dir = b.dir.clone();
+    drop(b);
+    settle();
+    // b comes back on the same port, with its data, 600 ms from now.
+    let back = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Node::start_at("back-b-again", port, Some(b_dir))
+    });
+    let t0 = std::time::Instant::now();
+    let r = a.query("SELECT id FROM items LIMIT 100 WITH (deadline_ms = 5000)").unwrap();
+    assert_eq!(r.rows.len(), 12, "the statement waited for b and got everything");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4), "{:?}", t0.elapsed());
+    let _b = back.join().unwrap();
 }
