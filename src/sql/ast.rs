@@ -242,9 +242,10 @@ pub enum Expr {
         via: String,
         /// Follow the adjacency index against its declared order.
         reverse: bool,
-        /// A structured predicate on the edge collection, applied at every
-        /// hop.
-        filter: Option<Box<Expr>>,
+        /// Structured predicates on the edge collection: none, one for
+        /// every hop, or one per hop (`WHERE a THEN WHERE b`), the i-th at
+        /// hop i.
+        filters: Vec<Expr>,
     },
     And(Vec<Expr>),
     Or(Vec<Expr>),
@@ -283,8 +284,27 @@ impl DistOp {
 
 #[derive(Debug, Clone)]
 pub enum HybridSource {
-    Text { path: String, query: String },
-    Vector { path: String, op: DistOp, query: Vec<f32> },
+    Text {
+        path: String,
+        query: String,
+    },
+    Vector {
+        path: String,
+        op: DistOp,
+        query: Vec<f32>,
+    },
+    /// `hops(id WITHIN 3 HOPS OF 'x' VIA cites)`: hop distance as a source,
+    /// nearer ranking higher. The same clause as the filter, walked the
+    /// same way; what differs is that each key keeps the hop it was first
+    /// reached at.
+    Hops {
+        path: String,
+        k: usize,
+        start: String,
+        via: String,
+        reverse: bool,
+        filters: Vec<Expr>,
+    },
 }
 
 impl HybridSource {
@@ -292,6 +312,7 @@ impl HybridSource {
         match self {
             HybridSource::Text { path, .. } => format!("text({path})"),
             HybridSource::Vector { path, .. } => format!("vector({path})"),
+            HybridSource::Hops { via, .. } => format!("hops({via})"),
         }
     }
 }

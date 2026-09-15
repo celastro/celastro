@@ -6,6 +6,23 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.26.0 — 2026-09-15
+
+A walk ranks, and filters per hop, hence a minor.
+
+**`hops(...)` is a fusion source.** `ORDER BY hybrid(text_match(body, 'x'),
+hops(id WITHIN 3 HOPS OF 'p1' VIA cites))` scores each node by the hop it
+was first reached at, lower better, and fuses it beside the other sources
+under either method; the plan lists the walk as `hops(...)` and the source
+as `hops(cites)`. Alone in `hybrid()` it is refused: a walk on its own is
+the filter. Bit-identical across shard counts and over the wire.
+
+**`THEN WHERE` gives each hop its own edge filter.** `VIA cites WHERE kind
+= 'a' THEN WHERE kind = 'b'` applies the i-th filter at hop i; one filter
+still applies to every hop, and a count that is neither one nor `k` is
+refused with the counts. The plan's hop lines say `edge filter i of n`.
+The wire's expansion now carries the hop (wire version 4).
+
 ## 0.25.0 — 2026-09-15
 
 The console serves connections at once, hence a minor.

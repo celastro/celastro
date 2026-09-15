@@ -186,10 +186,17 @@ to `dst`, the order the adjacency index was declared in; `VIA cites REVERSE`
 follows them the other way, and a collection created `WITH (undirected =
 true)` follows both. `VIA cites WHERE kind = 'cites'` applies a structured
 filter on the edge collection at every hop; a compound one goes in
-parentheses. The walk is resolved before the rest of the plan runs and the
-neighbourhood joins the text and vector sets as one more bitmap, so the
+parentheses, and `WHERE kind = 'a' THEN WHERE kind = 'b'` gives each hop its
+own, one per hop. The walk is resolved before the rest of the plan runs and
+the neighbourhood joins the text and vector sets as one more bitmap, so the
 answer is the same at any number of shards, and an edge collection can be
 spread over nodes like any other.
+
+A walk can rank as well as filter: `ORDER BY hybrid(text_match(body,
+'retrieval'), hops(id WITHIN 3 HOPS OF 'p1' VIA cites))` is one more fusion
+source, each node scored by the hop it was first reached at, so nearer
+nodes rank higher beside the text and vector scores under either method.
+On its own it is refused — a walk alone is the filter.
 
 `k` is required, and two caps bound what a hub can cost: `WITH (max_fanout =
 N)` follows at most `N` edges out of one node, `WITH (max_frontier = N)`
@@ -391,7 +398,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.25.0 && docker tag ghcr.io/celastro/celastro:0.25.0 celastro
+docker pull ghcr.io/celastro/celastro:0.26.0 && docker tag ghcr.io/celastro/celastro:0.26.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

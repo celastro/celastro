@@ -34,7 +34,7 @@ use crate::plan::exec;
 use crate::plan::explain::{HopExplain, UnitExplain, WalkExplain};
 use crate::plan::service::ShardService;
 use crate::shard::{Searchable, Shard};
-use crate::sql::ast::{Expr, Select};
+use crate::sql::ast::{Expr, HybridSource, OrderBy, Select};
 use crate::time::Timestamp;
 use crate::value::Value;
 
@@ -52,14 +52,27 @@ pub struct ExpandRequest<'a> {
     pub limit: Option<usize>,
     /// Follow the adjacency index against its declared order.
     pub reverse: bool,
-    /// A structured predicate on the edge collection, applied at every hop.
+    /// The structured predicate on the edge collection for this hop, if
+    /// the walk has one for it ([`filter_for`]).
     pub filter: Option<&'a Expr>,
     /// The statement's text and parameters, for a shard on another node,
     /// which re-parses them and finds the filter as the `walk`-th walk of
-    /// the predicate.
+    /// the statement at hop `hop`.
     pub statement: &'a str,
     pub params: &'a [Value],
     pub walk: usize,
+    pub hop: usize,
+}
+
+/// The edge filter for hop `hop` (from 1) of a walk with these filters:
+/// none, the one for every hop, or the `hop`-th of one per hop. A count
+/// that is neither one nor the walk's `k` was refused before the walk.
+pub fn filter_for(filters: &[Expr], hop: usize) -> Option<&Expr> {
+    match filters.len() {
+        0 => None,
+        1 => filters.first(),
+        _ => filters.get(hop - 1),
+    }
 }
 
 /// A shard's answer to one hop.
@@ -242,7 +255,8 @@ pub struct WalkSpec<'a> {
     pub k: usize,
     pub start: &'a str,
     pub reverse: bool,
-    pub filter: Option<&'a Expr>,
+    /// None, one for every hop, or one per hop; see [`filter_for`].
+    pub filters: &'a [Expr],
     /// The edge collection and its adjacency index.
     pub edges: &'a Collection,
     pub index: &'a IndexDef,
@@ -260,6 +274,9 @@ pub struct WalkSpec<'a> {
 /// `partial_results`, named for `missing`.
 pub struct WalkOutcome {
     pub keys: Vec<String>,
+    /// The live keys each hop reached first, sorted, hop 1 first: the
+    /// answer split by distance, for a walk that ranks rather than filters.
+    pub by_hop: Vec<Vec<String>>,
     pub explain: WalkExplain,
     pub cuts: Vec<String>,
     pub missing: Vec<String>,
@@ -291,6 +308,7 @@ pub fn walk(
     let mut missing = Vec::new();
     let mut cuts = Vec::new();
     let mut hops = Vec::new();
+    let mut by_hop = Vec::new();
     // Sorted and distinct, every one of them, so that each step below is a
     // merge and the frontier reaches the shards in key order.
     let mut seen: Vec<String> = vec![spec.start.to_string()];
@@ -313,10 +331,11 @@ pub fn walk(
             ts,
             limit: spec.max_fanout.map(|n| n + 1),
             reverse: spec.reverse,
-            filter: spec.filter,
+            filter: filter_for(spec.filters, hop),
             statement: spec.statement,
             params: spec.params,
             walk: spec.walk,
+            hop,
         };
         let mut scanned = 0usize;
         for s in edge_services {
@@ -405,6 +424,7 @@ pub fn walk(
         let dangling = new.len() - live.len();
         seen = union(seen, new);
         answer = union(answer, live.clone());
+        by_hop.push(live.clone());
         frontier = live;
         hops.push(HopExplain {
             hop,
@@ -417,6 +437,10 @@ pub fn walk(
             expand_micros,
             check_micros: t_check.elapsed().as_micros(),
             scanned,
+            filter: match spec.filters.len() {
+                0 | 1 => None,
+                n => Some((hop, n)),
+            },
         });
     }
     let keys = answer;
@@ -435,7 +459,34 @@ pub fn walk(
         keys: keys.len(),
         micros: t0.elapsed().as_micros(),
     };
-    Ok(WalkOutcome { keys, explain, cuts, missing })
+    Ok(WalkOutcome { keys, by_hop, explain, cuts, missing })
+}
+
+/// Every walk of a statement, as the coordinator runs them and as a shard
+/// on another node numbers them: the predicate's first, in the order
+/// `bind_hops` replaces them, then the `hops(...)` sources of an `ORDER BY
+/// hybrid(...)`, each as the `Expr::Hops` it would be as a filter.
+pub fn walks_of(sel: &Select) -> Vec<Expr> {
+    let mut out: Vec<Expr> = sel
+        .predicate
+        .as_ref()
+        .map(|p| hops_in(p).into_iter().cloned().collect())
+        .unwrap_or_default();
+    if let Some(OrderBy::Hybrid(h)) = &sel.order {
+        for s in &h.sources {
+            if let HybridSource::Hops { path, k, start, via, reverse, filters } = s {
+                out.push(Expr::Hops {
+                    path: path.clone(),
+                    k: *k,
+                    start: start.clone(),
+                    via: via.clone(),
+                    reverse: *reverse,
+                    filters: filters.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Every walk in a predicate, in the order `bind_hops` replaces them.

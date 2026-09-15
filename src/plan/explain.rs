@@ -154,6 +154,9 @@ pub struct HopExplain {
     /// Units that had no adjacency region -- a memtable, or a segment sealed
     /// before the index was declared -- and were scanned instead of probed.
     pub scanned: usize,
+    /// `(i, n)` when the walk has one edge filter per hop and this hop used
+    /// the i-th of n; `None` for no filter or one for every hop.
+    pub filter: Option<(usize, usize)>,
 }
 
 impl Explain {
@@ -184,6 +187,14 @@ impl Explain {
         for w in &self.walks {
             o.push_str(&format!("  walk: {} (index {}, {})\n", w.label, w.index, w.direction));
             for h in &w.hops {
+                let mut notes = String::new();
+                if let Some((i, n)) = h.filter {
+                    notes.push_str(&format!("; edge filter {i} of {n}"));
+                }
+                if h.scanned > 0 {
+                    notes
+                        .push_str(&format!("; {} unit(s) scanned: no adjacency region", h.scanned));
+                }
                 o.push_str(&format!(
                     "    hop {}: {} key(s) expanded over {} edge(s): {} new, {} dangling, \
                      frontier {}{} (expand {:.2} ms, check {:.2} ms{})\n",
@@ -200,11 +211,7 @@ impl Explain {
                     },
                     h.expand_micros as f64 / 1000.0,
                     h.check_micros as f64 / 1000.0,
-                    if h.scanned > 0 {
-                        format!("; {} unit(s) scanned: no adjacency region", h.scanned)
-                    } else {
-                        String::new()
-                    }
+                    notes
                 ));
             }
             o.push_str(&format!(

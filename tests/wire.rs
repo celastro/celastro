@@ -461,6 +461,10 @@ fn a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answ
          hybrid(text_match(body, 'vector index'), embedding <=> [0.2, 0.2, 0.9, 1.0], method => \
          'linear') LIMIT 6",
         "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-050' VIA cites REVERSE LIMIT 100",
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'graph search'), \
+         hops(id WITHIN 3 HOPS OF 'doc-005' VIA cites WHERE w > 1)) LIMIT 12 WITH (exact)",
+        "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-011' VIA cites WHERE w > 1 THEN WHERE w < 1 \
+         ORDER BY embedding <=> [0.9, 0.1, 0.1, 1.0] LIMIT 10 WITH (exact)",
         "SELECT id FROM items WHERE id WITHIN 2 HOPS OF 'doc-030' VIA cites LIMIT 100 WITH \
          (max_frontier = 5, max_fanout = 2)",
     ];

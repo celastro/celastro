@@ -884,6 +884,40 @@ impl<'a> Parser<'a> {
         Ok(OrderBy::Fields(fields))
     }
 
+    /// What follows `path WITHIN`: `k HOPS OF 'start' VIA edges [REVERSE]
+    /// [WHERE term [THEN WHERE term]...]`. An edge filter is ONE term -- a
+    /// comparison, a `NOT`, or a parenthesised predicate -- so that the
+    /// `AND` after it belongs to the statement, where a reader expects it,
+    /// and never to the walk; `THEN WHERE` gives the next hop its own.
+    fn walk_clause(&mut self) -> Result<(usize, String, String, bool, Vec<Expr>)> {
+        let k = self.usize_literal()?;
+        if !self.eat_kw("HOPS") && !self.eat_kw("HOP") {
+            return Err(Error::Sql(format!("expected `HOPS`, found {}", self.peek().describe())));
+        }
+        self.expect_kw("OF")?;
+        let start = match self.literal()? {
+            Value::Str(s) => s,
+            other => crate::json::to_string(&other),
+        };
+        self.expect_kw("VIA")?;
+        let via = self.ident()?;
+        let reverse = self.eat_kw("REVERSE");
+        let mut filters = Vec::new();
+        if self.eat_kw("WHERE") {
+            loop {
+                self.enter()?;
+                let f = self.not_expr();
+                self.leave();
+                filters.push(f?);
+                if !self.eat_kw("THEN") {
+                    break;
+                }
+                self.expect_kw("WHERE")?;
+            }
+        }
+        Ok((k, start, via, reverse, filters))
+    }
+
     fn dist_op(&mut self) -> Option<DistOp> {
         let op = match self.peek() {
             Tok::Punct("<->") => DistOp::L2,
@@ -959,6 +993,15 @@ impl<'a> Parser<'a> {
                 };
                 self.expect_punct(")")?;
                 sources.push(HybridSource::Text { path, query: q });
+            } else if self.is_kw("hops") {
+                // `hops(id WITHIN 3 HOPS OF 'x' VIA cites [REVERSE] [WHERE ...])`
+                self.i += 1;
+                self.expect_punct("(")?;
+                let path = self.path()?;
+                self.expect_kw("WITHIN")?;
+                let (k, start, via, reverse, filters) = self.walk_clause()?;
+                self.expect_punct(")")?;
+                sources.push(HybridSource::Hops { path, k, start, via, reverse, filters });
             } else {
                 let path = self.path()?;
                 let op = self
@@ -1064,34 +1107,10 @@ impl<'a> Parser<'a> {
         }
         let path = self.path()?;
         // `id WITHIN 2 HOPS OF 'p1' VIA cites [REVERSE] [WHERE kind = 'x']`:
-        // a walk. The edge filter is ONE term -- a comparison, a `NOT`, or a
-        // parenthesised predicate -- so that the `AND` after it belongs to
-        // the statement, where a reader expects it, and never to the walk.
+        // a walk.
         if self.eat_kw("WITHIN") {
-            let k = self.usize_literal()?;
-            if !self.eat_kw("HOPS") && !self.eat_kw("HOP") {
-                return Err(Error::Sql(format!(
-                    "expected `HOPS`, found {}",
-                    self.peek().describe()
-                )));
-            }
-            self.expect_kw("OF")?;
-            let start = match self.literal()? {
-                Value::Str(s) => s,
-                other => crate::json::to_string(&other),
-            };
-            self.expect_kw("VIA")?;
-            let via = self.ident()?;
-            let reverse = self.eat_kw("REVERSE");
-            let filter = if self.eat_kw("WHERE") {
-                self.enter()?;
-                let f = self.not_expr();
-                self.leave();
-                Some(Box::new(f?))
-            } else {
-                None
-            };
-            return Ok(Expr::Hops { path, k, start, via, reverse, filter });
+            let (k, start, via, reverse, filters) = self.walk_clause()?;
+            return Ok(Expr::Hops { path, k, start, via, reverse, filters });
         }
         // `path <=> [..] < 0.2`: a distance threshold. The operator decides
         // the metric, exactly as it does under `ORDER BY`, and the
@@ -1891,13 +1910,13 @@ mod tests {
         let Some(Expr::And(parts)) = &s.predicate else { panic!("{:?}", s.predicate) };
         assert_eq!(parts.len(), 2, "the AND after the edge filter is the statement's");
         match &parts[0] {
-            Expr::Hops { path, k, start, via, reverse, filter } => {
+            Expr::Hops { path, k, start, via, reverse, filters } => {
                 assert_eq!(
                     (path.as_str(), *k, start.as_str(), via.as_str(), *reverse),
                     ("id", 2, "p1", "cites", false)
                 );
                 assert!(
-                    matches!(filter.as_deref(), Some(Expr::Compare { path, op: CmpOp::Eq, .. }) if path == "kind")
+                    matches!(filters.as_slice(), [Expr::Compare { path, op: CmpOp::Eq, .. }] if path == "kind")
                 );
             }
             other => panic!("{other:?}"),
@@ -1909,12 +1928,46 @@ mod tests {
         let s = sel("SELECT id FROM papers WHERE NOT (id WITHIN 1 HOP OF 'p1' VIA cites REVERSE WHERE (a = 1 OR b = 2))", &[]);
         let Some(Expr::Not(inner)) = &s.predicate else { panic!("{:?}", s.predicate) };
         match inner.as_ref() {
-            Expr::Hops { k, reverse, filter, .. } => {
+            Expr::Hops { k, reverse, filters, .. } => {
                 assert_eq!((*k, *reverse), (1, true));
-                assert!(matches!(filter.as_deref(), Some(Expr::Or(v)) if v.len() == 2));
+                assert!(matches!(filters.as_slice(), [Expr::Or(v)] if v.len() == 2));
             }
             other => panic!("{other:?}"),
         }
+
+        // Per-hop filters, and the walk as a fusion source.
+        let s = sel(
+            "SELECT id FROM papers WHERE id WITHIN 3 HOPS OF 'p1' VIA cites WHERE kind = 'a' \
+             THEN WHERE kind = 'b' THEN WHERE (kind = 'c' OR w > 1) AND n > 0 ORDER BY \
+             hybrid(text_match(body, 'graph'), hops(id WITHIN 2 HOPS OF 'p2' VIA cites REVERSE \
+             WHERE w > 1), method => 'linear') LIMIT 5",
+            &[],
+        );
+        let Some(Expr::And(parts)) = &s.predicate else { panic!("{:?}", s.predicate) };
+        match &parts[0] {
+            Expr::Hops { k, filters, .. } => {
+                assert_eq!(*k, 3);
+                assert_eq!(filters.len(), 3, "one filter per hop");
+                assert!(matches!(&filters[2], Expr::Or(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(&parts[1], Expr::Compare { path, .. } if path == "n"),
+            "the AND is the statement's"
+        );
+        let Some(OrderBy::Hybrid(h)) = &s.order else { panic!("{:?}", s.order) };
+        assert_eq!(h.sources.len(), 2);
+        match &h.sources[1] {
+            HybridSource::Hops { path, k, start, via, reverse, filters } => {
+                assert_eq!(
+                    (path.as_str(), *k, start.as_str(), via.as_str(), *reverse, filters.len()),
+                    ("id", 2, "p2", "cites", true, 1)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(h.sources[1].name(), "hops(cites)");
         for (sql, why) in [
             ("SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1'", "expected `VIA`"),
             ("SELECT id FROM papers WHERE id WITHIN 2 OF 'p1' VIA cites", "expected `HOPS`"),

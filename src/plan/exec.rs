@@ -216,20 +216,40 @@ fn truncated_prefixes(stats: &BTreeMap<String, GlobalStats>) -> Vec<String> {
 
 /// A candidate-generating source, resolved against the catalog.
 pub enum SourcePlan {
-    Text { path: String, query: TextQuery, terms: Vec<String>, name: String },
-    Vector { path: String, query: Vec<f32>, metric: Metric, name: String },
+    Text {
+        path: String,
+        query: TextQuery,
+        terms: Vec<String>,
+        name: String,
+    },
+    Vector {
+        path: String,
+        query: Vec<f32>,
+        metric: Metric,
+        name: String,
+    },
+    /// Hop distance, from the coordinator's walk: `walk` is its index among
+    /// the statement's `hops(...)` sources, whose candidates the executor
+    /// is handed already scored (`ExecInput::hop_sources`). A shard has
+    /// nothing to add and answers it with an empty list.
+    Hops {
+        name: String,
+        walk: usize,
+    },
 }
 
 impl SourcePlan {
     fn name(&self) -> &str {
         match self {
-            SourcePlan::Text { name, .. } | SourcePlan::Vector { name, .. } => name,
+            SourcePlan::Text { name, .. }
+            | SourcePlan::Vector { name, .. }
+            | SourcePlan::Hops { name, .. } => name,
         }
     }
     fn direction(&self) -> Direction {
         match self {
             SourcePlan::Text { .. } => Direction::HigherIsBetter,
-            SourcePlan::Vector { .. } => Direction::LowerIsBetter,
+            SourcePlan::Vector { .. } | SourcePlan::Hops { .. } => Direction::LowerIsBetter,
         }
     }
 }
@@ -257,6 +277,9 @@ pub struct ExecInput<'a> {
     /// order; `select` already has them bound as `IN` lists, and these are
     /// for the shards on other nodes that re-parse the statement.
     pub frontiers: &'a [Vec<String>],
+    /// One candidate list per `hops(...)` source of the ORDER BY, in order,
+    /// each key scored by the hop it was first reached at.
+    pub hop_sources: Vec<Vec<Candidate>>,
     /// The walks as the coordinator ran them, for the plan.
     pub walks: Vec<WalkExplain>,
     /// Cut lines from the walks, for the response.
@@ -580,6 +603,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     // boundary, is refused or reported by one rule.
     let partial = sel.with.partial_results;
     let mut per_source: Vec<Vec<Candidate>> = vec![Vec::new(); sources.len()];
+    // A hop source's candidates come from the coordinator's walk, not the
+    // shards; the walk ran before the scatter, so they are ready now.
+    for (i, sp) in sources.iter().enumerate() {
+        if let SourcePlan::Hops { walk, .. } = sp {
+            per_source[i] = input.hop_sources.get(*walk).cloned().unwrap_or_default();
+        }
+    }
     let mut missing: Vec<String> = Vec::new();
     for si in input.unreachable {
         ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
@@ -666,6 +696,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
                 SourcePlan::Vector { metric, .. } => {
                     (c.key, -c.raw_score, Some(distance::present(*metric, c.raw_score)))
                 }
+                SourcePlan::Hops { .. } => (c.key, -c.raw_score, None),
                 _ => (c.key, c.raw_score, None),
             })
             .collect()
@@ -894,7 +925,22 @@ pub(crate) fn plan_sources(coll: &Collection, sel: &Select, k: usize) -> Result<
                             name: format!("vector({path})"),
                         });
                     }
+                    HybridSource::Hops { via, .. } => {
+                        // The walk itself is checked and run by the
+                        // coordinator before the plan; here it is a source
+                        // with a name and a number.
+                        let walk =
+                            sources.iter().filter(|s| matches!(s, SourcePlan::Hops { .. })).count();
+                        sources.push(SourcePlan::Hops { name: format!("hops({via})"), walk });
+                    }
                 }
+            }
+            if h.sources.len() == 1 && matches!(h.sources[0], HybridSource::Hops { .. }) {
+                return Err(Error::Plan(
+                    "hops() ranks beside another source; a walk on its own is the filter \
+                     `WHERE id WITHIN k HOPS OF ...`"
+                        .into(),
+                ));
             }
         }
     }
@@ -1278,6 +1324,8 @@ fn run_source(
             ux.vector.push((name.clone(), report));
             Ok(hits)
         }
+        // Scored by the coordinator's walk; a unit has nothing to add.
+        SourcePlan::Hops { .. } => Ok(Vec::new()),
     }
 }
 

@@ -496,10 +496,13 @@ behaviour, not the hop, and the README says so.
 4. **A filter first, a source later.** `WHERE id WITHIN 2 HOPS OF 'p1' VIA
    cites` is one more `Expr` variant beside `text_match` and a distance
    threshold: it selects and contributes no rank. Hop distance as a
-   `SourceList` into fusion, so that nearer nodes rank higher, is a
-   separable later decision. A pattern surface, if the filter ever grows
-   into one, is SQL/PGQ, which is SQL and stays inside the front end's
-   shape.
+   `SourceList` into fusion, so that nearer nodes rank higher, was a
+   separable later decision and shipped in 0.26.0 as `hops(...)` inside
+   `hybrid(...)`: the same clause, walked the same way, each key scored by
+   the hop it was first reached at, lower better; the coordinator hands
+   the list to the executor and the shards answer that source empty. A
+   pattern surface, if the filter ever grows into one, is SQL/PGQ, which
+   is SQL and stays inside the front end's shape.
 
 5. **Bounded, and a cut says so.** `k` is required; there is no unbounded
    walk. `WITH (max_frontier = N)` caps the key set after any hop and
@@ -545,7 +548,8 @@ behaviour, not the hop, and the README says so.
    'cites'` is a structured bitmap on the edge collection applied at every
    hop: comparisons and their `AND`/`OR`/`NOT`, a compound one in
    parentheses so that the `AND` after the walk belongs to the statement.
-   One filter for the whole walk, per-hop filters a later extension.
+   One filter is for the whole walk; `WHERE a THEN WHERE b` (0.26.0) gives
+   hop i the i-th, and a count that is neither one nor `k` is refused.
 
 9. **Dangling edges.** An edge whose `dst` is deleted at the statement's
    instant, or never existed, is followed and resolves to nothing: skipped
@@ -716,6 +720,15 @@ the next measurement starts from the number that is left.
 
 ### Shipped
 
+The fourth slice, in 0.26.0: `hops(...)` as a fusion source and `THEN
+WHERE` per-hop edge filters, both bit-identical across shard counts and
+over the wire, which now carries the hop with an expansion. The tests:
+`engine::tests::a_hop_source_ranks_nearer_nodes_higher_and_per_hop_filters_apply_in_order`,
+the two statements added to `a_hop_statement_is_bit_identical_across_shard_counts`
+and to the three-node walk test, and
+`sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`
+extended.
+
 The third slice, in 0.23.1: the liveness check of an unpartitioned node
 collection as one galloping merge per segment (`Shard::present_sorted`),
 and the coordinator's sets as sorted vectors merged in one pass each. No
@@ -750,8 +763,8 @@ the fused plan; the README says what this is and is not. The tests:
 `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so`
 and, over a real transport,
 `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers`.
-Not in it, and open: hop distance as a fusion source (decision 4), per-hop
-edge filters (decision 8), and a pattern surface.
+Not in it, and open: a pattern surface. Hop distance as a source and
+per-hop edge filters followed in 0.26.0.
 
 ## Design notes
 

@@ -64,7 +64,7 @@ use crate::time::Timestamp;
 use crate::value::Value;
 
 /// Refused on mismatch, in both directions.
-pub const WIRE_VERSION: u8 = 3;
+pub const WIRE_VERSION: u8 = 4;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 const MAX_FRAME: u32 = 256 << 20;
@@ -893,6 +893,7 @@ impl ShardService for Remote {
         }
         put_bool(&mut body, req.reverse);
         put_uvarint(&mut body, req.walk as u64);
+        put_uvarint(&mut body, req.hop as u64);
         let b = self.call(Call::Expand, &body)?;
         let mut i = 0;
         let pairs = get_pairs(&b, &mut i)?;
@@ -1296,9 +1297,10 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                         if get_bool(body, &mut j)? { Some(get_count(body, &mut j)?) } else { None };
                     let reverse = get_bool(body, &mut j)?;
                     let wi = get_count(body, &mut j)?;
+                    let hop = get_count(body, &mut j)?;
                     let sel = select_of(&sql, &params)?;
-                    let hops = sel.predicate.as_ref().map(walk::hops_in).unwrap_or_default();
-                    let Some(Expr::Hops { via, filter, .. }) = hops.get(wi) else {
+                    let hops = walk::walks_of(&sel);
+                    let Some(Expr::Hops { via, filters, .. }) = hops.get(wi) else {
                         return Err(Error::Plan(format!(
                             "the statement has no walk number {wi} to expand"
                         )));
@@ -1314,10 +1316,11 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                         ts,
                         limit,
                         reverse,
-                        filter: filter.as_deref(),
+                        filter: walk::filter_for(filters, hop),
                         statement: &sql,
                         params: &params,
                         walk: wi,
+                        hop,
                     };
                     let x = local.expand(&req)?;
                     put_pairs(&mut out, &x.pairs);

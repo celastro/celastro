@@ -27,6 +27,7 @@ use crate::lifecycle::{self, IndexActivity, LifecyclePolicy};
 use crate::memtable::{FlushThresholds, MemtableBudget};
 use crate::mvcc::DeleteLog;
 use crate::plan::exec::{self, ExecInput, QueryResult};
+use crate::plan::fusion::Candidate;
 use crate::plan::service::{Local, ShardService, TermStats};
 use crate::plan::walk::{self, WalkSpec};
 use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
@@ -3665,17 +3666,19 @@ impl Db {
         // the point: the hybrid intersection is untouched.
         let mut ts = ts;
         let mut frontiers: Vec<Vec<String>> = Vec::new();
+        let mut hop_sources: Vec<Vec<Candidate>> = Vec::new();
         let mut walks = Vec::new();
         let mut cut_walks = Vec::new();
         let mut walk_missing = Vec::new();
-        let hops: Vec<Expr> = sel
-            .predicate
-            .as_ref()
-            .map(|p| walk::hops_in(p).into_iter().cloned().collect())
-            .unwrap_or_default();
+        // The predicate's walks first, then the `hops(...)` sources of the
+        // ORDER BY: the former bind as `IN` lists, the latter become
+        // candidate lists scored by hop, and a shard on another node numbers
+        // them the same way (`walk::walks_of`).
+        let hops: Vec<Expr> = walk::walks_of(sel);
+        let predicate_walks = sel.predicate.as_ref().map(|p| walk::hops_in(p).len()).unwrap_or(0);
         for (wi, h) in hops.iter().enumerate() {
-            let Expr::Hops { path, k, start, via, reverse, filter } = h else { unreachable!() };
-            let (edges, index) = self.check_walk(coll, path, *k, via, filter.as_deref())?;
+            let Expr::Hops { path, k, start, via, reverse, filters } = h else { unreachable!() };
+            let (edges, index) = self.check_walk(coll, path, *k, via, filters)?;
             self.touch_indexes(via, &[(index.path.clone(), IndexUse::Walk)])?;
             // The edge collection's holders, for its instant and its shards.
             let tablets = self.catalog.placement.get(via).cloned().unwrap_or_default();
@@ -3700,16 +3703,17 @@ impl Db {
                 }
                 remotes.insert(url, node);
             }
-            let label = format!(
+            let clause = format!(
                 "WITHIN {k} HOPS OF '{start}' VIA {via}{}",
                 if *reverse { " REVERSE" } else { "" }
             );
+            let label = if wi < predicate_walks { clause } else { format!("hops({clause})") };
             let spec = WalkSpec {
                 label,
                 k: *k,
                 start,
                 reverse: *reverse,
-                filter: filter.as_deref(),
+                filters,
                 edges: &edges,
                 index: &index,
                 nodes: coll,
@@ -3733,7 +3737,19 @@ impl Db {
                     partial,
                 )?
             };
-            frontiers.push(out.keys);
+            if wi < predicate_walks {
+                frontiers.push(out.keys);
+            } else {
+                // Scored by the hop a key was first reached at: nearer is
+                // better, and fusion ranks it beside the other sources.
+                let mut list = Vec::new();
+                for (i, keys) in out.by_hop.iter().enumerate() {
+                    for key in keys {
+                        list.push(Candidate { key: key.clone(), raw_score: (i + 1) as f32 });
+                    }
+                }
+                hop_sources.push(list);
+            }
             walks.push(out.explain);
             cut_walks.extend(out.cuts);
             walk_missing.extend(out.missing);
@@ -3956,6 +3972,7 @@ impl Db {
             analyze,
             statement: sql.to_string(),
             frontiers: &frontiers,
+            hop_sources,
             walks,
             cut_walks,
             walk_missing,
@@ -3972,7 +3989,7 @@ impl Db {
         path: &str,
         k: usize,
         via: &str,
-        filter: Option<&Expr>,
+        filters: &[Expr],
     ) -> Result<(Collection, IndexDef)> {
         if path != coll.primary_key {
             return Err(Error::Plan(format!(
@@ -4023,7 +4040,14 @@ impl Db {
                 index.name
             )));
         }
-        if let Some(f) = filter {
+        if filters.len() > 1 && filters.len() != k {
+            return Err(Error::Plan(format!(
+                "the walk over `{via}` has {k} hop(s) and {} edge filters; give one filter for \
+                 every hop, or one per hop joined by THEN WHERE",
+                filters.len()
+            )));
+        }
+        for f in filters {
             walk::check_edge_filter(edges, f)?;
         }
         Ok((edges.clone(), index.clone()))
@@ -4324,6 +4348,9 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
                 match s {
                     HybridSource::Text { path, .. } => out.push((path.clone(), IndexUse::Text)),
                     HybridSource::Vector { path, .. } => out.push((path.clone(), IndexUse::Vector)),
+                    // The walk touches its adjacency index itself, on the
+                    // edge collection, as a filter walk does.
+                    HybridSource::Hops { .. } => {}
                 }
             }
         }
@@ -8475,6 +8502,101 @@ mod tests {
     /// are in play -- answers a hop statement, fused with text and a vector,
     /// bit for bit the same. The walk is a function of the live graph at the
     /// instant, not of where its edges happen to be.
+    /// `hops(...)` inside `hybrid(...)` ranks by the hop a node was first
+    /// reached at, nearer first, beside the other sources under either
+    /// method; alone it is refused, since alone it is the filter. `THEN
+    /// WHERE` gives each hop its own edge filter, the plan says which, and
+    /// a count that fits neither one-for-all nor one-per-hop is refused.
+    #[test]
+    fn a_hop_source_ranks_nearer_nodes_higher_and_per_hop_filters_apply_in_order() {
+        let dir = tmp("hop-source");
+        let mut db = graph(&dir);
+        // From p1: hop 1 = p2 p3 p8, hop 2 = p4 p5 p9, hop 3 = p6. Text
+        // 'graph' matches p1 p2 p4 p6 p7 p8 p9 -- p6 p7 p8 p9 with one and
+        // the same score (the body is the one word), p2 and p4 with another
+        // (two words each). Where the text says the same, the hop decides.
+        for method in ["rrf", "linear"] {
+            let sql = format!(
+                "SELECT id FROM papers ORDER BY hybrid(text_match(body, 'graph'), \
+                 hops(id WITHIN 3 HOPS OF 'p1' VIA cites), method => '{method}') LIMIT 10"
+            );
+            let r = db.query(&sql).unwrap();
+            let keys: Vec<&str> = r.rows.iter().map(|r| r.key.as_str()).collect();
+            let pos = |k: &str| keys.iter().position(|x| *x == k).unwrap_or(usize::MAX);
+            // Under either method a hop-1 node beats the same text score at
+            // hop 2, 3 or unreached. Under linear fusion, where equal text
+            // scores normalise equal, the hop alone orders the rest; under
+            // RRF a text tie is broken by key before the ranks fuse, so p6's
+            // better text rank can lift it over p9, and only the first place
+            // is the hop's.
+            assert!(
+                pos("p8") < pos("p9") && pos("p8") < pos("p6") && pos("p8") < pos("p7"),
+                "{method}: hop 1 first among equal text scores: {keys:?}"
+            );
+            assert!(pos("p2") < pos("p4"), "{method}: hop 1 before hop 2 at equal text: {keys:?}");
+            if method == "linear" {
+                assert!(
+                    pos("p9") < pos("p6") && pos("p6") < pos("p7"),
+                    "linear: hop 2, hop 3, unreached: {keys:?}"
+                );
+            }
+            assert!(
+                keys.contains(&"p3"),
+                "{method}: reached but no text match is still a candidate"
+            );
+            assert!(
+                keys.contains(&"p7"),
+                "{method}: text match but never reached is still a candidate"
+            );
+            assert!(keys.contains(&"p1"), "{method}: the start, matching the text, is a candidate of the text source: {keys:?}");
+            assert!(
+                keys.contains(&"p5"),
+                "{method}: reached at hop 2 with no text match: {keys:?}"
+            );
+            let plan = plan_of(&mut db, &sql);
+            assert!(plan.contains("walk: hops(WITHIN 3 HOPS OF 'p1' VIA cites)"), "{plan}");
+            assert!(plan.contains("sources=[\"text(body)\", \"hops(cites)\"]"), "{plan}");
+        }
+        let alone = db.query(
+            "SELECT id FROM papers ORDER BY hybrid(hops(id WITHIN 2 HOPS OF 'p1' VIA cites)) LIMIT 5",
+        );
+        assert!(alone.unwrap_err().to_string().contains("ranks beside another source"));
+
+        let hop = |db: &mut Db, clause: &str| {
+            key_set(&db.query(&format!("SELECT id FROM papers WHERE {clause} LIMIT 100")).unwrap())
+        };
+        assert_eq!(
+            hop(
+                &mut db,
+                "id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'weak' THEN WHERE kind = 'cites'"
+            ),
+            ["p8", "p9"],
+            "hop 1 follows the weak edge only, hop 2 the strong ones from there"
+        );
+        assert_eq!(
+            hop(
+                &mut db,
+                "id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'cites' THEN WHERE kind = 'weak'"
+            ),
+            ["p2", "p3"],
+            "no weak edge leaves hop 1's frontier"
+        );
+        let plan = plan_of(
+            &mut db,
+            "SELECT id FROM papers WHERE id WITHIN 2 HOPS OF 'p1' VIA cites WHERE kind = 'weak' \
+             THEN WHERE kind = 'cites' LIMIT 100",
+        );
+        assert!(plan.contains("edge filter 1 of 2"), "{plan}");
+        assert!(plan.contains("edge filter 2 of 2"), "{plan}");
+        let mismatch = db.query(
+            "SELECT id FROM papers WHERE id WITHIN 3 HOPS OF 'p1' VIA cites WHERE kind = 'a' \
+             THEN WHERE kind = 'b' LIMIT 5",
+        );
+        let msg = mismatch.unwrap_err().to_string();
+        assert!(msg.contains("3 hop(s) and 2 edge filters"), "{msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_hop_statement_is_bit_identical_across_shard_counts() {
         let layouts: [(&str, &str); 3] = [
@@ -8494,6 +8616,11 @@ mod tests {
              LIMIT 8 WITH (exact)",
             "SELECT id FROM nodes WHERE id WITHIN 2 HOPS OF 'n030' VIA edges REVERSE LIMIT 100",
             "SELECT id FROM nodes WHERE id WITHIN 2 HOPS OF 'n003' VIA edges LIMIT 100 WITH (max_frontier = 7, max_fanout = 3)",
+            "SELECT id FROM nodes ORDER BY hybrid(text_match(body, 'graph search'), \
+             hops(id WITHIN 3 HOPS OF 'n005' VIA edges WHERE w > 1)) LIMIT 12 WITH (exact)",
+            "SELECT id FROM nodes WHERE id WITHIN 3 HOPS OF 'n011' VIA edges WHERE w > 3 THEN WHERE w < 2 \
+             THEN WHERE w = 2 ORDER BY hybrid(embedding <=> [0.9, 0.1, 0.1, 1.0], \
+             hops(id WITHIN 2 HOPS OF 'n011' VIA edges REVERSE), method => 'linear') LIMIT 10 WITH (exact)",
         ];
         let mut answers: Vec<Vec<String>> = Vec::new();
         for (li, (nsplit, esplit)) in layouts.iter().enumerate() {
