@@ -265,8 +265,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.33.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.33.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.33.1 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.33.1 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

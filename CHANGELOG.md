@@ -6,6 +6,18 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.33.1 — 2026-09-15
+
+A performance fix, hence a patch.
+
+**The distance functions vectorise.** `perf` put 78% of an HNSW build in
+`distance::dot`: an indexed loop paying a bounds check per element. `dot`
+and `l2_squared` run over `chunks_exact(4)` now, the same four
+accumulators in the same order (every score bit for bit what it was),
+and the compiler turns the lanes into one SSE register. A 16,384-node
+graph over 128 dimensions builds in 34 s instead of 85; `COMPACT` over
+50,000 vectors in 115 s instead of 247.
+
 ## 0.33.0 — 2026-09-15
 
 A default that changes what a load costs, and a lock, hence a minor.

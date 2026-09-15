@@ -16,19 +16,26 @@ use crate::catalog::Metric;
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let chunks = n / 4;
-    let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for i in 0..chunks {
-        let j = i * 4;
-        s0 += a[j] * b[j];
-        s1 += a[j + 1] * b[j + 1];
-        s2 += a[j + 2] * b[j + 2];
-        s3 += a[j + 3] * b[j + 3];
+    // Four accumulators over chunks of four, then the tail: the same
+    // operations in the same order as the indexed loop this replaces, so
+    // every score is bit for bit what it was -- but over `chunks_exact`,
+    // whose slices the compiler knows are four long, there is no bounds
+    // check per element and the four lanes become one SSE register. The
+    // HNSW build spent 78% of its time in the indexed version (P6).
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let (ca, cb) = (a.chunks_exact(4), b.chunks_exact(4));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    let mut acc = [0.0f32; 4];
+    for (x, y) in ca.zip(cb) {
+        acc[0] += x[0] * y[0];
+        acc[1] += x[1] * y[1];
+        acc[2] += x[2] * y[2];
+        acc[3] += x[3] * y[3];
     }
-    let mut s = s0 + s1 + s2 + s3;
-    for i in chunks * 4..n {
-        s += a[i] * b[i];
+    let mut s = acc[0] + acc[1] + acc[2] + acc[3];
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
     }
     s
 }
@@ -36,23 +43,24 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let chunks = n / 4;
-    let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for i in 0..chunks {
-        let j = i * 4;
-        let d0 = a[j] - b[j];
-        let d1 = a[j + 1] - b[j + 1];
-        let d2 = a[j + 2] - b[j + 2];
-        let d3 = a[j + 3] - b[j + 3];
-        s0 += d0 * d0;
-        s1 += d1 * d1;
-        s2 += d2 * d2;
-        s3 += d3 * d3;
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let (ca, cb) = (a.chunks_exact(4), b.chunks_exact(4));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    let mut acc = [0.0f32; 4];
+    for (x, y) in ca.zip(cb) {
+        let d0 = x[0] - y[0];
+        let d1 = x[1] - y[1];
+        let d2 = x[2] - y[2];
+        let d3 = x[3] - y[3];
+        acc[0] += d0 * d0;
+        acc[1] += d1 * d1;
+        acc[2] += d2 * d2;
+        acc[3] += d3 * d3;
     }
-    let mut s = s0 + s1 + s2 + s3;
-    for i in chunks * 4..n {
-        let d = a[i] - b[i];
+    let mut s = acc[0] + acc[1] + acc[2] + acc[3];
+    for (x, y) in ra.iter().zip(rb) {
+        let d = x - y;
         s += d * d;
     }
     s
