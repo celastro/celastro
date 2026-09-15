@@ -1,8 +1,10 @@
-//! The primitives an in-tree TLS 1.3 needs, and nothing more: SHA-256 (the
-//! S3 signer's, shared), SHA-512, HMAC and HKDF, ChaCha20-Poly1305, and the
-//! curve25519 pair — X25519 for key agreement, Ed25519 for signatures. Each
-//! is written from its RFC and pinned against the vectors published there;
-//! none is a port of another library.
+//! The primitives an in-tree TLS 1.3 needs, and nothing more: SHA-256 and
+//! HMAC (the S3 signer's too), SHA-512, HKDF, ChaCha20-Poly1305, and the
+//! curve25519 pair — X25519 for key agreement, Ed25519 for signatures —
+//! with RSA and P-256 verification for what other issuers sign. Each is
+//! written from its RFC and pinned against the vectors published there;
+//! none is a port of another library. Nothing here reaches up into the
+//! database: this module is the bottom of the tree.
 //!
 //! What "constant-time" means here, stated once: nothing branches on, or
 //! indexes memory by, a secret. Field and scalar arithmetic run the same
@@ -44,4 +46,13 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Lowercase hex, the one spelling of bytes the crate prints.
+pub(crate) fn hex(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() * 2);
+    for x in b {
+        out.push_str(&format!("{x:02x}"));
+    }
+    out
 }

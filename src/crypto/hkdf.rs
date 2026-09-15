@@ -31,7 +31,7 @@ pub fn expand(prk: &[u8; 32], info: &[u8], len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objstore::hex;
+    use crate::crypto::hex;
 
     #[test]
     fn hkdf_matches_rfc_5869() {

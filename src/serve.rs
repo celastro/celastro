@@ -26,6 +26,8 @@
 //! not get tested.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+
+use crate::crypto::hex;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -406,14 +408,6 @@ fn urandom_bytes() -> std::io::Result<[u8; 16]> {
     let mut bytes = [0u8; 16];
     source.read_exact(&mut bytes)?;
     Ok(bytes)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 // ----------------------------------------------------------------- deadlines

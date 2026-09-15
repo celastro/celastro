@@ -905,17 +905,17 @@ mod tests {
                 .unwrap();
         let early = hkdf::extract(&[0u8; 32], &[0u8; 32]);
         assert_eq!(
-            crate::objstore::hex(&early),
+            crate::crypto::hex(&early),
             "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
         );
         let derived = derive_secret(&early, "derived", &sha256(&[]));
         assert_eq!(
-            crate::objstore::hex(&derived),
+            crate::crypto::hex(&derived),
             "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
         );
         let hs = hkdf::extract(&derived, &shared);
         assert_eq!(
-            crate::objstore::hex(&hs),
+            crate::crypto::hex(&hs),
             "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
         );
         // The transcript hash of ClientHello..ServerHello in that trace.
@@ -925,22 +925,22 @@ mod tests {
                 .unwrap();
         let c_hs = derive_secret(&hs, "c hs traffic", &th);
         assert_eq!(
-            crate::objstore::hex(&c_hs),
+            crate::crypto::hex(&c_hs),
             "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
         );
         let s_hs = derive_secret(&hs, "s hs traffic", &th);
         assert_eq!(
-            crate::objstore::hex(&s_hs),
+            crate::crypto::hex(&s_hs),
             "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
         );
         // The trace's suite is AES-128-GCM, so its key is 16 bytes and its
         // iv 12: the same labels, expanded to those lengths.
         assert_eq!(
-            crate::objstore::hex(&expand_label(&s_hs, "key", &[], 16)),
+            crate::crypto::hex(&expand_label(&s_hs, "key", &[], 16)),
             "3fce516009c21727d0f2e4e86ee403bc"
         );
         assert_eq!(
-            crate::objstore::hex(&expand_label(&s_hs, "iv", &[], 12)),
+            crate::crypto::hex(&expand_label(&s_hs, "iv", &[], 12)),
             "5d313eb2671276ee13000b30"
         );
     }

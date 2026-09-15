@@ -51,7 +51,7 @@ pub fn public_key(secret: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objstore::hex;
+    use crate::crypto::hex;
 
     fn unhex(s: &str) -> [u8; 32] {
         let v: Vec<u8> =
