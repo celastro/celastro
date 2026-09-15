@@ -43,6 +43,10 @@ spec:
           args: {{ concat (list "--dir" "/data" "--port" (.Values.port | toString) "serve") $bind | toJson }}
           {{- end }}
           env:
+            {{- range $k, $v := .Values.tuning }}
+            - name: {{ $k | quote }}
+              value: {{ $v | toString | quote }}
+            {{- end }}
             {{- if .Values.tls.enabled }}
             - name: CELASTRO_TLS_CERT
               value: /tls/tls.crt

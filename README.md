@@ -265,8 +265,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.31.1 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.31.1 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.32.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.32.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -327,6 +327,15 @@ post-filter and filter-aware vector search, and a deterministic simulator
 that puts partitions, crashes and reordering on the coordinator-to-shard
 boundary. The whole of it, with its measurements and the map from each
 guarantee to the test that pins it, is in [docs/design.md](docs/design.md).
+
+## Tuning
+
+Every performance knob is an environment variable read at start —
+`CELASTRO_INSERT_BATCH` (documents per log sync in one `INSERT`, 1000),
+the memtable and residency budgets, the deadline, compaction, the vector
+build, the console's connection cap — and [docs/tuning.md](docs/tuning.md)
+lists each with its default and when to move it. The chart sets them
+through its `tuning:` map.
 
 ## Building and testing
 

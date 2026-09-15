@@ -167,6 +167,12 @@ pub struct DbOpts {
     /// should not be a way to write anywhere on the node. Unset, only
     /// absolute paths and `s3://` destinations are taken.
     pub backup_dir: Option<PathBuf>,
+    /// How many documents of one `INSERT` a shard appends before it syncs
+    /// the log: a statement of more is taken in chunks of this many, one
+    /// `fdatasync` each. Larger means fewer disk round trips for a bulk
+    /// load and more records unsynced at any one moment (the statement is
+    /// not acknowledged until all of them are); 1000 by default.
+    pub insert_batch: usize,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -196,6 +202,7 @@ impl Default for DbOpts {
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
             archive: crate::objstore::ArchiveOpts::default(),
             backup_dir: None,
+            insert_batch: 1000,
             node: None,
             tls: None,
         }
@@ -2182,10 +2189,11 @@ impl Db {
     }
 
     /// The documents of one statement: the ones this node's shards own go to
-    /// each shard as one batch -- one WAL sync per shard, not one per
-    /// document -- and the ones another node owns are forwarded one at a
-    /// time as [`insert`](Self::insert) forwards them. In statement order
-    /// within a shard; the last timestamp is what the acknowledgement names.
+    /// each shard in chunks of `DbOpts::insert_batch` -- one WAL sync per
+    /// chunk, not one per document -- and the ones another node owns are
+    /// forwarded one at a time as [`insert`](Self::insert) forwards them. In
+    /// statement order within a shard; the last timestamp is what the
+    /// acknowledgement names.
     pub fn insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
         let _deadline = self.arm_default_deadline();
         let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
@@ -2213,14 +2221,19 @@ impl Db {
                 }
             }
         }
-        for (idx, batch) in here {
-            let stamps = {
-                let shards = self.shards.get_mut(collection).expect("checked above");
-                shards[idx].insert_many(batch)?
-            };
-            for ts in stamps {
-                self.note_write(collection, ts);
-                last = last.max(ts);
+        let chunk = self.opts.insert_batch.max(1);
+        for (idx, mut batch) in here {
+            while !batch.is_empty() {
+                let tail = batch.split_off(batch.len().min(chunk));
+                let stamps = {
+                    let shards = self.shards.get_mut(collection).expect("checked above");
+                    shards[idx].insert_many(batch)?
+                };
+                for ts in stamps {
+                    self.note_write(collection, ts);
+                    last = last.max(ts);
+                }
+                batch = tail;
             }
         }
         self.maybe_run_lifecycle()?;
@@ -7561,6 +7574,31 @@ mod tests {
     /// `Db::open`'s scan stops at the first shard directory that is not there
     /// -- so the collection comes back with half its key space missing and
     /// nothing anywhere returns an error.
+    /// `insert_batch` is the number of documents per sync within one
+    /// statement: 2,500 documents at 1,000 a chunk are three syncs of the
+    /// shard's log, and every document is there afterwards.
+    #[test]
+    fn a_statement_of_many_documents_syncs_once_per_insert_batch() {
+        let dir =
+            std::env::temp_dir().join(format!("celastro-insert-batch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut opts = DbOpts::default();
+        opts.insert_batch = 1000;
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+        let log = dir.join("collections").join("items").join("shard-0000").join("wal.log");
+        let docs: Vec<Value> = (0..2500)
+            .map(|i| Value::obj(vec![("id".to_string(), Value::Str(format!("d{i:05}")))]))
+            .collect();
+        durability_probe::start();
+        db.insert_many("items", docs).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!(ev.count(Op::WalSync, &log), 3, "{}", ev.count(Op::WalAppend, &log));
+        assert_eq!(ev.count(Op::WalAppend, &log), 2500);
+        assert_eq!(db.query("SELECT id FROM items LIMIT 10000").unwrap().rows.len(), 2500);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn creating_a_collection_makes_the_directories_that_hold_it_durable() {
         let dir = tmp("dircreate");

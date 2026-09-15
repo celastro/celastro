@@ -6,6 +6,25 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.32.0 — 2026-09-15
+
+The tunables are named, hence a minor.
+
+**`CELASTRO_INSERT_BATCH`** (1000): how many documents of one `INSERT` a
+shard appends before it syncs the log; a statement of more is taken in
+chunks of that many, one `fdatasync` each. `DbOpts::insert_batch` for
+the library.
+
+**Every performance knob is an environment variable**, read at start by
+`celastro-cli` and refused by name when it does not parse: the memtable
+thresholds and budget, the residency budget and idle unloads, the
+statement deadline, the recall sample rate, the lifecycle interval,
+compaction's fanout, cap and dead ratio, the vector quantizer and HNSW
+parameters, the flat tier's size, and the console's connection cap
+(`CELASTRO_MAX_CONNECTIONS`, `Server::with_max_connections`). Sizes take
+`K`/`M`/`G`. [docs/tuning.md](docs/tuning.md) lists each with its default
+and when to move it; the chart's `tuning:` map sets them on every pod.
+
 ## 0.31.1 — 2026-09-15
 
 A write-path fix, hence a patch.

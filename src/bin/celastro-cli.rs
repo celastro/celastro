@@ -83,6 +83,10 @@ GLOBAL FLAGS:
   --dir <DIR>                open a persistent database (default: in memory)
   --json                     machine-readable output instead of tables
 
+TUNING: the CELASTRO_* variables in docs/tuning.md (insert batch, memtable
+and residency budgets, compaction, the vector build, the console's
+connection cap) are read at start; a value that does not parse is refused.
+
 `serve` prints its URL — token included — on stdout before it starts serving,
 so the line can be piped or clicked; the notes go to stderr. Under `--json` that
 first line is a JSON object carrying `url`, `addr` and `token` instead, so write
@@ -536,7 +540,10 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::TlsSecret { secret, name, names, days } = cmd {
         return tls_secret(&secret, &name, &names, days, json);
     }
-    let mut opts = db_opts();
+    let mut opts = match db_opts() {
+        Ok(o) => o,
+        Err(e) => return fail(json, &e),
+    };
     opts.tls = tls.clone();
     let mut db = match &dir {
         Some(d) => match Db::open(d, opts) {
@@ -703,6 +710,10 @@ fn serve(
     tls: Option<Arc<Tls>>,
     json: bool,
 ) -> i32 {
+    let connections = match max_connections() {
+        Ok(n) => n,
+        Err(e) => return fail(json, &e),
+    };
     let server = match bind {
         // The operator's token, or nothing: a per-run token is printed where
         // a client on the network cannot read it, and differs per node.
@@ -718,12 +729,12 @@ fn serve(
                 );
             };
             match Server::bind_network(ip, port, token) {
-                Ok(s) => s.with_tls(tls.clone()),
+                Ok(s) => s.with_tls(tls.clone()).with_max_connections(connections),
                 Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
             }
         }
         None => match Server::bind(port) {
-            Ok(s) => s.with_tls(tls.clone()),
+            Ok(s) => s.with_tls(tls.clone()).with_max_connections(connections),
             Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
         },
     };
@@ -1745,9 +1756,10 @@ const DEMO_TOPICS: &[(&str, &str)] = &[
 /// plain HTTP), `CELASTRO_ARCHIVE_BUCKET`, and optionally
 /// `CELASTRO_ARCHIVE_PREFIX` and `CELASTRO_ARCHIVE_REGION`. The credentials
 /// are `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, read by the library.
-fn db_opts() -> DbOpts {
+fn db_opts() -> std::result::Result<DbOpts, String> {
     let mut o = DbOpts::default();
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    tuning_into(&mut o, &var)?;
     o.node = var("CELASTRO_NODE");
     if let Some(endpoint) = var("CELASTRO_ARCHIVE_ENDPOINT") {
         o.archive.endpoint = Some(endpoint);
@@ -1757,7 +1769,133 @@ fn db_opts() -> DbOpts {
     }
     o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
     o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
-    o
+    Ok(o)
+}
+
+/// The performance tunables, from the environment: each `CELASTRO_*` below
+/// overrides one field of the options, and a value that does not parse is
+/// refused with its name rather than silently defaulted. `docs/tuning.md`
+/// says what each does and when to change it.
+fn tuning_into(
+    o: &mut DbOpts,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> std::result::Result<(), String> {
+    fn num<T: std::str::FromStr>(name: &str, v: &str) -> std::result::Result<T, String> {
+        v.trim().parse::<T>().map_err(|_| format!("{name}: `{v}` is not a number"))
+    }
+    /// Bytes, with an optional K, M or G (binary) suffix: `64M`, `4G`.
+    fn bytes(name: &str, v: &str) -> std::result::Result<usize, String> {
+        let t = v.trim();
+        let (digits, mult) = match t.chars().last().map(|c| c.to_ascii_uppercase()) {
+            Some('K') => (&t[..t.len() - 1], 1usize << 10),
+            Some('M') => (&t[..t.len() - 1], 1usize << 20),
+            Some('G') => (&t[..t.len() - 1], 1usize << 30),
+            _ => (t, 1),
+        };
+        let n: usize = num(name, digits)?;
+        n.checked_mul(mult).ok_or_else(|| format!("{name}: `{v}` is too large"))
+    }
+    if let Some(v) = var("CELASTRO_INSERT_BATCH") {
+        let n: usize = num("CELASTRO_INSERT_BATCH", &v)?;
+        if n == 0 {
+            return Err("CELASTRO_INSERT_BATCH: at least 1".into());
+        }
+        o.insert_batch = n;
+    }
+    if let Some(v) = var("CELASTRO_MEMTABLE_MAX_BYTES") {
+        o.thresholds.max_bytes = bytes("CELASTRO_MEMTABLE_MAX_BYTES", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_MEMTABLE_MAX_VECTORS") {
+        o.thresholds.max_vectors = num("CELASTRO_MEMTABLE_MAX_VECTORS", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_MEMTABLE_MAX_VERSIONS") {
+        o.thresholds.max_versions = num("CELASTRO_MEMTABLE_MAX_VERSIONS", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_MEMTABLE_BUDGET_BYTES") {
+        o.memtable_budget_bytes = bytes("CELASTRO_MEMTABLE_BUDGET_BYTES", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_RESIDENCY_BUDGET_BYTES") {
+        o.residency.budget_bytes = bytes("CELASTRO_RESIDENCY_BUDGET_BYTES", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_CACHED_IDLE_UNLOAD_SECS") {
+        o.residency.cached_idle_unload =
+            Duration::from_secs(num("CELASTRO_CACHED_IDLE_UNLOAD_SECS", &v)?);
+    }
+    if let Some(v) = var("CELASTRO_ARCHIVED_IDLE_UNLOAD_SECS") {
+        o.residency.archived_idle_unload =
+            Duration::from_secs(num("CELASTRO_ARCHIVED_IDLE_UNLOAD_SECS", &v)?);
+    }
+    if let Some(v) = var("CELASTRO_ARCHIVED_ACCESS") {
+        o.residency.archived_access = match v.trim().to_ascii_lowercase().as_str() {
+            "fault-in" | "fault_in" | "faultin" => celastro::residency::ArchivedAccess::FaultIn,
+            "refuse" => celastro::residency::ArchivedAccess::Refuse,
+            other => {
+                return Err(format!(
+                    "CELASTRO_ARCHIVED_ACCESS: `{other}` is not fault-in or refuse"
+                ))
+            }
+        };
+    }
+    if let Some(v) = var("CELASTRO_STATEMENT_DEADLINE_MS") {
+        let n: u64 = num("CELASTRO_STATEMENT_DEADLINE_MS", &v)?;
+        o.statement_deadline_ms = if n == 0 { None } else { Some(n) };
+    }
+    if let Some(v) = var("CELASTRO_RECALL_SAMPLE_RATE") {
+        o.recall_sample_rate = num("CELASTRO_RECALL_SAMPLE_RATE", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_LIFECYCLE_INTERVAL_WRITES") {
+        o.lifecycle_interval_writes = num("CELASTRO_LIFECYCLE_INTERVAL_WRITES", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_COMPACTION_TIER_FANOUT") {
+        let n: usize = num("CELASTRO_COMPACTION_TIER_FANOUT", &v)?;
+        if n < 2 {
+            return Err("CELASTRO_COMPACTION_TIER_FANOUT: at least 2".into());
+        }
+        o.compaction.tier_fanout = n;
+    }
+    if let Some(v) = var("CELASTRO_COMPACTION_SEGMENT_CAP") {
+        o.compaction.segment_cap = num("CELASTRO_COMPACTION_SEGMENT_CAP", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_COMPACTION_DEAD_RATIO") {
+        let r: f64 = num("CELASTRO_COMPACTION_DEAD_RATIO", &v)?;
+        if !(0.0..=1.0).contains(&r) {
+            return Err("CELASTRO_COMPACTION_DEAD_RATIO: between 0 and 1".into());
+        }
+        o.compaction.dead_ratio = r;
+    }
+    if let Some(v) = var("CELASTRO_VECTOR_QUANTIZER") {
+        o.build.quantizer = match v.trim().to_ascii_lowercase().as_str() {
+            "sq8" => celastro::vector::quant::Quantizer::Sq8,
+            "one-bit" | "onebit" | "1bit" => celastro::vector::quant::Quantizer::OneBit,
+            other => {
+                return Err(format!("CELASTRO_VECTOR_QUANTIZER: `{other}` is not sq8 or one-bit"))
+            }
+        };
+    }
+    if let Some(v) = var("CELASTRO_HNSW_M") {
+        o.build.hnsw.m = num("CELASTRO_HNSW_M", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_HNSW_M0") {
+        o.build.hnsw.m0 = num("CELASTRO_HNSW_M0", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_HNSW_EF_CONSTRUCTION") {
+        o.build.hnsw.ef_construction = num("CELASTRO_HNSW_EF_CONSTRUCTION", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_FLAT_TIER_MAX") {
+        o.build.flat_tier_max = num("CELASTRO_FLAT_TIER_MAX", &v)?;
+    }
+    Ok(())
+}
+
+/// `CELASTRO_MAX_CONNECTIONS`, or the server's default.
+fn max_connections() -> std::result::Result<usize, String> {
+    match std::env::var("CELASTRO_MAX_CONNECTIONS").ok().filter(|v| !v.is_empty()) {
+        None => Ok(celastro::serve::MAX_CONNECTIONS),
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("CELASTRO_MAX_CONNECTIONS: `{v}` is not a count of at least 1")),
+        },
+    }
 }
 
 fn demo_opts() -> DbOpts {
@@ -1963,6 +2101,57 @@ mod tests {
         match parse(&["--attached", "2", "serve"]) {
             Cli::Usage(msg) => assert!(msg.contains("--attached")),
             other => panic!("`--attached` outside health must be refused, got {other:?}"),
+        }
+    }
+
+    /// Every tunable parses from its variable, with byte suffixes and the
+    /// named choices, and a bad value names itself instead of defaulting.
+    #[test]
+    fn the_tunables_parse_from_the_environment_and_a_bad_one_is_named() {
+        let env: std::collections::BTreeMap<&str, &str> = [
+            ("CELASTRO_INSERT_BATCH", "250"),
+            ("CELASTRO_MEMTABLE_MAX_BYTES", "16M"),
+            ("CELASTRO_MEMTABLE_MAX_VECTORS", "1000"),
+            ("CELASTRO_MEMTABLE_BUDGET_BYTES", "2G"),
+            ("CELASTRO_RESIDENCY_BUDGET_BYTES", "512M"),
+            ("CELASTRO_CACHED_IDLE_UNLOAD_SECS", "10"),
+            ("CELASTRO_ARCHIVED_ACCESS", "refuse"),
+            ("CELASTRO_STATEMENT_DEADLINE_MS", "0"),
+            ("CELASTRO_RECALL_SAMPLE_RATE", "0"),
+            ("CELASTRO_COMPACTION_DEAD_RATIO", "0.5"),
+            ("CELASTRO_VECTOR_QUANTIZER", "one-bit"),
+            ("CELASTRO_HNSW_M", "24"),
+            ("CELASTRO_FLAT_TIER_MAX", "100"),
+        ]
+        .into_iter()
+        .collect();
+        let mut o = DbOpts::default();
+        tuning_into(&mut o, &|k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(o.insert_batch, 250);
+        assert_eq!(o.thresholds.max_bytes, 16 << 20);
+        assert_eq!(o.thresholds.max_vectors, 1000);
+        assert_eq!(o.memtable_budget_bytes, 2 << 30);
+        assert_eq!(o.residency.budget_bytes, 512 << 20);
+        assert_eq!(o.residency.cached_idle_unload, Duration::from_secs(10));
+        assert!(matches!(o.residency.archived_access, celastro::residency::ArchivedAccess::Refuse));
+        assert_eq!(o.statement_deadline_ms, None);
+        assert_eq!(o.recall_sample_rate, 0);
+        assert_eq!(o.compaction.dead_ratio, 0.5);
+        assert!(matches!(o.build.quantizer, celastro::vector::quant::Quantizer::OneBit));
+        assert_eq!(o.build.hnsw.m, 24);
+        assert_eq!(o.build.flat_tier_max, 100);
+        let untouched = DbOpts::default();
+        assert_eq!(o.compaction.tier_fanout, untouched.compaction.tier_fanout);
+        for (k, v) in [
+            ("CELASTRO_INSERT_BATCH", "0"),
+            ("CELASTRO_MEMTABLE_MAX_BYTES", "lots"),
+            ("CELASTRO_COMPACTION_DEAD_RATIO", "2"),
+            ("CELASTRO_VECTOR_QUANTIZER", "float16"),
+            ("CELASTRO_COMPACTION_TIER_FANOUT", "1"),
+        ] {
+            let e = tuning_into(&mut DbOpts::default(), &|q| (q == k).then(|| v.to_string()))
+                .unwrap_err();
+            assert!(e.contains(k), "{k}: {e}");
         }
     }
 

@@ -94,10 +94,11 @@ const SATURATED_PAUSE: Duration = Duration::from_millis(25);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_ACCEPT_FAILURES: u32 = 40;
 
-/// Connections served at once. Past this the listener stops accepting and
-/// the kernel's backlog holds the rest; a thread per connection is what a
-/// stalled client costs, and sixty-four of them is a limit, not a pool.
-const MAX_CONNECTIONS: usize = 64;
+/// Connections served at once, unless `Server::with_max_connections` says
+/// otherwise. Past this the listener stops accepting and the kernel's
+/// backlog holds the rest; a thread per connection is what a stalled client
+/// costs, and sixty-four of them is a limit, not a pool.
+pub const MAX_CONNECTIONS: usize = 64;
 
 // ---------------------------------------------------------------- the server
 
@@ -109,6 +110,8 @@ pub struct Server {
     /// What every accepted connection is wrapped in, when the process has
     /// certificates; plain HTTP otherwise.
     tls: Option<Arc<Tls>>,
+    /// Connections served at once; `MAX_CONNECTIONS` unless tuned.
+    max_connections: usize,
 }
 
 /// Where the console is reachable from, which decides two of the guards.
@@ -155,7 +158,14 @@ impl Server {
     pub fn bind(port: u16) -> Result<Server> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         let addr = listener.local_addr()?;
-        Ok(Server { listener, addr, token: new_token()?, reach: Reach::Loopback, tls: None })
+        Ok(Server {
+            listener,
+            addr,
+            token: new_token()?,
+            reach: Reach::Loopback,
+            tls: None,
+            max_connections: MAX_CONNECTIONS,
+        })
     }
 
     /// Bind the console to an address of the operator's choosing, for the one
@@ -186,10 +196,24 @@ impl Server {
         let listener = TcpListener::bind(SocketAddr::from((addr, port)))?;
         let bound = listener.local_addr()?;
         let reach = if addr.is_loopback() { Reach::Loopback } else { Reach::Network };
-        Ok(Server { listener, addr: bound, token, reach, tls: None })
+        Ok(Server {
+            listener,
+            addr: bound,
+            token,
+            reach,
+            tls: None,
+            max_connections: MAX_CONNECTIONS,
+        })
     }
 
     /// Serve over TLS with `tls`, or plain with `None`.
+    /// Serve up to `n` connections at once (`CELASTRO_MAX_CONNECTIONS`);
+    /// at least one.
+    pub fn with_max_connections(mut self, n: usize) -> Server {
+        self.max_connections = n.max(1);
+        self
+    }
+
     pub fn with_tls(mut self, tls: Option<Arc<Tls>>) -> Server {
         self.tls = tls;
         self
@@ -268,7 +292,7 @@ impl Server {
             if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
                 return Ok(());
             }
-            if active.load(AtomicOrdering::Acquire) >= MAX_CONNECTIONS {
+            if active.load(AtomicOrdering::Acquire) >= server.max_connections {
                 std::thread::sleep(SATURATED_PAUSE);
                 continue;
             }
