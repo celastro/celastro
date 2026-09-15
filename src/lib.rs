@@ -77,6 +77,7 @@ pub mod column;
 pub mod compaction;
 pub(crate) mod crypto;
 pub mod deadline;
+pub(crate) mod dirlock;
 pub mod engine;
 pub mod error;
 pub mod harness;

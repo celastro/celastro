@@ -654,6 +654,8 @@ fn resolution_never_leaks_back_into_the_catalog() {
         "a node that merely caches a minimal index must not write that back as the declaration; \
          once the catalog is cluster state that would demote the index for the holder too"
     );
+    // One handle per directory: the first is let go before the reopen.
+    drop(db);
     let re = Db::open(&d, DbOpts::default()).unwrap();
     assert_eq!(
         re.catalog.get("items").unwrap().index_by_name("items_body").unwrap().tier,
@@ -695,6 +697,8 @@ fn a_promotion_that_cannot_move_its_files_changes_nothing() {
     std::fs::remove_file(&segs).unwrap();
     std::fs::create_dir_all(&segs).unwrap();
     db.persist().unwrap();
+    // One handle per directory: the first is let go before the reopen.
+    drop(db);
     let re = Db::open(&d, DbOpts::default()).unwrap();
     assert_eq!(
         re.catalog.get("items").unwrap().index_by_name("items_body").unwrap().tier,
@@ -1421,6 +1425,8 @@ fn a_tier_change_that_cannot_move_its_files_changes_nothing() {
     std::fs::remove_file(&arch).unwrap();
     std::fs::create_dir_all(&arch).unwrap();
     db.persist().unwrap();
+    // One handle per directory: the first is let go before the reopen.
+    drop(db);
     let re = Db::open(&d, DbOpts::default()).unwrap();
     assert_eq!(re.catalog.get("items").unwrap().index_by_name("items_body").unwrap().tier, before);
     let _ = std::fs::remove_dir_all(&d);

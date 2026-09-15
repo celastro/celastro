@@ -37,8 +37,13 @@ use crate::vector::VectorStore;
 pub struct FlushThresholds {
     /// Byte threshold for this memtable.
     pub max_bytes: usize,
-    /// Vector-count threshold. Order 20–50k; the bound on the brute-force scan
-    /// is what makes freshness cheap.
+    /// Vector-count threshold. The flat tier's size by default (4,096), so a
+    /// seal writes a flat segment and builds no graph: the graph is
+    /// compaction's to build, when segments merge past the flat tier. Until
+    /// 0.33.0 this was 32,768, and every seal of a vector collection built
+    /// a 32k-node HNSW in the ingest path -- 729 MB and 148 s for 50k
+    /// documents against 219 MB and 10 s; queries over the flat segments
+    /// pay one or two milliseconds until `COMPACT` merges them.
     pub max_vectors: usize,
     /// Version-depth threshold, applied only while a `gc_horizon` is pinned.
     ///
@@ -60,7 +65,7 @@ pub struct FlushThresholds {
 
 impl Default for FlushThresholds {
     fn default() -> Self {
-        FlushThresholds { max_bytes: 64 << 20, max_vectors: 32_768, max_versions: 8 }
+        FlushThresholds { max_bytes: 64 << 20, max_vectors: 4_096, max_versions: 8 }
     }
 }
 
@@ -224,7 +229,7 @@ impl Memtable {
                 }
             }
         }
-        let sz = doc.heap_size() + sort_key.len() + 64;
+        let sz = doc.heap_size() + std::mem::size_of::<Value>() + sort_key.len() + 64;
         self.bytes += sz;
         if let Some(b) = &self.budget {
             b.add(sz);

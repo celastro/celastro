@@ -6,6 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.33.0 — 2026-09-15
+
+A default that changes what a load costs, and a lock, hence a minor.
+
+**A memtable seals at the flat tier.** `CELASTRO_MEMTABLE_MAX_VECTORS`
+defaults to 4,096 (was 32,768): a seal writes a flat segment and builds
+no HNSW graph; `COMPACT` builds it when segments merge past the flat
+tier. Measured over 50,000 documents with 128-dimensional vectors: 729 MB
+and 148 s before, 219 MB and 10 s after; the whole 300,000-document load
+under a 512 MiB cgroup limit completes in 17 s where it was killed at
+28,000 documents. Queries over the uncompacted flat segments pay one or
+two milliseconds. `Value::heap_size` counts an element's inline slot and
+nothing for a scalar, so the byte threshold sees a vector at its size.
+`docs/tuning.md` carries the sweep and a starting point for a pod's
+`resources`.
+
+**One process per data directory.** `Db::open` holds `<dir>/LOCK` with
+`flock(2)` for the life of the `Db`; a second open -- another process,
+or a second `Db` in this one -- is refused naming the directory and the
+holder's pid, and a crash releases the lock. Off unix the file is the
+lock and a crashed holder's is removed by hand.
+
 ## 0.32.0 — 2026-09-15
 
 The tunables are named, hence a minor.

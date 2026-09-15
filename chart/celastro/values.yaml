@@ -119,6 +119,13 @@ backup:
 #     CELASTRO_RESIDENCY_BUDGET_BYTES: "2G"
 tuning: {}
 
+# A starting point for a node that ingests, measured (see the binary's
+# docs/tuning.md): requests 512Mi, limits 1Gi. The chart passes this map
+# through unchanged; empty means no requests and no limits.
+# resources:
+#   requests: {memory: 512Mi, cpu: "1"}
+#   limits: {memory: 1Gi}
+
 probes:
   periodSeconds: 10
   failureThreshold: 3

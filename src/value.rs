@@ -218,17 +218,26 @@ impl Value {
     }
 
     /// A rough in-memory footprint, used for the memtable byte threshold (§4.3).
+    /// The bytes this value owns on the heap: what a memtable holding it
+    /// pays beyond the `Value` itself. An element of an array or a field of
+    /// an object is a whole `Value` inline in its parent's vector, so it
+    /// counts `size_of::<Value>()` there and its own heap on top; a scalar
+    /// owns nothing. Until 0.33.0 a float counted 16 and an element's inline
+    /// size nothing, which made a 128-dimensional vector look half its
+    /// size and the memtable's byte threshold seal late.
     pub fn heap_size(&self) -> usize {
+        let slot = std::mem::size_of::<Value>();
         match self {
             Value::Null
             | Value::Bool(_)
             | Value::Int(_)
             | Value::Float(_)
-            | Value::Timestamp(_) => 16,
-            Value::Str(s) => 24 + s.len(),
-            Value::Array(a) => 24 + a.iter().map(|v| v.heap_size()).sum::<usize>(),
+            | Value::Timestamp(_) => 0,
+            Value::Str(s) => s.len(),
+            Value::Array(a) => a.len() * slot + a.iter().map(|v| v.heap_size()).sum::<usize>(),
             Value::Object(o) => {
-                24 + o.iter().map(|(k, v)| 24 + k.len() + v.heap_size()).sum::<usize>()
+                o.len() * (slot + std::mem::size_of::<String>())
+                    + o.iter().map(|(k, v)| k.len() + v.heap_size()).sum::<usize>()
             }
         }
     }

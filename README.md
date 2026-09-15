@@ -265,14 +265,16 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.32.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.32.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.33.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.33.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
 bind) or `--bind` with a token; it handles SIGTERM, so `docker stop` ends it
 saved. [docs/container.md](docs/container.md) has the rest: volumes and
-ownership, the REPL's stdin, what each flag costs.
+ownership, the REPL's stdin, what each flag costs. One process per data
+directory: `serve` holds `<dir>/LOCK` with `flock`, a second open is
+refused naming the holder, and a crash releases it.
 
 ## The archived tier
 
@@ -321,7 +323,8 @@ translation; that is the mechanism behind the single-plan claim, and it is
 treated as a load-bearing invariant. Around it: immutable segments with a
 self-describing footer, a write-ahead log fsynced before a write is
 acknowledged (once per statement: a thousand documents in one `INSERT`
-cost one sync), block-max WAND for BM25, a tiered HNSW index with SQ8 and 1-bit
+cost one sync), memtables sealed flat at the flat tier's size so a load
+builds no graph (`COMPACT` does, later), block-max WAND for BM25, a tiered HNSW index with SQ8 and 1-bit
 codes and full-precision rerank, runtime choice between brute force,
 post-filter and filter-aware vector search, and a deterministic simulator
 that puts partitions, crashes and reordering on the coordinator-to-shard

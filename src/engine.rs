@@ -740,6 +740,9 @@ pub struct Db {
     pub clock: Arc<Hlc>,
     pub opts: DbOpts,
     dir: Option<PathBuf>,
+    /// The directory's lock, for as long as this `Db` is open; `None` in
+    /// memory.
+    lock: Option<crate::dirlock::DirLock>,
     budget: Arc<MemtableBudget>,
     residency: Arc<ResidencyManager>,
     /// The statistics cache. Behind a lock, not `&mut self`: a read fills
@@ -838,6 +841,7 @@ impl Db {
             clock: Arc::new(Hlc::new()),
             opts,
             dir: None,
+            lock: None,
             budget,
             residency,
             stats: Mutex::new(BTreeMap::new()),
@@ -883,6 +887,7 @@ impl Db {
         let mut db = Db::with_opts(opts);
         db.archive = archive;
         fs::create_dir_all(dir)?;
+        db.lock = Some(crate::dirlock::take(dir)?);
         db.dir = Some(dir.to_path_buf());
         // Absent is a fresh database. Unreadable is not: read as absent it
         // opened a database with no collections, and the next DDL published
@@ -4882,6 +4887,8 @@ mod tests {
         );
         assert!(db.catalog.activity[&key].promotable());
         // And it survives the write, rather than being a live-only repair.
+        // One handle per directory: the first is let go before the reopen.
+        drop(db);
         let re = Db::open(&dir, DbOpts::default()).unwrap();
         assert_eq!(re.catalog.activity[&key].demoted_by, None);
         let _ = fs::remove_dir_all(&dir);
@@ -7596,6 +7603,29 @@ mod tests {
         assert_eq!(ev.count(Op::WalSync, &log), 3, "{}", ev.count(Op::WalAppend, &log));
         assert_eq!(ev.count(Op::WalAppend, &log), 2500);
         assert_eq!(db.query("SELECT id FROM items LIMIT 10000").unwrap().rows.len(), 2500);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One process -- one `Db` -- per directory: a second open while the
+    /// first is alive is refused naming the directory and the holder, and
+    /// succeeds once the first is dropped. The lock is `flock`, so a crash
+    /// releases it without anyone cleaning up.
+    #[test]
+    fn a_directory_is_opened_by_one_db_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("celastro-dirlock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let first = Db::open(&dir, DbOpts::default()).unwrap();
+        let e = match Db::open(&dir, DbOpts::default()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a second open of a held directory succeeded"),
+        };
+        assert!(e.contains("open in another process"), "{e}");
+        assert!(e.contains(&format!("pid {}", std::process::id())), "{e}");
+        assert!(dir.join("LOCK").exists());
+        drop(first);
+        let again = Db::open(&dir, DbOpts::default());
+        assert!(again.is_ok(), "{:?}", again.err());
+        drop(again);
         let _ = fs::remove_dir_all(&dir);
     }
 

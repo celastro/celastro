@@ -131,8 +131,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.32.0 .
-kind load docker-image celastro:0.32.0        # for a kind cluster
+docker build -t celastro:0.33.0 .
+kind load docker-image celastro:0.33.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -288,3 +288,12 @@ built from the tree at the time:
   node's backup, 3,000 rows and the text query back, no restarts. The
   first build shared one `LATEST` between pods and every pod restored the
   last writer's shard, which is why backups are per node now.
+- **Ingest under a memory limit** (celastro 0.33.0): the binary of the
+  image, 300 statements of 1,000 documents (50,000 with text and 128-d
+  vectors, 250,000 edges) in a cgroup with `MemoryMax`. With the old
+  memtable default (32,768 vectors a seal) a 512 MiB cap killed the load
+  at 28,000 documents and 256 MiB at 14,000; with the new default (4,096,
+  the flat tier) 512 MiB completes in 17 s at the cap, 256 MiB is killed
+  with 137,000 of the edges in. Uncapped: 967 MB and 280 s before, 219 MB
+  and 10 s for the 50,000 documents after. `resources` in `values.yaml`
+  carries the starting point.

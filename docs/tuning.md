@@ -19,9 +19,20 @@ the effect, not to be reproduced.
 |---|---|---|
 | `CELASTRO_INSERT_BATCH` | `1000` | Documents of one `INSERT` appended to a shard's log before it is synced. A statement of more is taken in chunks of this many, one `fdatasync` each; a statement of fewer is one sync. The statement is acknowledged only when every chunk is on disk, so a larger value costs nothing in durability, only the memory of the records in flight. 1,000 documents: 621 ms at one sync per document, 19 ms at one sync per thousand. Raise it for a bulk load of large statements; lower it if a statement's documents are large and memory is tight. |
 | `CELASTRO_MEMTABLE_MAX_BYTES` | `64M` | A shard's memtable is sealed into a segment once it holds this many bytes of documents. Smaller: less memory per shard and smaller segments (more of them to search until compaction merges them); larger: fewer, bigger segments and more memory during a load. The first knob for a pod with a memory limit. |
-| `CELASTRO_MEMTABLE_MAX_VECTORS` | `32768` | The same seal, by vectors held: an HNSW build is quadratic-ish in its input, so the memtable is sealed before the build gets long. |
+| `CELASTRO_MEMTABLE_MAX_VECTORS` | `4096` | The same seal, by vectors held. At the default -- the flat tier's size -- a seal writes a flat segment and builds no graph; the graph is built when `COMPACT` merges segments past the flat tier. This is the knob that governs a vector ingest: measured over 50,000 documents with 128-dimensional vectors, `32768` (the default until 0.33.0) took 729 MB and 148 s, `16384` 437 MB and 177 s, `8192` 291 MB and 177 s, `4096` 219 MB and 10 s. What the smaller segments cost a query until they are compacted: a vector top ten 8.8 → 10.6 ms, a hybrid 8.4 → 9.2 ms, BM25 and point lookups nothing. Raise it only if you would rather build graphs during ingest than run `COMPACT` after it. |
 | `CELASTRO_MEMTABLE_MAX_VERSIONS` | `8` | The same seal, by the longest version chain of one key, and only while a GC horizon is pinned (a backup, export or move in flight holds versions back): a seal then fans out into every retained version, and this bounds how many. |
 | `CELASTRO_MEMTABLE_BUDGET_BYTES` | `1G` | The node-wide budget for every memtable together. Past it the largest is sealed early whatever its own thresholds say. With `MEMTABLE_MAX_BYTES`, what bounds a node's memory during ingest. |
+
+**A pod with a memory limit.** Measured with the defaults above on the
+same 50,000 documents plus 250,000 edge documents, loaded as 300
+statements of 1,000: under a 512 MiB limit the load completes in 17 s;
+under 256 MiB it is killed with the edges two thirds in. So: requests of
+512 MiB and a limit of 1 GiB is the starting point for a node that
+ingests, and `CELASTRO_MEMTABLE_MAX_BYTES=16M` with
+`CELASTRO_RESIDENCY_BUDGET_BYTES` at half the limit for a smaller one.
+The residency budget bounds what queries decode; the memtable thresholds
+bound what a load holds; the two together are the node's memory, plus the
+process itself and the page cache the kernel reclaims under pressure.
 
 ## Memory of the indexes
 
