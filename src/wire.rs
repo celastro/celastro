@@ -70,7 +70,9 @@ pub const WIRE_VERSION: u8 = 4;
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 const MAX_FRAME: u32 = 256 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(25);
+/// How long the listener is waited on before `stop` and the shutdown flag
+/// are read again; a connection ends the wait at once (`signal::wait_readable`).
+const ACCEPT_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -955,7 +957,9 @@ pub fn serve(
                 let moves = moves.clone();
                 std::thread::spawn(move || serve_connection(s, &db, &moves, &token, &stop));
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                crate::signal::wait_readable(&listener, ACCEPT_WAIT);
+            }
             Err(e) => return Err(e.into()),
         }
     }

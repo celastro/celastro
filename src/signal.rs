@@ -25,7 +25,9 @@
 //! the way a person at a terminal expects. The one-shot verbs are jobs, and a
 //! job that is killed is a job that stops.
 
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -35,8 +37,43 @@ mod sys {
     pub const SIGTERM: i32 = 15;
     /// `SIG_ERR`: `(sighandler_t)-1`.
     pub const SIG_ERR: usize = usize::MAX;
+    pub const POLLIN: i16 = 1;
+    /// `struct pollfd`, as every unix lays it out.
+    #[repr(C)]
+    pub struct PollFd {
+        pub fd: i32,
+        pub events: i16,
+        pub revents: i16,
+    }
     extern "C" {
         pub fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        pub fn poll(fds: *mut PollFd, nfds: std::os::raw::c_ulong, timeout: i32) -> i32;
+    }
+}
+
+/// Wait until `listener` has a connection to accept, or `timeout` passes, or
+/// a signal interrupts the wait; the answer is whether there is one. What an
+/// accept loop waits on instead of a clock: the wait ends the moment a
+/// connection arrives, so a request never pays for a sleep, and `poll(2)` is
+/// the one wait a handler always interrupts -- `signal(2)` installs with
+/// `SA_RESTART`, which restarts a blocking `accept` and never a `poll` -- so
+/// the loop re-reads [`shutdown_requested`] within `timeout` at the latest.
+/// Off unix there is no `poll` to bind and the wait is the sleep it always
+/// was, reported as ready so the caller tries the accept.
+pub fn wait_readable(listener: &TcpListener, timeout: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut fd = sys::PollFd { fd: listener.as_raw_fd(), events: sys::POLLIN, revents: 0 };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: one `pollfd` on the stack, its count given as one, and the
+        // descriptor is the listener's for as long as the borrow lasts.
+        unsafe { sys::poll(&mut fd, 1, ms) > 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::sleep(timeout.min(Duration::from_millis(25)));
+        true
     }
 }
 
@@ -85,5 +122,27 @@ mod tests {
         assert_eq!(install_shutdown_handlers(), cfg!(unix));
         assert_eq!(install_shutdown_handlers(), cfg!(unix));
         assert!(!shutdown_requested());
+    }
+
+    /// The wait ends when a connection arrives, not when a clock does: a
+    /// connection made after the wait began is seen well inside a timeout
+    /// that would otherwise be paid in full, and a listener nobody dials
+    /// reports nothing when the timeout passes.
+    #[test]
+    fn the_wait_ends_when_a_connection_arrives_and_reports_nothing_when_none_does() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(!wait_readable(&listener, Duration::from_millis(50)));
+        assert!(t0.elapsed() >= Duration::from_millis(45), "{:?}", t0.elapsed());
+        let addr = listener.local_addr().unwrap();
+        let dial = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            std::net::TcpStream::connect(addr).unwrap()
+        });
+        let t0 = std::time::Instant::now();
+        assert!(wait_readable(&listener, Duration::from_secs(5)));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        let _keep = dial.join().unwrap();
+        listener.accept().unwrap();
     }
 }

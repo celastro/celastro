@@ -6,6 +6,23 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.29.1 — 2026-09-15
+
+A latency fix, hence a patch.
+
+**A request no longer waits for a clock to be accepted.** The console's
+and the wire's accept loops slept 25 ms between polls of their listener
+(so a SIGTERM would be noticed: a blocking `accept` restarts after the
+handler), which put up to 25 ms in front of every connection — a point
+lookup measured 25 ms at concurrency one, and so did a BM25 query and a
+single-document insert. Both loops now wait on the listener with
+`poll(2)` (an `extern "C"` binding beside `signal(2)`'s), which a
+connection ends at once and a handler interrupts; the shutdown flag is
+re-read within 100 ms at the latest. Off unix the sleep stays. Measured
+over the console at concurrency one on four cores, 50k documents: a point
+lookup 25.2 → 1.3 ms, a BM25 top ten 24.9 → 4.4 ms, a vector top ten 25.2
+→ 5.2 ms, a hybrid top ten 25.1 → 7.5 ms (p50).
+
 ## 0.29.0 — 2026-09-15
 
 The chart makes its own TLS material again and the TLS verifies what other

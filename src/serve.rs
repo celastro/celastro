@@ -79,6 +79,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 const MAX_DRAIN: u64 = 4 * MAX_BODY as u64;
 
+/// How long the accept loop waits on the listener before re-reading the
+/// shutdown flag: the bound on noticing a SIGTERM that arrived between the
+/// read and the wait, and nothing a request ever pays (`signal::wait_readable`).
+const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+/// How long the loop sleeps when every one of `MAX_CONNECTIONS` is taken
+/// before looking again; the kernel's backlog holds what arrives meanwhile.
+const SATURATED_PAUSE: Duration = Duration::from_millis(25);
 /// How long the accept loop pauses after a failure that will repeat, and how
 /// many of those in a row it tolerates before giving up. See `accept_backoff`.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -238,11 +245,13 @@ impl Server {
     ///
     /// A SIGTERM or SIGINT ends it the same way, once the caller has installed
     /// the handlers (`signal::install_shutdown_handlers`). The listener is
-    /// polled rather than blocked on: a blocking `accept` is restarted after a
-    /// handler runs, so the flag would be read only when the next connection
-    /// happened to arrive, which for a `docker stop` is never.
+    /// not blocked on -- a blocking `accept` is restarted after a handler
+    /// runs, so the flag would be read only when the next connection happened
+    /// to arrive, which for a `docker stop` is never -- but waited on with
+    /// `poll(2)`, which a handler interrupts and a connection ends at once.
+    /// Until 0.29.1 the wait was a 25 ms sleep, and every request paid up to
+    /// that much before it was accepted.
     pub fn run(self, db: &Mutex<Db>) -> Result<()> {
-        const POLL: Duration = Duration::from_millis(25);
         self.listener.set_nonblocking(true)?;
         let mut failures = 0u32;
         // Set by the connection that was asked to shut down; the loop reads
@@ -256,7 +265,7 @@ impl Server {
                 return Ok(());
             }
             if active.load(AtomicOrdering::Acquire) >= MAX_CONNECTIONS {
-                std::thread::sleep(POLL);
+                std::thread::sleep(SATURATED_PAUSE);
                 continue;
             }
             match server.listener.accept() {
@@ -276,7 +285,9 @@ impl Server {
                         active.fetch_sub(1, AtomicOrdering::AcqRel);
                     });
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
+                }
                 Err(e) => {
                     eprintln!("celastro-cli: accept failed: {e}");
                     match accept_backoff(e.kind(), failures + 1) {
