@@ -188,6 +188,8 @@ at least sixteen printable bytes, the same at every node), accepts whatever
 Connections are served at once, up to sixty-four, and reads run side by
 side on every core; a statement that changes something runs alone, since
 the engine is single-writer. `/api/health` names the node that answered.
+A `serve` also compacts on its own — one job at a time, built outside the
+lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 
 ## Encryption in transit
 
@@ -270,8 +272,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.35.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.35.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.36.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.36.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

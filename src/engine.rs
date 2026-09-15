@@ -2372,6 +2372,46 @@ impl Db {
         Ok(n)
     }
 
+    /// The next compaction some shard of this node wants, planned and
+    /// pinned under the lock: the console's maintenance thread takes one,
+    /// builds it with [`compaction_build`](Self::compaction_build) holding
+    /// nothing, and installs it with
+    /// [`compaction_install`](Self::compaction_install). `None` when every
+    /// shard is quiet.
+    pub fn compaction_reserve(&mut self) -> Option<CompactionTicket> {
+        let opts = self.opts.compaction;
+        for (name, shards) in self.shards.iter_mut() {
+            for (i, s) in shards.iter_mut().enumerate() {
+                if let Some(reserved) = compaction::reserve(s, &opts) {
+                    return Some(CompactionTicket { collection: name.clone(), shard: i, reserved });
+                }
+            }
+        }
+        None
+    }
+
+    /// Build a reserved compaction: no `Db` is involved, so no lock is held
+    /// while the segments are merged.
+    pub fn compaction_build(ticket: &CompactionTicket) -> Result<Option<compaction::Built>> {
+        compaction::build(&ticket.reserved)
+    }
+
+    /// Install a built compaction on the shard it was reserved on. `false`
+    /// when the shard moved on meanwhile and the build is dropped.
+    pub fn compaction_install(
+        &mut self,
+        ticket: CompactionTicket,
+        built: compaction::Built,
+    ) -> Result<bool> {
+        let Some(shards) = self.shards.get_mut(&ticket.collection) else { return Ok(false) };
+        let Some(shard) = shards.get_mut(ticket.shard) else { return Ok(false) };
+        let installed = compaction::install(shard, built)?;
+        if installed {
+            self.persist()?;
+        }
+        Ok(installed)
+    }
+
     pub fn compact(&mut self, collection: &str) -> Result<usize> {
         let opts = self.opts.compaction;
         let shards = self
@@ -4653,6 +4693,28 @@ fn sum_term_stats(
         }
     }
     Ok((sum, complete))
+}
+
+/// A compaction reserved on one shard: what the console's maintenance
+/// thread carries between the lock it took to plan and the lock it takes
+/// to install.
+pub struct CompactionTicket {
+    collection: String,
+    shard: usize,
+    reserved: compaction::Reserved,
+}
+
+impl CompactionTicket {
+    /// `<collection> shard <i>: <n> segment(s) -> level <l>`, for a log line.
+    pub fn describe(&self) -> String {
+        format!(
+            "`{}` shard {}: {} segment(s) into level {}",
+            self.collection,
+            self.shard,
+            self.reserved.inputs.len(),
+            self.reserved.level
+        )
+    }
 }
 
 /// The first word or two of a statement, for a message that names it.

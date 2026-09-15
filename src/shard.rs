@@ -2779,9 +2779,22 @@ impl Shard {
         ids: &[u64],
         retain_from: Timestamp,
     ) -> Result<(Vec<PendingDoc>, Vec<CarriedDelete>)> {
+        collect_from_handles(&self.segments, ids, retain_from)
+    }
+}
+
+/// The live rows of the segments `ids` name among `handles`, and the
+/// deletes to carry: what a compaction reads, from the handles alone, so a
+/// build can run with no lock on the shard (`compaction::build`).
+pub(crate) fn collect_from_handles(
+    handles: &[Arc<SegmentHandle>],
+    ids: &[u64],
+    retain_from: Timestamp,
+) -> Result<(Vec<PendingDoc>, Vec<CarriedDelete>)> {
+    {
         let mut docs = Vec::new();
         let mut deletes = Vec::new();
-        for h in self.segments.iter().filter(|h| ids.contains(&h.id())) {
+        for h in handles.iter().filter(|h| ids.contains(&h.id())) {
             let log = h.deletes.read().unwrap();
             let n = h.segment.num_docs();
             for ord in 0..n as u32 {
@@ -2799,7 +2812,9 @@ impl Shard {
         }
         Ok((docs, deletes))
     }
+}
 
+impl Shard {
     pub fn segment_summary(&self, t: Timestamp) -> Vec<(u64, u32, usize, usize, f64)> {
         self.segments
             .iter()

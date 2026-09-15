@@ -6,6 +6,26 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.36.0 — 2026-09-15
+
+Compaction runs itself, hence a minor.
+
+**`serve` compacts on its own.** A maintenance thread asks every second,
+under the write lock for a moment, whether any shard has a compaction to
+do; builds it with no lock held -- the inputs are pinned by their
+handles, so a minute of merging costs the statements nothing -- and
+installs it under the lock, where a shard that moved on meanwhile (a
+`COMPACT` took the inputs, a drop) declines it. One job at a time, a
+log line each, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
+Since 0.33.0 seals are flat and the graphs were built only when
+`COMPACT` was said; now they are built as the flat segments gather.
+`Db::compaction_reserve`, `compaction_build`, `compaction_install` and
+`compaction::{reserve, build, install}` for the library. Watched on a
+node with twelve flat segments of 50,000 vectors: three merges of four
+in about 30 s each while inserts went on at 10-30 ms and vector queries
+at 7-60 ms, which then settled from 45 ms over the flat segments to 8
+ms over the graphs.
+
 ## 0.35.0 — 2026-09-15
 
 The wire's port, and the second half of the build speed; hence a minor.

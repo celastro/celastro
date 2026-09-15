@@ -715,6 +715,14 @@ fn serve(
         Ok(n) => n,
         Err(e) => return fail(json, &e),
     };
+    let auto_compact = !matches!(
+        std::env::var("CELASTRO_AUTO_COMPACT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    );
     let server = match bind {
         // The operator's token, or nothing: a per-run token is printed where
         // a client on the network cannot read it, and differs per node.
@@ -730,12 +738,18 @@ fn serve(
                 );
             };
             match Server::bind_network(ip, port, token) {
-                Ok(s) => s.with_tls(tls.clone()).with_max_connections(connections),
+                Ok(s) => s
+                    .with_tls(tls.clone())
+                    .with_max_connections(connections)
+                    .with_auto_compact(auto_compact),
                 Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
             }
         }
         None => match Server::bind(port) {
-            Ok(s) => s.with_tls(tls.clone()).with_max_connections(connections),
+            Ok(s) => s
+                .with_tls(tls.clone())
+                .with_max_connections(connections)
+                .with_auto_compact(auto_compact),
             Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
         },
     };

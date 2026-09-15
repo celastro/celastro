@@ -16,9 +16,11 @@
 //! 3. **Format and parameter upgrades** (§12.3) — a rolling rebuild, never a
 //!    migration.
 
+use std::sync::Arc;
+
 use crate::error::Result;
 use crate::segment::{PendingDoc, Segment, SegmentBuilder};
-use crate::shard::Shard;
+use crate::shard::{SegmentHandle, Shard};
 use crate::time::Timestamp;
 
 #[derive(Debug, Clone, Copy)]
@@ -228,6 +230,111 @@ pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
     }
     shard.install_compaction(&inputs, outputs, &carried, retain_from)?;
     Ok(())
+}
+
+/// A job planned and its inputs pinned, for a build that runs with no lock
+/// held: the handles keep the input files alive, the ids are reserved on
+/// the shard, and everything else is a copy. What the console's maintenance
+/// thread takes under the write lock in a moment, builds from for as long
+/// as it takes, and brings back to `install`.
+pub struct Reserved {
+    pub inputs: Vec<u64>,
+    pub level: u32,
+    pub handles: Vec<Arc<SegmentHandle>>,
+    pub coll: crate::catalog::Collection,
+    pub build: crate::segment::BuildOpts,
+    /// Segment ids reserved for the outputs; a build that would need more
+    /// is left to `COMPACT`.
+    pub ids: Vec<u64>,
+    pub retain_from: Timestamp,
+    pub segment_cap: usize,
+}
+
+/// What `build` made, to be installed by the shard it was reserved on.
+pub struct Built {
+    pub inputs: Vec<u64>,
+    pub outputs: Vec<Segment>,
+    pub carried: Vec<crate::shard::CarriedDelete>,
+    pub retain_from: Timestamp,
+}
+
+impl std::fmt::Debug for Reserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Reserved({} input(s) -> level {})", self.inputs.len(), self.level)
+    }
+}
+
+/// Plan the next job on `shard` and pin what it needs, reserving segment
+/// ids for its outputs. `None` when the shard is quiet.
+pub fn reserve(shard: &mut Shard, opts: &CompactionOpts) -> Option<Reserved> {
+    let now = shard.clock.peek();
+    let job = plan(shard, now, opts)?;
+    let (inputs, level) = match &job {
+        Job::Rewrite { input, .. } => {
+            let level = shard
+                .segments
+                .iter()
+                .find(|h| h.id() == *input)
+                .map(|h| h.segment.level)
+                .unwrap_or(0);
+            (vec![*input], level)
+        }
+        Job::Merge { inputs, level } => (inputs.clone(), *level),
+    };
+    let handles: Vec<Arc<SegmentHandle>> =
+        shard.segments.iter().filter(|h| inputs.contains(&h.id())).cloned().collect();
+    // At most one output per version layer per cap-sized piece; `k` inputs
+    // hold at most `k` versions of a key, and twice that is room to spare.
+    let n = inputs.len() as u64 * 2 + 2;
+    let ids: Vec<u64> = (0..n).map(|k| shard.next_segment_id + k).collect();
+    shard.next_segment_id += n;
+    Some(Reserved {
+        inputs,
+        level,
+        handles,
+        coll: shard.coll.clone(),
+        build: shard.opts.build,
+        ids,
+        retain_from: shard.retain_from(now),
+        segment_cap: opts.segment_cap,
+    })
+}
+
+/// Build the outputs of a reserved job, with no lock held: the same rows,
+/// layers and pieces `run` would produce. `None` when the reserved ids run
+/// out, which `COMPACT` then handles in the ordinary way.
+pub fn build(r: &Reserved) -> Result<Option<Built>> {
+    let (docs, carried) = crate::shard::collect_from_handles(&r.handles, &r.inputs, r.retain_from)?;
+    let layers = crate::segment::layer_by_version(docs);
+    let mut outputs: Vec<Segment> = Vec::new();
+    let mut ids = r.ids.iter();
+    let chunk = r.segment_cap.max(1);
+    for (depth, layer) in layers.into_iter().enumerate().rev() {
+        let level = if depth == 0 { r.level } else { r.level.saturating_sub(1) };
+        let mut rest = layer;
+        while !rest.is_empty() {
+            let take = chunk.min(rest.len());
+            let piece: Vec<PendingDoc> = rest.drain(..take).collect();
+            let Some(&id) = ids.next() else { return Ok(None) };
+            let mut b = SegmentBuilder::new(r.build);
+            for pd in piece {
+                b.add(pd);
+            }
+            outputs.push(b.build(id, level, &r.coll)?);
+        }
+    }
+    Ok(Some(Built { inputs: r.inputs.clone(), outputs, carried, retain_from: r.retain_from }))
+}
+
+/// Install what `build` made, if the shard still holds every input: a
+/// shard that moved on meanwhile -- another compaction took the inputs, a
+/// drop -- gets nothing, and `false` says so.
+pub fn install(shard: &mut Shard, built: Built) -> Result<bool> {
+    if !built.inputs.iter().all(|id| shard.segments.iter().any(|h| h.id() == *id)) {
+        return Ok(false);
+    }
+    shard.install_compaction(&built.inputs, built.outputs, &built.carried, built.retain_from)?;
+    Ok(true)
 }
 
 /// Run jobs until the shard is quiet, bounded so a pathological policy cannot

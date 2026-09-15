@@ -112,6 +112,9 @@ pub struct Server {
     tls: Option<Arc<Tls>>,
     /// Connections served at once; `MAX_CONNECTIONS` unless tuned.
     max_connections: usize,
+    /// Whether the maintenance thread compacts on its own
+    /// (`CELASTRO_AUTO_COMPACT`); on unless told otherwise.
+    auto_compact: bool,
 }
 
 /// Where the console is reachable from, which decides two of the guards.
@@ -165,6 +168,7 @@ impl Server {
             reach: Reach::Loopback,
             tls: None,
             max_connections: MAX_CONNECTIONS,
+            auto_compact: true,
         })
     }
 
@@ -203,6 +207,7 @@ impl Server {
             reach,
             tls: None,
             max_connections: MAX_CONNECTIONS,
+            auto_compact: true,
         })
     }
 
@@ -211,6 +216,12 @@ impl Server {
     /// at least one.
     pub fn with_max_connections(mut self, n: usize) -> Server {
         self.max_connections = n.max(1);
+        self
+    }
+
+    /// Compact in the background, or not (`CELASTRO_AUTO_COMPACT=off`).
+    pub fn with_auto_compact(mut self, on: bool) -> Server {
+        self.auto_compact = on;
         self
     }
 
@@ -288,48 +299,54 @@ impl Server {
         let stop = AtomicBool::new(false);
         let active = AtomicUsize::new(0);
         let server = &self;
-        std::thread::scope(|scope| loop {
-            if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
-                return Ok(());
+        std::thread::scope(|scope| {
+            if server.auto_compact {
+                let stop = &stop;
+                scope.spawn(move || maintenance(db, stop));
             }
-            if active.load(AtomicOrdering::Acquire) >= server.max_connections {
-                std::thread::sleep(SATURATED_PAUSE);
-                continue;
-            }
-            match server.listener.accept() {
-                Ok((s, _)) => {
-                    failures = 0;
-                    // The listener's flag is not inherited on every platform
-                    // and must not be here: a connection is served blocking.
-                    s.set_nonblocking(false)?;
-                    active.fetch_add(1, AtomicOrdering::AcqRel);
-                    let (active, stop) = (&active, &stop);
-                    scope.spawn(move || {
-                        match server.serve_one(s, db) {
-                            Ok(Next::Serve) => {}
-                            Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
-                            Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
-                        }
-                        active.fetch_sub(1, AtomicOrdering::AcqRel);
-                    });
+            loop {
+                if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+                    return Ok(());
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
+                if active.load(AtomicOrdering::Acquire) >= server.max_connections {
+                    std::thread::sleep(SATURATED_PAUSE);
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("celastro-cli: accept failed: {e}");
-                    match accept_backoff(e.kind(), failures + 1) {
-                        // Nothing of ours went wrong, and it will not repeat by
-                        // itself: the run of failures starts over.
-                        Backoff::Now => failures = 0,
-                        Backoff::After(pause) => {
-                            failures += 1;
-                            std::thread::sleep(pause);
-                        }
-                        Backoff::GiveUp => {
-                            let run = failures + 1;
-                            eprintln!("celastro-cli: {run} accept failures in a row, stopping");
-                            return Err(e.into());
+                match server.listener.accept() {
+                    Ok((s, _)) => {
+                        failures = 0;
+                        // The listener's flag is not inherited on every platform
+                        // and must not be here: a connection is served blocking.
+                        s.set_nonblocking(false)?;
+                        active.fetch_add(1, AtomicOrdering::AcqRel);
+                        let (active, stop) = (&active, &stop);
+                        scope.spawn(move || {
+                            match server.serve_one(s, db) {
+                                Ok(Next::Serve) => {}
+                                Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
+                                Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
+                            }
+                            active.fetch_sub(1, AtomicOrdering::AcqRel);
+                        });
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
+                    }
+                    Err(e) => {
+                        eprintln!("celastro-cli: accept failed: {e}");
+                        match accept_backoff(e.kind(), failures + 1) {
+                            // Nothing of ours went wrong, and it will not repeat by
+                            // itself: the run of failures starts over.
+                            Backoff::Now => failures = 0,
+                            Backoff::After(pause) => {
+                                failures += 1;
+                                std::thread::sleep(pause);
+                            }
+                            Backoff::GiveUp => {
+                                let run = failures + 1;
+                                eprintln!("celastro-cli: {run} accept failures in a row, stopping");
+                                return Err(e.into());
+                            }
                         }
                     }
                 }
@@ -1150,6 +1167,48 @@ impl Served {
 /// is a status code, and a SQL problem is a JSON body.
 /// The database, whoever held it last: a statement that panicked with the
 /// lock held has already been reported, and the console keeps serving.
+/// The maintenance thread: compaction that runs itself. Every second it
+/// asks, under the write lock for a moment, whether any shard wants a
+/// job; builds the job with no lock held -- the inputs are pinned by their
+/// handles, so a minute of merging costs the statements nothing -- and
+/// installs it under the lock again, where a shard that moved on meanwhile
+/// declines it. One job at a time, logged, and off with
+/// `CELASTRO_AUTO_COMPACT=off`: scheduled and rate-limited, as the design
+/// notes ask of compaction, only no longer waiting to be asked. A
+/// shutdown waits for a build in flight; a kill loses nothing, since
+/// nothing is installed until the end.
+fn maintenance(db: &RwLock<Db>, stop: &AtomicBool) {
+    loop {
+        if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        if !maintenance_step(db) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// One job, if any shard wants one: reserved, built, installed. Whether a
+/// job was found.
+fn maintenance_step(db: &RwLock<Db>) -> bool {
+    let Some(ticket) = write(db).compaction_reserve() else { return false };
+    let what = ticket.describe();
+    let started = Instant::now();
+    match Db::compaction_build(&ticket) {
+        Ok(Some(built)) => match write(db).compaction_install(ticket, built) {
+            Ok(true) => eprintln!(
+                "celastro-cli: compacted {what} in {:.1} s",
+                started.elapsed().as_secs_f64()
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!("celastro-cli: compaction of {what} could not be installed: {e}"),
+        },
+        Ok(None) => {}
+        Err(e) => eprintln!("celastro-cli: compaction of {what} failed: {e}"),
+    }
+    true
+}
+
 /// The database for a read: many at once, beside no write. Poisoning is
 /// recovered from, as everywhere in the crate: a panic in one request is
 /// that request's failure, not the console's.
@@ -2478,6 +2537,59 @@ mod tests {
         assert!(writer.join().unwrap().body.contains("\"ok\":true"));
         let rows = run_sql(&db, "SELECT id FROM items LIMIT 10");
         assert!(rows.body.contains("\"count\":2"), "{}", rows.body);
+    }
+
+    /// The maintenance step merges what the planner would: four flat
+    /// segments at level 0 become one at level 1, built with no lock held
+    /// and installed under it; and a build whose inputs are gone by the time
+    /// it is installed -- a `COMPACT` ran meanwhile -- is dropped, leaving
+    /// no duplicate.
+    #[test]
+    fn a_maintenance_step_compacts_what_the_planner_wants_and_drops_a_stale_build() {
+        let mut opts = crate::engine::DbOpts::default();
+        opts.compaction.tier_fanout = 4;
+        let db = RwLock::new(Db::with_opts(opts));
+        assert!(run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY)")
+            .body
+            .contains("\"ok\":true"));
+        for round in 0..4 {
+            let docs: Vec<String> =
+                (0..20).map(|i| format!("('{{\"id\":\"d{round}-{i}\"}}')")).collect();
+            assert!(run_sql(&db, &format!("INSERT INTO items VALUES {}", docs.join(",")))
+                .body
+                .contains("\"ok\":true"));
+            assert!(run_sql(&db, "FLUSH items").body.contains("\"ok\":true"));
+        }
+        let segments = |db: &RwLock<Db>| -> usize {
+            let shards = read(db);
+            let s = shards.shards("items").unwrap();
+            s[0].segment_summary(crate::time::MAX_TS).len()
+        };
+        assert_eq!(segments(&db), 4);
+        assert!(maintenance_step(&db), "four level-0 segments are a job");
+        assert_eq!(segments(&db), 1, "merged into one");
+        assert!(!maintenance_step(&db), "and the shard is quiet");
+        let rows = run_sql(&db, "SELECT id FROM items LIMIT 1000");
+        assert!(rows.body.contains("\"count\":80"), "{}", rows.body);
+
+        // A stale build: reserved, then the inputs compacted by a statement
+        // before the install.
+        for round in 4..8 {
+            let docs: Vec<String> =
+                (0..20).map(|i| format!("('{{\"id\":\"d{round}-{i}\"}}')")).collect();
+            assert!(run_sql(&db, &format!("INSERT INTO items VALUES {}", docs.join(",")))
+                .body
+                .contains("\"ok\":true"));
+            assert!(run_sql(&db, "FLUSH items").body.contains("\"ok\":true"));
+        }
+        let ticket = write(&db).compaction_reserve().expect("four new level-0 segments");
+        let built = Db::compaction_build(&ticket).unwrap().expect("within the reserved ids");
+        assert!(run_sql(&db, "COMPACT items").body.contains("\"ok\":true"));
+        let after_compact = segments(&db);
+        assert!(!write(&db).compaction_install(ticket, built).unwrap(), "the inputs are gone");
+        assert_eq!(segments(&db), after_compact, "nothing was installed twice");
+        let rows = run_sql(&db, "SELECT id FROM items LIMIT 1000");
+        assert!(rows.body.contains("\"count\":160"), "{}", rows.body);
     }
 
     #[test]

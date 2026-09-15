@@ -1103,6 +1103,18 @@ publication path: the manifest names the segment by id and looks for it in
 both directories, so a rename whose entries a crash took back was a segment
 the manifest named and neither directory held.
 
+**Compaction runs itself in `serve`, and stays scheduled and visible.**
+Until 0.36.0 nothing ran a job unless `COMPACT` was said, and 0.33.0's
+flat seals made that a query cost that only grew. The console's
+maintenance thread asks every second, under the write lock for a moment,
+whether a shard has a job (`compaction::reserve`: the planner's answer
+with its inputs pinned by their handles and its output ids reserved),
+builds it holding nothing (`compaction::build`, the same rows, layers and
+pieces `run` makes), and installs it under the lock
+(`compaction::install`), where a shard that moved on declines it. One
+job at a time, a log line each, `CELASTRO_AUTO_COMPACT=off` to stop it:
+what §12.1 asked for, minus the waiting to be asked.
+
 **A statement's cost is bounded by a deadline that is on by default and
 checked inside the loops.** Thirty seconds unless the `Db` or the statement
 says otherwise; `WITH (deadline_ms = N)` raises it, `WITH (no_deadline)` lifts

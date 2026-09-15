@@ -133,8 +133,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.35.0 .
-kind load docker-image celastro:0.35.0        # for a kind cluster
+docker build -t celastro:0.36.0 .
+kind load docker-image celastro:0.36.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
