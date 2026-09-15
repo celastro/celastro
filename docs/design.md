@@ -399,9 +399,8 @@ without a dot.
 
 Consensus and replication, follower reads and closed timestamps, hedged
 requests, two-phase commit for multi-shard writes and for multi-node DDL,
-stateless compaction workers, dynamic shard split and merge, moving a shard
-between nodes, and a graph database's pattern language, unbounded paths and
-analytics — the bounded walk in the section after this one is a retrieval
+stateless compaction workers, dynamic shard split and merge, and a graph
+database's pattern language, unbounded paths and analytics — the bounded walk in the section after this one is a retrieval
 mode, and says what it is not. A collection's shards can be spread over nodes and any
 holder can coordinate, but each shard has exactly one holder and a statement
 that changes the catalog reaches the holders one by one, reporting the ones it
