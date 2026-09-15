@@ -1,6 +1,6 @@
 [package]
 name = "celastro"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Hybrid document database: SQL, BM25 and vector retrieval in a single query plan"
@@ -18,11 +18,21 @@ repository = "https://github.com/celastro/celastro"
 # .dockerignore has no effect on `cargo package`, which ships tracked files.
 exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*", "chart/*"]
 
+[features]
+# Encryption in transit -- the wire between nodes and the console's traffic
+# from clients, over TLS 1.3 by rustls. Off by default, so the library as
+# published is std-only; the image and the chart build with it.
+tls = ["dep:rustls", "dep:rustls-pki-types"]
+
 [dependencies]
-# Intentionally none. Celastro is std-only: JSON, bitmaps, term dictionaries,
-# postings, quantization, HNSW and the SQL front end are all in-tree, because
-# the ordinal-space invariant (§4.2) means every index has to speak the
-# segment's own identifier space. Borrowed indexes rarely do.
+# Minimal, and every one of them optional. With no feature on, celastro is
+# std-only: JSON, bitmaps, term dictionaries, postings, quantization, HNSW
+# and the SQL front end are all in-tree, because the ordinal-space invariant
+# (§4.2) means every index has to speak the segment's own identifier space,
+# and borrowed indexes rarely do. TLS is the exception: the one thing a
+# hand-written version would make worse, not better.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pki-types = { version = "1.7", features = ["std"], optional = true }
 
 [lints.clippy]
 # Numeric kernels, blocked decoders and column scans index deliberately: the

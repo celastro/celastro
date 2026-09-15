@@ -40,7 +40,7 @@ impl Node {
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
-            celastro::wire::serve(listener, d, TOKEN.to_string(), s).unwrap();
+            celastro::wire::serve(listener, d, TOKEN.to_string(), s, None).unwrap();
         });
         Node { url, db, stop, dir }
     }
@@ -298,7 +298,7 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
-            celastro::wire::serve(listener, d, TOKEN.to_string(), s).unwrap();
+            celastro::wire::serve(listener, d, TOKEN.to_string(), s, None).unwrap();
         });
         Node { url: a_url, db, stop, dir: a_dir }
     };
@@ -652,7 +652,7 @@ fn a_shard_moves_between_nodes_and_every_node_agrees() {
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
-            celastro::wire::serve(listener, d, TOKEN.to_string(), s).unwrap();
+            celastro::wire::serve(listener, d, TOKEN.to_string(), s, None).unwrap();
         });
         Node { url: c_url, db, stop, dir: c_dir }
     };

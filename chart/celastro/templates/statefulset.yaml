@@ -43,6 +43,14 @@ spec:
           args: {{ concat (list "--dir" "/data" "--port" (.Values.port | toString) "serve") $bind | toJson }}
           {{- end }}
           env:
+            {{- if .Values.tls.enabled }}
+            - name: CELASTRO_TLS_CERT
+              value: /tls/tls.crt
+            - name: CELASTRO_TLS_KEY
+              value: /tls/tls.key
+            - name: CELASTRO_TLS_CA
+              value: /tls/ca.crt
+            {{- end }}
             {{- if .Values.console.expose }}
             - name: CELASTRO_TOKEN
               valueFrom:
@@ -118,10 +126,21 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "celastro.tlsSecretName" . }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

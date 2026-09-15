@@ -18,6 +18,28 @@ wire:
   token: ""
   existingSecret: ""
 
+# Encryption in transit: the wire between pods and the console's traffic
+# from clients over TLS 1.3, each pod serving one certificate and verifying
+# every other pod's against one CA. Off by default. On, the chart makes a
+# CA and a certificate once and keeps them across upgrades; the certificate
+# names every pod, both Services, `localhost` and 127.0.0.1 (the probe asks
+# the console as `localhost`). Or name a Secret of your own with `tls.crt`,
+# `tls.key` and `ca.crt` -- the certificate has to carry those same names --
+# or name a cert-manager issuer and the chart emits a Certificate for it to
+# fill (an issuer whose Secrets carry `ca.crt`: a CA issuer does, a
+# self-signed one puts its own certificate there, which also works). The
+# tokens stay: a certificate says which pod is talking, the token that it may.
+tls:
+  enabled: false
+  existingSecret: ""
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+  # Validity of the certificates the chart makes itself, in days.
+  days: 3650
+
 image:
   repository: ghcr.io/celastro/celastro
   # Empty means the chart's appVersion.

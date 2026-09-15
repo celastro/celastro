@@ -407,7 +407,8 @@ that changes the catalog reaches the holders one by one, reporting the ones it
 did not reach. The
 `archived` tier is an S3-compatible object store when one is configured and a
 local directory that stands in for one when not; the client is in-tree and
-plain HTTP, since the crate carries no TLS.
+plain HTTP: the `tls` feature (0.27.0) encrypts the wire and the console,
+not the archive client, yet.
 
 The *boundaries* those attach to are real, and that is the point of having built
 them first:
@@ -1054,7 +1055,8 @@ reaches a loopback bind that a published port never could.
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
 stands in for, `PUT`, ranged `GET`, `HEAD` and `DELETE`, path-style and signed
-with Signature Version 4, over plain HTTP because the crate carries no TLS.
+with Signature Version 4, over plain HTTP: the `tls` feature covers the wire
+and the console, not this client, yet.
 SHA-256, HMAC, the signer and a small HTTP/1.1 client are in-tree and pinned
 against the published vectors, AWS's own worked example included. A remote
 segment is opened by reading its footer with two ranged reads and each

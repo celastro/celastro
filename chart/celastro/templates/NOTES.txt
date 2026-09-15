@@ -20,11 +20,19 @@ the Secret {{ include "celastro.consoleSecretName" . }}:
 Send it as the X-Celastro-Token header (or ?t=) with every request, for
 example from a pod in the cluster:
 
-  http://{{ include "celastro.fullname" . }}-console:{{ .Values.port }}/api/health
+  {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}://{{ include "celastro.fullname" . }}-console:{{ .Values.port }}/api/health
+{{- if .Values.tls.enabled }}
+
+The console and the wire are over TLS; the CA to verify against is `ca.crt`
+in the Secret {{ include "celastro.tlsSecretName" . }}:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "celastro.tlsSecretName" . }} -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
+{{- else }}
 
 This is plain HTTP and the token is the only thing protecting the database:
-keep the Service inside a network you trust, or put an ingress that terminates
-TLS in front of it.
+keep the Service inside a network you trust, put an ingress that terminates
+TLS in front of it, or set tls.enabled.
+{{- end }}
 {{- else }}
 
 The console binds 127.0.0.1 inside the pod and prints its URL, token included,

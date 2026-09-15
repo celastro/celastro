@@ -6,6 +6,37 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.27.0 — 2026-09-15
+
+Encryption in transit, behind a feature, and the first dependency, hence a
+minor.
+
+**The `tls` feature.** `cargo build --features tls` — the image is built
+so — brings rustls with the ring provider, the crate's first and only
+dependency, and with it `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and
+`CELASTRO_TLS_CA` (PEM; all three or none) put the wire between nodes and
+the console over TLS 1.3: each node serves its certificate, verifies every
+peer against the CA by the name it dialled, and `celastro-cli health`
+verifies its own console as `localhost`. The tokens stay. Without the
+feature the crate is std-only as before, and a build without it refuses to
+start with those variables set rather than serve plain. The README's claim
+goes from "zero dependencies" to "minimal dependencies", and says which.
+
+**The chart's `tls.enabled`.** A CA and a certificate naming every pod,
+both Services, `localhost` and `127.0.0.1`, made once and kept across
+upgrades; or `tls.existingSecret`; or `tls.certManager.issuerRef` for a
+cert-manager `Certificate`. Off by default, and an install without it is
+what it was.
+
+**A node dials its peers outside the database lock.** The attach thread
+ran `ATTACH NODE` under the lock, and the dial inside it — five seconds per
+peer that is not up yet — held every statement and every health probe
+behind it; with the wire's handshake on top, a pod failed its own liveness
+probe three times while its peers were starting and was restarted once
+per install. The peer is dialled first, without the lock, and attached
+only once it answered. A three-pod TLS install now reaches ready in 49
+seconds with no restarts, against 77 with one each.
+
 ## 0.26.0 — 2026-09-15
 
 A walk ranks, and filters per hop, hence a minor.

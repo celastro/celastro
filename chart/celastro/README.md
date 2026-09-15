@@ -31,7 +31,8 @@ Raising `replicas` later adds attached nodes; `REBALANCE notes` moves shards
 onto them, and `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:9000'`
 moves one by hand. Lowering `replicas` strands the shards on the removed
 pods' volumes: move them off first, then scale down. The wire is plain TCP
-with the shared token and no TLS, inside the cluster network only.
+with the shared token, inside the cluster network only, and encrypted when
+`tls.enabled` is set (below).
 
 Clients reach a cluster through the console, exposed:
 
@@ -48,8 +49,36 @@ connection after one request; a DNS name that resolved to every pod would
 have handed each client the same first address. Any pod coordinates a
 statement over every pod's shards, and `/api/health` names the pod that
 answered. Plain HTTP with the token as the only guard: keep the Service
-inside a network you trust, or put an ingress that terminates TLS in front of
-it (`console.service.type` is what an ingress or a cloud balancer wants).
+inside a network you trust, put an ingress that terminates TLS in front of
+it (`console.service.type` is what an ingress or a cloud balancer wants), or
+set `tls.enabled`.
+
+### Encryption in transit
+
+```
+helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true
+```
+
+Every pod then serves the wire and the console over TLS 1.3 with one
+certificate and verifies every other pod against one CA. Where the material
+comes from, in order of precedence:
+
+- `tls.certManager.issuerRef.name`: the chart emits a cert-manager
+  `Certificate` for that issuer, and the issuer fills the Secret and renews it
+  (a pod reads the files at start, so a renewal reaches it at its next
+  restart). The issuer's Secrets have to carry `ca.crt` — a CA issuer does, a
+  self-signed one puts its own certificate there, which also works.
+- `tls.existingSecret`: a Secret of yours with `tls.crt`, `tls.key` and
+  `ca.crt`. The certificate has to name every pod (`<release>-<i>.<release>`),
+  both Services, `localhost` and `127.0.0.1` — the probe asks the pod's own
+  console as `localhost`.
+- Neither: the chart makes a CA and a certificate with those names, valid
+  `tls.days` days (3650), once, and keeps them across upgrades, in the Secret
+  `<release>-tls`.
+
+Clients verify the console against `ca.crt` from that Secret, as the notes
+say. The tokens stay in force with TLS on; the archive endpoint stays plain
+HTTP.
 
 A pod that is down is its shards down, and so is a pod that has just come
 back, for a little longer: a restarted pod has a new address, and the other
@@ -73,8 +102,8 @@ To run an image of your own instead, build one and put it where the cluster
 can pull it, or load it into a local cluster, then point the chart at it:
 
 ```
-docker build -t celastro:0.26.0 .
-kind load docker-image celastro:0.26.0        # for a kind cluster
+docker build -t celastro:0.27.0 .
+kind load docker-image celastro:0.27.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -143,6 +172,10 @@ every pod restarted.
 | `archive.bucket`, `archive.prefix`, `archive.region` | empty | the bucket, and optional key prefix and region |
 | `archive.existingSecret` | empty | a `Secret` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` |
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
+| `tls.enabled` | `false` | the wire and the console over TLS 1.3, one certificate per release, every pod verified against one CA |
+| `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt`, naming every pod, both Services and `localhost` |
+| `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` is emitted for it |
+| `tls.days` | `3650` | validity of the CA and certificate the chart makes itself |
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because the console answers one request at a time |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
 
@@ -211,3 +244,22 @@ of items on tcp://celastro-0... did not answer` before ten in a row
 succeeded — the restarted pod's old address, held by the others until the
 cluster DNS TTL ran out — and health requests were again answered by all
 three pods.
+
+Encryption in transit, on 2026-09-15 with the chart at 0.5.0 and an image
+built from the tree with the `tls` feature: `helm install --set replicas=3
+--set console.expose=true --set tls.enabled=true --wait` had three pods
+`READY 1/1` in 49 seconds with no restarts (an earlier build had one per
+pod: the peers were dialled under the database lock and the liveness probe
+timed out behind it). The generated certificate carried eleven names. From
+a client pod, with `ca.crt` from the Secret: `/api/health` over TLS,
+verified as `celastro-console`; the name `elsewhere.example` refused by the
+client; plain HTTP answered with a TLS alert and no status line; a
+handshake to `celastro-0.celastro:9000` completed as TLSv1.3
+`TLS_AES_256_GCM_SHA384` with a certificate naming the pod and `localhost`;
+a spread collection created and thirty rows read back through the TLS
+console. `helm upgrade` kept the certificate. The same checks passed with
+the generated material copied to a Secret of another name and
+`tls.existingSecret`, and with cert-manager v1.16 issuing from a CA
+`ClusterIssuer` through `tls.certManager.issuerRef` (the `Certificate`
+Ready, the issuer `lab-ca`). Rendered without `tls.enabled`, the manifests
+contain no TLS at all.

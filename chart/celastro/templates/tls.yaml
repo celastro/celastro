@@ -1,0 +1,55 @@
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecret) (not .Values.tls.certManager.issuerRef.name) }}
+{{- /* Made once and kept: an upgrade that reissued the CA would leave every
+       running pod refusing every restarted one until all had turned over. */ -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "celastro.tlsSecretName" .) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "celastro.tlsSecretName" . }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  {{- if and $existing (index $existing.data "tls.crt") (index $existing.data "tls.key") (index $existing.data "ca.crt") }}
+  tls.crt: {{ index $existing.data "tls.crt" | quote }}
+  tls.key: {{ index $existing.data "tls.key" | quote }}
+  ca.crt: {{ index $existing.data "ca.crt" | quote }}
+  {{- else }}
+  {{- $ca := genCA (printf "%s CA" (include "celastro.fullname" .)) (int .Values.tls.days) }}
+  {{- /* genSignedCert wants a list of interfaces, which `list`/`append` make and `splitList` does not. */ -}}
+  {{- $names := list }}
+  {{- range splitList "," (include "celastro.tlsNames" .) }}{{ $names = append $names . }}{{ end }}
+  {{- $cert := genSignedCert (include "celastro.fullname" .) (list "127.0.0.1") $names (int .Values.tls.days) $ca }}
+  tls.crt: {{ $cert.Cert | b64enc | quote }}
+  tls.key: {{ $cert.Key | b64enc | quote }}
+  ca.crt: {{ $ca.Cert | b64enc | quote }}
+  {{- end }}
+{{- end }}
+{{- if and .Values.tls.enabled .Values.tls.certManager.issuerRef.name }}
+---
+# cert-manager fills the Secret and renews it; the pods read the files at
+# start, so a renewal reaches a pod at its next restart.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "celastro.fullname" . }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "celastro.tlsSecretName" . }}
+  commonName: {{ include "celastro.fullname" . }}
+  dnsNames:
+    {{- range splitList "," (include "celastro.tlsNames" .) }}
+    - {{ . | quote }}
+    {{- end }}
+  ipAddresses:
+    - 127.0.0.1
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ .Values.tls.certManager.issuerRef.name | quote }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind | quote }}
+    group: {{ .Values.tls.certManager.issuerRef.group | quote }}
+{{- end }}

@@ -4,8 +4,9 @@ A hybrid document database. Structured SQL, BM25 full-text, vector similarity
 and a bounded graph walk are four first-class retrieval modes evaluated in a
 **single query plan**, rather than orchestrated across separate services.
 
-Written in Rust with **zero dependencies outside `std`** — no crates, no C
-libraries. The bitmaps, term dictionary, block-max postings, quantizers, HNSW
+Written in Rust with **minimal dependencies**: none outside `std` unless the
+`tls` feature is on, and then rustls and what it brings, nothing else. The
+bitmaps, term dictionary, block-max postings, quantizers, HNSW
 
 ```sh
 cargo install celastro        # the `celastro` REPL and the `celastro-cli` tool
@@ -274,13 +275,36 @@ Service or a load balancer: the console then answers the token in
 `CELASTRO_TOKEN` — yours, at least sixteen printable bytes, the same at every
 node — instead of a per-run one, accepts whatever `Host` routed to it, and
 requires a browser's `Origin` to be that host. It is plain HTTP; keep it
-inside a network you trust or behind an ingress that terminates TLS. Any node
+inside a network you trust or behind an ingress that terminates TLS — or
+give it certificates, below. Any node
 coordinates a statement over every node's shards, and `/api/health` names
 the node that answered, so a client behind a balancer can see its requests
 spread. Connections are served at once, up to sixty-four, with the database
 locked only around the statement; the statements themselves serialise per
 node, because the engine is single-writer — a node runs one at a time, and
 the threads see to it that the one running never waits on a socket.
+
+## Encryption in transit
+
+Off by default. A build with the `tls` feature — the published image is one,
+`cargo build --features tls` makes another — reads three files from the
+environment, all PEM, all three or none:
+
+```
+CELASTRO_TLS_CERT=/tls/tls.crt   # this node's certificate chain, leaf first
+CELASTRO_TLS_KEY=/tls/tls.key    # its private key
+CELASTRO_TLS_CA=/tls/ca.crt      # the CA every node's certificate chains to
+```
+
+With them the console and the wire serve TLS 1.3 (rustls, the crate's one
+dependency), every peer is verified against the CA by the name it was dialled
+— a pod's, in a cluster — and `celastro-cli health` verifies its own console
+as `localhost`, which the certificate has to name. The tokens stay: a
+certificate says which node is talking, the token says it may. A build
+without the feature refuses to start with the variables set rather than serve
+plain and say nothing. The chart's `tls.enabled` does all of this with a CA
+and certificate it makes once, a Secret of yours, or a cert-manager
+`Certificate`. The archive client to an S3 store is still plain HTTP.
 
 ## Copying a collection
 
@@ -367,7 +391,8 @@ then. Reads of the shard are answered throughout. A holder the map did not
 reach is named with the `LOCAL PLACE SHARD ...` that repairs it. Nothing
 crosses the wire but the shard's files, so a move costs their size.
 
-The wire is plain TCP with a shared token and no TLS: for a network you
+The wire is plain TCP with a shared token unless certificates are given (see
+"Encryption in transit" below): for a network you
 trust.
 
 ## The archived tier and an object store
@@ -398,7 +423,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.26.0 && docker tag ghcr.io/celastro/celastro:0.26.0 celastro
+docker pull ghcr.io/celastro/celastro:0.27.0 && docker tag ghcr.io/celastro/celastro:0.27.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql
@@ -456,9 +481,11 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-No dependencies outside `std`, and Rust 1.75 or later. A change also has to
-build on that floor and must not rewrite `Cargo.lock`. These are gates, but
-nothing in this repository runs them for you.
+No dependencies outside `std` without the `tls` feature, and Rust 1.75 or
+later. A change also has to build on that floor, with and without the
+feature (`cargo test --features tls` runs the TLS tests too), and must not
+rewrite `Cargo.lock`. These are gates, but nothing in this repository runs
+them for you.
 
 Every test is named after the failure it prevents, not the feature it covers.
 A test that passes with the behaviour it names removed is worse than no test.

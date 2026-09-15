@@ -28,7 +28,7 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -36,6 +36,7 @@ use crate::engine::{Db, Outcome};
 use crate::error::{Error, Result};
 use crate::json;
 use crate::plan::exec::QueryResult;
+use crate::tls::{self, Stream, Tls};
 use crate::value::Value;
 
 // The three assets are compiled in. A console that reads its own UI off the
@@ -95,6 +96,9 @@ pub struct Server {
     addr: SocketAddr,
     token: String,
     reach: Reach,
+    /// What every accepted connection is wrapped in, when the process has
+    /// certificates; plain HTTP otherwise.
+    tls: Option<Arc<Tls>>,
 }
 
 /// Where the console is reachable from, which decides two of the guards.
@@ -141,7 +145,7 @@ impl Server {
     pub fn bind(port: u16) -> Result<Server> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         let addr = listener.local_addr()?;
-        Ok(Server { listener, addr, token: new_token()?, reach: Reach::Loopback })
+        Ok(Server { listener, addr, token: new_token()?, reach: Reach::Loopback, tls: None })
     }
 
     /// Bind the console to an address of the operator's choosing, for the one
@@ -172,7 +176,18 @@ impl Server {
         let listener = TcpListener::bind(SocketAddr::from((addr, port)))?;
         let bound = listener.local_addr()?;
         let reach = if addr.is_loopback() { Reach::Loopback } else { Reach::Network };
-        Ok(Server { listener, addr: bound, token, reach })
+        Ok(Server { listener, addr: bound, token, reach, tls: None })
+    }
+
+    /// Serve over TLS with `tls`, or plain with `None`.
+    pub fn with_tls(mut self, tls: Option<Arc<Tls>>) -> Server {
+        self.tls = tls;
+        self
+    }
+
+    /// Whether connections are encrypted.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Where this console is reachable from.
@@ -193,12 +208,18 @@ impl Server {
 
     /// The URL to open, token included.
     pub fn url(&self) -> String {
-        format!("http://{}:{}/?t={}", self.addr.ip(), self.addr.port(), self.token)
+        format!(
+            "{}://{}:{}/?t={}",
+            if self.tls.is_some() { "https" } else { "http" },
+            self.addr.ip(),
+            self.addr.port(),
+            self.token
+        )
     }
 
     /// Serve until a shutdown is requested. Returns `Ok(())` on clean shutdown.
     ///
-    /// A thread per connection, at most [`MAX_CONNECTIONS`] of them, and the
+    /// A thread per connection, at most `MAX_CONNECTIONS` (sixty-four) of them, and the
     /// database locked only around the statement: reading a request, parsing
     /// it, checking it and writing its answer all happen outside the lock, so
     /// a client that is slow to send or slow to read delays nobody but
@@ -279,6 +300,7 @@ impl Server {
 
     fn serve_one(&self, stream: TcpStream, db: &Mutex<Db>) -> std::io::Result<Next> {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        let stream = tls::accept(self.tls.as_ref(), stream)?;
         // The read side is armed per read, from the deadline, by `Wire::arm`.
         let deadlines = Deadlines::from_now();
         let mut io = BufReader::new(stream);
@@ -290,7 +312,7 @@ impl Server {
         socket.flush()?;
         // No keep-alive: close the write half so the client sees the end of the
         // body without having to trust `Content-Length` alone.
-        let _ = socket.shutdown(std::net::Shutdown::Write);
+        let _ = socket.shutdown_write();
         Ok(served.next)
     }
 }
@@ -396,7 +418,7 @@ trait Wire: BufRead {
     fn arm(&mut self, deadline: Instant) -> std::result::Result<(), Reject>;
 }
 
-impl Wire for BufReader<TcpStream> {
+impl Wire for BufReader<Box<dyn Stream>> {
     fn arm(&mut self, deadline: Instant) -> std::result::Result<(), Reject> {
         let left = match time_left(deadline) {
             Some(d) => d,
@@ -1306,8 +1328,8 @@ fn health_json(db: &Db) -> String {
 /// What `celastro-cli health` runs, and what a container's probe runs,
 /// because the image has no shell and no curl and the console binds
 /// loopback, which a probe from outside the pod cannot reach.
-pub fn probe_health(port: u16) -> Result<bool> {
-    let raw = probe(port)?;
+pub fn probe_health(port: u16, tls: Option<&Arc<Tls>>) -> Result<bool> {
+    let raw = probe(port, tls)?;
     let ok_status = raw.starts_with("HTTP/1.1 200 ") || raw.starts_with("HTTP/1.0 200 ");
     Ok(ok_status && raw.contains(r#""ok":true"#))
 }
@@ -1316,8 +1338,8 @@ pub fn probe_health(port: u16) -> Result<bool> {
 /// started, from the same answer: what `celastro-cli health --attached N`
 /// compares, so a readiness probe can wait for a node's peers. `Ok(0)` for
 /// a console whose answer does not carry the count.
-pub fn probe_attached(port: u16) -> Result<u64> {
-    let raw = probe(port)?;
+pub fn probe_attached(port: u16, tls: Option<&Arc<Tls>>) -> Result<u64> {
+    let raw = probe(port, tls)?;
     let n = raw
         .split_once(r#""attached":"#)
         .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
@@ -1326,12 +1348,15 @@ pub fn probe_attached(port: u16) -> Result<u64> {
     Ok(n)
 }
 
-/// One `GET /api/health` on loopback, the raw answer.
-fn probe(port: u16) -> Result<String> {
+/// One `GET /api/health` on loopback, the raw answer. With `tls` the
+/// console is expected to serve TLS and to name `localhost` in its
+/// certificate, which is what the chart's certificates do.
+fn probe(port: u16, tls: Option<&Arc<Tls>>) -> Result<String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    let s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut s = tls::connect(tls, s, "localhost")?;
     // One write: `write!` would send the request in pieces, one per
     // formatted fragment, and a server that reads once and closes answers
     // the first piece with a reset.
@@ -2144,12 +2169,12 @@ mod tests {
                 );
             }
         });
-        assert!(probe_health(port).unwrap(), "a serving console");
-        assert_eq!(probe_attached(port).unwrap(), 0, "a node that attached nothing");
-        assert!(!probe_health(port).unwrap(), "an answer that is not well");
+        assert!(probe_health(port, None).unwrap(), "a serving console");
+        assert_eq!(probe_attached(port, None).unwrap(), 0, "a node that attached nothing");
+        assert!(!probe_health(port, None).unwrap(), "an answer that is not well");
         let closed =
             std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        assert!(probe_health(closed).is_err(), "nothing listening is an error, not a false");
+        assert!(probe_health(closed, None).is_err(), "nothing listening is an error, not a false");
     }
 
     /// The console reads `truncated_prefixes` off the wire and renders it the

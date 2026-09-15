@@ -61,6 +61,7 @@ use crate::plan::walk::{self, ExpandRequest, HopExpansion};
 use crate::sql::ast::{Expr, Select, Statement};
 use crate::text::scorer::{Expansion, GlobalStats, PrefixUse};
 use crate::time::Timestamp;
+use crate::tls::{self, Stream, Tls};
 use crate::value::Value;
 
 /// Refused on mismatch, in both directions.
@@ -500,7 +501,10 @@ pub struct Node {
     url: String,
     addr: String,
     token: String,
-    stream: Mutex<Option<TcpStream>>,
+    stream: Mutex<Option<Box<dyn Stream>>>,
+    /// What the connection is wrapped in and verified by, when the process
+    /// has certificates; plain TCP otherwise.
+    tls: Option<Arc<Tls>>,
 }
 
 impl std::fmt::Debug for Node {
@@ -518,7 +522,7 @@ pub struct Hello {
 }
 
 impl Node {
-    pub fn new(url: &str, token: Option<&str>) -> Result<Node> {
+    pub fn new(url: &str, token: Option<&str>, tls: Option<Arc<Tls>>) -> Result<Node> {
         let addr = parse_url(url)?;
         let token = token
             .ok_or_else(|| {
@@ -527,20 +531,23 @@ impl Node {
                 ))
             })?
             .to_string();
-        Ok(Node { url: url.to_string(), addr, token, stream: Mutex::new(None) })
+        Ok(Node { url: url.to_string(), addr, token, stream: Mutex::new(None), tls })
     }
 
     pub fn url(&self) -> &str {
         &self.url
     }
 
-    fn connect(&self) -> std::io::Result<TcpStream> {
+    fn connect(&self) -> std::io::Result<Box<dyn Stream>> {
         let mut last = None;
         for a in self.addr.to_socket_addrs()? {
             match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
                 Ok(s) => {
                     s.set_nodelay(true)?;
-                    return Ok(s);
+                    // Verified by the name the URL gave, which is the name
+                    // in the peer's certificate: the pod's, in a cluster.
+                    let host = self.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&self.addr);
+                    return tls::connect(self.tls.as_ref(), s, host);
                 }
                 Err(e) => last = Some(e),
             }
@@ -920,6 +927,7 @@ pub fn serve(
     db: Arc<Mutex<Db>>,
     token: String,
     stop: Arc<AtomicBool>,
+    tls: Option<Arc<Tls>>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let token = Arc::new(token);
@@ -931,6 +939,16 @@ pub fn serve(
         match listener.accept() {
             Ok((s, _)) => {
                 s.set_nonblocking(false)?;
+                // The handshake happens on the connection's own thread, with
+                // its first read; a peer that never speaks costs that thread
+                // its idle poll and nothing else.
+                let s = match tls::accept(tls.as_ref(), s) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("celastro: a wire connection could not be set up: {e}");
+                        continue;
+                    }
+                };
                 let db = db.clone();
                 let token = token.clone();
                 let stop = stop.clone();
@@ -950,7 +968,7 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
 
 fn serve_connection(
-    mut s: TcpStream,
+    mut s: Box<dyn Stream>,
     db: &Mutex<Db>,
     moves: &Moves,
     token: &str,
@@ -1096,13 +1114,16 @@ fn handle(db: &Mutex<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Ve
                 })?;
             let tablets = get_tablets(body, &mut j)?;
             let from = get_string(body, &mut j)?;
-            let me = db
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .node()
-                .map(str::to_string)
-                .ok_or_else(|| Error::Plan("this node has no address".into()))?;
-            let source = Arc::new(Node::new(&from, Some(token))?);
+            let (me, tls) = {
+                let g = db.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    g.node()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::Plan("this node has no address".into()))?,
+                    g.tls(),
+                )
+            };
+            let source = Arc::new(Node::new(&from, Some(token), tls)?);
             let files = source.begin_move(&collection, shard, &me)?;
             let mut db = db.lock().unwrap_or_else(|p| p.into_inner());
             db.pull_here(&coll, &tablets, shard, Some(&source), &files)?;

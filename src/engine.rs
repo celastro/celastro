@@ -170,6 +170,10 @@ pub struct DbOpts {
     /// single node that places every shard on itself and can attach nobody.
     /// `celastro-cli` reads it from `CELASTRO_NODE`.
     pub node: Option<String>,
+    /// Encryption in transit, when the process was given certificates
+    /// (`crate::tls`): what the wire to another node is wrapped in. `None`
+    /// is plain TCP.
+    pub tls: Option<Arc<crate::tls::Tls>>,
 }
 
 impl Default for DbOpts {
@@ -186,6 +190,7 @@ impl Default for DbOpts {
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
             archive: crate::objstore::ArchiveOpts::default(),
             node: None,
+            tls: None,
         }
     }
 }
@@ -1114,6 +1119,12 @@ impl Db {
         self.opts.node.as_deref()
     }
 
+    /// What this process wraps its wire connections in, if certificates
+    /// were given; what a node dials another with.
+    pub fn tls(&self) -> Option<Arc<crate::tls::Tls>> {
+        self.opts.tls.clone()
+    }
+
     /// The data directory, or `None` in memory.
     pub fn data_dir(&self) -> Option<&Path> {
         self.dir.as_deref()
@@ -1222,7 +1233,11 @@ impl Db {
         if let Some(n) = self.nodes.get(url) {
             return Ok(n.clone());
         }
-        let n = Arc::new(crate::wire::Node::new(url, self.wire_token.as_deref())?);
+        let n = Arc::new(crate::wire::Node::new(
+            url,
+            self.wire_token.as_deref(),
+            self.opts.tls.clone(),
+        )?);
         self.nodes.insert(url.to_string(), n.clone());
         Ok(n)
     }

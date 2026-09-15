@@ -93,6 +93,7 @@ pub mod sim;
 pub mod sql;
 pub mod text;
 pub mod time;
+pub mod tls;
 pub mod value;
 pub mod variant;
 pub mod vector;

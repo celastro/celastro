@@ -25,6 +25,7 @@ use celastro::error::Result;
 use celastro::json;
 use celastro::plan::exec::{QueryResult, Row};
 use celastro::serve::Server;
+use celastro::tls::Tls;
 use celastro::value::Value;
 use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,8 +97,11 @@ rest.
 network, for nodes behind a Service or a load balancer: every node then answers
 the token in CELASTRO_TOKEN -- at least sixteen printable bytes, the same at
 every node -- instead of a per-run one, and any of them coordinates a statement
-over every node's shards. Plain HTTP: for a network you trust, or an ingress that
-terminates TLS in front of it.
+over every node's shards. Plain HTTP unless certificates are given: a build with
+the `tls` feature (the image is one) reads CELASTRO_TLS_CERT, CELASTRO_TLS_KEY
+and CELASTRO_TLS_CA -- all three, PEM -- and then serves the console and the
+wire over TLS 1.3, verifies every peer against that CA by the name it dialled,
+and probes its own console as `localhost`, which the certificate has to name.
 
 `--json` covers every command, `help` and `version` included, and stdout carries
 the whole answer: a failure that ends the command is written there too, as
@@ -409,11 +413,19 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     // Before any directory is opened: the probe asks a RUNNING console, and
     // opening its directory from a second process is the one thing the data
     // directory does not support.
+    // Certificates, when the environment names them, before anything
+    // listens or dials: a half-set or unreadable one stops the command here.
+    let tls = match Tls::from_env() {
+        Ok(t) => t.map(Arc::new),
+        Err(e) => return fail(json, &e.to_string()),
+    };
     if let Cmd::Health { port, attached } = cmd {
-        return health(port, attached, json);
+        return health(port, attached, tls.as_ref(), json);
     }
+    let mut opts = db_opts();
+    opts.tls = tls.clone();
     let mut db = match &dir {
-        Some(d) => match Db::open(d, db_opts()) {
+        Some(d) => match Db::open(d, opts) {
             Ok(db) => db,
             Err(e) => return fail(json, &format!("could not open {}: {e}", d.display())),
         },
@@ -424,7 +436,7 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     };
     let code = match cmd {
         Cmd::Serve { port, open, shard_bind, bind } => {
-            serve(&mut db, port, open, shard_bind, bind, json)
+            serve(&mut db, port, open, shard_bind, bind, tls, json)
         }
         Cmd::Exec(sql) => statement(&mut db, &sql, json),
         Cmd::Script(file) => run_script(&mut db, &file, json),
@@ -537,15 +549,15 @@ fn ack(json: bool, message: &str) {
 /// `health`: exit 0 when a console on `--port` answers that it is serving,
 /// 1 otherwise. A container's liveness and readiness probe, since the image
 /// has no shell and the console binds loopback.
-fn health(port: u16, attached: Option<u64>, json: bool) -> i32 {
-    match celastro::serve::probe_health(port) {
+fn health(port: u16, attached: Option<u64>, tls: Option<&Arc<Tls>>, json: bool) -> i32 {
+    match celastro::serve::probe_health(port, tls) {
         Ok(true) => {
             // Readiness for a node of a cluster: serving is not enough while
             // the peers it was given have not answered it since it started,
             // because a statement it coordinates reaches shards it does not
             // hold through them. Liveness asks without `--attached`.
             if let Some(want) = attached {
-                let have = celastro::serve::probe_attached(port).unwrap_or(0);
+                let have = celastro::serve::probe_attached(port, tls).unwrap_or(0);
                 if have < want {
                     return fail(
                         json,
@@ -571,6 +583,7 @@ fn serve(
     open: bool,
     shard_bind: Option<String>,
     bind: Option<IpAddr>,
+    tls: Option<Arc<Tls>>,
     json: bool,
 ) -> i32 {
     let server = match bind {
@@ -588,12 +601,12 @@ fn serve(
                 );
             };
             match Server::bind_network(ip, port, token) {
-                Ok(s) => s,
+                Ok(s) => s.with_tls(tls.clone()),
                 Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
             }
         }
         None => match Server::bind(port) {
-            Ok(s) => s,
+            Ok(s) => s.with_tls(tls.clone()),
             Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
         },
     };
@@ -619,9 +632,14 @@ fn serve(
     if server.reach() == celastro::serve::Reach::Network {
         eprintln!(
             "The console is on a routable address, answering any client presenting the token \
-             in {}: this is plain HTTP, for a network you trust or an ingress that terminates \
-             TLS in front of it. The token is the only thing protecting this database.",
-            celastro::serve::TOKEN_ENV
+             in {}: {}. The token is what protects this database.",
+            celastro::serve::TOKEN_ENV,
+            if server.is_tls() {
+                "over TLS, with the certificate the environment named"
+            } else {
+                "this is plain HTTP, for a network you trust or an ingress that terminates TLS \
+                 in front of it"
+            }
         );
     } else {
         eprintln!(
@@ -657,13 +675,17 @@ fn serve(
             Err(e) => return fail(json, &format!("could not bind {bind} for the wire: {e}")),
         };
         eprintln!(
-            "celastro-cli serving shards on {} to any node presenting the wire token; this is \
-             plain TCP, for a network you trust",
-            listener.local_addr().map(|a| a.to_string()).unwrap_or(bind)
+            "celastro-cli serving shards on {} to any node presenting the wire token; {}",
+            listener.local_addr().map(|a| a.to_string()).unwrap_or(bind),
+            if tls.is_some() {
+                "over TLS, peers verified against the CA the environment named"
+            } else {
+                "this is plain TCP, for a network you trust"
+            }
         );
-        let (wire_db, wire_stop) = (shared.clone(), stop.clone());
+        let (wire_db, wire_stop, wire_tls) = (shared.clone(), stop.clone(), tls.clone());
         std::thread::spawn(move || {
-            if let Err(e) = celastro::wire::serve(listener, wire_db, token, wire_stop) {
+            if let Err(e) = celastro::wire::serve(listener, wire_db, token, wire_stop, wire_tls) {
                 eprintln!("celastro-cli: the wire stopped: {e}");
             }
         });
@@ -706,17 +728,29 @@ const ATTACH_ENV: &str = "CELASTRO_ATTACH";
 /// peer that is this node's own address is skipped, so the same list can be
 /// handed to every member of a cluster.
 fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
-    let me = db.lock().unwrap_or_else(|p| p.into_inner()).node().map(str::to_string);
+    let (me, tls) = {
+        let g = db.lock().unwrap_or_else(|p| p.into_inner());
+        (g.node().map(str::to_string), g.tls())
+    };
+    let token = celastro::wire::token_from_env();
     let mut pending: Vec<&String> = peers.iter().filter(|p| me.as_ref() != Some(*p)).collect();
     let mut attempt = 0u32;
     while !pending.is_empty() && !stop.load(Ordering::Relaxed) {
         attempt += 1;
         let mut still = Vec::new();
         for url in pending {
-            let r = db
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .execute(&format!("ATTACH NODE '{}'", url.replace('\'', "''")));
+            // Dial first, without the database lock: a peer that is not up
+            // yet costs this thread its connect timeout and nobody else's.
+            // Dialling under the lock held every statement and every probe
+            // behind it for as long as the peers took to start, and a pod
+            // failed its liveness probe on its own health that way.
+            let reachable = celastro::wire::Node::new(url, token.as_deref(), tls.clone())
+                .and_then(|n| n.hello());
+            let r = reachable.and_then(|_| {
+                db.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .execute(&format!("ATTACH NODE '{}'", url.replace('\'', "''")))
+            });
             match r {
                 Ok(_) => eprintln!("celastro-cli: attached {url}"),
                 Err(e) => {

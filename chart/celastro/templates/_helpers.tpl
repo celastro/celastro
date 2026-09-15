@@ -31,6 +31,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "celastro.tlsSecretName" -}}
+{{- if .Values.tls.existingSecret -}}
+{{- .Values.tls.existingSecret -}}
+{{- else -}}
+{{- printf "%s-tls" (include "celastro.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Every name a pod's certificate has to carry: the pods, the headless
+     Service, the console Service, and localhost for the probe. */}}
+{{- define "celastro.tlsNames" -}}
+{{- $name := include "celastro.fullname" . -}}
+{{- $names := list "localhost" $name (printf "%s-console" $name) (printf "%s.%s.svc" $name .Release.Namespace) (printf "%s-console.%s.svc" $name .Release.Namespace) -}}
+{{- range $i := until (int .Values.replicas) -}}
+{{- $names = append $names (printf "%s-%d.%s" $name $i $name) -}}
+{{- $names = append $names (printf "%s-%d.%s.%s.svc" $name $i $name $.Release.Namespace) -}}
+{{- end -}}
+{{- join "," $names -}}
+{{- end -}}
+
 {{- define "celastro.consoleSecretName" -}}
 {{- if .Values.console.existingSecret -}}
 {{- .Values.console.existingSecret -}}
