@@ -49,20 +49,21 @@ COPY src ./src
 # is the code `cargo build --release` produces on the same target.
 ENV RUSTFLAGS="-C strip=symbols"
 
-# Built with the `tls` feature: the image is what runs in a cluster, and a
-# cluster is where the wire and the console want encrypting. That feature is
-# the crate's only dependency (rustls with the ring provider, and what those
-# two bring), so this is the one layer that reaches the registry; --locked
-# refuses to rewrite Cargo.lock, which CONTRIBUTING.md requires, so what is
-# fetched is exactly what the lockfile names. No dependency-caching stage: a
-# dummy-main.rs or cargo-chef layer would save a minute of a build nobody
-# waits on and add a way to be wrong.
+# No dependency-caching stage, deliberately. [dependencies] in Cargo.toml is
+# empty by policy, so Cargo.lock names exactly one package — this one — and the
+# usual dummy-main.rs or cargo-chef layer would cache nothing while adding a
+# layer and a way to be wrong.
+#
+# --offline is that policy as a build gate: nothing is vendored into this layer
+# and the builder has no reason to reach the network, so a dependency that ever
+# appears in Cargo.toml fails here, loudly, instead of quietly resolving.
+# --locked refuses to rewrite Cargo.lock, which CONTRIBUTING.md requires.
 #
 # Only celastro-cli is built. It is a superset of the older `celastro` binary
 # (--dir D -> --dir D repl, --file F -> run F, --demo -> demo) and each binary
 # would statically link its own copy of std, so shipping both would roughly
 # double the image for no new function.
-RUN cargo build --release --locked --features tls --bin celastro-cli
+RUN cargo build --release --locked --offline --bin celastro-cli
 
 # The licence and the copyright notice are staged here rather than COPYed
 # straight into `scratch` so their mode is fixed by this file instead of by

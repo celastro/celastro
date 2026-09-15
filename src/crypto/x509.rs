@@ -483,12 +483,13 @@ mod tests {
         let key_der = pem::decode_all(&m.key, "PRIVATE KEY").unwrap().remove(0);
         let kp = KeyPair::from_pkcs8_der(&key_der).unwrap();
         assert_eq!(kp.public, leaf.public_key);
-        // The fixture certificates under tests/tls are ECDSA and are refused by name.
-        let ecdsa =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tls/ca.crt"))
-                .unwrap();
-        let der = pem::decode_all(&ecdsa, "CERTIFICATE").unwrap().remove(0);
-        let e = parse(&der).unwrap_err();
+        // A certificate of another algorithm is refused by name: the same
+        // leaf with its key's OID changed to one this build does not read.
+        let mut other_alg = leaf_der.clone();
+        let ed = [0x06, 0x03, 0x2b, 0x65, 0x70];
+        let pos = other_alg.windows(5).position(|w| w == ed).unwrap();
+        other_alg[pos..pos + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
+        let e = parse(&other_alg).unwrap_err();
         assert!(e.to_string().contains("only Ed25519"), "{e}");
     }
 }

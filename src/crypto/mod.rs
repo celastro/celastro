@@ -27,6 +27,7 @@ pub mod pem;
 pub mod random;
 pub mod sc25519;
 pub mod sha2;
+pub mod tls13;
 pub mod x25519;
 pub mod x509;
 

@@ -29,11 +29,10 @@ diff turns into yes. It is structural:
   segment every index type produces sets in the same `u32` ordinal space. A
   change that is locally correct can violate that globally, and reviewing for it
   requires context that is not in the tree yet.
-- **The minimal-dependency rule is absolute.** Nothing outside `std` without
-  the `tls` feature, and behind it only rustls with the ring provider and what
-  those two bring (Apache-2.0, ISC and MIT, all of them). A patch that adds a
-  dependency cannot be taken no matter what it does, and that is easier to
-  state up front than to litigate per PR.
+- **The zero-dependency rule is absolute.** Nothing outside `std`, no crates,
+  no C libraries — the TLS included. A patch that adds a dependency cannot be
+  taken no matter what it does, and that is easier to state up front than to
+  litigate per PR.
 - **Provenance.** celastro is AGPL-3.0-only with no CLA. Keeping the history
   free of outside copyright keeps relicensing and dual-licensing decisions
   simple, and there is no mechanism here for negotiating that per contributor.

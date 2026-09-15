@@ -50,25 +50,31 @@ helm install celastro chart/celastro --set replicas=3 --set console.expose=true 
 ```
 
 Every pod then serves the wire and the console over TLS 1.3 with one
-certificate and verifies every other pod against one CA. The material, in
-order of precedence:
+certificate and verifies every other pod against one CA. The material is
+Ed25519 — the binary's TLS is its own and reads no other algorithm — from
+one of two places:
 
+- `tls.existingSecret`: a Secret with `tls.crt`, `tls.key` and `ca.crt`,
+  made by the binary and loaded with `kubectl`:
+
+  ```
+  celastro-cli tls init ./tls celastro celastro-0.celastro,celastro-1.celastro,celastro-2.celastro,celastro-console,celastro.default.svc,celastro-console.default.svc
+  kubectl create secret generic celastro-tls --from-file=./tls/tls.crt --from-file=./tls/tls.key --from-file=./tls/ca.crt
+  helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true --set tls.existingSecret=celastro-tls
+  ```
+
+  The certificate has to name every pod (`<release>-<i>.<release>`), both
+  Services and `localhost` (the tool adds `localhost` and `127.0.0.1`; the
+  probe asks the pod's own console as `localhost`).
 - `tls.certManager.issuerRef.name`: the chart emits a cert-manager
-  `Certificate` for that issuer, and the issuer fills the Secret and renews it
-  (a pod reads the files at start, so a renewal reaches it at its next
-  restart). The issuer's Secrets have to carry `ca.crt` — a CA issuer does, a
-  self-signed one puts its own certificate there, which also works.
-- `tls.existingSecret`: a Secret of yours with `tls.crt`, `tls.key` and
-  `ca.crt`. The certificate has to name every pod (`<release>-<i>.<release>`),
-  both Services, `localhost` and `127.0.0.1` — the probe asks the pod's own
-  console as `localhost`.
-- Neither: the chart makes a CA and a certificate with those names, valid
-  `tls.days` days (3650), once, and keeps them across upgrades, in the Secret
-  `<release>-tls`.
+  `Certificate` with `privateKey.algorithm: Ed25519` and those names, and the
+  issuer fills the Secret and renews it (a pod reads the files at start, so a
+  renewal reaches it at its next restart). The issuer's Secrets have to carry
+  `ca.crt` — a CA issuer does.
 
-Clients verify the console against `ca.crt` from that Secret, as the notes
-say. The tokens stay in force with TLS on; the archive endpoint stays plain
-HTTP.
+`tls.enabled` with neither is refused at install. Clients verify the console
+against `ca.crt` from the Secret, as the notes say. The tokens stay in force
+with TLS on; the archive endpoint stays plain HTTP.
 
 A pod that has just restarted has a new address, and the other pods may hold
 the old one for the cluster DNS TTL (30 seconds on kubeadm); until then a
@@ -89,8 +95,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.27.1 .
-kind load docker-image celastro:0.27.1        # for a kind cluster
+docker build -t celastro:0.28.0 .
+kind load docker-image celastro:0.28.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -151,10 +157,9 @@ peer that is down does not get every pod restarted.
 | `archive.bucket`, `archive.prefix`, `archive.region` | empty | the bucket, and optional key prefix and region |
 | `archive.existingSecret` | empty | a `Secret` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` |
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
-| `tls.enabled` | `false` | the wire and the console over TLS 1.3, one certificate per release, every pod verified against one CA |
-| `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt`, naming every pod, both Services and `localhost` |
-| `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` is emitted for it |
-| `tls.days` | `3650` | validity of the CA and certificate the chart makes itself |
+| `tls.enabled` | `false` | the wire and the console over TLS 1.3, one Ed25519 certificate per release, every pod verified against one CA; needs one of the next two |
+| `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro-cli tls init`, naming every pod, both Services and `localhost` |
+| `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` (Ed25519) is emitted for it |
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because the console answers one request at a time |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
 
@@ -207,3 +212,14 @@ built from the tree at the time:
   material under `tls.existingSecret` and with cert-manager v1.16 issuing
   from a CA `ClusterIssuer`. Rendered without `tls.enabled`, the manifests
   contain no TLS.
+- **The in-tree TLS** (chart 0.6.0, celastro 0.28.0): material from
+  `celastro-cli tls init` through `tls.existingSecret` — three pods ready, no
+  restarts; `tls.enabled` without a source refused at install. From a client
+  pod, python's `ssl` verified the console as `celastro-console` against the
+  CA, refused `elsewhere.example`, got a TLS alert for plain HTTP, and shook
+  hands with a pod's wire port as TLSv1.3 `TLS_CHACHA20_POLY1305_SHA256`
+  with a certificate naming eight hosts; thirty rows through the TLS console.
+  `openssl s_client` through a port-forward: TLSv1.3, that suite, peer
+  signature type Ed25519, `Verification: OK`. cert-manager v1.16 with an
+  Ed25519 CA `ClusterIssuer` through `tls.certManager.issuerRef`: the
+  `Certificate` Ready, the same checks passed, no restarts.

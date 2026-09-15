@@ -1,8 +1,6 @@
-//! Encryption in transit, with the `tls` feature: the console and the wire
-//! serve TLS when given certificates, a client with the CA is answered, a
-//! client without one is not, and a build without the feature refuses to
-//! start with the variables set rather than serving plain.
-#![cfg(feature = "tls")]
+//! Encryption in transit: the console and the wire serve TLS when given
+//! certificates, a client with the CA is answered, a client without one is
+//! not, and the material is all three files or none.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,8 +15,25 @@ use celastro::tls::{self, Tls, CA_ENV, CERT_ENV, KEY_ENV};
 /// The environment is process-wide; the tests take turns.
 static ENV: Mutex<()> = Mutex::new(());
 
+/// Where this process's test material lives: a CA and a `localhost`
+/// certificate it signed, made once by the crate's own generator.
 fn fixture(name: &str) -> String {
-    format!("{}/tests/tls/{name}", env!("CARGO_MANIFEST_DIR"))
+    let dir = std::env::temp_dir().join(format!("celastro-tls-fixtures-{}", std::process::id()));
+    if !dir.join("ca.crt").exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = celastro::tls::make_material(
+            "localhost",
+            &["localhost".to_string()],
+            &["127.0.0.1".parse().unwrap()],
+            30,
+        )
+        .unwrap();
+        std::fs::write(dir.join("ca.crt"), m.ca_cert).unwrap();
+        std::fs::write(dir.join("localhost.crt"), m.cert).unwrap();
+        std::fs::write(dir.join("localhost.key"), m.key).unwrap();
+        std::fs::write(dir.join("README"), "test material, made by the crate\n").unwrap();
+    }
+    dir.join(name).display().to_string()
 }
 
 /// The test CA and the `localhost` certificate it signed, from the
@@ -27,7 +42,7 @@ fn material() -> Arc<Tls> {
     std::env::set_var(CERT_ENV, fixture("localhost.crt"));
     std::env::set_var(KEY_ENV, fixture("localhost.key"));
     std::env::set_var(CA_ENV, fixture("ca.crt"));
-    let t = Tls::from_env().expect("the fixtures parse").expect("all three are set");
+    let t = Tls::from_env().expect("the material parses").expect("all three are set");
     Arc::new(t)
 }
 

@@ -47,7 +47,7 @@ test that pins it.
 | rank fusion, coordinator only | `plan::fusion` | RRF and weighted linear |
 | a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF` as a filter or a `hops(...)` source; `expand` and `present` on `ShardService` |
 | the wire between nodes, a shard's move | `wire`, `engine` "moves" | length-prefixed frames of the crate's codec, a shared token, one holder per shard |
-| encryption in transit, behind the `tls` feature | `tls` | rustls streams under the wire and the console; `CELASTRO_TLS_*` |
+| encryption in transit | `tls`, `crypto` | an in-tree TLS 1.3 under the wire and the console; `CELASTRO_TLS_*` |
 | the console and its guards | `serve` | a token on every request, loopback or `--bind`, a thread per connection |
 | a seeded fault schedule on the shard boundary | `sim` | drops, restarts, reorder; "a fault can shorten an answer only by saying so" |
 | scatter-gather, query-then-fetch | `plan::exec` | shards return `(pk, source, raw score)` |
@@ -411,8 +411,8 @@ that changes the catalog reaches the holders one by one, reporting the ones it
 did not reach. The
 `archived` tier is an S3-compatible object store when one is configured and a
 local directory that stands in for one when not; the client is in-tree and
-plain HTTP: the `tls` feature (0.27.0) encrypts the wire and the console,
-not the archive client, yet.
+plain HTTP: the TLS (0.28.0) encrypts the wire and the console, not the
+archive client, yet.
 
 The *boundaries* those attach to are real, and that is the point of having built
 them first:
@@ -1019,8 +1019,8 @@ liveness check.
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
 stands in for, `PUT`, ranged `GET`, `HEAD` and `DELETE`, path-style and signed
-with Signature Version 4, over plain HTTP: the `tls` feature covers the wire
-and the console, not this client, yet.
+with Signature Version 4, over plain HTTP: the TLS covers the wire and the
+console, not this client, yet.
 SHA-256, HMAC, the signer and a small HTTP/1.1 client are in-tree and pinned
 against the published vectors, AWS's own worked example included. A remote
 segment is opened by reading its footer with two ranged reads and each
@@ -1036,6 +1036,27 @@ retires it, because nothing lists the store: an object a failed publication
 left behind is not reclaimed, which is the one thing the local directory does
 that the store does not. Credentials come from the environment at open and
 are never written anywhere.
+
+**The TLS is in the tree, and this is what it is.** `src/crypto` holds
+SHA-512, HKDF, ChaCha20-Poly1305, the 25519 field, X25519, Ed25519, DER,
+PEM and X.509, and `crypto::tls13` the record layer and both sides of the
+handshake: TLS 1.3 only, one suite, one group, one signature scheme,
+server authentication only, no resumption, 0-RTT, client certificates,
+HelloRetryRequest or key update. A stock client speaks that subset; an
+Ed25519 certificate is the one thing it asks of an issuer. Every primitive
+is pinned against its RFC or FIPS vectors, the key schedule against RFC
+8448's trace, the whole against itself over loopback and against a stock
+client on kind. What "constant-time" means here: nothing branches on or
+indexes by a secret; the field and scalar arithmetic run the same
+instructions whatever the values, a conditional on a secret bit is a mask,
+and secrets are compared by folding every byte. The compiler is not asked
+to keep that -- there is no `black_box` in the floor's `std` -- so the code
+keeps it by having no branch to remove. It was written for a crate that
+takes no dependency, by the user's decision after rustls had shipped
+behind a feature and been withdrawn; it is unaudited, and the README says
+so. What would move it forward: RSA and ECDSA verification of chains
+another issuer signed (public-key operations, no timing concern), and the
+archive client over the same stream.
 
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container

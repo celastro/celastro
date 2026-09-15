@@ -100,11 +100,11 @@ rest.
 network, for nodes behind a Service or a load balancer: every node then answers
 the token in CELASTRO_TOKEN -- at least sixteen printable bytes, the same at
 every node -- instead of a per-run one, and any of them coordinates a statement
-over every node's shards. Plain HTTP unless certificates are given: a build with
-the `tls` feature (the image is one) reads CELASTRO_TLS_CERT, CELASTRO_TLS_KEY
-and CELASTRO_TLS_CA -- all three, PEM -- and then serves the console and the
-wire over TLS 1.3, verifies every peer against that CA by the name it dialled,
-and probes its own console as `localhost`, which the certificate has to name.
+over every node's shards. Plain HTTP unless certificates are given:
+CELASTRO_TLS_CERT, CELASTRO_TLS_KEY and CELASTRO_TLS_CA -- all three, PEM,
+Ed25519 -- make the console and the wire TLS 1.3, every peer verified against
+that CA by the name it dialled, and the health probe verifying its own console
+as `localhost`, which the certificate has to name. `tls init` makes such a set.
 
 `--json` covers every command, `help` and `version` included, and stdout carries
 the whole answer: a failure that ends the command is written there too, as

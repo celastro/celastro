@@ -2,10 +2,9 @@
 
 A hybrid document database: structured SQL, BM25 full-text, vector similarity
 and a bounded graph walk are four retrieval modes evaluated in **one query
-plan**, not orchestrated across services. Rust, **minimal dependencies** —
-none outside `std` unless the `tls` feature is on, and then rustls and what
-it brings. Everything else, from the bitmaps and postings to the HNSW index
-and the SQL front end, is in the tree.
+plan**, not orchestrated across services. Rust, **zero dependencies outside
+`std`**: the bitmaps and postings, the HNSW index, the SQL front end and the
+TLS are all in the tree.
 
 ```sh
 cargo install celastro        # `celastro-cli`, and the older `celastro` REPL
@@ -191,20 +190,30 @@ that answered.
 
 ## Encryption in transit
 
-Off by default. A build with the `tls` feature — the published image is one —
-reads three PEM files from the environment, all three or none:
+Off by default. Three PEM files from the environment, all three or none, turn
+it on:
 
 ```
 CELASTRO_TLS_CERT=/tls/tls.crt   # this node's certificate chain, leaf first
-CELASTRO_TLS_KEY=/tls/tls.key    # its private key
+CELASTRO_TLS_KEY=/tls/tls.key    # its private key, PKCS#8
 CELASTRO_TLS_CA=/tls/ca.crt      # the CA every node's certificate chains to
 ```
 
 With them the console and the wire serve TLS 1.3, every peer is verified
 against the CA by the name it was dialled, and `celastro-cli health` verifies
 its own console as `localhost`, which the certificate has to name. The tokens
-stay: a certificate says which node is talking, the token says it may. A
-build without the feature refuses to start with the variables set. The
+stay: a certificate says which node is talking, the token says it may.
+`celastro-cli tls init ./tls celastro-0.celastro` makes a CA and a certificate
+that fit.
+
+**The TLS is in the tree and unaudited.** It is TLS 1.3 only, one cipher
+suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange and **Ed25519
+certificates only** — a certificate from another algorithm is refused by
+name, so material from cert-manager needs `privateKey.algorithm: Ed25519`.
+No resumption, no client certificates, no HelloRetryRequest. Every primitive
+is pinned against its RFC vectors and the key schedule against RFC 8448, and
+the code branches on no secret, but nobody outside this repository has
+reviewed it; that is the price of zero dependencies, chosen knowingly. The
 archive client to an S3 store is still plain HTTP.
 
 ## Two or more nodes
@@ -251,8 +260,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.27.1 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.27.1 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.28.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.28.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -289,13 +298,13 @@ guarantee to the test that pins it, is in [docs/design.md](docs/design.md).
 
 ```
 cargo build --release
-cargo test && cargo test --features tls
+cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Rust 1.75 or later, with and without the feature; a change must not rewrite
-`Cargo.lock`. Every test is named after the failure it prevents.
+No dependencies outside `std`, Rust 1.75 or later, and a change must not
+rewrite `Cargo.lock`. Every test is named after the failure it prevents.
 
 ## Contributing, security, licence
 

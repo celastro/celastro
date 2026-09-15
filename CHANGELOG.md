@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.28.0 — 2026-09-15
+
+The TLS is in the tree and the crate is back at zero dependencies, hence a
+minor; 0.27.0 and 0.27.1, which carried rustls behind a feature, are
+yanked.
+
+**TLS 1.3, written here.** `src/crypto` holds SHA-512, HKDF,
+ChaCha20-Poly1305, the 25519 field, X25519, Ed25519, DER, PEM and X.509;
+`crypto::tls13` the record layer and both sides of the handshake. One
+suite (`TLS_CHACHA20_POLY1305_SHA256`), one group, **Ed25519 certificates
+only**; no resumption, client certificates, HelloRetryRequest or key
+update. Every primitive is pinned against its RFC vectors and the key
+schedule against RFC 8448. `CELASTRO_TLS_CERT`, `_KEY` and `_CA` mean what
+they meant; the `tls` feature is gone, so every build has it. It is
+unaudited, and the README says so.
+
+**`celastro-cli tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`** writes a CA and a
+certificate for `NAME`, `NAMES`, `localhost` and 127.0.0.1, as the four PEM
+files `serve` reads.
+
+**The chart's `tls.enabled`** now takes its material from
+`tls.existingSecret` (made with `tls init`) or a cert-manager issuer, for
+which the emitted `Certificate` asks Ed25519; with neither it is refused at
+install, since the chart cannot make Ed25519 material itself. `tls.days` is
+gone with the generated path.
+
 ## 0.27.1 — 2026-09-15
 
 Documentation only, hence a patch: the crate's page carries the README.

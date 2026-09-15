@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.27.1
+docker pull ghcr.io/celastro/celastro:0.28.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -224,10 +224,11 @@ $ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0
 ```
 
 Plain HTTP unless the image is also given certificates: mount them and set
-`CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM)
-and the console and the wire serve TLS 1.3, with the CA verifying every peer.
-The chart's `console.expose` and `tls.enabled` are these two, with the token
-and the certificates in Secrets and a Service over the pods.
+`CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM,
+Ed25519 — `celastro-cli tls init` makes a set) and the console and the wire
+serve TLS 1.3, with the CA verifying every peer. The chart's `console.expose`
+and `tls.enabled` are these two, with the token and the certificates in
+Secrets and a Service over the pods.
 
 ## `panic = "abort"` makes the container the unit of recovery
 

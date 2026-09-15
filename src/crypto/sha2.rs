@@ -1,7 +1,7 @@
 //! SHA-256 and SHA-512, FIPS 180-4. SHA-256 lives with the S3 signer that
 //! needed it first and is re-exported here; SHA-512 is Ed25519's hash.
 
-pub(crate) use crate::objstore::hmac_sha256;
+pub(crate) use crate::objstore::{hmac_sha256, sha256};
 
 const K512: [u64; 80] = [
     0x428a2f98d728ae22,

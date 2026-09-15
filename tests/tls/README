@@ -1,4 +1,0 @@
-Test material for the `tls` feature, and nothing else: a self-signed CA and a
-certificate for `localhost` / 127.0.0.1 signed by it, ECDSA P-256, valid for a
-hundred years, generated once with openssl. The private keys here protect
-nothing; the tests that read them run only with `--features tls`.
