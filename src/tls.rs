@@ -28,6 +28,27 @@ pub const KEY_ENV: &str = "CELASTRO_TLS_KEY";
 /// against.
 pub const CA_ENV: &str = "CELASTRO_TLS_CA";
 
+/// The four PEM files `celastro-cli tls init` writes: a CA, its key, and a
+/// certificate it signed with its key.
+pub struct Material {
+    pub ca_cert: String,
+    pub ca_key: String,
+    pub cert: String,
+    pub key: String,
+}
+
+/// A self-signed Ed25519 CA and a certificate for `name` carrying `dns`
+/// and `ips`, valid from an hour ago for `days`.
+pub fn make_material(
+    name: &str,
+    dns: &[String],
+    ips: &[std::net::IpAddr],
+    days: i64,
+) -> Result<Material> {
+    let m = crate::crypto::x509::make(name, dns, ips, days)?;
+    Ok(Material { ca_cert: m.ca_cert, ca_key: m.ca_key, cert: m.cert, key: m.key })
+}
+
 /// A socket, plain or encrypted, as the wire and the console see one: the
 /// bytes, and the four things they set on the socket underneath.
 pub trait Stream: Read + Write + Send {

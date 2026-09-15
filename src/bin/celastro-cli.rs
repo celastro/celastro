@@ -67,6 +67,9 @@ COMMANDS:
         [--attached N]           and has verified N other nodes since it started
   export <COLLECTION> <DIR>  copy a collection, as of now, into a new database directory
   import <DIR>               adopt a collection an export wrote into this database
+  tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
+                             write a CA and a certificate for NAME (and NAMES, comma-separated
+                             DNS names and IP addresses) into DIR, valid DAYS days (3650)
   help                       this
   version                    print the version
 
@@ -149,15 +152,35 @@ enum Cli {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
-    Serve { port: u16, open: bool, shard_bind: Option<String>, bind: Option<IpAddr> },
+    Serve {
+        port: u16,
+        open: bool,
+        shard_bind: Option<String>,
+        bind: Option<IpAddr>,
+    },
     Exec(String),
     Script(PathBuf),
     Repl,
     Demo,
     Catalog,
-    Health { port: u16, attached: Option<u64> },
-    Export { collection: String, to: PathBuf },
-    Import { from: PathBuf },
+    Health {
+        port: u16,
+        attached: Option<u64>,
+    },
+    Export {
+        collection: String,
+        to: PathBuf,
+    },
+    Import {
+        from: PathBuf,
+    },
+    /// `tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: a CA and a certificate.
+    TlsInit {
+        dir: PathBuf,
+        name: String,
+        names: Vec<String>,
+        days: i64,
+    },
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
@@ -287,6 +310,30 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
         "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached },
+        "tls" => match rest.first().map(String::as_str) {
+            Some("init") if rest.len() >= 3 && rest.len() <= 5 => {
+                let names: Vec<String> = rest
+                    .get(3)
+                    .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let days = match rest.get(4) {
+                    Some(d) => match d.parse::<i64>() {
+                        Ok(n) if n > 0 => n,
+                        _ => return Cli::Usage(format!("`tls init` wants a positive number of days, not `{d}`")),
+                    },
+                    None => 3650,
+                };
+                Cmd::TlsInit { dir: PathBuf::from(&rest[1]), name: rest[2].clone(), names, days }
+            }
+            _ => {
+                return Cli::Usage(
+                    "`tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: write a CA and a certificate for NAME \
+                     into DIR; NAMES is a comma-separated list of DNS names and IP addresses the \
+                     certificate also carries, DAYS the validity (3650)"
+                        .to_string(),
+                )
+            }
+        },
         "export" => match rest.len() {
             2 => Cmd::Export { collection: rest[0].clone(), to: PathBuf::from(&rest[1]) },
             _ => {
@@ -422,6 +469,9 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::Health { port, attached } = cmd {
         return health(port, attached, tls.as_ref(), json);
     }
+    if let Cmd::TlsInit { dir, name, names, days } = cmd {
+        return tls_init(&dir, &name, &names, days, json);
+    }
     let mut opts = db_opts();
     opts.tls = tls.clone();
     let mut db = match &dir {
@@ -447,6 +497,7 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             EXIT_OK
         }
         Cmd::Health { .. } => unreachable!("answered before the database was opened"),
+        Cmd::TlsInit { .. } => unreachable!("answered before the database was opened"),
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
             Ok(export) => match export.write_to(&to) {
                 Ok(()) => {
@@ -766,6 +817,84 @@ fn attach_peers(db: &Mutex<Db>, stop: &AtomicBool, peers: &[String]) {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
+}
+
+/// `tls init`: a self-signed CA and a certificate it signed, as the four PEM
+/// files `serve` reads through `CELASTRO_TLS_CERT`, `_KEY` and `_CA` (the
+/// CA's key is written beside them for a later certificate and is not read
+/// by anything). The certificate names `name`, every entry of `names`, and
+/// `localhost` with 127.0.0.1, which the health probe needs.
+fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> i32 {
+    let mut dns: Vec<String> = vec![name.to_string(), "localhost".to_string()];
+    let mut ips: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().expect("a literal")];
+    for n in names {
+        match n.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            Err(_) => {
+                let lower = n.to_ascii_lowercase();
+                if !dns.contains(&lower) {
+                    dns.push(lower);
+                }
+            }
+        }
+    }
+    let material = match celastro::tls::make_material(name, &dns, &ips, days) {
+        Ok(m) => m,
+        Err(e) => return fail(json, &format!("could not make the certificates: {e}")),
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return fail(json, &format!("could not create {}: {e}", dir.display()));
+    }
+    for (file, text, private) in [
+        ("ca.crt", &material.ca_cert, false),
+        ("ca.key", &material.ca_key, true),
+        ("tls.crt", &material.cert, false),
+        ("tls.key", &material.key, true),
+    ] {
+        let path = dir.join(file);
+        if path.exists() {
+            return fail(
+                json,
+                &format!("{} exists; not overwriting a key or certificate", path.display()),
+            );
+        }
+        if let Err(e) = write_private(&path, text, private) {
+            return fail(json, &format!("could not write {}: {e}", path.display()));
+        }
+    }
+    if json {
+        println!(
+            r#"{{"ok":true,"kind":"tls","dir":{},"names":{},"days":{days}}}"#,
+            json::to_string(&Value::Str(dir.display().to_string())),
+            json::to_string(&Value::Array(dns.iter().map(|n| Value::Str(n.clone())).collect()))
+        );
+    } else {
+        println!(
+            "wrote ca.crt, ca.key, tls.crt and tls.key into {}: a certificate for {} valid {days} days, \
+             signed by a CA of its own",
+            dir.display(),
+            dns.join(", ")
+        );
+    }
+    EXIT_OK
+}
+
+/// A file that only its owner may read, when it is a key.
+fn write_private(path: &Path, text: &str, private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(if private { 0o600 } else { 0o644 });
+    }
+    let mut f = o.open(path)?;
+    f.write_all(text.as_bytes())
 }
 
 fn serve_json(server: &Server) -> Value {
@@ -1585,6 +1714,63 @@ mod tests {
             Cli::Usage(msg) => assert!(msg.contains("--attached")),
             other => panic!("`--attached` outside health must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tls_init_writes_a_ca_and_a_certificate_and_refuses_to_overwrite() {
+        match parse(&["tls", "init", "/tmp/x", "celastro", "a.example,10.0.0.1", "30"]) {
+            Cli::Run { cmd: Cmd::TlsInit { dir, name, names, days }, .. } => {
+                assert_eq!(
+                    (dir, name.as_str(), names, days),
+                    (
+                        PathBuf::from("/tmp/x"),
+                        "celastro",
+                        vec!["a.example".to_string(), "10.0.0.1".to_string()],
+                        30
+                    )
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse(&["tls", "init", "/tmp/x"]), Cli::Usage(_)));
+        assert!(matches!(parse(&["tls", "init", "/tmp/x", "n", "", "zero"]), Cli::Usage(_)));
+        let dir = std::env::temp_dir().join(format!("celastro-tls-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            tls_init(&dir, "celastro", &["c-0.c".to_string(), "10.1.2.3".to_string()], 7, false),
+            EXIT_OK
+        );
+        for f in ["ca.crt", "ca.key", "tls.crt", "tls.key"] {
+            let text = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(text.starts_with("-----BEGIN "), "{f}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("tls.key")).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(dir.join("tls.crt")).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        // The material loads as `serve` would load it, and the certificate names the probe's host.
+        std::env::set_var(celastro::tls::CERT_ENV, dir.join("tls.crt"));
+        std::env::set_var(celastro::tls::KEY_ENV, dir.join("tls.key"));
+        std::env::set_var(celastro::tls::CA_ENV, dir.join("ca.crt"));
+        let loaded = Tls::from_env();
+        std::env::remove_var(celastro::tls::CERT_ENV);
+        std::env::remove_var(celastro::tls::KEY_ENV);
+        std::env::remove_var(celastro::tls::CA_ENV);
+        let _ = loaded;
+        assert_ne!(
+            tls_init(&dir, "celastro", &[], 7, false),
+            EXIT_OK,
+            "an existing file is not overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
