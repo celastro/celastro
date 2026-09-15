@@ -223,7 +223,7 @@ what `demo` needs and what makes `exec` usable with nothing on disk.
 | `repl` | interactive session on stdin |
 | `demo` | build a small hybrid corpus and show it working |
 | `catalog` | list collections and their indexes |
-| `health [--port N]` | exit 0 if a console is serving on that port; a container's probe |
+| `health [--port N] [--attached N]` | exit 0 if a console is serving on that port — and, with `--attached`, has verified `N` other nodes since it started; a container's probes |
 | `version` | print the version |
 
 | global flag | |
@@ -255,13 +255,22 @@ and renders `EXPLAIN ANALYZE` output. Only the URL is on stdout, so
 `celastro-cli serve | xargs xdg-open` works, and `--open` does the same
 without the pipe.
 
-It binds loopback and nothing else, and it will not be talked into more: the
-endpoint executes arbitrary SQL, so a bind reachable from the network is a
-remote shell. Three guards sit in front of it — the loopback bind, a `Host`
-check against DNS rebinding, and a per-run token — and every request needs the
-token. `POST /api/shutdown` with the token stops the server after a clean
-save. The console, like the CLI, saves after every statement that changed
-something.
+It binds loopback unless told otherwise: the endpoint executes arbitrary
+SQL, so a bind reachable from the network is a remote shell. Three guards sit
+in front of it — the loopback bind, a `Host` check against DNS rebinding, and
+a per-run token — and every request needs the token. `POST /api/shutdown`
+with the token stops the server after a clean save. The console, like the
+CLI, saves after every statement that changed something.
+
+`serve --bind 0.0.0.0` is the one way onto a network, for nodes behind a
+Service or a load balancer: the console then answers the token in
+`CELASTRO_TOKEN` — yours, at least sixteen printable bytes, the same at every
+node — instead of a per-run one, accepts whatever `Host` routed to it, and
+requires a browser's `Origin` to be that host. It is plain HTTP; keep it
+inside a network you trust or behind an ingress that terminates TLS. Any node
+coordinates a statement over every node's shards, and `/api/health` names
+the node that answered, so a client behind a balancer can see its requests
+spread.
 
 ## Copying a collection
 
@@ -379,7 +388,7 @@ linked `celastro-cli` in an image `FROM scratch`, no shell, no libc, nothing
 running as root. The `Dockerfile` builds the same image from the tree.
 
 ```
-docker pull ghcr.io/celastro/celastro:0.23.1 && docker tag ghcr.io/celastro/celastro:0.23.1 celastro
+docker pull ghcr.io/celastro/celastro:0.24.0 && docker tag ghcr.io/celastro/celastro:0.24.0 celastro
 docker run --rm celastro demo                                            # in memory
 docker volume create celastro-data
 docker run --rm -i -v celastro-data:/data celastro --dir /data repl < quickstart.sql

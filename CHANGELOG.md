@@ -6,6 +6,40 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.24.0 — 2026-09-15
+
+The console can serve a cluster's clients, hence a minor.
+
+**The console binds where it is told.** `celastro-cli serve --bind 0.0.0.0`
+(or another routable address) puts the console on a network, for nodes
+behind a Service or a load balancer. It then answers the token in
+`CELASTRO_TOKEN` — the operator's, at least sixteen printable bytes, the
+same at every node — instead of a per-run one, the `Host` allow-list gives
+way to the token (a client reaches it by whatever name routes to it) and a
+browser's `Origin` must be the `Host` the same request named. Without
+`--bind` nothing changes: loopback, a per-run token, the three guards.
+`/api/health` now names the node that answered (`node`, null for a node
+without an address).
+
+**The chart exposes it on request.** `console.expose=true` binds every pod
+on all interfaces, gives them one token from a `Secret` the chart generates
+once and keeps across upgrades (or `console.token`, or
+`console.existingSecret`), and adds a Service `<release>-console` with a
+cluster IP — the console closes every connection after one request, so a
+ClusterIP spreads requests per request over the pods, and any pod
+coordinates a statement over every pod's shards. Plain HTTP: for a network
+you trust, or behind an ingress that terminates TLS.
+
+**Ready means attached.** `/api/health` reports `attached`, the other nodes
+this process has verified since it started, and `celastro-cli health
+--attached N` exits 0 only once that reaches `N`. The chart's readiness
+probe asks for `replicas - 1` when there is more than one pod, so a pod
+that has just restarted is not routed to until it can coordinate over its
+peers; liveness still asks only whether it serves. The headless Service
+now publishes a pod's address before the pod is ready, which that probe
+needs: a pod attaches its peers by name, and a name that resolved only
+once its pod was ready would have left every pod waiting for every other.
+
 ## 0.23.1 — 2026-09-15
 
 A walk got cheaper again and nothing else changed, hence a patch.

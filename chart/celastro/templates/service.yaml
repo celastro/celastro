@@ -1,6 +1,9 @@
 # Headless: the StatefulSet needs a service for its stable identity, and
-# nothing routes to the console anyway -- it binds 127.0.0.1 inside the pod.
-# The wire port is what the pods reach each other on, by pod name.
+# nothing routes to the console through it -- by default it binds 127.0.0.1
+# inside the pod, and when exposed it is reached through the console Service
+# below, which has a cluster IP and so spreads requests over the pods rather
+# than handing every client the same first address. The wire port is what
+# the pods reach each other on, by pod name.
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,6 +12,11 @@ metadata:
     {{- include "celastro.labels" . | nindent 4 }}
 spec:
   clusterIP: None
+  # A pod's name resolves before the pod is ready. Readiness with peers
+  # means "attached every other pod", and a pod attaches a peer by its
+  # name: without this, no pod could resolve any other until that other was
+  # ready, and none would ever be.
+  publishNotReadyAddresses: true
   selector:
     {{- include "celastro.selectorLabels" . | nindent 4 }}
   ports:
@@ -20,3 +28,22 @@ spec:
       port: {{ .Values.wire.port }}
       targetPort: {{ .Values.wire.port }}
     {{- end }}
+{{- if .Values.console.expose }}
+---
+# The console for clients: one address, requests spread over every ready
+# pod. Each request is its own connection, so the spread is per request.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "celastro.fullname" . }}-console
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.console.service.type }}
+  selector:
+    {{- include "celastro.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: console
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+{{- end }}

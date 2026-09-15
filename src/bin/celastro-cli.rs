@@ -26,7 +26,7 @@ use celastro::json;
 use celastro::plan::exec::{QueryResult, Row};
 use celastro::serve::Server;
 use celastro::value::Value;
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +55,7 @@ USAGE:
 
 COMMANDS:
   serve [--port N] [--open]  serve the browser UI on 127.0.0.1
+        [--bind ADDR]            or on ADDR, answering the token in CELASTRO_TOKEN
         [--shard-bind ADDR:PORT] and this node's shards to other nodes
   exec <SQL>                 run one statement and print the result
   run <FILE>                 run a script of statements
@@ -62,6 +63,7 @@ COMMANDS:
   demo                       build a small hybrid corpus and show it working
   catalog                    list collections and their indexes
   health [--port N]          exit 0 if a console is serving on 127.0.0.1:N
+        [--attached N]           and has verified N other nodes since it started
   export <COLLECTION> <DIR>  copy a collection, as of now, into a new database directory
   import <DIR>               adopt a collection an export wrote into this database
   help                       this
@@ -89,6 +91,13 @@ come up, its own address skipped, so every node of a cluster can be given the
 same list. ATTACH NODE, CREATE COLLECTION ... WITH (nodes = [...]), MOVE SHARD,
 REBALANCE and LOCAL are the statements that go with it; docs/design.md has the
 rest.
+
+`serve --bind 0.0.0.0` (or another routable address) puts the console on a
+network, for nodes behind a Service or a load balancer: every node then answers
+the token in CELASTRO_TOKEN -- at least sixteen printable bytes, the same at
+every node -- instead of a per-run one, and any of them coordinates a statement
+over every node's shards. Plain HTTP: for a network you trust, or an ingress that
+terminates TLS in front of it.
 
 `--json` covers every command, `help` and `version` included, and stdout carries
 the whole answer: a failure that ends the command is written there too, as
@@ -136,13 +145,13 @@ enum Cli {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cmd {
-    Serve { port: u16, open: bool, shard_bind: Option<String> },
+    Serve { port: u16, open: bool, shard_bind: Option<String>, bind: Option<IpAddr> },
     Exec(String),
     Script(PathBuf),
     Repl,
     Demo,
     Catalog,
-    Health { port: u16 },
+    Health { port: u16, attached: Option<u64> },
     Export { collection: String, to: PathBuf },
     Import { from: PathBuf },
 }
@@ -154,6 +163,8 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut port: Option<u16> = None;
     let mut open = false;
     let mut shard_bind: Option<String> = None;
+    let mut bind: Option<IpAddr> = None;
+    let mut attached: Option<u64> = None;
     let mut verb: Option<String> = None;
     // `-h` and `-V` are answered after the whole line is read rather than at
     // the moment they are seen, so that `celastro-cli -h --json` honours the
@@ -212,6 +223,24 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 Some(v) => shard_bind = Some(v),
                 None => return Cli::Usage(missing_value(&name)),
             },
+            "--attached" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) => attached = Some(n),
+                    Err(_) => return Cli::Usage(format!("`--attached` wants a count, not `{v}`")),
+                },
+                None => return Cli::Usage(missing_value(&name)),
+            },
+            "--bind" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => match v.parse::<IpAddr>() {
+                    Ok(ip) => bind = Some(ip),
+                    Err(_) => {
+                        return Cli::Usage(format!(
+                            "`--bind` wants an IP address such as 0.0.0.0, not `{v}`"
+                        ))
+                    }
+                },
+                None => return Cli::Usage(missing_value(&name)),
+            },
             "-h" | "--help" => want_help = true,
             "-V" | "--version" => want_version = true,
             other => return Cli::Usage(format!("unknown flag `{other}`")),
@@ -234,9 +263,12 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "serve" | "repl" | "demo" | "catalog" | "health" if !rest.is_empty() => {
             return Cli::Usage(format!("`{verb}` takes no arguments"));
         }
-        "serve" => {
-            Cmd::Serve { port: port.unwrap_or(DEFAULT_PORT), open, shard_bind: shard_bind.clone() }
-        }
+        "serve" => Cmd::Serve {
+            port: port.unwrap_or(DEFAULT_PORT),
+            open,
+            shard_bind: shard_bind.clone(),
+            bind,
+        },
         "exec" => match rest.len() {
             1 => Cmd::Exec(rest[0].clone()),
             0 => return Cli::Usage("`exec` needs a statement to run".to_string()),
@@ -250,7 +282,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "repl" => Cmd::Repl,
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
-        "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT) },
+        "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached },
         "export" => match rest.len() {
             2 => Cmd::Export { collection: rest[0].clone(), to: PathBuf::from(&rest[1]) },
             _ => {
@@ -280,6 +312,12 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         if shard_bind.is_some() {
             return Cli::Usage("`--shard-bind` only means something to `serve`".to_string());
         }
+        if bind.is_some() {
+            return Cli::Usage("`--bind` only means something to `serve`".to_string());
+        }
+    }
+    if attached.is_some() && !matches!(cmd, Cmd::Health { .. }) {
+        return Cli::Usage("`--attached` only means something to `health`".to_string());
     }
     // The demo builds its own database, with build options no persistent
     // database should inherit. Accepting `--dir` alongside it would run the
@@ -371,8 +409,8 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     // Before any directory is opened: the probe asks a RUNNING console, and
     // opening its directory from a second process is the one thing the data
     // directory does not support.
-    if let Cmd::Health { port } = cmd {
-        return health(port, json);
+    if let Cmd::Health { port, attached } = cmd {
+        return health(port, attached, json);
     }
     let mut db = match &dir {
         Some(d) => match Db::open(d, db_opts()) {
@@ -385,7 +423,9 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
         None => Db::in_memory(),
     };
     let code = match cmd {
-        Cmd::Serve { port, open, shard_bind } => serve(&mut db, port, open, shard_bind, json),
+        Cmd::Serve { port, open, shard_bind, bind } => {
+            serve(&mut db, port, open, shard_bind, bind, json)
+        }
         Cmd::Exec(sql) => statement(&mut db, &sql, json),
         Cmd::Script(file) => run_script(&mut db, &file, json),
         Cmd::Repl => repl(&mut db, json),
@@ -497,9 +537,22 @@ fn ack(json: bool, message: &str) {
 /// `health`: exit 0 when a console on `--port` answers that it is serving,
 /// 1 otherwise. A container's liveness and readiness probe, since the image
 /// has no shell and the console binds loopback.
-fn health(port: u16, json: bool) -> i32 {
+fn health(port: u16, attached: Option<u64>, json: bool) -> i32 {
     match celastro::serve::probe_health(port) {
         Ok(true) => {
+            // Readiness for a node of a cluster: serving is not enough while
+            // the peers it was given have not answered it since it started,
+            // because a statement it coordinates reaches shards it does not
+            // hold through them. Liveness asks without `--attached`.
+            if let Some(want) = attached {
+                let have = celastro::serve::probe_attached(port).unwrap_or(0);
+                if have < want {
+                    return fail(
+                        json,
+                        &format!("serving on 127.0.0.1:{port}, but {have} of {want} other node(s) attached so far"),
+                    );
+                }
+            }
             if json {
                 println!(r#"{{"ok":true,"kind":"health","port":{port}}}"#);
             } else {
@@ -512,10 +565,37 @@ fn health(port: u16, json: bool) -> i32 {
     }
 }
 
-fn serve(db: &mut Db, port: u16, open: bool, shard_bind: Option<String>, json: bool) -> i32 {
-    let server = match Server::bind(port) {
-        Ok(s) => s,
-        Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
+fn serve(
+    db: &mut Db,
+    port: u16,
+    open: bool,
+    shard_bind: Option<String>,
+    bind: Option<IpAddr>,
+    json: bool,
+) -> i32 {
+    let server = match bind {
+        // The operator's token, or nothing: a per-run token is printed where
+        // a client on the network cannot read it, and differs per node.
+        Some(ip) => {
+            let Some(token) = celastro::serve::token_from_env() else {
+                return fail(
+                    json,
+                    &format!(
+                        "--bind needs {} in the environment: a console on a network answers a \
+                         token you chose, the same at every node, never a per-run one",
+                        celastro::serve::TOKEN_ENV
+                    ),
+                );
+            };
+            match Server::bind_network(ip, port, token) {
+                Ok(s) => s,
+                Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
+            }
+        }
+        None => match Server::bind(port) {
+            Ok(s) => s,
+            Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
+        },
     };
     let url = server.url();
     // The URL reaches stdout before the first request is served, so it can be
@@ -536,12 +616,21 @@ fn serve(db: &mut Db, port: u16, open: bool, shard_bind: Option<String>, json: b
         "POST /api/shutdown to stop"
     };
     eprintln!("celastro-cli serving on {} — {stops}", server.local_addr());
-    eprintln!(
-        "The token in that URL is the only thing protecting this database. Anyone who can\n\
-         read this terminal, this process's environment or its command line can use it, and\n\
-         the server answers every request that carries it. Treat the URL as a password, and\n\
-         stop the server when you are done."
-    );
+    if server.reach() == celastro::serve::Reach::Network {
+        eprintln!(
+            "The console is on a routable address, answering any client presenting the token \
+             in {}: this is plain HTTP, for a network you trust or an ingress that terminates \
+             TLS in front of it. The token is the only thing protecting this database.",
+            celastro::serve::TOKEN_ENV
+        );
+    } else {
+        eprintln!(
+            "The token in that URL is the only thing protecting this database. Anyone who can\n\
+             read this terminal, this process's environment or its command line can use it, and\n\
+             the server answers every request that carries it. Treat the URL as a password, and\n\
+             stop the server when you are done."
+        );
+    }
     if open {
         // Not fatal: the URL is already printed, so a desktop without an opener
         // costs a copy and paste rather than the session.
@@ -1449,6 +1538,40 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_count_reaches_health_and_nothing_else() {
+        match parse(&["--attached", "2", "health"]) {
+            Cli::Run { cmd: Cmd::Health { attached, .. }, .. } => assert_eq!(attached, Some(2)),
+            other => panic!("`--attached 2 health` must parse, got {other:?}"),
+        }
+        match parse(&["--attached", "two", "health"]) {
+            Cli::Usage(msg) => assert!(msg.contains("two")),
+            other => panic!("a count that is not a number must be refused, got {other:?}"),
+        }
+        match parse(&["--attached", "2", "serve"]) {
+            Cli::Usage(msg) => assert!(msg.contains("--attached")),
+            other => panic!("`--attached` outside health must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bind_address_reaches_serve_and_nothing_else() {
+        match parse(&["--bind", "0.0.0.0", "serve"]) {
+            Cli::Run { cmd: Cmd::Serve { bind, .. }, .. } => {
+                assert_eq!(bind, Some("0.0.0.0".parse::<IpAddr>().unwrap()))
+            }
+            other => panic!("`--bind 0.0.0.0 serve` must parse, got {other:?}"),
+        }
+        match parse(&["--bind", "everywhere", "serve"]) {
+            Cli::Usage(msg) => assert!(msg.contains("everywhere")),
+            other => panic!("a bind that is not an address must be refused, got {other:?}"),
+        }
+        match parse(&["--bind", "0.0.0.0", "exec", "SELECT 1"]) {
+            Cli::Usage(msg) => assert!(msg.contains("--bind")),
+            other => panic!("`--bind` outside serve must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_port_that_is_not_a_number_is_refused_rather_than_falling_back_to_the_default() {
         match parse(&["--port", "eight", "serve"]) {
             Cli::Usage(msg) => assert!(msg.contains("eight")),
@@ -1840,14 +1963,14 @@ mod tests {
     #[test]
     fn health_takes_a_port_and_nothing_else() {
         match parse_args(vec!["health".to_string()]) {
-            Cli::Run { cmd: Cmd::Health { port }, dir, .. } => {
+            Cli::Run { cmd: Cmd::Health { port, .. }, dir, .. } => {
                 assert_eq!(port, DEFAULT_PORT);
                 assert!(dir.is_none());
             }
             other => panic!("{other:?}"),
         }
         match parse_args(vec!["--port".into(), "9".into(), "health".into()]) {
-            Cli::Run { cmd: Cmd::Health { port }, .. } => assert_eq!(port, 9),
+            Cli::Run { cmd: Cmd::Health { port, .. }, .. } => assert_eq!(port, 9),
             other => panic!("{other:?}"),
         }
         assert!(matches!(parse_args(vec!["health".into(), "x".into()]), Cli::Usage(_)));

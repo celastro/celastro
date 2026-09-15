@@ -697,6 +697,11 @@ pub struct Db {
     wire_token: Option<String>,
     /// One connection per other node, opened on demand. See `crate::wire`.
     nodes: BTreeMap<String, Arc<crate::wire::Node>>,
+    /// The nodes this process has verified since it started -- an `ATTACH
+    /// NODE` that reached them and agreed on address and version. Not the
+    /// catalog's list, which persists across a restart and so says nothing
+    /// about whether a peer answers *now*; this is what readiness asks.
+    attached: BTreeSet<String>,
     /// Shards of this node pinned for a move, by `(collection, index)`:
     /// the files the target pulls, as they were at the pin. Shared with the
     /// wire server, which answers a target's reads from it without this
@@ -748,6 +753,7 @@ impl Db {
             sim: None,
             wire_token: crate::wire::token_from_env(),
             nodes: BTreeMap::new(),
+            attached: BTreeSet::new(),
             moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             queries_seen: 0,
             last_commit: 0,
@@ -1411,10 +1417,19 @@ impl Db {
                 env!("CARGO_PKG_VERSION")
             )));
         }
+        self.attached.insert(url.to_string());
         if !self.catalog.nodes.iter().any(|n| n == url) {
             self.catalog.nodes.push(url.to_string());
         }
         self.persist_catalog()
+    }
+
+    /// How many other nodes this process has verified since it started.
+    /// What a readiness probe compares with the peers a node was given, so
+    /// a pod is not routed to before it can reach the shards it does not
+    /// hold.
+    pub fn attached_count(&self) -> usize {
+        self.attached.len()
     }
 
     /// Forget a node. Refused while a placement still names it: the shards

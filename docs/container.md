@@ -11,7 +11,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.23.1
+docker pull ghcr.io/celastro/celastro:0.24.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -184,8 +184,9 @@ namespace, which under `--network host` is the host's.
 
 ## The console binds loopback, and `-p` therefore cannot reach it
 
-`celastro-cli serve` puts a browser console on `127.0.0.1` and on nothing else.
-`Server::bind` in `src/serve.rs` states why:
+`celastro-cli serve` puts a browser console on `127.0.0.1` and on nothing else
+unless `--bind` says otherwise (see the end of this section). `Server::bind`
+in `src/serve.rs` states why:
 
 > 127.0.0.1 and nothing else: never 0.0.0.0, never `::`, never a name that might
 > resolve to a routable address. This endpoint executes arbitrary SQL, so a bind
@@ -262,6 +263,22 @@ the token; and it is a Linux mode — Docker Desktop offers host networking on
 macOS and Windows only as a setting you turn on deliberately. That is the trade,
 and it is a real one: the alternative is not a safer bind, it is running the
 console outside the container against the same directory, or not running it.
+
+**`--bind 0.0.0.0` is the deliberate exception**, for nodes behind a Service
+or a load balancer. It needs `CELASTRO_TOKEN` in the environment — at least
+sixteen printable bytes, the same at every node — and with it the console
+answers on every interface, so `-p 8787:8787` reaches it and the `Host` check
+gives way to the token:
+
+```
+$ docker run -d -p 8787:8787 -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef \
+    -v celastro-data:/data celastro --dir /data serve --bind 0.0.0.0
+$ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0.1:8787/api/health
+```
+
+Plain HTTP, and the token is the only guard: a network you trust, or an
+ingress that terminates TLS in front of it. The chart's `console.expose` is
+this, with the token in a `Secret` and a Service over the pods.
 
 ## `panic = "abort"` makes the container the unit of recovery
 

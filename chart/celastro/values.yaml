@@ -24,12 +24,32 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# The console's port inside the pod. It binds 127.0.0.1 only, so nothing
-# routes to it: reach it with `kubectl port-forward`, which connects inside
-# the pod's network namespace. The probes run the binary itself for the same
-# reason -- the image has no shell and no curl, and a probe from outside the
-# pod could not reach a loopback bind.
+# The console's port inside the pod. Unless `console.expose` is on it binds
+# 127.0.0.1 only, so nothing routes to it: reach it with `kubectl
+# port-forward`, which connects inside the pod's network namespace. The
+# probes run the binary itself for the same reason -- the image has no shell
+# and no curl, and a probe from outside the pod could not reach a loopback
+# bind -- and they keep doing so when the console is exposed, since a bind
+# on every interface includes loopback.
 port: 8787
+
+# The console beyond its pod. Off, it is reached by `kubectl port-forward`
+# and answers a token printed once per start in the pod's log. On, every
+# pod binds it on all interfaces and answers one shared token, and a second
+# Service, `<release>-console`, spreads requests over the pods: the console
+# closes every connection after one request, so a ClusterIP spreads them per
+# request, not per client, and any pod coordinates a statement over every
+# pod's shards. Plain HTTP with no TLS: for a network you trust, or behind
+# an ingress that terminates TLS. The token comes from a Secret with the key
+# CELASTRO_TOKEN -- at least sixteen printable bytes: name an existing one,
+# give one here, or leave both empty and the chart generates one and keeps
+# it across upgrades. `/api/health` names the pod that answered.
+console:
+  expose: false
+  service:
+    type: ClusterIP
+  token: ""
+  existingSecret: ""
 
 persistence:
   size: 10Gi
@@ -54,6 +74,9 @@ archive:
 probes:
   periodSeconds: 10
   failureThreshold: 3
+  # The console answers one request at a time, so a probe behind a long
+  # statement waits for it; one second, the default, was seen to time out.
+  timeoutSeconds: 5
 
 resources: {}
 nodeSelector: {}

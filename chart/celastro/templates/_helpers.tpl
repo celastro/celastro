@@ -31,6 +31,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "celastro.consoleSecretName" -}}
+{{- if .Values.console.existingSecret -}}
+{{- .Values.console.existingSecret -}}
+{{- else -}}
+{{- printf "%s-console" (include "celastro.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Every pod's wire address, comma-separated: what each pod attaches. */}}
 {{- define "celastro.peers" -}}
 {{- $name := include "celastro.fullname" . -}}

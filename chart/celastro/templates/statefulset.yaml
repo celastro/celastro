@@ -36,12 +36,20 @@ spec:
         - name: celastro
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $bind := ternary (list "--bind" "0.0.0.0") (list) .Values.console.expose }}
           {{- if gt (int .Values.replicas) 1 }}
-          args: ["--dir", "/data", "--port", {{ .Values.port | quote }}, "serve", "--shard-bind", {{ printf "0.0.0.0:%d" (int .Values.wire.port) | quote }}]
+          args: {{ concat (list "--dir" "/data" "--port" (.Values.port | toString) "serve") $bind (list "--shard-bind" (printf "0.0.0.0:%d" (int .Values.wire.port))) | toJson }}
           {{- else }}
-          args: ["--dir", "/data", "--port", {{ .Values.port | quote }}, "serve"]
+          args: {{ concat (list "--dir" "/data" "--port" (.Values.port | toString) "serve") $bind | toJson }}
           {{- end }}
           env:
+            {{- if .Values.console.expose }}
+            - name: CELASTRO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "celastro.consoleSecretName" . }}
+                  key: CELASTRO_TOKEN
+            {{- end }}
             {{- if gt (int .Values.replicas) 1 }}
             # The pod's stable name is its address: `tcp://<pod>.<service>:<wire port>`.
             - name: POD_NAME
@@ -83,15 +91,28 @@ spec:
           # The probes ask the console itself, from inside the pod, and the
           # console answers only after it has read its catalog: a process
           # that is up with a database it cannot open is not ready.
+          # Ready means able to coordinate: with peers, the node has to have
+          # verified every one of them since it started, or a Service would
+          # route a statement to a pod that cannot yet reach the shards it
+          # does not hold. Liveness asks only whether it serves.
           readinessProbe:
             exec:
+              {{- if gt (int .Values.replicas) 1 }}
+              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health", "--attached", {{ sub (int .Values.replicas) 1 | toString | quote }}]
+              {{- else }}
               command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
+              {{- end }}
+            # The console serves one request at a time, so a probe that lands
+            # behind a statement waits for it; the default second was seen
+            # to time out during a rolling restart.
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
             failureThreshold: {{ .Values.probes.failureThreshold }}
           livenessProbe:
             exec:
               command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
             initialDelaySeconds: 10
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
             failureThreshold: {{ .Values.probes.failureThreshold }}
           volumeMounts:

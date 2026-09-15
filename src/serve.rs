@@ -26,7 +26,7 @@
 //! not get tested.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,7 +88,39 @@ pub struct Server {
     listener: TcpListener,
     addr: SocketAddr,
     token: String,
+    reach: Reach,
 }
+
+/// Where the console is reachable from, which decides two of the guards.
+/// On loopback the `Host` allow-list refuses a rebound name and a browser's
+/// `Origin` must be this machine's. On a network the console is reached by
+/// whatever name routes to it -- a Service, a load balancer, a pod address
+/// -- so `Host` may be anything and an `Origin`, when a browser sends one,
+/// must be the `Host` the same request named: same-origin by the name the
+/// client used. The token on every request is then what stands between the
+/// network and the SQL prompt, which is why a network bind takes the
+/// operator's token and never a per-run one ([`Server::bind_network`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Loopback,
+    Network,
+}
+
+/// The environment variable a network-bound console reads its token from,
+/// the console's counterpart of the wire's `CELASTRO_WIRE_TOKEN`: every
+/// node behind one Service has to answer the same token, so it is chosen
+/// once by whoever runs them and given to each.
+pub const TOKEN_ENV: &str = "CELASTRO_TOKEN";
+
+/// The console token from the environment, or `None` when unset or empty.
+pub fn token_from_env() -> Option<String> {
+    std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty())
+}
+
+/// The least a network console's token may be. Sixteen bytes matches what
+/// `new_token` draws from `/dev/urandom`; a shorter one is a guess away
+/// from a SQL prompt on a routable address, and is refused.
+pub const MIN_NETWORK_TOKEN: usize = 16;
 
 impl Server {
     /// Bind the console to the loopback interface.
@@ -103,7 +135,43 @@ impl Server {
     pub fn bind(port: u16) -> Result<Server> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         let addr = listener.local_addr()?;
-        Ok(Server { listener, addr, token: new_token()? })
+        Ok(Server { listener, addr, token: new_token()?, reach: Reach::Loopback })
+    }
+
+    /// Bind the console to an address of the operator's choosing, for the one
+    /// deployment where loopback is not enough: several nodes behind a
+    /// Service or a load balancer, each answering the same token, any of
+    /// them coordinating a statement over every node's shards.
+    ///
+    /// Everything `bind` says about the surface still holds -- this is an
+    /// arbitrary-SQL endpoint on a routable address, plain HTTP, for a
+    /// network that is trusted or an ingress that terminates TLS in front
+    /// of it -- so the bind is explicit, the token is the operator's rather
+    /// than drawn per run (a per-run token differs per node, which is
+    /// useless behind a balancer, and is printed where a client cannot read
+    /// it), and a token shorter than [`MIN_NETWORK_TOKEN`] bytes or holding
+    /// anything but printable ASCII is refused. A loopback address here is
+    /// the same console `bind` gives, with the operator's token.
+    pub fn bind_network(addr: IpAddr, port: u16, token: String) -> Result<Server> {
+        if token.len() < MIN_NETWORK_TOKEN || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(Error::Io(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "the console token must be at least {MIN_NETWORK_TOKEN} printable ASCII \
+                     bytes with no whitespace; this one is {} byte(s)",
+                    token.len()
+                ),
+            )));
+        }
+        let listener = TcpListener::bind(SocketAddr::from((addr, port)))?;
+        let bound = listener.local_addr()?;
+        let reach = if addr.is_loopback() { Reach::Loopback } else { Reach::Network };
+        Ok(Server { listener, addr: bound, token, reach })
+    }
+
+    /// Where this console is reachable from.
+    pub fn reach(&self) -> Reach {
+        self.reach
     }
 
     /// The address actually bound, which is only known after `bind` when the
@@ -119,7 +187,7 @@ impl Server {
 
     /// The URL to open, token included.
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/?t={}", self.addr.port(), self.token)
+        format!("http://{}:{}/?t={}", self.addr.ip(), self.addr.port(), self.token)
     }
 
     /// Serve until a shutdown is requested. Returns `Ok(())` on clean shutdown.
@@ -191,7 +259,8 @@ impl Server {
         // Under the lock for the whole request, as the wire's calls are: the
         // engine is single-threaded and the lock is what serialises the two.
         let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-        let served = answer(&mut io, &self.token, self.addr.port(), &mut guard, deadlines);
+        let served =
+            answer(&mut io, &self.token, self.addr.port(), self.reach, &mut guard, deadlines);
         drop(guard);
         let socket = io.get_mut();
         served.response.write_to(socket)?;
@@ -866,6 +935,19 @@ fn origin_is_ours(origin: &str, port: u16) -> bool {
     ours.iter().any(|o| origin.eq_ignore_ascii_case(o))
 }
 
+/// On a network the console's own origin is `http://` and whatever `Host`
+/// the same request named: the name the client reached it by, which is the
+/// name a page it served would carry as its origin. `https` is not ours --
+/// the console serves none -- and neither is any other host, so a form on
+/// a page from elsewhere is refused exactly as on loopback.
+fn origin_is_host(origin: &str, host: &str) -> bool {
+    let (scheme, rest) = match origin.is_char_boundary(7) {
+        true => origin.split_at(7),
+        false => return false,
+    };
+    scheme.eq_ignore_ascii_case("http://") && rest.eq_ignore_ascii_case(host.trim())
+}
+
 /// `application/json`, with or without parameters (`; charset=utf-8`).
 fn is_json_media_type(value: &str) -> bool {
     let base = value.split(';').next().unwrap_or("").trim();
@@ -882,9 +964,12 @@ fn is_json_media_type(value: &str) -> bool {
 /// that tells us where the request came from must say `same-origin`. It is only
 /// applied to `POST`, because a user typing the console's URL into the address
 /// bar sends `Sec-Fetch-Site: none` and that navigation must still work.
-fn same_site_post(head: &Head, port: u16) -> std::result::Result<(), Reject> {
+fn same_site_post(head: &Head, port: u16, reach: Reach) -> std::result::Result<(), Reject> {
     if let Some(origin) = head.header("origin") {
-        if !origin_is_ours(origin, port) {
+        let ours = origin_is_ours(origin, port)
+            || (reach == Reach::Network
+                && head.header("host").is_some_and(|h| origin_is_host(origin, h)));
+        if !ours {
             return Err(Reject::Forbidden);
         }
     }
@@ -904,7 +989,21 @@ fn same_site_post(head: &Head, port: u16) -> std::result::Result<(), Reject> {
 /// console included, because handing out the page is handing out the shape of
 /// the API and inviting the browser to call it. Only then the route, so an
 /// unauthenticated client cannot map which paths exist by their status codes.
+#[cfg(test)]
 fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, Reject> {
+    dispatch_for(head, token, port, Reach::Loopback)
+}
+
+/// [`dispatch`] for a console of either reach. On a network the `Host`
+/// allow-list does not apply -- the console is reached by whatever name
+/// routes to it -- but the header is still required, the token still
+/// guards every path, and a browser's `Origin` must be that `Host`.
+fn dispatch_for(
+    head: &Head,
+    token: &str,
+    port: u16,
+    reach: Reach,
+) -> std::result::Result<Action, Reject> {
     // A missing `Host` is answered 403 rather than 400: HTTP/1.1 requires the
     // header, so its absence is a client declining to say where it thinks it is
     // talking, which deserves the same answer as saying the wrong thing.
@@ -912,7 +1011,7 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
         Some(h) => h,
         None => return Err(Reject::Forbidden),
     };
-    if !host_is_local(host) {
+    if reach == Reach::Loopback && !host_is_local(host) {
         return Err(Reject::Forbidden);
     }
     // Health needs no token. It is what a supervisor's probe asks, and a
@@ -936,7 +1035,7 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
         ("GET", "/style.css") => Ok(asset(CT_CSS, STYLE_CSS)),
         ("GET", "/api/catalog") => Ok(Action::Catalog),
         ("POST", "/api/query") => {
-            same_site_post(head, port)?;
+            same_site_post(head, port, reach)?;
             // A cross-origin form cannot set this content type, and asking for
             // it is what forces a preflight the browser will refuse to send.
             match head.header("content-type") {
@@ -945,7 +1044,7 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
             }
         }
         ("POST", "/api/shutdown") => {
-            same_site_post(head, port)?;
+            same_site_post(head, port, reach)?;
             Ok(Action::Shutdown)
         }
         _ => match allowed_methods(&head.path) {
@@ -973,7 +1072,14 @@ impl Served {
 
 /// Read one request and produce one response. Never fails: a protocol problem
 /// is a status code, and a SQL problem is a JSON body.
-fn answer<W: Wire>(io: &mut W, token: &str, port: u16, db: &mut Db, dl: Deadlines) -> Served {
+fn answer<W: Wire>(
+    io: &mut W,
+    token: &str,
+    port: u16,
+    reach: Reach,
+    db: &mut Db,
+    dl: Deadlines,
+) -> Served {
     let head = match read_head(io, dl.head) {
         Ok(h) => h,
         // The head did not parse, so there is no declared length to believe:
@@ -988,7 +1094,7 @@ fn answer<W: Wire>(io: &mut W, token: &str, port: u16, db: &mut Db, dl: Deadline
     // it and never gets a statement as far as the database. Every other route
     // ignores the body, and an ignored body is drained rather than left to make
     // the close an RST.
-    let action = dispatch(&head, token, port);
+    let action = dispatch_for(&head, token, port, reach);
     if !matches!(action, Ok(Action::Query)) {
         drain(io, head.content_length as u64);
     }
@@ -1149,8 +1255,17 @@ fn health_json(db: &Db) -> String {
     let license = jstr(env!("CARGO_PKG_LICENSE"));
     let copyright = jstr(COPYRIGHT);
     let collections = db.collection_count();
+    // Which node answered: a client behind a Service that spreads its
+    // requests can see them land, and a node without an address says so.
+    let node = match db.node() {
+        Some(n) => jstr(n),
+        None => "null".to_string(),
+    };
+    // Verified since start, for a readiness probe: a node that has not yet
+    // reached its peers can coordinate nothing that lives on them.
+    let attached = db.attached_count();
     format!(
-        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections}}}"#
+        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections},"node":{node},"attached":{attached}}}"#
     )
 }
 
@@ -1160,6 +1275,27 @@ fn health_json(db: &Db) -> String {
 /// because the image has no shell and no curl and the console binds
 /// loopback, which a probe from outside the pod cannot reach.
 pub fn probe_health(port: u16) -> Result<bool> {
+    let raw = probe(port)?;
+    let ok_status = raw.starts_with("HTTP/1.1 200 ") || raw.starts_with("HTTP/1.0 200 ");
+    Ok(ok_status && raw.contains(r#""ok":true"#))
+}
+
+/// How many other nodes the console on `port` has verified since it
+/// started, from the same answer: what `celastro-cli health --attached N`
+/// compares, so a readiness probe can wait for a node's peers. `Ok(0)` for
+/// a console whose answer does not carry the count.
+pub fn probe_attached(port: u16) -> Result<u64> {
+    let raw = probe(port)?;
+    let n = raw
+        .split_once(r#""attached":"#)
+        .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(0);
+    Ok(n)
+}
+
+/// One `GET /api/health` on loopback, the raw answer.
+fn probe(port: u16) -> Result<String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1172,8 +1308,7 @@ pub fn probe_health(port: u16) -> Result<bool> {
     s.write_all(request.as_bytes())?;
     let mut raw = String::new();
     s.read_to_string(&mut raw)?;
-    let ok_status = raw.starts_with("HTTP/1.1 200 ") || raw.starts_with("HTTP/1.0 200 ");
-    Ok(ok_status && raw.contains(r#""ok":true"#))
+    Ok(raw)
 }
 
 /// Where the source of this build is offered, as AGPL §13 requires of a
@@ -1460,7 +1595,7 @@ mod tests {
     /// The same, keeping the database and the caller's marching orders.
     fn serve_request(db: &mut Db, request: &str) -> (String, Next) {
         let mut io = Cursor::new(request.as_bytes());
-        let served = answer(&mut io, "tok", PORT, db, wide());
+        let served = answer(&mut io, "tok", PORT, Reach::Loopback, db, wide());
         let mut out = Vec::new();
         served.response.write_to(&mut out).expect("a Vec never fails to be written to");
         (String::from_utf8(out).expect("responses are utf-8"), served.next)
@@ -1530,6 +1665,85 @@ mod tests {
         assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::Forbidden));
         let h = get("/api/catalog?t=tok", "localhost", None);
         assert!(dispatch(&h, "tok", PORT).is_ok());
+    }
+
+    #[test]
+    fn a_network_console_takes_any_host_but_still_the_token_and_its_own_origin() {
+        let h = get("/api/catalog", "celastro-console:8787", Some("tok"));
+        assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::Forbidden), "loopback refuses it");
+        assert!(
+            dispatch_for(&h, "tok", PORT, Reach::Network).is_ok(),
+            "a network console serves it"
+        );
+        let wrong = get("/api/catalog", "celastro-console:8787", Some("nottok"));
+        assert_eq!(
+            dispatch_for(&wrong, "tok", PORT, Reach::Network).err(),
+            Some(Reject::Unauthorized)
+        );
+        let none = get("/api/catalog", "celastro-console:8787", None);
+        assert_eq!(
+            dispatch_for(&none, "tok", PORT, Reach::Network).err(),
+            Some(Reject::Unauthorized)
+        );
+        let no_host = head("GET /api/catalog HTTP/1.1\r\nX-Celastro-Token: tok\r\n");
+        assert_eq!(
+            dispatch_for(&no_host, "tok", PORT, Reach::Network).err(),
+            Some(Reject::Forbidden)
+        );
+        // A browser on a page the console served names the console's own
+        // host as its origin; a page from anywhere else does not.
+        let post = |origin: &str| {
+            head(&format!(
+                "POST /api/query HTTP/1.1\r\nHost: celastro-console:8787\r\nX-Celastro-Token: tok\r\n\
+                 Origin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n"
+            ))
+        };
+        assert!(dispatch_for(&post("http://celastro-console:8787"), "tok", PORT, Reach::Network)
+            .is_ok());
+        assert!(dispatch_for(&post("HTTP://Celastro-Console:8787"), "tok", PORT, Reach::Network)
+            .is_ok());
+        for foreign in [
+            "http://evil.example",
+            "https://celastro-console:8787",
+            "null",
+            "http://celastro-console:9000",
+        ] {
+            assert_eq!(
+                dispatch_for(&post(foreign), "tok", PORT, Reach::Network).err(),
+                Some(Reject::Forbidden),
+                "{foreign}"
+            );
+        }
+        assert_eq!(
+            dispatch(&post("http://celastro-console:8787"), "tok", PORT).err(),
+            Some(Reject::Forbidden)
+        );
+    }
+
+    #[test]
+    fn a_network_bind_refuses_a_weak_token_and_keeps_the_one_it_is_given() {
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for weak in [
+            "",
+            "short",
+            "fifteen-bytes..",
+            "sixteen bytes ok",
+            "sixteen\tbytes-ok",
+            "sixteen-bytes-ok\n",
+        ] {
+            let refused = Server::bind_network(lo, 0, weak.to_string());
+            assert!(refused.is_err(), "{weak:?} must be refused");
+        }
+        let good = "0123456789abcdef0123456789abcdef";
+        let s = Server::bind_network(lo, 0, good.to_string()).unwrap();
+        assert_eq!(s.token(), good);
+        assert_eq!(s.reach(), Reach::Loopback, "a loopback address keeps the loopback guards");
+        assert!(s.url().starts_with("http://127.0.0.1:"));
+        assert!(s.url().ends_with(&format!("/?t={good}")));
+        let any =
+            Server::bind_network(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, good.to_string()).unwrap();
+        assert_eq!(any.reach(), Reach::Network);
+        assert!(any.url().starts_with("http://0.0.0.0:"));
     }
 
     #[test]
@@ -1849,6 +2063,7 @@ mod tests {
             }
         });
         assert!(probe_health(port).unwrap(), "a serving console");
+        assert_eq!(probe_attached(port).unwrap(), 0, "a node that attached nothing");
         assert!(!probe_health(port).unwrap(), "an answer that is not well");
         let closed =
             std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -2291,7 +2506,7 @@ mod tests {
         request.push_str(&format!("Content-Length: {}\r\n\r\n{sql}", sql.len()));
         let mut db = Db::in_memory();
         let mut io = Cursor::new(request.as_bytes());
-        let served = answer(&mut io, "tok", PORT, &mut db, wide());
+        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &mut db, wide());
         assert_eq!(served.response.status, 401);
         assert_eq!(io.position() as usize, request.len(), "the refused body must be drained");
 
