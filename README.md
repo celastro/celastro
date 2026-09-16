@@ -163,7 +163,10 @@ serves a browser console on `127.0.0.1:8787`: SQL, the catalog, `EXPLAIN
 ANALYZE` rendered. The endpoint executes arbitrary SQL, so on loopback three
 guards sit in front of it — the bind, a `Host` check against DNS rebinding,
 and a per-run token every request needs. `POST /api/shutdown` with the token
-stops it after a clean save.
+stops it after a clean save; `GET /api/metrics` is the process's counters
+(statements and their time, refusals, compactions, connections, resumed
+handshakes) and what it holds per collection, in the text format a
+Prometheus scraper reads.
 
 `serve --bind 0.0.0.0` puts it on a network, for nodes behind a Service or a
 load balancer: the console then answers the token in `CELASTRO_TOKEN` (yours,

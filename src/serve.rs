@@ -30,7 +30,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use crate::crypto::hex;
 use crate::sql;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +53,8 @@ const CT_HTML: &str = "text/html; charset=utf-8";
 const CT_JS: &str = "text/javascript; charset=utf-8";
 const CT_CSS: &str = "text/css; charset=utf-8";
 const CT_JSON: &str = "application/json";
+/// The Prometheus text exposition format, which every scraper reads.
+const CT_METRICS: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// The largest request body accepted, in bytes. A SQL statement that does not
 /// fit in a mebibyte is not a statement anybody typed into a console.
@@ -115,6 +117,157 @@ pub struct Server {
     /// Whether the maintenance thread compacts on its own
     /// (`CELASTRO_AUTO_COMPACT`); on unless told otherwise.
     auto_compact: bool,
+}
+
+/// What this process has done since it started, for `/api/metrics`: the
+/// statements it ran and how long they took, the requests it refused, the
+/// compactions the maintenance thread finished, the connections it served.
+/// Process-wide atomics, added to from the request threads and read
+/// without a lock.
+struct Counters {
+    statements: AtomicU64,
+    statements_failed: AtomicU64,
+    statement_micros: AtomicU64,
+    statement_micros_max: AtomicU64,
+    refused: AtomicU64,
+    compactions: AtomicU64,
+    compaction_millis: AtomicU64,
+    connections: AtomicU64,
+}
+
+static COUNTERS: Counters = Counters {
+    statements: AtomicU64::new(0),
+    statements_failed: AtomicU64::new(0),
+    statement_micros: AtomicU64::new(0),
+    statement_micros_max: AtomicU64::new(0),
+    refused: AtomicU64::new(0),
+    compactions: AtomicU64::new(0),
+    compaction_millis: AtomicU64::new(0),
+    connections: AtomicU64::new(0),
+};
+
+/// The metrics page: the process's counters, then what the database holds
+/// right now -- collections, and per collection its shards on this node,
+/// their segments and their visible documents -- and the TLS handshakes
+/// that resumed. One line per number, typed, in the text format a
+/// Prometheus scraper reads; the token is required like everywhere else.
+fn metrics_text(db: &Db) -> String {
+    use AtomicOrdering::Relaxed;
+    let c = &COUNTERS;
+    let mut out = String::new();
+    let mut line = |name: &str, ty: &str, help: &str, labels: &str, value: String| {
+        if !out.contains(&format!("# TYPE {name} ")) {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {ty}\n"));
+        }
+        out.push_str(&format!("{name}{labels} {value}\n"));
+    };
+    line(
+        "celastro_statements_total",
+        "counter",
+        "Statements the console ran.",
+        "",
+        c.statements.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_statements_failed_total",
+        "counter",
+        "Statements that were refused or failed.",
+        "",
+        c.statements_failed.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_statement_seconds_sum",
+        "counter",
+        "Time spent running statements.",
+        "",
+        format!("{:.6}", c.statement_micros.load(Relaxed) as f64 / 1e6),
+    );
+    line(
+        "celastro_statement_seconds_max",
+        "gauge",
+        "The longest statement since start.",
+        "",
+        format!("{:.6}", c.statement_micros_max.load(Relaxed) as f64 / 1e6),
+    );
+    line(
+        "celastro_requests_refused_total",
+        "counter",
+        "Requests refused for a missing or wrong token, or a failed guard.",
+        "",
+        c.refused.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_compactions_total",
+        "counter",
+        "Compactions the maintenance thread installed.",
+        "",
+        c.compactions.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_compaction_seconds_sum",
+        "counter",
+        "Time the maintenance thread spent compacting.",
+        "",
+        format!("{:.3}", c.compaction_millis.load(Relaxed) as f64 / 1e3),
+    );
+    line(
+        "celastro_connections_total",
+        "counter",
+        "Connections the console served.",
+        "",
+        c.connections.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_tls_resumed_handshakes_total",
+        "counter",
+        "TLS handshakes that resumed from a ticket.",
+        "",
+        crate::tls::resumed_handshakes().to_string(),
+    );
+    line(
+        "celastro_collections",
+        "gauge",
+        "Collections in the catalog.",
+        "",
+        db.collection_count().to_string(),
+    );
+    line(
+        "celastro_attached_nodes",
+        "gauge",
+        "Other nodes verified since start.",
+        "",
+        db.attached_count().to_string(),
+    );
+    let now = db.now_ts();
+    let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
+    for name in names {
+        let Ok(shards) = db.shards(&name) else { continue };
+        let labels = format!("{{collection={}}}", jstr(&name));
+        line(
+            "celastro_shards",
+            "gauge",
+            "Shards of the collection held by this node.",
+            &labels,
+            shards.len().to_string(),
+        );
+        let segments: usize = shards.iter().map(|s| s.manifest().segments.len()).sum();
+        line(
+            "celastro_segments",
+            "gauge",
+            "Sealed segments across the shards held here.",
+            &labels,
+            segments.to_string(),
+        );
+        let docs: usize = shards.iter().map(|s| s.num_docs(now)).sum();
+        line(
+            "celastro_documents",
+            "gauge",
+            "Documents visible now across the shards held here.",
+            &labels,
+            docs.to_string(),
+        );
+    }
+    out
 }
 
 impl Drop for Server {
@@ -364,6 +517,7 @@ impl Server {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         // A source that has been refused lately waits before it is answered
         // again: a sixteen-byte token is not guessed at line rate.
+        COUNTERS.connections.fetch_add(1, AtomicOrdering::Relaxed);
         let peer = stream.peer_addr().ok().map(|a| a.ip());
         if let Some(ip) = peer {
             let wait = throttle(|t| t.penalty(ip, Instant::now()));
@@ -378,6 +532,9 @@ impl Server {
         // The lock is taken inside `answer`, around the statement and nothing
         // else; the socket is never read or written under it.
         let served = answer(&mut io, &self.token, self.addr.port(), self.reach, db, deadlines);
+        if served.response.status == 401 || served.response.status == 403 {
+            COUNTERS.refused.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if served.response.status == 401 {
             if let Some(ip) = peer {
                 throttle(|t| t.refused(ip, Instant::now()));
@@ -1044,6 +1201,8 @@ enum Action {
     /// Answer the health probe; needs `&Db`, because a probe that does not
     /// touch the database measures the process and not the database.
     Health,
+    /// The metrics page; needs `&Db` for what it holds.
+    Metrics,
     /// Read the body and run the SQL in it; needs `&mut Db`.
     Query,
     /// Acknowledge, then stop serving so the caller can close the database.
@@ -1085,7 +1244,9 @@ fn with_tokenised_assets(html: &str, token: &str) -> String {
 /// not one of this console's. One table, so a 405 can say what it accepts.
 fn allowed_methods(path: &str) -> Option<&'static str> {
     match path {
-        "/" | "/app.js" | "/style.css" | "/api/health" | "/api/catalog" => Some("GET"),
+        "/" | "/app.js" | "/style.css" | "/api/health" | "/api/catalog" | "/api/metrics" => {
+            Some("GET")
+        }
         "/api/query" | "/api/shutdown" => Some("POST"),
         _ => None,
     }
@@ -1214,6 +1375,7 @@ fn dispatch_for(
         ("GET", "/app.js") => Ok(asset(CT_JS, APP_JS)),
         ("GET", "/style.css") => Ok(asset(CT_CSS, STYLE_CSS)),
         ("GET", "/api/catalog") => Ok(Action::Catalog),
+        ("GET", "/api/metrics") => Ok(Action::Metrics),
         ("POST", "/api/query") => {
             same_site_post(head, port, reach)?;
             // A cross-origin form cannot set this content type, and asking for
@@ -1284,6 +1446,10 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
     match Db::compaction_build(&ticket) {
         Ok(Some(built)) => match write(db).compaction_install(ticket, built) {
             Ok(true) => {
+                COUNTERS.compactions.fetch_add(1, AtomicOrdering::Relaxed);
+                COUNTERS
+                    .compaction_millis
+                    .fetch_add(started.elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
                 eprintln!("celastro: compacted {what} in {:.1} s", started.elapsed().as_secs_f64())
             }
             Ok(false) => {}
@@ -1338,6 +1504,9 @@ fn answer<W: Wire>(
         Ok(Action::Reply(response)) => Served::keep(response),
         Ok(Action::Health) => Served::keep(Response::json(health_json(&read(db)))),
         Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(&read(db)))),
+        Ok(Action::Metrics) => {
+            Served::keep(Response::new(200, "OK", CT_METRICS, metrics_text(&read(db))))
+        }
         Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
     };
@@ -1717,6 +1886,19 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// ack that claims a durability the disk does not have is worse than an error.
 fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let started = Instant::now();
+    let response = run_sql_untimed(db, sql);
+    let micros = started.elapsed().as_micros() as u64;
+    COUNTERS.statements.fetch_add(1, AtomicOrdering::Relaxed);
+    if !response.body.starts_with(r#"{"ok":true"#) {
+        COUNTERS.statements_failed.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    COUNTERS.statement_micros.fetch_add(micros, AtomicOrdering::Relaxed);
+    COUNTERS.statement_micros_max.fetch_max(micros, AtomicOrdering::Relaxed);
+    response
+}
+
+fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
+    let started = Instant::now();
     // Parsed first, without any lock, to know which lock: a read runs under
     // the shared one beside other reads; everything else takes the
     // exclusive one. Parsing twice for a write is cheap; a wrong lock is
@@ -1778,6 +1960,39 @@ fn text_json(kind: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The metrics page names every counter once, typed, and counts what
+    /// the database holds per collection; a statement run through the
+    /// console moves the counters.
+    #[test]
+    fn the_metrics_page_counts_statements_and_what_the_database_holds() {
+        let db = RwLock::new(Db::in_memory());
+        let before = COUNTERS.statements.load(AtomicOrdering::Relaxed);
+        for sql in [
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT)",
+            "INSERT INTO notes VALUES ('{\"id\":\"n1\",\"topic\":\"a\"}')",
+            "SELECT nothing FROM nowhere",
+        ] {
+            let _ = run_sql(&db, sql);
+        }
+        let text = metrics_text(&read(&db));
+        assert!(text.contains("# TYPE celastro_statements_total counter"), "{text}");
+        assert!(text.contains("celastro_collections 1"), "{text}");
+        assert!(text.contains("celastro_shards{collection=\"notes\"} 1"), "{text}");
+        assert!(text.contains("celastro_documents{collection=\"notes\"} 1"), "{text}");
+        assert!(text.contains("celastro_statement_seconds_sum "), "{text}");
+        assert!(COUNTERS.statements.load(AtomicOrdering::Relaxed) >= before + 3);
+        assert!(COUNTERS.statements_failed.load(AtomicOrdering::Relaxed) >= 1);
+        assert_eq!(text.matches("# TYPE celastro_shards ").count(), 1, "one TYPE line per name");
+        let head = parse_head(
+            "GET /api/metrics HTTP/1.1\r\nHost: h\r\nX-Celastro-Token: 0123456789abcdef\r\n\r\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            dispatch_for(&head, "0123456789abcdef", 8787, Reach::Network),
+            Ok(Action::Metrics)
+        ));
+    }
+
     /// On a network bind the API takes the token in the header only, while
     /// the page and its assets still take `?t=`; on loopback both work
     /// everywhere, as they always have.

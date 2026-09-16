@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`GET /api/metrics`.** The process's counters -- statements run and
+failed, their total and longest time, requests refused, compactions the
+maintenance thread installed and their time, connections served, TLS
+handshakes that resumed -- and what the node holds now: collections,
+attached nodes, and per collection the shards held here with their
+segments and visible documents. Prometheus text exposition, one `TYPE`
+line per name, the token required as for every other endpoint.
+
 ## 0.43.1 — 2026-09-16
 
 Secrets wipe themselves when dropped; a patch.
