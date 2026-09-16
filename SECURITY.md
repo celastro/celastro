@@ -99,9 +99,17 @@ cert-manager needs `privateKey.algorithm: Ed25519`); the CA above it and
 any intermediate may be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256) or
 ECDSA P-256, and as a client the node accepts servers signing with those
 too, which is how it reaches a Kubernetes API and answers its
-`CertificateRequest` with an empty certificate. No session resumption, no
-client certificates, no HelloRetryRequest, no 0-RTT, no key update; a
-stock client speaks that subset. Every primitive is pinned against its RFC
+`CertificateRequest` with an empty certificate. Session resumption by
+ticket (0.40.0): after every handshake the server sends a
+NewSessionTicket sealed under a key derived from its TLS private key --
+the same on every node serving the same certificate, so a ticket resumes
+at any of them -- and a client that offers it within a day, with a key
+share (PSK with (EC)DHE only, so forward secrecy is kept), skips the
+certificate flight; a ticket the server cannot open, or a binder that does
+not verify, is a full handshake or a refusal, never a downgrade. This
+client offers a ticket only to the name, address and trust anchors it was
+issued under. No client certificates, no HelloRetryRequest, no 0-RTT, no
+key update; a stock client speaks that subset. Every primitive is pinned against its RFC
 vectors and the key schedule against RFC 8448; nothing branches on or
 indexes by a secret, by masks rather than by asking the compiler. The
 archive client to an S3 store is plain HTTP. A finding against any of

@@ -9,8 +9,10 @@
 //! here; [`TlsStream`] wraps a `TcpStream` and completes the handshake on
 //! first use, so a listener's accept loop never blocks on a peer.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 
 use super::chacha20poly1305 as aead;
 use super::hkdf;
@@ -47,6 +49,14 @@ const EXT_SUPPORTED_GROUPS: u16 = 10;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
+const EXT_PRE_SHARED_KEY: u16 = 41;
+const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
+const PSK_DHE_KE: u8 = 1;
+
+/// How long a ticket resumes for: a day, well under the protocol's week.
+/// The server refuses one older than this by its own clock; the client
+/// stops offering one at the lifetime the ticket named.
+const TICKET_LIFETIME_SECS: u64 = 86_400;
 
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
@@ -109,6 +119,142 @@ impl Keys {
     }
 }
 
+// ------------------------------------------------------------- resumption
+
+/// What a client keeps from a server's NewSessionTicket: the opaque ticket
+/// to offer, the PSK it stands for, and when it stops being offered.
+#[derive(Clone)]
+struct Ticket {
+    ticket: Vec<u8>,
+    psk: [u8; 32],
+    /// Seconds since the epoch when the ticket arrived.
+    received: u64,
+    lifetime: u32,
+    age_add: u32,
+}
+
+/// The tickets this process holds, one per server it has spoken to, keyed
+/// by the name it verified and the address it dialled. Process-wide, so
+/// every connection `https_request` opens -- or the wire dials -- after the
+/// first resumes; replaced by each newer ticket.
+static TICKETS: Mutex<Option<HashMap<String, Ticket>>> = Mutex::new(None);
+
+fn ticket_store<T>(f: impl FnOnce(&mut HashMap<String, Ticket>) -> T) -> T {
+    let mut g = TICKETS.lock().unwrap_or_else(|p| p.into_inner());
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+/// Forget every ticket: what a test does between servers.
+pub fn forget_tickets() {
+    ticket_store(|t| t.clear());
+}
+
+/// How many tickets this process holds.
+pub fn tickets_held() -> usize {
+    ticket_store(|t| t.len())
+}
+
+/// How many handshakes this process has served that resumed from a ticket.
+static RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn resumed_handshakes() -> u64 {
+    RESUMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn now_secs() -> u64 {
+    (crate::time::now_micros() / 1_000_000) as u64
+}
+
+/// The key a server seals its tickets under, derived from its TLS key: the
+/// same on every node that serves the same certificate, so a ticket from
+/// one pod resumes at another behind the same Service, and gone with the
+/// key. Never written anywhere.
+fn ticket_key(key: &KeyPair) -> [u8; 32] {
+    hkdf::extract(b"celastro tls ticket v1", &key.seed)
+}
+
+const TICKET_AAD: &[u8] = b"celastro tls ticket v1";
+
+/// A ticket as the server hands it out: `1 | nonce(12) | ciphertext | tag`
+/// over `psk(32) | issued_at(8) | age_add(4)`. Opaque to the client.
+fn seal_ticket(
+    tkey: &[u8; 32],
+    psk: &[u8; 32],
+    issued_at: u64,
+    age_add: u32,
+) -> io::Result<Vec<u8>> {
+    let nonce: [u8; 12] =
+        random::bytes(12).map_err(|e| err(e.to_string()))?.try_into().expect("twelve bytes");
+    let mut plain = Vec::with_capacity(44);
+    plain.extend_from_slice(psk);
+    plain.extend_from_slice(&issued_at.to_be_bytes());
+    plain.extend_from_slice(&age_add.to_be_bytes());
+    let tag = aead::seal(tkey, &nonce, TICKET_AAD, &mut plain);
+    let mut out = Vec::with_capacity(1 + 12 + plain.len() + 16);
+    out.push(1);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&plain);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
+
+/// The PSK a ticket stands for, if this server sealed it and it is not
+/// older than the lifetime. `None` for anything else -- another node's
+/// key, a tampered byte, an old ticket -- and the handshake goes on in
+/// full, which is what the protocol says happens.
+fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
+    if ticket.len() != 1 + 12 + 44 + 16 || ticket[0] != 1 {
+        return None;
+    }
+    let nonce: [u8; 12] = ticket[1..13].try_into().ok()?;
+    let mut data = ticket[13..13 + 44].to_vec();
+    let tag: [u8; 16] = ticket[13 + 44..].try_into().ok()?;
+    if !aead::open(tkey, &nonce, TICKET_AAD, &mut data, &tag) {
+        return None;
+    }
+    let psk: [u8; 32] = data[..32].try_into().ok()?;
+    let issued_at = u64::from_be_bytes(data[32..40].try_into().ok()?);
+    let now = now_secs();
+    if now < issued_at.saturating_sub(60) || now > issued_at + TICKET_LIFETIME_SECS {
+        return None;
+    }
+    Some(psk)
+}
+
+/// The PSK a resumption master secret and a ticket nonce make.
+fn resumption_psk(res_master: &[u8; 32], nonce: &[u8]) -> [u8; 32] {
+    let v = expand_label(res_master, "resumption", nonce, 32);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// The binder over the truncated ClientHello: the same construction as
+/// Finished, keyed from the early secret's "res binder".
+fn psk_binder(psk: &[u8; 32], truncated_hello_hash: &[u8; 32]) -> [u8; 32] {
+    let early = hkdf::extract(&[0u8; 32], psk);
+    let binder_key = derive_secret(&early, "res binder", &sha256(&[]));
+    finished_verify(&binder_key, truncated_hello_hash)
+}
+
+/// A NewSessionTicket message's fields.
+struct NewSessionTicket {
+    lifetime: u32,
+    age_add: u32,
+    nonce: Vec<u8>,
+    ticket: Vec<u8>,
+}
+
+fn parse_new_session_ticket(body: &[u8]) -> io::Result<NewSessionTicket> {
+    let mut r = Reader::new(body);
+    let lifetime = r.u32()?;
+    let age_add = r.u32()?;
+    let nonce = r.vec8()?.to_vec();
+    let ticket = r.vec16()?.to_vec();
+    let _exts = r.vec16()?;
+    Ok(NewSessionTicket { lifetime, age_add, nonce, ticket })
+}
+
 fn finished_verify(base: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
     let fk = expand_label(base, "finished", &[], 32);
     let mut key = [0u8; 32];
@@ -147,6 +293,12 @@ pub struct TlsStream {
     /// Bytes of the socket read ahead of a record boundary.
     inbuf: Vec<u8>,
     closed: bool,
+    /// Whether the handshake resumed from a ticket.
+    resumed: bool,
+    /// A client's, after its handshake: the resumption master secret a
+    /// NewSessionTicket's PSK derives from, and the store key it goes under.
+    res_master: Option<[u8; 32]>,
+    store_key: Option<String>,
 }
 
 impl TlsStream {
@@ -174,7 +326,16 @@ impl TlsStream {
             pending_at: 0,
             inbuf: Vec::new(),
             closed: false,
+            resumed: false,
+            res_master: None,
+            store_key: None,
         }
+    }
+
+    /// Whether the handshake resumed from a ticket rather than running in
+    /// full. Meaningful once the handshake has happened.
+    pub fn resumed(&self) -> bool {
+        self.resumed
     }
 
     /// Complete the handshake if it has not been done. An error here is
@@ -355,12 +516,35 @@ impl TlsStream {
         if !hello.suites.contains(&SUITE_CHACHA) {
             return Err(err("the client does not offer TLS_CHACHA20_POLY1305_SHA256"));
         }
-        if !hello.sig_algs.contains(&SIG_ED25519) {
-            return Err(err("the client does not accept Ed25519 signatures"));
-        }
         let Some(client_share) = hello.x25519_share else {
             return Err(err("the client sent no X25519 key share; a retry is not supported"));
         };
+        // A ticket this server sealed, offered with the DHE mode and a
+        // binder that verifies, resumes: the early secret is the PSK's and
+        // the certificate flight is skipped. Anything short of that -- no
+        // offer, another node's ticket, a stale one -- is a full handshake,
+        // for which the client has to accept our signature.
+        let tkey = ticket_key(key);
+        let psk: Option<[u8; 32]> = match &hello.psk {
+            Some(offer) if hello.psk_dhe => match open_ticket(&tkey, &offer.identity) {
+                Some(psk) => {
+                    let truncated = sha256(&transcript[..4 + offer.binders_at]);
+                    if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
+                        return Err(err("the PSK binder does not verify"));
+                    }
+                    Some(psk)
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        if psk.is_none() && !hello.sig_algs.contains(&SIG_ED25519) {
+            return Err(err("the client does not accept Ed25519 signatures"));
+        }
+        self.resumed = psk.is_some();
+        if self.resumed {
+            RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let eph = random::array32().map_err(|e| err(e.to_string()))?;
         let our_share = x25519::public_key(&eph);
         let shared = x25519::x25519(&eph, &client_share);
@@ -380,6 +564,9 @@ impl TlsStream {
         ks.extend_from_slice(&32u16.to_be_bytes());
         ks.extend_from_slice(&our_share);
         extension(&mut exts, EXT_KEY_SHARE, &ks);
+        if psk.is_some() {
+            extension(&mut exts, EXT_PRE_SHARED_KEY, &0u16.to_be_bytes());
+        }
         sh.extend_from_slice(&(exts.len() as u16).to_be_bytes());
         sh.extend_from_slice(&exts);
         self.write_handshake(HS_SERVER_HELLO, &sh, &mut transcript)?;
@@ -389,7 +576,7 @@ impl TlsStream {
             self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
         }
         // Keys.
-        let early = hkdf::extract(&[0u8; 32], &[0u8; 32]);
+        let early = hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
         let empty_hash = sha256(&[]);
         let hs_secret = hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared);
         let th = sha256(&transcript);
@@ -397,26 +584,29 @@ impl TlsStream {
         let s_hs = derive_secret(&hs_secret, "s hs traffic", &th);
         self.write_keys = Some(Keys::from_secret(&s_hs));
         self.read_keys = Some(Keys::from_secret(&c_hs));
-        // EncryptedExtensions, Certificate, CertificateVerify, Finished.
+        // EncryptedExtensions, Certificate, CertificateVerify, Finished --
+        // the middle two only when the client did not resume.
         self.write_handshake(HS_ENCRYPTED_EXTENSIONS, &[0, 0], &mut transcript)?;
-        let mut cert = vec![0u8];
-        let mut list = Vec::new();
-        for c in chain_der {
-            list.extend_from_slice(&(c.len() as u32).to_be_bytes()[1..]);
-            list.extend_from_slice(c);
-            list.extend_from_slice(&[0, 0]);
+        if psk.is_none() {
+            let mut cert = vec![0u8];
+            let mut list = Vec::new();
+            for c in chain_der {
+                list.extend_from_slice(&(c.len() as u32).to_be_bytes()[1..]);
+                list.extend_from_slice(c);
+                list.extend_from_slice(&[0, 0]);
+            }
+            cert.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
+            cert.extend_from_slice(&list);
+            self.write_handshake(HS_CERTIFICATE, &cert, &mut transcript)?;
+            let th = sha256(&transcript);
+            let content = verify_content(true, &th);
+            let sig = ed25519::sign(&key.seed, &content);
+            let mut cv = Vec::new();
+            cv.extend_from_slice(&SIG_ED25519.to_be_bytes());
+            cv.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+            cv.extend_from_slice(&sig);
+            self.write_handshake(HS_CERTIFICATE_VERIFY, &cv, &mut transcript)?;
         }
-        cert.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
-        cert.extend_from_slice(&list);
-        self.write_handshake(HS_CERTIFICATE, &cert, &mut transcript)?;
-        let th = sha256(&transcript);
-        let content = verify_content(true, &th);
-        let sig = ed25519::sign(&key.seed, &content);
-        let mut cv = Vec::new();
-        cv.extend_from_slice(&SIG_ED25519.to_be_bytes());
-        cv.extend_from_slice(&(sig.len() as u16).to_be_bytes());
-        cv.extend_from_slice(&sig);
-        self.write_handshake(HS_CERTIFICATE_VERIFY, &cv, &mut transcript)?;
         let th = sha256(&transcript);
         let fin = finished_verify(&s_hs, &th);
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
@@ -436,6 +626,27 @@ impl TlsStream {
         }
         self.write_keys = Some(Keys::from_secret(&s_ap));
         self.read_keys = Some(Keys::from_secret(&c_ap));
+        // A ticket for next time, under the application keys: the PSK it
+        // stands for derives from this handshake's resumption master
+        // secret, so a resumed connection hands out a fresh ticket too.
+        let th_client_fin = sha256(&transcript);
+        let res_master = derive_secret(&master, "res master", &th_client_fin);
+        let nonce = [0u8];
+        let psk_next = resumption_psk(&res_master, &nonce);
+        let age_add = u32::from_be_bytes(
+            random::bytes(4).map_err(|e| err(e.to_string()))?.try_into().expect("four bytes"),
+        );
+        let ticket = seal_ticket(&tkey, &psk_next, now_secs(), age_add)?;
+        let mut nst = Vec::with_capacity(ticket.len() + 16);
+        nst.extend_from_slice(&(TICKET_LIFETIME_SECS as u32).to_be_bytes());
+        nst.extend_from_slice(&age_add.to_be_bytes());
+        nst.push(nonce.len() as u8);
+        nst.extend_from_slice(&nonce);
+        nst.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+        nst.extend_from_slice(&ticket);
+        nst.extend_from_slice(&[0, 0]);
+        let mut post = Vec::new();
+        self.write_handshake(HS_NEW_SESSION_TICKET, &nst, &mut post)?;
         Ok(())
     }
 
@@ -444,6 +655,23 @@ impl TlsStream {
     fn client_handshake(&mut self, anchors: &[Certificate], host: &str) -> io::Result<()> {
         let mut transcript = Vec::new();
         let mut hs_buf = Vec::new();
+        // The ticket for this server, if one is held and still young. Keyed
+        // by the name, the address and the anchors: a ticket resumes the
+        // trust it was issued under, and a connection that trusts another
+        // CA sees a certificate.
+        let mut anchor_bytes = Vec::new();
+        for a in anchors {
+            anchor_bytes.extend_from_slice(&a.der);
+        }
+        let store_key = format!(
+            "{host}|{}|{}",
+            self.sock.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+            super::hex(&sha256(&anchor_bytes)[..8])
+        );
+        let now = now_secs();
+        let ticket: Option<Ticket> = ticket_store(|t| t.get(&store_key).cloned())
+            .filter(|t| now < t.received + t.lifetime.min(TICKET_LIFETIME_SECS as u32) as u64);
+        self.store_key = Some(store_key);
         let eph = random::array32().map_err(|e| err(e.to_string()))?;
         let our_share = x25519::public_key(&eph);
         let client_random = random::array32().map_err(|e| err(e.to_string()))?;
@@ -490,14 +718,50 @@ impl TlsStream {
         ks.extend_from_slice(&(entry.len() as u16).to_be_bytes());
         ks.extend_from_slice(&entry);
         extension(&mut exts, EXT_KEY_SHARE, &ks);
+        if let Some(t) = &ticket {
+            // PSK with (EC)DHE only -- the key share above stays -- and the
+            // offer last, its binder computed over everything before it.
+            extension(&mut exts, EXT_PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
+            let age_ms = (now - t.received).saturating_mul(1000) as u32;
+            let obfuscated = age_ms.wrapping_add(t.age_add);
+            let mut psk = Vec::new();
+            let mut identities = Vec::new();
+            identities.extend_from_slice(&(t.ticket.len() as u16).to_be_bytes());
+            identities.extend_from_slice(&t.ticket);
+            identities.extend_from_slice(&obfuscated.to_be_bytes());
+            psk.extend_from_slice(&(identities.len() as u16).to_be_bytes());
+            psk.extend_from_slice(&identities);
+            psk.extend_from_slice(&33u16.to_be_bytes());
+            psk.push(32);
+            psk.extend_from_slice(&[0u8; 32]);
+            extension(&mut exts, EXT_PRE_SHARED_KEY, &psk);
+        }
         ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
         ch.extend_from_slice(&exts);
+        if let Some(t) = &ticket {
+            // The binder: over the message with its header, cut where the
+            // binders list begins, then written into place.
+            let cut = ch.len() - 35;
+            let mut prefix = Vec::with_capacity(4 + cut);
+            prefix.push(HS_CLIENT_HELLO);
+            prefix.extend_from_slice(&(ch.len() as u32).to_be_bytes()[1..]);
+            prefix.extend_from_slice(&ch[..cut]);
+            let binder = psk_binder(&t.psk, &sha256(&prefix));
+            let at = ch.len() - 32;
+            ch[at..].copy_from_slice(&binder);
+        }
         self.write_handshake(HS_CLIENT_HELLO, &ch, &mut transcript)?;
         let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         if ty != HS_SERVER_HELLO {
             return Err(err("expected a ServerHello"));
         }
         let sh = parse_server_hello(&body)?;
+        let psk: Option<[u8; 32]> = match (sh.selected_psk, &ticket) {
+            (Some(0), Some(t)) => Some(t.psk),
+            (Some(_), _) => return Err(err("the server selected a PSK that was not offered")),
+            (None, _) => None,
+        };
+        self.resumed = psk.is_some();
         if sh.version != Some(VERSION_13) {
             return Err(err("the server did not select TLS 1.3"));
         }
@@ -508,7 +772,7 @@ impl TlsStream {
             return Err(err("the server sent no X25519 key share"));
         };
         let shared = x25519::x25519(&eph, &server_share);
-        let early = hkdf::extract(&[0u8; 32], &[0u8; 32]);
+        let early = hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
         let empty_hash = sha256(&[]);
         let hs_secret = hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared);
         let th = sha256(&transcript);
@@ -523,8 +787,20 @@ impl TlsStream {
         // A server that accepts client certificates asks for one here; a
         // Kubernetes API server always does. The answer is an empty
         // Certificate carrying its context, sent before our Finished.
+        let th_before_next = sha256(&transcript);
         let (mut ty, mut body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         let mut request_context: Option<Vec<u8>> = None;
+        if psk.is_some() {
+            // Resumed: the server is authenticated by the PSK, and its
+            // flight goes straight to Finished.
+            if ty != HS_FINISHED {
+                return Err(err("expected the server's Finished"));
+            }
+            if !super::ct_eq(&finished_verify(&s_hs, &th_before_next), &body) {
+                return Err(err("the server's Finished does not verify"));
+            }
+            return self.client_finish(&transcript, &hs_secret, &c_hs, None);
+        }
         if ty == HS_CERTIFICATE_REQUEST {
             let n = *body.first().ok_or_else(|| err("a malformed CertificateRequest"))? as usize;
             if body.len() < 1 + n {
@@ -583,8 +859,24 @@ impl TlsStream {
         if !super::ct_eq(&finished_verify(&s_hs, &th_before_fin), &body) {
             return Err(err("the server's Finished does not verify"));
         }
+        self.client_finish(&transcript, &hs_secret, &c_hs, request_context)
+    }
+
+    /// The client's last flight, after the server's Finished was verified:
+    /// the application keys from the transcript so far, an empty
+    /// Certificate if one was asked for, our Finished, and the resumption
+    /// master secret kept for the ticket the server sends next.
+    fn client_finish(
+        &mut self,
+        transcript: &[u8],
+        hs_secret: &[u8; 32],
+        c_hs: &[u8; 32],
+        request_context: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        let mut transcript = transcript.to_vec();
+        let empty_hash = sha256(&[]);
         let th_server_fin = sha256(&transcript);
-        let master = hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32]);
+        let master = hkdf::extract(&derive_secret(hs_secret, "derived", &empty_hash), &[0u8; 32]);
         let c_ap = derive_secret(&master, "c ap traffic", &th_server_fin);
         let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
         // Middlebox compatibility: a CCS before our first encrypted record.
@@ -598,10 +890,36 @@ impl TlsStream {
         // Our Finished covers our (empty) Certificate too; the application
         // keys above do not, by the RFC's key schedule.
         let th_client_fin = sha256(&transcript);
-        let fin = finished_verify(&c_hs, &th_client_fin);
+        let fin = finished_verify(c_hs, &th_client_fin);
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         self.read_keys = Some(Keys::from_secret(&s_ap));
         self.write_keys = Some(Keys::from_secret(&c_ap));
+        let th_client_fin = sha256(&transcript);
+        self.res_master = Some(derive_secret(&master, "res master", &th_client_fin));
+        Ok(())
+    }
+
+    /// A NewSessionTicket after the handshake: the PSK it stands for is
+    /// derived and kept under this server's key, replacing an older one.
+    fn take_ticket(&mut self, body: &[u8]) -> io::Result<()> {
+        let (Some(res_master), Some(key)) = (&self.res_master, &self.store_key) else {
+            return Ok(());
+        };
+        let t = parse_new_session_ticket(body)?;
+        if t.ticket.is_empty() || t.lifetime == 0 {
+            return Ok(());
+        }
+        let ticket = Ticket {
+            psk: resumption_psk(res_master, &t.nonce),
+            ticket: t.ticket,
+            received: now_secs(),
+            lifetime: t.lifetime,
+            age_add: t.age_add,
+        };
+        let key = key.clone();
+        ticket_store(|s| {
+            s.insert(key, ticket);
+        });
         Ok(())
     }
 }
@@ -674,6 +992,9 @@ impl<'a> Reader<'a> {
     fn u16(&mut self) -> io::Result<u16> {
         Ok(((self.u8()? as u16) << 8) | self.u8()? as u16)
     }
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(((self.u16()? as u32) << 16) | self.u16()? as u32)
+    }
     fn bytes(&mut self, n: usize) -> io::Result<&'a [u8]> {
         let s = self.b.get(self.i..self.i + n).ok_or_else(|| err("a truncated message"))?;
         self.i += n;
@@ -698,6 +1019,18 @@ struct ClientHello {
     versions: Vec<u16>,
     sig_algs: Vec<u16>,
     x25519_share: Option<[u8; 32]>,
+    /// The first identity of a pre_shared_key offer, if the extension was
+    /// the last one as the protocol requires.
+    psk: Option<PskOffer>,
+    psk_dhe: bool,
+}
+
+struct PskOffer {
+    identity: Vec<u8>,
+    binder: Vec<u8>,
+    /// Where in the ClientHello body the binders list begins: the
+    /// transcript the binder covers ends there.
+    binders_at: usize,
 }
 
 fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
@@ -712,14 +1045,33 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let mut versions = Vec::new();
     let mut sig_algs = Vec::new();
     let mut x25519_share = None;
+    let mut psk = None;
+    let mut psk_dhe = false;
     if !r.done() {
         let exts = r.vec16()?;
         let mut e = Reader::new(exts);
         while !e.done() {
             let ty = e.u16()?;
             let data = e.vec16()?;
+            let last = e.done();
             let mut d = Reader::new(data);
             match ty {
+                EXT_PSK_KEY_EXCHANGE_MODES => {
+                    psk_dhe = d.vec8()?.contains(&PSK_DHE_KE);
+                }
+                EXT_PRE_SHARED_KEY if last => {
+                    let identities = d.vec16()?;
+                    let mut i = Reader::new(identities);
+                    let identity = i.vec16()?.to_vec();
+                    let _obfuscated_age = i.u32()?;
+                    let binders = d.vec16()?;
+                    let mut b = Reader::new(binders);
+                    let binder = b.vec8()?.to_vec();
+                    // The binders list is the tail of the body: its u16
+                    // length and its bytes.
+                    let binders_at = body.len() - 2 - binders.len();
+                    psk = Some(PskOffer { identity, binder, binders_at });
+                }
                 EXT_SUPPORTED_VERSIONS => {
                     let list = d.vec8()?;
                     versions =
@@ -747,13 +1099,14 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
             }
         }
     }
-    Ok(ClientHello { session_id, suites, versions, sig_algs, x25519_share })
+    Ok(ClientHello { session_id, suites, versions, sig_algs, x25519_share, psk, psk_dhe })
 }
 
 struct ServerHello {
     suite: u16,
     version: Option<u16>,
     x25519_share: Option<[u8; 32]>,
+    selected_psk: Option<u16>,
 }
 
 fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
@@ -770,6 +1123,7 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
     let _compression = r.u8()?;
     let mut version = None;
     let mut x25519_share = None;
+    let mut selected_psk = None;
     if !r.done() {
         let exts = r.vec16()?;
         let mut e = Reader::new(exts);
@@ -779,6 +1133,7 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
             let mut d = Reader::new(data);
             match ty {
                 EXT_SUPPORTED_VERSIONS => version = Some(d.u16()?),
+                EXT_PRE_SHARED_KEY => selected_psk = Some(d.u16()?),
                 EXT_KEY_SHARE => {
                     let group = d.u16()?;
                     let share = d.vec16()?;
@@ -792,7 +1147,7 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
             }
         }
     }
-    Ok(ServerHello { suite, version, x25519_share })
+    Ok(ServerHello { suite, version, x25519_share, selected_psk })
 }
 
 fn parse_certificate_message(body: &[u8]) -> io::Result<Vec<Certificate>> {
@@ -850,13 +1205,24 @@ impl Read for TlsStream {
                     return Err(alert_error(&body));
                 }
                 CT_HANDSHAKE => {
-                    // A ticket is ignored; a key update is not supported.
-                    match body.first() {
-                        Some(&HS_NEW_SESSION_TICKET) => {}
-                        Some(&HS_KEY_UPDATE) => {
-                            return Err(err("a key update, which this build does not support"))
+                    // Post-handshake messages, possibly several to a record:
+                    // a ticket is kept, a key update is not supported.
+                    let mut i = 0;
+                    while i + 4 <= body.len() {
+                        let len = ((body[i + 1] as usize) << 16)
+                            | ((body[i + 2] as usize) << 8)
+                            | body[i + 3] as usize;
+                        let Some(msg) = body.get(i + 4..i + 4 + len) else {
+                            return Err(err("a torn post-handshake message"));
+                        };
+                        match body[i] {
+                            HS_NEW_SESSION_TICKET => self.take_ticket(msg)?,
+                            HS_KEY_UPDATE => {
+                                return Err(err("a key update, which this build does not support"))
+                            }
+                            _ => return Err(err("an unexpected handshake message")),
                         }
-                        _ => return Err(err("an unexpected handshake message")),
+                        i += 4 + len;
                     }
                 }
                 _ => return Err(err("an unexpected record")),
@@ -948,6 +1314,163 @@ mod tests {
     /// Our client to our server over loopback: the handshake completes,
     /// bytes round-trip both ways, a close_notify ends the read side, and a
     /// client that trusts another CA is refused with a certificate error.
+    /// RFC 8448 sections 3 and 4: the resumption master secret, the PSK a
+    /// ticket nonce makes of it, the early secret, the binder key, and the
+    /// binder over the truncated ClientHello -- the cut included, since the
+    /// 477 octets the RFC hashes are embedded and hashed here.
+    #[test]
+    fn the_resumption_secrets_and_the_psk_binder_match_rfc_8448() {
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        let arr = |s: &str| -> [u8; 32] { unhex(s).try_into().unwrap() };
+        let master = arr("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+        let th_client_fin = arr("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
+        let res_master = derive_secret(&master, "res master", &th_client_fin);
+        assert_eq!(
+            crate::crypto::hex(&res_master),
+            "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"
+        );
+        let psk = resumption_psk(&res_master, &[0, 0]);
+        assert_eq!(
+            crate::crypto::hex(&psk),
+            "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"
+        );
+        let early = hkdf::extract(&[0u8; 32], &psk);
+        assert_eq!(
+            crate::crypto::hex(&early),
+            "9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"
+        );
+        let binder_key = derive_secret(&early, "res binder", &sha256(&[]));
+        assert_eq!(
+            crate::crypto::hex(&binder_key),
+            "69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256"
+        );
+        let prefix = unhex("010001fc03031bc3ceb6bbe39cff938355b5a50adb6db21b7a6af649d7b4bc419d7876487d95000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00140012001d00170018001901000101010201030104003300260024001d0020e4ffb68ac05f8d96c99da26698346c6be16482badddafe051a66b4f18d668f0b002a0000002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c0002400100150057000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002900dd00b800b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafcd0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e5bfbc388e93343694093934ae4d357fad6aacb");
+        assert_eq!(prefix.len(), 477);
+        let hash = sha256(&prefix);
+        assert_eq!(
+            crate::crypto::hex(&hash),
+            "63224b2e4573f2d3454ca84b9d009a04f6be9e05711a8396473aefa01e924a14"
+        );
+        assert_eq!(
+            crate::crypto::hex(&psk_binder(&psk, &hash)),
+            "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
+        );
+        // The message parses as this build's server reads it: the offer is
+        // the last extension, the identity is the RFC's ticket, and the
+        // binder list begins where the RFC's prefix ends.
+        let mut full = prefix.clone();
+        full.extend_from_slice(&[0, 0x21, 0x20]);
+        full.extend_from_slice(&unhex(
+            "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d",
+        ));
+        let hello = parse_client_hello(&full[4..]).unwrap();
+        let offer = hello.psk.expect("an offer");
+        assert!(hello.psk_dhe);
+        assert_eq!(offer.binders_at + 4, prefix.len());
+        assert_eq!(offer.identity.len(), 0xb2);
+        assert_eq!(&offer.identity[..4], &[0x2c, 0x03, 0x5d, 0x82]);
+        assert_eq!(
+            crate::crypto::hex(&offer.binder),
+            "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
+        );
+    }
+
+    /// Two connections to one server: the first in full and it hands out a
+    /// ticket, the second resumes on both sides and hands out another; a
+    /// server under another key cannot open the ticket and the handshake
+    /// runs in full; a ticket tampered with in the store does the same; an
+    /// old one is not offered at all.
+    #[test]
+    fn a_second_connection_resumes_and_a_ticket_the_server_cannot_open_falls_back() {
+        forget_tickets();
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        // An echo server that reports, per connection, whether it resumed.
+        let start = |chain_der: Vec<Vec<u8>>, key: KeyPair, n: usize| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let h = std::thread::spawn(move || {
+                let mut resumed = Vec::new();
+                for _ in 0..n {
+                    let (sock, _) = listener.accept().unwrap();
+                    let mut s =
+                        TlsStream::server(sock, ServerSide { chain_der: &chain_der, key: &key });
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).unwrap();
+                    s.write_all(&buf).unwrap();
+                    s.close_notify().unwrap();
+                    resumed.push(s.resumed());
+                }
+                resumed
+            });
+            (addr, h)
+        };
+        let talk = |addr: std::net::SocketAddr, anchor: &Certificate, host: &str| -> bool {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut c =
+                TlsStream::client(sock, ClientSide { anchors: std::slice::from_ref(anchor), host });
+            c.write_all(b"hello").unwrap();
+            c.close_notify().unwrap();
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"hello");
+            c.resumed()
+        };
+        let (addr, server) = start(chain_der.clone(), key.clone(), 3);
+        assert!(!talk(addr, &anchor, "127.0.0.1"), "the first handshake is full");
+        assert_eq!(tickets_held(), 1, "and it left a ticket");
+        assert!(talk(addr, &anchor, "127.0.0.1"), "the second resumes");
+        assert!(talk(addr, &anchor, "127.0.0.1"), "and so does the third, on the new ticket");
+        assert_eq!(server.join().unwrap(), vec![false, true, true]);
+
+        // The same certificate served under another key: its ticket key
+        // differs, the offered ticket does not open, the handshake is full.
+        let other = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let other_chain = pem::decode_all(&other.cert, "CERTIFICATE").unwrap();
+        let other_key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&other.key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+        let other_anchor =
+            x509::parse(&pem::decode_all(&other.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        // Make the client hold a ticket under the new server's store key by
+        // moving the one it has.
+        let (addr2, server2) = start(other_chain, other_key, 2);
+        let tag = |a: &Certificate| crate::crypto::hex(&sha256(&a.der)[..8]);
+        let key1 = format!("127.0.0.1|{addr}|{}", tag(&anchor));
+        let key2 = format!("127.0.0.1|{addr2}|{}", tag(&other_anchor));
+        ticket_store(|t| {
+            let ticket = t.remove(&key1).expect("a ticket from the first server");
+            t.insert(key2.clone(), ticket);
+        });
+        assert!(!talk(addr2, &other_anchor, "127.0.0.1"), "another key: full, not refused");
+        // Tampered: a byte of the ticket flipped. The server cannot open it
+        // and runs in full; nothing is refused.
+        ticket_store(|t| {
+            let ticket = t.get_mut(&key2).expect("the new server's ticket");
+            ticket.ticket[20] ^= 0x55;
+        });
+        assert!(!talk(addr2, &other_anchor, "127.0.0.1"), "tampered: full, not refused");
+        assert_eq!(server2.join().unwrap(), vec![false, false]);
+        // Old: not offered.
+        ticket_store(|t| {
+            let ticket = t.get_mut(&key2).expect("a ticket");
+            ticket.received -= TICKET_LIFETIME_SECS + 10;
+        });
+        let (addr3, server3) = start(chain_der, key, 1);
+        ticket_store(|t| {
+            let ticket = t.remove(&key2).unwrap();
+            t.insert(format!("127.0.0.1|{addr3}|{}", tag(&anchor)), ticket);
+        });
+        assert!(!talk(addr3, &anchor, "127.0.0.1"));
+        assert_eq!(server3.join().unwrap(), vec![false]);
+        forget_tickets();
+    }
+
     #[test]
     fn a_client_and_a_server_of_this_crate_talk_and_a_wrong_anchor_is_refused() {
         let m = x509::make(

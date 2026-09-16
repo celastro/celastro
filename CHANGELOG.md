@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.40.0 — 2026-09-16
+
+TLS session resumption, hence a minor. Nothing changes for a plain
+console, and a client of an earlier version speaks to this one as before.
+
+**Session tickets.** After every TLS handshake the server sends a
+NewSessionTicket, and a client that connects again within a day offers it
+and skips the certificate flight: one round trip and no signature on
+either side. The ticket is the PSK, its issue time and its age mask,
+sealed under a key HKDF derives from the node's TLS private key, so every
+node serving the same certificate -- a chart release's pods behind their
+Service -- opens every other's tickets, and a restart changes nothing. PSK
+with (EC)DHE only; the client keeps one ticket per name, address and set
+of trust anchors, in process, so `celastro-cli --url`'s session, the
+wire's dials and a browser's requests all resume; a ticket the server
+cannot open is a full handshake, a binder that does not verify a refusal.
+Pinned to RFC 8448's resumed trace (the resumption master secret, the
+PSK, the early and binder secrets, and the binder over the 477 octets of
+the truncated ClientHello), and checked against OpenSSL 3.0's `s_client`
+(`Reused, TLSv1.3`) and curl 8.5 on the second of two requests.
+`tls::resumed_handshakes()` counts them.
+
+**A Deployment section in the README**: one process, a container, VMs
+and Kubernetes side by side, with what each holds and how clients reach
+it.
+
 ## 0.39.0 — 2026-09-16
 
 The command line is a client, hence a minor.

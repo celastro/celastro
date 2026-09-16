@@ -80,6 +80,18 @@ fn the_console_serves_tls_and_answers_only_a_client_that_verifies_it() {
     // The probe a container runs is the same client.
     assert!(celastro::serve::probe_health(port, Some(&tls)).unwrap());
 
+    // A connection after the first resumes on the ticket the first brought
+    // back: one round trip, no certificate, and the server counts it.
+    let before = tls::resumed_handshakes();
+    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut s = tls::connect(Some(&tls), sock, "localhost").unwrap();
+    s.write_all(request("/api/health").as_bytes()).unwrap();
+    let mut again = String::new();
+    s.read_to_string(&mut again).unwrap();
+    assert!(again.starts_with("HTTP/1.1 200 "), "{again}");
+    assert_eq!(tls::resumed_handshakes(), before + 1, "the handshake resumed");
+
     // With the CA but the wrong name: refused by the client before a byte
     // of HTTP is sent.
     let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();

@@ -135,6 +135,27 @@ local or remote (below); `--json` makes every command's output
 machine-readable, failures included. Statements end with `;` or a
 blank line. Exit codes: 0, 1 a runtime or SQL error, 2 a usage error.
 
+## Deployment
+
+One binary, one shape of data directory, four ways to run it. Every node
+serves a console any client can reach and, in a cluster, its shards to the
+other nodes; the sections that follow have each option's details.
+
+| option | how | data | clients | notes |
+|---|---|---|---|---|
+| **one process** | `celastro-cli --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:0.40.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
+| **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
+
+What is optional in every shape: TLS on the console and the wire
+(`CELASTRO_TLS_*`), encryption at rest (`CELASTRO_MASTER_KEY_FILE`), an
+S3-compatible store or a shared mount behind the `archived` tier and the
+backups (`CELASTRO_ARCHIVE_*`, `CELASTRO_BACKUP_DIR`), and the tunables in
+[docs/tuning.md](docs/tuning.md). What is not: one process per data
+directory (`LOCK`), one holder per shard, and every write on disk before it
+is acknowledged.
+
 ## The console
 
 `celastro-cli --dir ./data serve` prints a URL with a token on stdout and
@@ -157,7 +178,8 @@ lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 ## Encryption
 
 In transit: `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
-(PEM) put the console and the wire on TLS 1.3; `celastro-cli tls init
+(PEM) put the console and the wire on TLS 1.3, with session tickets so a
+client's next connection skips the certificate; `celastro-cli tls init
 ./tls <name>` makes a set, and the chart's `tls.enabled` does it for you.
 At rest: `celastro-cli key master ./master.key`, then
 `CELASTRO_MASTER_KEY_FILE=./master.key` on every start, encrypts every file
@@ -246,8 +268,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.39.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.39.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.40.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.40.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

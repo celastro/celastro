@@ -1104,9 +1104,16 @@ are never written anywhere.
 SHA-512, HKDF, ChaCha20-Poly1305, the 25519 field, X25519, Ed25519, DER,
 PEM and X.509, and `crypto::tls13` the record layer and both sides of the
 handshake: TLS 1.3 only, one suite, one group, Ed25519 for the node's
-own signature, server authentication only, no resumption, 0-RTT, client
-certificates, HelloRetryRequest or key update. A stock client speaks that
-subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
+own signature, server authentication only, session resumption by PSK
+ticket with (EC)DHE (0.40.0: the ticket is `psk | issued | age_add`
+sealed under HKDF of the node's private key, so every node behind one
+certificate opens every other's tickets and a restart changes nothing;
+the client keeps one ticket per name, address and anchor set for a day;
+the binder is pinned to RFC 8448's resumed trace, the truncation of the
+ClientHello included; a ticket that does not open is a full handshake, a
+binder that does not verify is a refusal; the server never accepts a PSK
+without a key share), but no 0-RTT, client certificates,
+HelloRetryRequest or key update. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
 is wider than signing: chains and CertificateVerify from RSA (PKCS#1 v1.5
 and PSS, SHA-256) and ECDSA P-256 are accepted (0.29.0; `bignum`, `rsa`,
 `p256`, public-key operations only, so no timing concern), which is what

@@ -223,6 +223,14 @@ pub fn https_request(
     parse_response(&raw)
 }
 
+/// How many TLS handshakes this process has served that resumed from a
+/// session ticket rather than running in full. A client that connects
+/// again within a day -- `celastro-cli --url`, a browser, a node dialling
+/// a peer -- resumes; the count says it did.
+pub fn resumed_handshakes() -> u64 {
+    crate::crypto::tls13::resumed_handshakes()
+}
+
 /// The same request in the clear, for a console that serves plain HTTP.
 pub fn http_request(
     addr: &str,
