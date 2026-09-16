@@ -6,6 +6,27 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.38.0 — 2026-09-16
+
+Aggregates, hence a minor.
+
+**`count(*)`, `count(path)`, `sum`, `min`, `max`, `avg` and `GROUP BY
+path`.** One row, or one per group, over every row the predicate admits
+-- a text match or a distance threshold in `WHERE` included. Each shard
+folds its own rows into partials (an ungrouped `count(*)` never decodes
+a document) and the coordinator merges them, so a count over a cluster
+moves numbers, not rows. `ORDER BY`, `LIMIT` and `OFFSET` apply to the
+groups by the result's fields (an alias, or the call as written:
+`count(*)`, `sum(n)`); without `LIMIT` every group is returned. Nulls
+and absent paths are skipped by everything but `count(*)`; `sum` and
+`avg` refuse a non-number, `min` and `max` a group of mixed kinds; a
+bare path beside an aggregate is refused at parse time unless it is the
+`GROUP BY` path; a ranked `ORDER BY`, `COLLAPSE BY` and `AFTER` are
+refused. A node holding a shard folds the statement it is sent, so a
+cluster with a node older than this version answers a count with a
+refusal naming the shard rather than a wrong number. `Projection::Aggregate`,
+`AggFunc` and `Select::group_by` in the AST.
+
 ## 0.37.0 — 2026-09-16
 
 Encryption at rest, hence a minor. Nothing changes for a database opened

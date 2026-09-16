@@ -137,6 +137,61 @@ const QUERIES: &[&str] = &[
      'linear') LIMIT 8",
 ];
 
+/// An aggregate over shards on three nodes is the aggregate over the rows:
+/// each holder folds its own, the coordinator merges the partials, and
+/// every node answers what one process answers.
+#[test]
+fn an_aggregate_over_three_nodes_answers_what_one_process_answers() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("agg-a");
+    let b = Node::start("agg-b");
+    let c = Node::start("agg-c");
+    let one_dir = dir("agg-one");
+    let mut one = Db::open(&one_dir, DbOpts::default()).unwrap();
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    for sql in [CREATE, INDEXES[0]] {
+        a.ack(sql);
+        one.execute(sql).unwrap();
+    }
+    for i in 0..90usize {
+        if i == 60 {
+            a.ack("FLUSH items");
+            one.execute("FLUSH items").unwrap();
+        }
+        [&a, &b, &c][i % 3].db.write().unwrap().insert("items", doc(i)).unwrap();
+        one.insert("items", doc(i)).unwrap();
+    }
+    assert!(b.db.write().unwrap().delete_key("items", "t1\u{1}doc-031").unwrap());
+    assert!(one.delete_key("items", "t1\u{1}doc-031").unwrap());
+    let rows = |r: &QueryResult| -> Vec<(String, String)> {
+        r.rows.iter().map(|row| (row.key.clone(), celastro::json::to_string(&row.doc))).collect()
+    };
+    for q in [
+        "SELECT count(*) FROM items",
+        "SELECT count(*), sum(n), min(n), max(n), avg(n) FROM items WHERE n >= 10",
+        "SELECT tenant, count(*) AS c, sum(n) AS s FROM items GROUP BY tenant ORDER BY s DESC",
+        "SELECT count(*) FROM items WHERE text_match(body, 'graph')",
+        "SELECT tenant, count(*) FROM items WHERE tenant = 't2' GROUP BY tenant",
+    ] {
+        let want = rows(&one.query(q).unwrap());
+        assert!(!want.is_empty(), "{q}");
+        for n in [&a, &b, &c] {
+            assert_eq!(rows(&n.query(q).unwrap()), want, "{q} on {}", n.url);
+        }
+    }
+    let r = a.query("SELECT count(*) FROM items").unwrap();
+    assert_eq!(rows(&r), vec![(String::new(), r#"{"count(*)":89}"#.to_string())]);
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&one_dir);
+}
+
 /// The whole of M1's exit criterion: a collection spread one shard per
 /// node, written through any node, answers on every node exactly what the
 /// same corpus answers in one process -- bit for bit, through a real

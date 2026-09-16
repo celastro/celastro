@@ -746,6 +746,16 @@ impl<'a> Parser<'a> {
             } else if self.is_kw("distance") {
                 self.i += 1;
                 projections.push(Projection::Distance);
+            } else if let Some(func) = self.aggregate_call() {
+                self.i += 2;
+                let path = if func == AggFunc::Count && self.eat_punct("*") {
+                    None
+                } else {
+                    Some(self.path()?)
+                };
+                self.expect_punct(")")?;
+                let alias = if self.eat_kw("AS") { Some(self.ident()?) } else { None };
+                projections.push(Projection::Aggregate { func, path, alias });
             } else {
                 let path = self.path()?;
                 let alias = if self.eat_kw("AS") { Some(self.ident()?) } else { None };
@@ -758,6 +768,39 @@ impl<'a> Parser<'a> {
         self.expect_kw("FROM")?;
         let collection = self.ident()?;
         let predicate = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+        let group_by = if self.eat_kw("GROUP") {
+            self.expect_kw("BY")?;
+            Some(self.path()?)
+        } else {
+            None
+        };
+        // An aggregate list is all aggregates, plus the grouped path if there
+        // is one: a bare path beside a `count(*)` has no row to be read
+        // from, and saying so here names the path.
+        if projections.iter().any(|p| matches!(p, Projection::Aggregate { .. }))
+            || group_by.is_some()
+        {
+            for p in &projections {
+                match p {
+                    Projection::Aggregate { .. } => {}
+                    Projection::Path { path, .. } if group_by.as_deref() == Some(path.as_str()) => {
+                    }
+                    Projection::Path { path, .. } => {
+                        return Err(Error::Sql(format!(
+                            "`{path}` is neither aggregated nor the GROUP BY path"
+                        )))
+                    }
+                    Projection::All => {
+                        return Err(Error::Sql("`*` cannot be listed beside an aggregate".into()))
+                    }
+                    Projection::Score | Projection::Distance => {
+                        return Err(Error::Sql(
+                            "score and distance are per row; an aggregate has none".into(),
+                        ))
+                    }
+                }
+            }
+        }
 
         let mut order = None;
         if self.eat_kw("ORDER") {
@@ -821,8 +864,16 @@ impl<'a> Parser<'a> {
             offset,
             cursor,
             collapse,
+            group_by,
             with,
         })
+    }
+
+    /// `count(`, `sum(`, ... at the cursor: the function, without consuming.
+    fn aggregate_call(&self) -> Option<AggFunc> {
+        let Tok::Ident(s) = self.peek() else { return None };
+        let func = AggFunc::parse(s)?;
+        matches!(self.t.get(self.i + 1), Some(Tok::Punct(p)) if *p == "(").then_some(func)
     }
 
     fn with_opts(&mut self) -> Result<WithOpts> {
@@ -1500,6 +1551,31 @@ mod tests {
             Statement::Select(s) => *s,
             other => panic!("expected SELECT, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn aggregates_parse_with_their_names_and_the_group_by_path() {
+        let s =
+            sel("SELECT tenant, count(*), sum(doc.n) AS total, Avg(w) FROM t GROUP BY tenant", &[]);
+        assert_eq!(s.group_by.as_deref(), Some("tenant"));
+        assert!(s.aggregates());
+        let names: Vec<String> = s.projections.iter().filter_map(|p| p.aggregate_name()).collect();
+        assert_eq!(names, vec!["count(*)", "total", "avg(w)"]);
+        assert!(matches!(
+            &s.projections[1],
+            Projection::Aggregate { func: AggFunc::Count, path: None, alias: None }
+        ));
+        // A path that happens to be named like a function is a path.
+        let s = sel("SELECT count FROM t", &[]);
+        assert!(matches!(&s.projections[0], Projection::Path { path, .. } if path == "count"));
+        assert!(!s.aggregates());
+        // Refused at parse time, naming the path.
+        let e = parse("SELECT tenant, n, count(*) FROM t GROUP BY tenant", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`n` is neither aggregated"), "{e}");
+        let e = parse("SELECT sum(*) FROM t", &[]).unwrap_err().to_string();
+        assert!(e.contains("identifier"), "{e}");
     }
 
     #[test]

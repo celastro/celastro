@@ -553,6 +553,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         ex.notes.push("no partition-key equality: the query fans out to every shard".to_string());
     }
 
+    // --- Aggregates: every shard folds its matching rows into one partial
+    // per group, the coordinator merges the partials. No candidate
+    // generation, no fetch.
+    if sel.aggregates() {
+        return aggregate_select(&input, &prefix, t0, ex);
+    }
+
     // Resolve the ORDER BY into candidate-generating sources.
     let SourcePlanning { sources, method, weights, rrf_c, k_prime } =
         plan_sources(input.coll, sel, k)?;
@@ -847,6 +854,488 @@ fn project(projections: &[Projection], rows: &mut [Row]) {
         }
         row.doc = Value::obj(fields);
     }
+}
+
+/// The coordinator's half of an aggregate statement. Each shard answers a
+/// scan whose hits are one per group -- the group's value as the sort key,
+/// its JSON as the row key, the partial accumulators as the document (see
+/// [`aggregate_on`]) -- and the partials of one group from every shard
+/// merge into the group's row. `ORDER BY` names output fields (an alias,
+/// or the call as written), `LIMIT` and `OFFSET` count groups; without a
+/// `LIMIT` every group is returned, because the groups are the answer and
+/// there is no page to stop at.
+fn aggregate_select(
+    input: &ExecInput<'_>,
+    prefix: &Option<String>,
+    t0: Instant,
+    mut ex: Explain,
+) -> Result<QueryResult> {
+    let sel = input.select;
+    if sel.collapse.is_some() {
+        return Err(Error::Plan("COLLAPSE BY has no meaning with an aggregate".into()));
+    }
+    if sel.cursor.is_some() {
+        return Err(Error::Plan(
+            "AFTER has no meaning with an aggregate: the groups are one answer".into(),
+        ));
+    }
+    if matches!(sel.order, Some(OrderBy::Distance { .. }) | Some(OrderBy::Hybrid(_))) {
+        return Err(Error::Plan(
+            "an aggregate is over every row the predicate admits; a ranked ORDER BY chooses \
+             k of them, which is a different question -- put the distance in WHERE, or \
+             aggregate in the client"
+                .into(),
+        ));
+    }
+    let partial = sel.with.partial_results;
+    let specs: Vec<(AggFunc, Option<&str>)> = sel
+        .projections
+        .iter()
+        .filter_map(|p| match p {
+            Projection::Aggregate { func, path, .. } => Some((*func, path.as_deref())),
+            _ => None,
+        })
+        .collect();
+    // Group key (JSON) -> (group value, partials in spec order).
+    let mut groups: BTreeMap<String, (Value, Vec<Value>)> = BTreeMap::new();
+    let mut missing: Vec<String> = Vec::new();
+    for si in input.unreachable {
+        ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
+        missing.push(shard_name(*si));
+    }
+    for shard in input.shards {
+        let si = shard.index();
+        if input.unreachable.contains(&si) {
+            continue;
+        }
+        if let Some(p) = prefix {
+            if !shard.may_hold(p) {
+                ex.shards.push(ShardExplain {
+                    index: si,
+                    pruned: true,
+                    prune_reason: Some("out of key range".into()),
+                    manifest_version: shard.manifest_version(),
+                    ..Default::default()
+                });
+                continue;
+            }
+        }
+        if let Some(ms) = deadline::passed() {
+            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+            missing.push(shard_name(si));
+            if partial {
+                continue;
+            }
+            return Err(shard_deadline(si, ms));
+        }
+        let req = ScanRequest {
+            coll: input.coll,
+            select: sel,
+            ts: input.ts,
+            prefix: prefix.as_deref(),
+            stats: input.stats,
+            analyze: input.analyze,
+            keep: usize::MAX,
+            after: None,
+            fields: &[],
+            statement: &input.statement,
+            params: input.params,
+            frontiers: input.frontiers,
+        };
+        match shard.scan(&req) {
+            Ok(a) => {
+                if a.timed_out {
+                    missing.push(shard_name(si));
+                }
+                ex.shards.push(a.explain);
+                for h in a.hits {
+                    // A node of an older version answers a scan with rows,
+                    // not partials; its shard cannot be aggregated.
+                    let partials = match h.doc.as_ref().and_then(|d| d.path(AGG_FIELD)) {
+                        Some(Value::Array(v)) if v.len() == specs.len() => v.clone(),
+                        _ => {
+                            return Err(Error::Plan(format!(
+                                "shard {si} answered rows where partial aggregates were asked; \
+                                 the node holding it runs a version without aggregates"
+                            )))
+                        }
+                    };
+                    let group = h.sort.first().cloned().unwrap_or(Value::Null);
+                    match groups.get_mut(&h.key) {
+                        Some((_, acc)) => {
+                            for ((func, _), (a, b)) in
+                                specs.iter().zip(acc.iter_mut().zip(partials))
+                            {
+                                *a = merge_partial(*func, std::mem::replace(a, Value::Null), b)?;
+                            }
+                        }
+                        None => {
+                            groups.insert(h.key, (group, partials));
+                        }
+                    }
+                }
+            }
+            Err(Error::Deadline(e)) => {
+                if !partial {
+                    return Err(Error::Deadline(e));
+                }
+                ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+                missing.push(shard_name(si));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // No group and no row at all is still one row: `count(*)` of nothing is 0.
+    if sel.group_by.is_none() && groups.is_empty() {
+        let empty = specs.iter().map(|(f, _)| empty_partial(*f)).collect();
+        groups.insert(String::new(), (Value::Null, empty));
+    }
+    let mut rows: Vec<Row> = Vec::with_capacity(groups.len());
+    for (key, (group, acc)) in groups {
+        let mut fields: Vec<(String, Value)> = Vec::new();
+        let mut next = 0usize;
+        for p in &sel.projections {
+            match p {
+                Projection::Path { path, alias } => {
+                    fields.push((alias.clone().unwrap_or_else(|| path.clone()), group.clone()));
+                }
+                Projection::Aggregate { func, .. } => {
+                    let name = p.aggregate_name().expect("an aggregate");
+                    fields.push((name, finish_partial(*func, &acc[next])));
+                    next += 1;
+                }
+                _ => {}
+            }
+        }
+        rows.push(Row { key, doc: Value::obj(fields), score: None, distance: None });
+    }
+    if let Some(OrderBy::Fields(fields)) = &sel.order {
+        for (name, _) in fields {
+            if !rows.first().is_some_and(|r| r.doc.path(name).is_some()) && !rows.is_empty() {
+                return Err(Error::Plan(format!(
+                    "ORDER BY `{name}`: an aggregate statement orders by a field of its result \
+                     (an alias, or the call as written); it has {}",
+                    match &rows[0].doc {
+                        Value::Object(f) => {
+                            f.iter().map(|(k, _)| format!("`{k}`")).collect::<Vec<_>>().join(", ")
+                        }
+                        _ => String::new(),
+                    }
+                )));
+            }
+        }
+        rows.sort_by(|a, b| {
+            for (name, asc) in fields {
+                let (x, y) = (a.doc.path(name), b.doc.path(name));
+                let o = match (x, y) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (Some(v), None) if v.is_null() => std::cmp::Ordering::Greater,
+                    (None, Some(v)) if v.is_null() => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (Some(x), Some(y)) => match (x.is_null(), y.is_null()) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Less,
+                        _ => agg_cmp(x, y).unwrap_or(std::cmp::Ordering::Equal),
+                    },
+                };
+                let o = if *asc { o } else { o.reverse() };
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            a.key.cmp(&b.key)
+        });
+    }
+    let total = rows.len();
+    let rows: Vec<Row> =
+        rows.into_iter().skip(sel.offset).take(sel.limit.unwrap_or(usize::MAX)).collect();
+    ex.limit = sel.limit.unwrap_or(total);
+    ex.notes.push(format!("aggregate: {total} group(s) merged from the shards' partials"));
+    ex.total_micros = t0.elapsed().as_micros();
+    let cut = truncated_prefixes(input.stats);
+    ex.notes.extend(cut.iter().cloned());
+    if !partial {
+        deadline::check()?;
+    }
+    let mut all_missing = input.walk_missing.clone();
+    all_missing.extend(missing);
+    ex.missing = all_missing.clone();
+    Ok(QueryResult {
+        rows,
+        explain: if input.analyze { Some(ex) } else { None },
+        missing: all_missing,
+        truncated_prefixes: cut,
+        cut_walks: input.cut_walks.clone(),
+        next_cursor: None,
+    })
+}
+
+/// The field a shard's aggregate hit carries its partials under.
+const AGG_FIELD: &str = "__agg";
+
+/// A partial with nothing folded in yet.
+fn empty_partial(func: AggFunc) -> Value {
+    match func {
+        AggFunc::Count => Value::Int(0),
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => Value::Null,
+        AggFunc::Avg => Value::Array(vec![Value::Null, Value::Int(0)]),
+    }
+}
+
+/// Fold one row's value into a partial. `Null` (and an absent path) is
+/// skipped by everything but `count(*)`, which is fed `Int(1)` per row.
+fn fold_partial(func: AggFunc, acc: Value, v: &Value, path: &str) -> Result<Value> {
+    if v.is_null() {
+        return Ok(acc);
+    }
+    Ok(match func {
+        AggFunc::Count => Value::Int(acc.as_i64().unwrap_or(0) + 1),
+        AggFunc::Sum => add_numbers(acc, number_of(v, "sum", path)?),
+        AggFunc::Min => match acc {
+            Value::Null => v.clone(),
+            a => {
+                if agg_cmp(v, &a)? == std::cmp::Ordering::Less {
+                    v.clone()
+                } else {
+                    a
+                }
+            }
+        },
+        AggFunc::Max => match acc {
+            Value::Null => v.clone(),
+            a => {
+                if agg_cmp(v, &a)? == std::cmp::Ordering::Greater {
+                    v.clone()
+                } else {
+                    a
+                }
+            }
+        },
+        AggFunc::Avg => {
+            let (sum, n) = avg_parts(&acc);
+            Value::Array(vec![add_numbers(sum, number_of(v, "avg", path)?), Value::Int(n + 1)])
+        }
+    })
+}
+
+/// Merge two partials of one group, from two shards.
+fn merge_partial(func: AggFunc, a: Value, b: Value) -> Result<Value> {
+    Ok(match func {
+        AggFunc::Count => Value::Int(a.as_i64().unwrap_or(0) + b.as_i64().unwrap_or(0)),
+        AggFunc::Sum => match (&a, &b) {
+            (Value::Null, _) => b,
+            (_, Value::Null) => a,
+            _ => add_numbers(a, b),
+        },
+        AggFunc::Min | AggFunc::Max => match (&a, &b) {
+            (Value::Null, _) => b,
+            (_, Value::Null) => a,
+            _ => {
+                let o = agg_cmp(&b, &a)?;
+                let take_b = match func {
+                    AggFunc::Min => o == std::cmp::Ordering::Less,
+                    _ => o == std::cmp::Ordering::Greater,
+                };
+                if take_b {
+                    b
+                } else {
+                    a
+                }
+            }
+        },
+        AggFunc::Avg => {
+            let (sa, na) = avg_parts(&a);
+            let (sb, nb) = avg_parts(&b);
+            let sum = match (&sa, &sb) {
+                (Value::Null, _) => sb,
+                (_, Value::Null) => sa,
+                _ => add_numbers(sa, sb),
+            };
+            Value::Array(vec![sum, Value::Int(na + nb)])
+        }
+    })
+}
+
+/// The value a finished partial presents.
+fn finish_partial(func: AggFunc, acc: &Value) -> Value {
+    match func {
+        AggFunc::Avg => {
+            let (sum, n) = avg_parts(acc);
+            match (sum.as_f64(), n) {
+                (Some(s), n) if n > 0 => Value::Float(s / n as f64),
+                _ => Value::Null,
+            }
+        }
+        _ => acc.clone(),
+    }
+}
+
+fn avg_parts(acc: &Value) -> (Value, i64) {
+    match acc {
+        Value::Array(v) if v.len() == 2 => (v[0].clone(), v[1].as_i64().unwrap_or(0)),
+        _ => (Value::Null, 0),
+    }
+}
+
+/// A row's value as a number for `sum` and `avg`, or the reason it is not.
+fn number_of(v: &Value, func: &str, path: &str) -> Result<Value> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Ok(v.clone()),
+        other => Err(Error::Plan(format!(
+            "{func}({path}): a value at `{path}` is {}, not a number",
+            other.ty().name()
+        ))),
+    }
+}
+
+/// Integers stay integers until they overflow or meet a float.
+fn add_numbers(a: Value, b: Value) -> Value {
+    match (&a, &b) {
+        (Value::Null, _) => b,
+        (_, Value::Null) => a,
+        (Value::Int(x), Value::Int(y)) => match x.checked_add(*y) {
+            Some(s) => Value::Int(s),
+            None => Value::Float(*x as f64 + *y as f64),
+        },
+        _ => Value::Float(a.as_f64().unwrap_or(0.0) + b.as_f64().unwrap_or(0.0)),
+    }
+}
+
+/// How `min`, `max` and `ORDER BY` compare two non-null values: numbers
+/// with numbers, strings with strings, timestamps with timestamps, booleans
+/// with booleans; anything else is a mixed group, which is refused rather
+/// than ordered by an accident of encoding.
+fn agg_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => Ok(a
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&b.as_f64().unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal)),
+        (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        (Value::Timestamp(x), Value::Timestamp(y)) => Ok(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        _ => Err(Error::Plan(format!(
+            "min/max over mixed kinds: {} and {} at one path",
+            a.ty().name(),
+            b.ty().name()
+        ))),
+    }
+}
+
+/// The shard's half of an aggregate statement: every matching row of every
+/// unit folded into the partials of its group, one hit per group. A
+/// `count(*)` alone, ungrouped, never decodes a document: it is the
+/// survivors' popcount. Everything else reads each row's document once for
+/// the group value and the aggregated paths.
+pub(crate) fn aggregate_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result<ShardScan> {
+    let sel = req.select;
+    let specs: Vec<(AggFunc, Option<&str>)> = sel
+        .projections
+        .iter()
+        .filter_map(|p| match p {
+            Projection::Aggregate { func, path, .. } => Some((*func, path.as_deref())),
+            _ => None,
+        })
+        .collect();
+    let count_only =
+        sel.group_by.is_none() && specs.iter().all(|(f, p)| *f == AggFunc::Count && p.is_none());
+    let mut sx =
+        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+    let t0 = Instant::now();
+    let snap = shard.snapshot_at(req.ts);
+    let units = shard.sources(&snap);
+    let mut groups: BTreeMap<String, (Value, Vec<Value>)> = BTreeMap::new();
+    let mut timed_out = false;
+    for unit in units.iter() {
+        let n = unit.num_docs();
+        if n == 0 {
+            continue;
+        }
+        let ut = Instant::now();
+        let mut ux = UnitExplain { label: unit.label(), docs: n, ..Default::default() };
+        let io0 = unit.io_counters();
+        let vis = unit.visibility(req.ts);
+        ux.visible = vis.popcount();
+        let mut filter = match req.prefix {
+            Some(p) => unit.key_prefix(p),
+            None => Bitmap::all(n),
+        };
+        filter.and_inplace(&vis);
+        if let Some(e) = &sel.predicate {
+            let bm = eval_expr(unit, e, &vis, &filter, req.stats, req.analyze, &mut ux)?;
+            filter.and_inplace(&bm);
+        }
+        ux.survivors = filter.popcount();
+        ux.selectivity = ux.survivors as f64 / n as f64;
+        if count_only {
+            let entry = groups.entry(String::new()).or_insert_with(|| {
+                (Value::Null, specs.iter().map(|(f, _)| empty_partial(*f)).collect())
+            });
+            for acc in entry.1.iter_mut() {
+                *acc = Value::Int(acc.as_i64().unwrap_or(0) + ux.survivors as i64);
+            }
+        } else {
+            for ord in filter.iter() {
+                if deadline::expired() {
+                    break;
+                }
+                let doc = unit.document(ord)?;
+                let group = match &sel.group_by {
+                    Some(p) => doc.path(p).cloned().unwrap_or(Value::Null),
+                    None => Value::Null,
+                };
+                let key = match &sel.group_by {
+                    Some(_) => crate::json::to_string(&group),
+                    None => String::new(),
+                };
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (group.clone(), specs.iter().map(|(f, _)| empty_partial(*f)).collect())
+                });
+                for ((func, path), acc) in specs.iter().zip(entry.1.iter_mut()) {
+                    let v = match path {
+                        Some(p) => doc.path(p).cloned().unwrap_or(Value::Null),
+                        None => Value::Int(1),
+                    };
+                    *acc = fold_partial(
+                        *func,
+                        std::mem::replace(acc, Value::Null),
+                        &v,
+                        path.unwrap_or("*"),
+                    )?;
+                }
+            }
+        }
+        if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
+            ux.loads = l1.saturating_sub(l0);
+            ux.faults = f1.saturating_sub(f0);
+        }
+        ux.micros = ut.elapsed().as_micros();
+        sx.units.push(ux);
+        if let Some(ms) = deadline::passed() {
+            if !sel.with.partial_results {
+                return Err(shard_deadline(si, ms));
+            }
+            timed_out = true;
+            break;
+        }
+    }
+    sx.timed_out = timed_out;
+    sx.micros = t0.elapsed().as_micros();
+    let hits = groups
+        .into_iter()
+        .map(|(key, (group, acc))| ScanHit {
+            sort: if sel.group_by.is_some() { vec![group] } else { Vec::new() },
+            key,
+            doc: Some(Value::obj(vec![(AGG_FIELD.to_string(), Value::Array(acc))])),
+            handle: (0, 0),
+            parent: None,
+        })
+        .collect();
+    Ok(ShardScan { hits, explain: sx, timed_out })
 }
 
 fn cmp_dir(d: Direction, a: f32, b: f32) -> std::cmp::Ordering {
@@ -1496,6 +1985,9 @@ fn scan(
 /// the document; otherwise it travels as a handle.
 pub(crate) fn scan_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result<ShardScan> {
     let sel = req.select;
+    if sel.aggregates() {
+        return aggregate_on(shard, si, req);
+    }
     let needs_doc = !req.fields.is_empty() || sel.collapse.is_some();
     let mut sx =
         ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
@@ -1867,6 +2359,7 @@ pub fn select_for_delete(collection: &str, predicate: &Expr) -> Select {
         offset: 0,
         cursor: None,
         collapse: None,
+        group_by: None,
         with: WithOpts::default(),
     }
 }

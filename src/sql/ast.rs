@@ -374,6 +374,61 @@ pub enum Projection {
     /// `score` and `distance` pseudo-columns.
     Score,
     Distance,
+    /// `count(*)`, `count(path)`, `sum(path)`, `min(path)`, `max(path)`,
+    /// `avg(path)`: one value over every row the statement matches, or one
+    /// per group under `GROUP BY`. `path` is `None` for `count(*)`.
+    Aggregate {
+        func: AggFunc,
+        path: Option<String>,
+        alias: Option<String>,
+    },
+}
+
+impl Projection {
+    /// The name an aggregate's value is keyed by in the row: the alias, or
+    /// the call as written (`count(*)`, `sum(n)`).
+    pub fn aggregate_name(&self) -> Option<String> {
+        match self {
+            Projection::Aggregate { func, path, alias } => {
+                Some(alias.clone().unwrap_or_else(|| {
+                    format!("{}({})", func.name(), path.as_deref().unwrap_or("*"))
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggFunc {
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+            AggFunc::Avg => "avg",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AggFunc> {
+        match s.to_ascii_lowercase().as_str() {
+            "count" => Some(AggFunc::Count),
+            "sum" => Some(AggFunc::Sum),
+            "min" => Some(AggFunc::Min),
+            "max" => Some(AggFunc::Max),
+            "avg" => Some(AggFunc::Avg),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,5 +476,17 @@ pub struct Select {
     /// `k` amplified accordingly (§5.4). The v1 answer to multi-vector
     /// documents.
     pub collapse: Option<String>,
+    /// `GROUP BY path`: one row per distinct value at the path, the
+    /// aggregates in the list computed over each group's rows.
+    pub group_by: Option<String>,
     pub with: WithOpts,
+}
+
+impl Select {
+    /// Whether the list aggregates: a statement of one row, or one per
+    /// group, over every row the predicate admits.
+    pub fn aggregates(&self) -> bool {
+        self.projections.iter().any(|p| matches!(p, Projection::Aggregate { .. }))
+            || self.group_by.is_some()
+    }
 }

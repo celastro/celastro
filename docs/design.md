@@ -44,6 +44,7 @@ test that pins it.
 | tiered vector index, two-stage scoring | `vector`, `vector::hnsw`, `vector::quant` | SQ8 and 1-bit codes, full-precision rerank |
 | runtime filtered-search selection | `vector::VectorStore::choose` | brute force / post-filter / ACORN-style |
 | `COLLAPSE BY` | `plan::exec` | with `k` amplification |
+| `count`, `sum`, `min`, `max`, `avg`, `GROUP BY` | `plan::exec` `aggregate_on`, `aggregate_select` | partials per shard as scan hits, merged at the coordinator |
 | rank fusion, coordinator only | `plan::fusion` | RRF and weighted linear |
 | a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF` as a filter or a `hops(...)` source; `expand` and `present` on `ShardService` |
 | the wire between nodes, a shard's move | `wire`, `engine` "moves" | length-prefixed frames of the crate's codec, a shared token, one holder per shard |
@@ -939,6 +940,29 @@ list is only valid for the dictionary it came from. Over the bound the statement
 is refused rather than quietly trimmed — a silent aggregate cap would be the
 same failure one level up.
 
+**An aggregate is a scan whose hits are partials, so it crosses the wire
+as a scan.** `count(*)`, `count(path)`, `sum`, `min`, `max`, `avg` and
+`GROUP BY` fold on the shard: `aggregate_on` walks the same filtered
+bitmap the scan walks and keeps one accumulator per group, reading each
+row's document once for the group value and the aggregated paths -- and
+not at all for an ungrouped `count(*)`, which is the survivors' popcount.
+The shard answers a `ShardScan` whose hits are one per group: the group's
+value as the sort key, its JSON as the row key, the partials under one
+field of the document. That shape is chosen so a node holding a shard
+parses the statement it was sent and folds, and the answer travels in the
+frame a scan already has; a node of a version before aggregates answers
+rows instead, which the coordinator detects and refuses by name rather
+than summing documents. `aggregate_select` merges the partials of one
+group from every shard (counts add, sums add -- integers stay integers
+until they overflow or meet a float -- `min`/`max` compare within one
+kind and refuse a mixed group, `avg` carries its sum and count until the
+end), orders the groups by the result's fields (an alias or the call as
+written), and pages them; without `LIMIT` every group is returned,
+because the groups are the answer. A ranked `ORDER BY` is refused: it
+chooses k rows, which is a different question. `partial_results` keeps
+its meaning -- a shard that ran out of time is reported missing and its
+rows are absent from the fold.
+
 **`search_after` over an approximate index is not cheaper than `OFFSET`.** A
 graph search has no resume primitive: an HNSW heap cannot restart from a
 distance without re-traversing, so an ANN cursor costs `depth + k` per shard,
@@ -1294,6 +1318,7 @@ guarantee:
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
 | a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro-cli send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
+| an aggregate is the fold over every admitted row, on one node or three, and refuses what it cannot mean | `aggregates::*` (`tests/aggregates.rs`: every function over a flushed segment and a memtable with a delete, nulls skipped, the empty fold, `GROUP BY` with `ORDER BY` an alias and a page, the null group, the refusals), `wire::an_aggregate_over_three_nodes_answers_what_one_process_answers`, `parser::tests::aggregates_parse_with_their_names_and_the_group_by_path` |
 | an encrypted database writes no plaintext anywhere and opens under its master only | `encryption::an_encrypted_database_holds_no_plaintext_and_opens_under_its_master_only` (a marker string grepped for under the directory, the store, a backup and an export after seals, a delete, a compaction and a tier move both ways; reopen through the WAL; no master and another master refused), `encryption::a_plain_database_with_data_is_not_encrypted_in_place`, `encryption::a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended`, `encryption::a_backup_restores_under_the_same_master_and_is_refused_without_it`, `encryption::an_import_crosses_key_regimes_which_is_how_a_database_takes_or_changes_a_key`, `encryption::a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves`, `cipher::tests::*` (frames round-trip, a ranged read opens only its frames, the wrong key, index or identity fails, the wrapped key opens under its master only, a torn record log stops at the tear) |
 | the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |
 | a health probe measures the database, needs no token, and stays behind the Host check | `serve::tests::the_health_probe_needs_no_token_and_reports_the_database`, `serve::tests::the_probe_tells_serving_from_unwell_from_absent` (the client half: serving, unwell and absent are three answers), `celastro-cli::tests::health_takes_a_port_and_nothing_else`; the chart itself is verified by hand against a `kind` cluster, as its README records |
@@ -1346,5 +1371,6 @@ tests/
   wire.rs                        three nodes in one process, every node answering what one does
   tls.rs                         the console and the wire over TLS
   encryption.rs                  no plaintext at rest; refusals; backup, import and move under a key
+  aggregates.rs                  count, sum, min, max, avg and GROUP BY over segments and a memtable
   pki/                           RSA and P-256 chains and signatures from openssl
 ```

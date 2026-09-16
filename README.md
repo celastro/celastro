@@ -110,6 +110,20 @@ Documents nest at most 128 deep, and a field whose name contains a dot is
 unreachable by a path. `DROP INDEX` and `DROP COLLECTION` are final. The
 [design notes](docs/design.md) have the reasoning behind each.
 
+## Counting and summing
+
+```sql
+SELECT count(*) FROM notes WHERE topic = 'storage';
+SELECT topic, count(*) AS n, avg(words) FROM notes GROUP BY topic ORDER BY n DESC LIMIT 5;
+```
+
+`count(*)`, `count(path)`, `sum`, `min`, `max` and `avg` fold every row the
+predicate admits -- text matches and distance thresholds included -- into
+one row, or one per `GROUP BY` value; each shard folds its own rows and
+the coordinator merges the partials, so a count never moves a document.
+`ORDER BY`, `LIMIT` and `OFFSET` then apply to the groups, by the result's
+fields. Nulls and absent paths are skipped by everything but `count(*)`.
+
 ## Walking a graph
 
 An edge is a document in a collection of its own that points into a node
@@ -260,8 +274,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.37.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.37.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.38.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.38.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
