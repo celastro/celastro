@@ -8,6 +8,13 @@ repository.
 
 ## Unreleased
 
+**Backpressure.** A shard holding more flat segments than
+`CELASTRO_COMPACTION_DEBT` (32) makes each write to it wait
+`CELASTRO_COMPACTION_DEBT_WAIT_MS` (20) per segment past the debt, a
+second at most, so a load cannot run further ahead of compaction than
+reads can bear; `celastro_backpressure_waits_total` and `_seconds_sum`
+count it.
+
 **`BACKUP TO '<dest>' KEEP <n>`.** After the copy, this node's backups at
 the destination beyond the newest `n` are removed -- the record first, so
 a prune that stops halfway leaves an incomplete backup rather than a

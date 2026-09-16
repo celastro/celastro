@@ -59,6 +59,8 @@ process itself and the page cache the kernel reclaims under pressure.
 | `CELASTRO_AUTO_COMPACT` | `on` | `serve` runs a maintenance thread that compacts on its own: every second it asks whether a shard has a job, builds it with no lock held, and installs it under the lock; one job at a time, logged. `off` leaves it to `COMPACT`. Scripts and `exec` compact only on `COMPACT`. |
 | `CELASTRO_COMPACTION_TIER_FANOUT` | `4` | Segments of one size class merged into the next when this many have gathered. Lower merges sooner (fewer segments to search, more rewriting); higher the reverse. |
 | `CELASTRO_COMPACTION_SEGMENT_CAP` | `5000000` | The largest segment compaction makes, in documents. |
+| `CELASTRO_COMPACTION_DEBT` | `32` | Backpressure: flat (level 0) segments a shard may hold before each write to it waits, so a load cannot run further ahead of compaction than reads can bear. `celastro_backpressure_waits_total` in the metrics counts the waits. |
+| `CELASTRO_COMPACTION_DEBT_WAIT_MS` | `20` | The wait per flat segment past the debt, a second at most per write. |
 | `CELASTRO_COMPACTION_DEAD_RATIO` | `0.30` | A segment whose deleted or superseded share passes this is rewritten on its own, whatever its size class. |
 
 ## The vector index

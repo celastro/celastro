@@ -2218,6 +2218,12 @@ fn tuning_into(
     if let Some(v) = var("CELASTRO_COMPACTION_SEGMENT_CAP") {
         o.compaction.segment_cap = num("CELASTRO_COMPACTION_SEGMENT_CAP", &v)?;
     }
+    if let Some(v) = var("CELASTRO_COMPACTION_DEBT") {
+        o.compaction.debt_segments = num("CELASTRO_COMPACTION_DEBT", &v)?;
+    }
+    if let Some(v) = var("CELASTRO_COMPACTION_DEBT_WAIT_MS") {
+        o.compaction.debt_wait_ms = num("CELASTRO_COMPACTION_DEBT_WAIT_MS", &v)?;
+    }
     if let Some(v) = var("CELASTRO_COMPACTION_DEAD_RATIO") {
         let r: f64 = num("CELASTRO_COMPACTION_DEAD_RATIO", &v)?;
         if !(0.0..=1.0).contains(&r) {

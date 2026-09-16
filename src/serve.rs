@@ -231,6 +231,21 @@ fn metrics_text(db: &Db) -> String {
         "",
         db.collection_count().to_string(),
     );
+    let (waits, waited) = db.backpressure();
+    line(
+        "celastro_backpressure_waits_total",
+        "counter",
+        "Writes that waited for compaction to catch up.",
+        "",
+        waits.to_string(),
+    );
+    line(
+        "celastro_backpressure_seconds_sum",
+        "counter",
+        "Time writes spent waiting for compaction.",
+        "",
+        format!("{:.3}", waited as f64 / 1e6),
+    );
     let (seal_failures, _) = db.seal_failures();
     line(
         "celastro_seal_failures_total",

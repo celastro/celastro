@@ -811,6 +811,9 @@ pub struct Db {
     lock: Option<crate::dirlock::DirLock>,
     /// Encryption at rest, when the database has a data key.
     cipher: crate::cipher::Shared,
+    /// Writes that waited for compaction, and the time they waited.
+    backpressure_waits: u64,
+    backpressure_micros: u64,
     budget: Arc<MemtableBudget>,
     residency: Arc<ResidencyManager>,
     /// The statistics cache. Behind a lock, not `&mut self`: a read fills
@@ -911,6 +914,8 @@ impl Db {
             dir: None,
             lock: None,
             cipher: None,
+            backpressure_waits: 0,
+            backpressure_micros: 0,
             budget,
             residency,
             stats: Mutex::new(BTreeMap::new()),
@@ -2444,6 +2449,7 @@ impl Db {
         }
         let chunk = self.opts.insert_batch.max(1);
         for (idx, mut batch) in here {
+            self.wait_for_compaction(collection, idx);
             while !batch.is_empty() {
                 let tail = batch.split_off(batch.len().min(chunk));
                 let stamps = {
@@ -2462,6 +2468,28 @@ impl Db {
     }
 
     /// The node holding the shard that owns `key`: `None` for this one.
+    /// Backpressure before a write: while the shard holds more flat segments
+    /// than compaction has caught up with, the writer waits, so a load
+    /// cannot leave reads scanning dozens of unsorted segments. Counted for
+    /// the metrics.
+    fn wait_for_compaction(&mut self, collection: &str, idx: usize) {
+        let wait = match self.shards.get(collection).and_then(|s| s.get(idx)) {
+            Some(shard) => crate::compaction::backpressure(shard, &self.opts.compaction),
+            None => return,
+        };
+        if !wait.is_zero() {
+            self.backpressure_waits += 1;
+            self.backpressure_micros += wait.as_micros() as u64;
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// How often a write waited for compaction, and for how long in
+    /// microseconds, since this database was opened.
+    pub fn backpressure(&self) -> (u64, u64) {
+        (self.backpressure_waits, self.backpressure_micros)
+    }
+
     fn owner_of(&self, collection: &str, key: &str) -> Result<Option<String>> {
         let Some(tablets) = self.catalog.placement.get(collection) else {
             // No placement is a collection wholly here.
@@ -5114,6 +5142,30 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A shard past the flat-segment debt makes a write wait, and the wait
+    /// is counted; within the debt nothing waits.
+    #[test]
+    fn a_write_waits_when_flat_segments_run_ahead_of_compaction() {
+        let mut opts = DbOpts::default();
+        opts.thresholds.max_bytes = 1;
+        opts.compaction.tier_fanout = 1000;
+        opts.compaction.debt_segments = 2;
+        opts.compaction.debt_wait_ms = 30;
+        let mut db = Db::with_opts(opts);
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let doc = |i: usize| Value::obj(vec![("id".into(), Value::Str(format!("n{i}")))]);
+        for i in 0..2 {
+            db.insert_many("notes", vec![doc(i)]).unwrap();
+        }
+        assert_eq!(db.backpressure().0, 0, "two flat segments: within the debt");
+        db.insert_many("notes", vec![doc(2)]).unwrap();
+        let t0 = std::time::Instant::now();
+        db.insert_many("notes", vec![doc(3)]).unwrap();
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(30), "{:?}", t0.elapsed());
+        assert_eq!(db.backpressure().0, 1);
+        assert!(db.backpressure().1 >= 30_000);
+    }
 
     /// A directory that vanishes under a running node: writes are refused
     /// naming it, reads still answer from memory, and the node says it is

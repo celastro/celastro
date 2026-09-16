@@ -38,6 +38,13 @@ pub struct CompactionOpts {
     /// clamped to it, since a rewrite cannot produce a format this build does
     /// not know how to write.
     pub upgrade_below_format: u32,
+    /// Backpressure: flat (level 0) segments a shard may hold before each
+    /// write to it waits, so ingest cannot run further ahead of compaction
+    /// than reads can bear. `CELASTRO_COMPACTION_DEBT`.
+    pub debt_segments: usize,
+    /// How long a write waits per flat segment past the debt, capped at a
+    /// second. `CELASTRO_COMPACTION_DEBT_WAIT_MS`.
+    pub debt_wait_ms: u64,
 }
 
 impl Default for CompactionOpts {
@@ -47,8 +54,24 @@ impl Default for CompactionOpts {
             segment_cap: 5_000_000,
             dead_ratio: 0.30,
             upgrade_below_format: 0,
+            debt_segments: 32,
+            debt_wait_ms: 20,
         }
     }
+}
+
+/// The wait a write to `shard` earns now: nothing while its flat segments
+/// are within the debt, then `debt_wait_ms` per segment past it, a second
+/// at most. The maintenance thread merges four flat segments into one in
+/// tens of seconds; a writer that can seal faster than that would
+/// otherwise leave reads scanning dozens of flat segments.
+pub fn backpressure(shard: &crate::shard::Shard, opts: &CompactionOpts) -> std::time::Duration {
+    let flat = shard.segments.iter().filter(|h| h.segment.level == 0).count();
+    if flat <= opts.debt_segments {
+        return std::time::Duration::ZERO;
+    }
+    let over = (flat - opts.debt_segments) as u64;
+    std::time::Duration::from_millis(over.saturating_mul(opts.debt_wait_ms).min(1000))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
