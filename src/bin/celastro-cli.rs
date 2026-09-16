@@ -85,7 +85,17 @@ COMMANDS:
 
 GLOBAL FLAGS:
   --dir <DIR>                open a persistent database (default: in memory)
+  --url <URL>                talk to a console that is already serving, local or remote:
+                             exec, run, repl and catalog then go over HTTP to it
   --json                     machine-readable output instead of tables
+
+`--url http://host:8787` (or https://, verified by the CA in CELASTRO_TLS_CA)
+makes `exec`, `run`, `repl` and `catalog` clients of a running console rather
+than openers of a directory: every statement is sent as a request and the
+answer rendered as it would be locally. The token is CELASTRO_TOKEN, or the
+`?t=` of the URL `serve` printed, so that line can be pasted as it is. A
+cluster's nodes all coordinate, so the URL may name any node's console or a
+load balancer in front of them.
 
 TUNING: the CELASTRO_* variables in docs/tuning.md (insert batch, memtable
 and residency budgets, compaction, the vector build, the console's
@@ -157,6 +167,7 @@ Exit codes: 0 success, 1 a runtime or SQL error, 2 a usage error.
 enum Cli {
     Run {
         dir: Option<PathBuf>,
+        url: Option<String>,
         json: bool,
         cmd: Cmd,
     },
@@ -235,6 +246,7 @@ enum Cmd {
 fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let args: Vec<String> = argv.into_iter().collect();
     let mut dir: Option<PathBuf> = None;
+    let mut url: Option<String> = None;
     let mut json = false;
     let mut port: Option<u16> = None;
     let mut open = false;
@@ -274,6 +286,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         match name.as_str() {
             "--dir" => match value_for(inline.as_deref(), &args, &mut i) {
                 Some(v) => dir = Some(PathBuf::from(v)),
+                None => return Cli::Usage(missing_value(&name)),
+            },
+            "--url" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => url = Some(v),
                 None => return Cli::Usage(missing_value(&name)),
             },
             "--port" => match value_for(inline.as_deref(), &args, &mut i) {
@@ -479,7 +495,19 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         let msg = "demo builds its own in-memory database, so it cannot be combined with --dir";
         return Cli::Usage(msg.to_string());
     }
-    Cli::Run { dir, json, cmd }
+    // `--url` is the other side of `--dir`: a client of a console that has
+    // the directory open. The commands that open, serve or make files have
+    // no meaning through it, and saying so beats opening an in-memory
+    // database and quietly answering from that.
+    if url.is_some() {
+        if dir.is_some() {
+            return Cli::Usage("`--dir` opens a directory and `--url` talks to a console that has one open; one or the other".to_string());
+        }
+        if !matches!(cmd, Cmd::Exec(_) | Cmd::Script(_) | Cmd::Repl | Cmd::Catalog) {
+            return Cli::Usage("`--url` means something to `exec`, `run`, `repl` and `catalog`; the other commands run where they are".to_string());
+        }
+    }
+    Cli::Run { dir, url, json, cmd }
 }
 
 /// The value of a flag, written either `--flag value` or `--flag=value`.
@@ -527,7 +555,7 @@ fn main() {
             eprint!("\n{HELP}");
             std::process::exit(EXIT_USAGE);
         }
-        Cli::Run { dir, json, cmd } => std::process::exit(run(dir, json, cmd)),
+        Cli::Run { dir, url, json, cmd } => std::process::exit(run(dir, url, json, cmd)),
     }
 }
 
@@ -557,7 +585,24 @@ fn version_output(json: bool) -> String {
     json::to_string(&out)
 }
 
-fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
+fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
+    // A client of a running console: nothing here opens a directory, and
+    // the TLS material below is the server's, not the client's -- the
+    // client verifies by CELASTRO_TLS_CA alone.
+    if let Some(url) = url {
+        let console = match Console::connect(&url) {
+            Ok(c) => c,
+            Err(e) => return fail(json, &e),
+        };
+        let mut session = Session::Remote(&console);
+        return match cmd {
+            Cmd::Exec(sql) => statement_on(&mut session, &sql, json),
+            Cmd::Script(file) => run_script(&mut session, &file, json),
+            Cmd::Repl => repl(&mut session, json),
+            Cmd::Catalog => statement_on(&mut session, "SHOW CATALOG", json),
+            _ => unreachable!("refused by the parser"),
+        };
+    }
     // Before any directory is opened: the probe asks a RUNNING console, and
     // opening its directory from a second process is the one thing the data
     // directory does not support.
@@ -610,8 +655,8 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             serve(&mut db, port, open, shard_bind, bind, tls, json)
         }
         Cmd::Exec(sql) => statement(&mut db, &sql, json),
-        Cmd::Script(file) => run_script(&mut db, &file, json),
-        Cmd::Repl => repl(&mut db, json),
+        Cmd::Script(file) => run_script(&mut Session::Local(&mut db), &file, json),
+        Cmd::Repl => repl(&mut Session::Local(&mut db), json),
         Cmd::Demo => demo(&mut db, json),
         Cmd::Catalog => {
             print_catalog(&db, json);
@@ -970,51 +1015,171 @@ fn attach_peers(db: &RwLock<Db>, stop: &AtomicBool, peers: &[String]) {
 /// runs `BACKUP TO` on each pod. The answer is the console's JSON, printed
 /// as it came (`--json`) or as its message; the exit code follows `ok`.
 /// There is no timeout on the read: a backup answers when it is done.
-fn send(url: &str, sql: &str, json: bool) -> i32 {
-    let Some(token) = std::env::var("CELASTRO_TOKEN").ok().filter(|t| !t.is_empty()) else {
-        return fail(json, "CELASTRO_TOKEN is not set; `send` needs the console's token");
-    };
-    let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
-        (Some(r), _) => (true, r),
-        (_, Some(r)) => (false, r),
-        _ => return fail(json, &format!("`{url}` is not an http:// or https:// URL")),
-    };
-    let host_port = rest.split('/').next().unwrap_or("").trim_end_matches('/');
-    if host_port.is_empty() {
-        return fail(json, &format!("`{url}` names no host"));
-    }
-    let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
-    let addr = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:{DEFAULT_PORT}")
-    };
-    let body = json::to_string(&Value::obj(vec![("sql".to_string(), Value::Str(sql.to_string()))]));
-    let headers = [("X-Celastro-Token", token.as_str())];
-    let req = celastro::tls::HttpRequest {
-        method: "POST",
-        path: "/api/query",
-        headers: &headers,
-        body: Some(&body),
-    };
-    let answer = if https {
-        let ca = match std::env::var("CELASTRO_TLS_CA").ok().map(std::fs::read_to_string) {
-            Some(Ok(ca)) => ca,
-            Some(Err(e)) => return fail(json, &format!("CELASTRO_TLS_CA: {e}")),
-            None => {
-                return fail(
-                    json,
-                    "an https:// console needs CELASTRO_TLS_CA, the CA to verify it by",
-                )
-            }
+/// A running console, as a client sees it: where it is, how it is verified,
+/// and the token every request carries. `--url` and `send` both talk
+/// through this.
+struct Console {
+    url: String,
+    addr: String,
+    host: String,
+    /// The CA to verify an `https://` console by; `None` for plain HTTP.
+    ca: Option<String>,
+    token: String,
+}
+
+impl Console {
+    /// From the URL alone: `http://host[:port]` or `https://`, the port 8787
+    /// when absent, the token from `CELASTRO_TOKEN` or from the URL's `?t=`
+    /// -- the line `serve` printed pastes as it is -- and for https the CA
+    /// from `CELASTRO_TLS_CA`. Nothing is sent yet.
+    fn connect(url: &str) -> std::result::Result<Console, String> {
+        let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+            (Some(r), _) => (true, r),
+            (_, Some(r)) => (false, r),
+            _ => return Err(format!("`{url}` is not an http:// or https:// URL")),
         };
-        celastro::tls::https_request(&addr, host, &ca, &req, Duration::ZERO)
-    } else {
-        celastro::tls::http_request(&addr, host, &req, Duration::ZERO)
+        let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let host_port = path_part.split('/').next().unwrap_or("").trim_end_matches('/');
+        if host_port.is_empty() {
+            return Err(format!("`{url}` names no host"));
+        }
+        let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port).to_string();
+        let addr = if host_port.contains(':') {
+            host_port.to_string()
+        } else {
+            format!("{host_port}:{DEFAULT_PORT}")
+        };
+        let from_url = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("t="))
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        let token = match std::env::var("CELASTRO_TOKEN").ok().filter(|t| !t.is_empty()) {
+            Some(t) => t,
+            None => match from_url {
+                Some(t) => t,
+                None => {
+                    return Err("no token: set CELASTRO_TOKEN, or give the URL `serve` printed, \
+                                which carries it as ?t="
+                        .into())
+                }
+            },
+        };
+        let ca = if https {
+            match std::env::var("CELASTRO_TLS_CA").ok().map(std::fs::read_to_string) {
+                Some(Ok(ca)) => Some(ca),
+                Some(Err(e)) => return Err(format!("CELASTRO_TLS_CA: {e}")),
+                None => {
+                    return Err(
+                        "an https:// console needs CELASTRO_TLS_CA, the CA to verify it by".into()
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let url = format!("{}://{addr}", if https { "https" } else { "http" });
+        Ok(Console { url, addr, host, ca, token })
+    }
+
+    /// One statement to `/api/query`: the HTTP status and the body.
+    fn query(&self, sql: &str) -> std::result::Result<(u16, String), String> {
+        let body =
+            json::to_string(&Value::obj(vec![("sql".to_string(), Value::Str(sql.to_string()))]));
+        let headers =
+            [("X-Celastro-Token", self.token.as_str()), ("Content-Type", "application/json")];
+        let req = celastro::tls::HttpRequest {
+            method: "POST",
+            path: "/api/query",
+            headers: &headers,
+            body: Some(&body),
+        };
+        let answer = match &self.ca {
+            Some(ca) => {
+                celastro::tls::https_request(&self.addr, &self.host, ca, &req, Duration::ZERO)
+            }
+            None => celastro::tls::http_request(&self.addr, &self.host, &req, Duration::ZERO),
+        };
+        answer.map_err(|e| format!("reaching {}: {e}", self.url))
+    }
+
+    /// One statement, as the console's JSON document and the exit code it
+    /// earns; a transport failure is an error document like any other.
+    fn statement(&self, sql: &str) -> (Value, i32) {
+        match self.query(sql) {
+            Ok((status, text)) => {
+                let doc = json::parse(&text).unwrap_or_else(|_| {
+                    error_json(&format!(
+                        "the console answered HTTP {status} with something that is not JSON: {}",
+                        text.trim()
+                    ))
+                });
+                let ok = doc.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                (doc, if ok && (200..300).contains(&status) { EXIT_OK } else { EXIT_FAIL })
+            }
+            Err(e) => (error_json(&e), EXIT_FAIL),
+        }
+    }
+}
+
+/// A console's answer rendered as the local path renders the same outcome:
+/// rows as a table with the count, the missing shards and the cuts; an
+/// acknowledgement as its line; a plan or a recall report as its text; a
+/// refusal as `error:` on stderr.
+fn print_answer(doc: &Value) {
+    let ok = doc.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let e = doc.get("error").and_then(Value::as_str).unwrap_or("the console refused");
+        eprintln!("error: {e}");
+        return;
+    }
+    let text = |k: &str| doc.get(k).and_then(Value::as_str).map(str::to_string);
+    match doc.get("kind").and_then(Value::as_str).unwrap_or("") {
+        "rows" => {
+            let strings = |k: &str| -> Vec<String> {
+                doc.get(k)
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default()
+            };
+            let rows = doc
+                .get("rows")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|r| celastro::plan::exec::Row {
+                            key: r.get("key").and_then(Value::as_str).unwrap_or("").to_string(),
+                            doc: r.get("doc").cloned().unwrap_or(Value::Null),
+                            score: r.get("score").and_then(Value::as_f64).map(|f| f as f32),
+                            distance: r.get("distance").and_then(Value::as_f64).map(|f| f as f32),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut r = QueryResult::of_rows(rows);
+            r.missing = strings("missing");
+            r.truncated_prefixes = strings("truncated_prefixes");
+            r.cut_walks = strings("cut_walks");
+            r.next_cursor = text("next_cursor");
+            print_rows(&r);
+        }
+        "ack" => println!("{}", text("message").unwrap_or_default()),
+        "explain" | "recall" => print!("{}", text("text").unwrap_or_default()),
+        _ => println!("{}", json::to_string(doc)),
+    }
+    if let Some(ms) = doc.get("elapsed_ms").and_then(Value::as_f64) {
+        println!("({ms:.0} ms at the console)");
+    }
+}
+
+fn send(url: &str, sql: &str, json: bool) -> i32 {
+    let console = match Console::connect(url) {
+        Ok(c) => c,
+        Err(e) => return fail(json, &e),
     };
-    let (status, text) = match answer {
+    let (status, text) = match console.query(sql) {
         Ok(a) => a,
-        Err(e) => return fail(json, &format!("reaching {url}: {e}")),
+        Err(e) => return fail(json, &e),
     };
     let parsed = json::parse(&text).ok();
     let ok = parsed.as_ref().and_then(|v| v.get("ok")).and_then(Value::as_bool).unwrap_or(false);
@@ -1368,19 +1533,60 @@ fn statement(db: &mut Db, sql: &str, json: bool) -> i32 {
     }
 }
 
-fn run_script(db: &mut Db, file: &Path, json: bool) -> i32 {
+/// Where a session's statements go: a database this process opened, or a
+/// console another process is serving, reached over HTTP. `exec`, `run`
+/// and `repl` are the same loop over either.
+enum Session<'a> {
+    Local(&'a mut Db),
+    Remote(&'a Console),
+}
+
+/// One statement on the session, printed as the run asked, its exit code.
+fn statement_on(s: &mut Session<'_>, sql: &str, json: bool) -> i32 {
+    match s {
+        Session::Local(db) => statement(db, sql, json),
+        Session::Remote(c) => {
+            let (doc, code) = c.statement(sql);
+            if json {
+                println!("{}", json::to_string(&doc));
+            } else {
+                print_answer(&doc);
+            }
+            code
+        }
+    }
+}
+
+/// One statement's result as the `--json` document: what the local path
+/// prints, or what the console answered, which is the same shape.
+fn result_json(s: &mut Session<'_>, sql: &str) -> (Value, i32) {
+    match s {
+        Session::Local(db) => {
+            let t0 = Instant::now();
+            let outcome = db.execute(sql).and_then(Outcome::finished);
+            let took = t0.elapsed();
+            match outcome {
+                Ok(o) => (outcome_json(&o, took), EXIT_OK),
+                Err(e) => (error_json(&e.to_string()), EXIT_FAIL),
+            }
+        }
+        Session::Remote(c) => c.statement(sql),
+    }
+}
+
+fn run_script(s: &mut Session<'_>, file: &Path, json: bool) -> i32 {
     let text = match std::fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) => return fail(json, &format!("could not read {}: {e}", file.display())),
     };
     let stmts = split_statements(&text);
     if json {
-        return script_json(db, &stmts);
+        return script_json(s, &stmts);
     }
     for stmt in &stmts {
         // Stop at the first failure: the statements after it were written
         // expecting the one before to have happened.
-        if statement(db, stmt, false) != EXIT_OK {
+        if statement_on(s, stmt, false) != EXIT_OK {
             return EXIT_FAIL;
         }
     }
@@ -1389,20 +1595,15 @@ fn run_script(db: &mut Db, file: &Path, json: bool) -> i32 {
 
 /// A script is a stream of statements, but `--json` promises a single document
 /// on stdout — so the results are collected and printed once, at the end.
-fn script_json(db: &mut Db, stmts: &[String]) -> i32 {
+fn script_json(s: &mut Session<'_>, stmts: &[String]) -> i32 {
     let mut results: Vec<Value> = Vec::new();
     let mut code = EXIT_OK;
     for stmt in stmts {
-        let t0 = Instant::now();
-        let outcome = db.execute(stmt).and_then(Outcome::finished);
-        let took = t0.elapsed();
-        match outcome {
-            Ok(o) => results.push(outcome_json(&o, took)),
-            Err(e) => {
-                results.push(error_json(&e.to_string()));
-                code = EXIT_FAIL;
-                break;
-            }
+        let (doc, c) = result_json(s, stmt);
+        results.push(doc);
+        if c != EXIT_OK {
+            code = EXIT_FAIL;
+            break;
         }
     }
     let out = Value::obj(vec![
@@ -1414,7 +1615,7 @@ fn script_json(db: &mut Db, stmts: &[String]) -> i32 {
     code
 }
 
-fn repl(db: &mut Db, json: bool) -> i32 {
+fn repl(s: &mut Session<'_>, json: bool) -> i32 {
     let stdin = io::stdin();
     let mut buf = String::new();
     let mut code = EXIT_OK;
@@ -1463,7 +1664,7 @@ fn repl(db: &mut Db, json: bool) -> i32 {
         // A failed statement does not end the session — the operator is right
         // there — but it does decide the exit code, so a piped script that hit
         // an error is not reported afterwards as a clean run.
-        if statement(db, stmt, json) != EXIT_OK {
+        if statement_on(s, stmt, json) != EXIT_OK {
             code = EXIT_FAIL;
         }
     }

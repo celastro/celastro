@@ -124,11 +124,15 @@ language, no unbounded paths, no analytics.
 | `catalog` | collections and their indexes |
 | `health [--port N] [--attached N]` | exit 0 if a console is serving — and has verified `N` peers; a container's probes |
 | `export <COLLECTION> <DIR>`, `import <DIR>` | copy a collection as of an instant, without stopping the source; adopt one |
-| `send <URL> <SQL>` | one statement to a running console, the token from `CELASTRO_TOKEN` — what a backup CronJob runs |
+| `send <URL> <SQL>` | one statement to a running console, the answer as JSON — what a backup CronJob runs |
+| `key master <FILE>`, `key init <FILE>`, `key rekey <KEY> <MASTER>` | encryption at rest: a master key, a wrapped data key for a cluster, a master rotated |
+| `tls init <DIR> <NAME>`, `tls secret <SECRET> <NAME>` | a CA and a certificate, as files or as a Kubernetes Secret |
 | `version` | |
 
-`--dir <DIR>` opens a persistent database; `--json` makes every command's
-output machine-readable, failures included. Statements end with `;` or a
+`--dir <DIR>` opens a persistent database; `--url <URL>` makes `exec`,
+`run`, `repl` and `catalog` clients of a console that is already serving,
+local or remote (below); `--json` makes every command's output
+machine-readable, failures included. Statements end with `;` or a
 blank line. Exit codes: 0, 1 a runtime or SQL error, 2 a usage error.
 
 ## The console
@@ -195,6 +199,35 @@ counts as gone.
 A shard moves without stopping the collection, its files being all that
 crosses the wire.
 
+### Connecting to a cluster
+
+Every node's console is a coordinator: a statement sent to any of them
+reaches every shard, wherever it is. A client therefore needs one URL and
+the shared token, and the CLI is such a client:
+
+```sh
+export CELASTRO_TOKEN=...                      # the token every node was started with
+celastro-cli --url http://10.0.0.2:8787 repl   # or exec, run, catalog; https:// with CELASTRO_TLS_CA
+celastro-cli send http://10.0.0.3:8787 "SELECT tenant, count(*) FROM notes GROUP BY tenant"
+```
+
+On VMs, start each node with `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`,
+`CELASTRO_NODE` its own address, `CELASTRO_ATTACH` the list of all of them
+(its own is skipped, so every node takes the same list), `CELASTRO_WIRE_TOKEN`
+for the wire and `CELASTRO_TOKEN` for the console, the same values
+everywhere. Point clients at any node, or at a load balancer over all of
+them with `/api/health` as its check: the console closes every connection
+after one request, so any balancer spreads clients per request, and a
+node that is down costs its own shards and nothing else. On Kubernetes
+the chart does the same: `console.expose` puts the Service
+`<release>-console` over the pods with one token in a Secret, reachable
+from inside the cluster, through `kubectl port-forward svc/<release>-console
+8787`, or behind an ingress; `tls.enabled` makes it https. Two things
+are per node rather than per cluster: `BACKUP TO` backs up the shards of
+the node it reaches, so a cluster is backed up by sending it to each node
+(the chart's CronJob does), and `LOCAL` prefixes a statement to the one
+node it reaches.
+
 ## Kubernetes and containers
 
 `chart/celastro` runs one pod or a cluster: a `StatefulSet` whose pods attach
@@ -213,8 +246,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.38.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.38.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.39.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.39.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

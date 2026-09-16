@@ -137,6 +137,22 @@ pub struct QueryResult {
     pub next_cursor: Option<String>,
 }
 
+impl QueryResult {
+    /// A result of these rows and nothing else: no plan, nothing missing or
+    /// cut, no cursor. What a client rebuilds from a console's answer before
+    /// filling in what the answer carried.
+    pub fn of_rows(rows: Vec<Row>) -> QueryResult {
+        QueryResult {
+            rows,
+            explain: None,
+            missing: Vec::new(),
+            truncated_prefixes: Vec::new(),
+            cut_walks: Vec::new(),
+            next_cursor: None,
+        }
+    }
+}
+
 /// The prefixes this query's statistics say were cut, rendered for a human.
 ///
 /// Read back off `GlobalStats` rather than threaded down from the coordinator

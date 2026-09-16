@@ -6,6 +6,24 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.39.0 — 2026-09-16
+
+The command line is a client, hence a minor.
+
+**`celastro-cli --url <URL>`.** `exec`, `run`, `repl` and `catalog` then
+talk to a console that is already serving -- on this machine or another,
+one node of a cluster or a load balancer over all of them -- and render
+the answers as the local path does: rows as a table with the count, the
+missing shards and the cuts; an acknowledgement as its line; a plan as
+its text; a refusal as `error:`. `--json` passes the console's document
+through unchanged. The token is `CELASTRO_TOKEN`, or the `?t=` of the
+URL `serve` printed, so that line pastes as it is; `https://` is
+verified by the CA in `CELASTRO_TLS_CA`. `send` takes the token from the
+URL too now, and always sends the `Content-Type` the console requires.
+`--url` with `--dir`, or with a command that opens, serves or makes
+files, is a usage error. The README says how a cluster is reached, on
+VMs and on Kubernetes. `QueryResult::of_rows` for the library.
+
 ## 0.38.0 — 2026-09-16
 
 Aggregates, hence a minor.

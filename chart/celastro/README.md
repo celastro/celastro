@@ -41,7 +41,10 @@ not headless — spreads requests over the ready pods, per request, because
 the console closes every connection after one. `/api/health` names the pod
 that answered. Plain HTTP with the token as the only guard: keep the Service
 inside a network you trust, put an ingress in front of it
-(`console.service.type`), or set `tls.enabled`.
+(`console.service.type`), or set `tls.enabled`. From a workstation,
+`kubectl port-forward svc/celastro-console 8787` and then
+`celastro-cli --url http://127.0.0.1:8787 repl` with the token in
+`CELASTRO_TOKEN` is a session against the cluster, any pod coordinating.
 
 ### Encryption in transit
 
@@ -152,8 +155,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.38.0 .
-kind load docker-image celastro:0.38.0        # for a kind cluster
+docker build -t celastro:0.39.0 .
+kind load docker-image celastro:0.39.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
