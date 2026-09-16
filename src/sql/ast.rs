@@ -65,6 +65,14 @@ pub enum Statement {
         node: Option<String>,
         as_of: Option<u64>,
     },
+    /// `VERIFY BACKUP '<path or s3://...>' [NODE '<address>'] [AS OF <ts>]`
+    /// -- read every object of the backup back and check its size and
+    /// checksum against the record; nothing is written.
+    VerifyBackup {
+        from: String,
+        node: Option<String>,
+        as_of: Option<u64>,
+    },
     /// `DROP COLLECTION <name>` — the collection, its files, its objects in
     /// the store, and everything recorded against it. Irreversible.
     DropCollection {

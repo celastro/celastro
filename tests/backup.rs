@@ -128,6 +128,65 @@ fn a_backup_restores_what_was_there_at_the_pin_and_a_second_one_copies_only_what
     }
 }
 
+/// `VERIFY BACKUP` reads every object back against the record's size and
+/// checksum; a byte flipped in a pool segment -- the same size, so the
+/// size check passes -- is named by the verify and refused by a restore.
+#[test]
+fn verify_backup_reads_every_object_back_and_a_flipped_byte_is_named_and_refused() {
+    let src = dir("verify-src");
+    let dest = dir("verify-dest");
+    let mut db = open(&src);
+    setup(&mut db, 30);
+    ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let m = ack(&mut db, &format!("VERIFY BACKUP '{}'", dest.display()));
+    assert!(m.starts_with("verified backup ") && m.contains("every one as recorded"), "{m}");
+    assert!(!m.contains("size only"), "{m}");
+    let pool = dest.join("pool").join("items").join("shard-0000");
+    let seg = std::fs::read_dir(&pool).unwrap().next().unwrap().unwrap().path();
+    let mut bytes = std::fs::read(&seg).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&seg, &bytes).unwrap();
+    let e = db
+        .execute(&format!("VERIFY BACKUP '{}'", dest.display()))
+        .and_then(Outcome::finished)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("does not match its recorded checksum") && e.contains("pool/items"), "{e}");
+    let d2 = dir("verify-dst");
+    let mut db2 = open(&d2);
+    let e = db2
+        .execute(&format!("RESTORE FROM '{}'", dest.display()))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("does not match its recorded checksum"), "{e}");
+    assert!(db2.catalog.collections.is_empty(), "nothing was adopted");
+    // A record without checksums (a backup from before they were written)
+    // verifies by size and says so.
+    let record = std::fs::read_dir(dest.join("nodes")).unwrap().next().unwrap().unwrap().path();
+    let ts_dir = std::fs::read_dir(record.join("backups")).unwrap().next().unwrap().unwrap().path();
+    let rec = std::fs::read_to_string(ts_dir.join("BACKUP")).unwrap();
+    let v1: String = rec
+        .lines()
+        .map(|l| match l.splitn(3, '\t').collect::<Vec<_>>()[..] {
+            [k, n, _] => format!("{k}\t{n}"),
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(ts_dir.join("BACKUP"), v1).unwrap();
+    bytes[mid] ^= 0x55;
+    std::fs::write(&seg, &bytes).unwrap();
+    let m = ack(&mut db, &format!("VERIFY BACKUP '{}'", dest.display()));
+    assert!(m.contains("checked by size only"), "{m}");
+    for p in [&src, &dest, &d2] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 #[test]
 fn a_damaged_destination_is_refused_before_anything_is_written_and_paths_are_confined() {
     let src = dir("dmg-src");

@@ -1152,6 +1152,27 @@ impl Db {
         Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls)))
     }
 
+    /// `VERIFY BACKUP '<src>' [NODE '<address>'] [AS OF <ts>]`: read every
+    /// object the backup's record names back from the store and check its
+    /// size and, for a backup written since checksums were recorded, its
+    /// SHA-256 against the record. Nothing is written; the reading runs
+    /// after the statement let go of the lock, as a backup's copy does.
+    /// The answer names the backup, counts the objects and bytes checked,
+    /// and refuses with the first mismatches by name.
+    pub fn verify_backup(
+        &mut self,
+        src: &str,
+        node: Option<&str>,
+        as_of: Option<u64>,
+    ) -> Result<Outcome> {
+        let target =
+            crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), src)?;
+        let here = self.opts.node.clone().unwrap_or_default();
+        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), as_of)?;
+        let slug = crate::backup::node_slug(node.unwrap_or(&here));
+        Ok(Outcome::Deferred(crate::backup::verify_job(target, slug, fetched)))
+    }
+
     /// `RESTORE FROM '<src>' [AS OF <ts>]`: the newest complete backup at
     /// the source, or the one pinned at `ts`, into this database, which has
     /// to be empty. Every object the backup's record names is verified to
@@ -3361,6 +3382,9 @@ impl Db {
             }
             Statement::Backup { to } => self.backup(&to),
             Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
+            Statement::VerifyBackup { from, node, as_of } => {
+                self.verify_backup(&from, node.as_deref(), as_of)
+            }
             Statement::Compact { collection } => {
                 let n = self.compact(&collection)?;
                 Ok(Outcome::Ack(format!("{n} compaction job(s) run")))
@@ -4943,6 +4967,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Compact { .. } => "COMPACT",
         Statement::Backup { .. } => "BACKUP",
         Statement::Restore { .. } => "RESTORE",
+        Statement::VerifyBackup { .. } => "VERIFY BACKUP",
         _ => "this statement",
     }
 }

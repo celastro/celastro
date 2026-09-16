@@ -29,6 +29,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::crypto::hex;
+use crate::crypto::sha2::sha256;
 use crate::engine::{handle_bytes, Deferred, ExportShard, Outcome};
 use crate::error::{Error, Result};
 use crate::objstore::{ArchiveOpts, DirStore, ObjectStore, S3Store};
@@ -36,8 +38,9 @@ use crate::objstore::{ArchiveOpts, DirStore, ObjectStore, S3Store};
 /// What `BACKUP` pinned: per collection, the shards this node holds by
 /// tablet index.
 pub(crate) type Exported = Vec<(String, Vec<(usize, ExportShard)>)>;
-/// One restored shard's files: (name under the shard directory, key, size).
-pub(crate) type ShardFiles = Vec<(String, String, u64)>;
+/// One restored shard's files: (name under the shard directory, key, size,
+/// SHA-256 as hex -- empty for a record written before checksums).
+pub(crate) type ShardFiles = Vec<(String, String, u64, String)>;
 /// A backup's files per collection and tablet index.
 pub(crate) type BackupShards = Vec<(String, Vec<(usize, ShardFiles)>)>;
 
@@ -156,11 +159,11 @@ fn run(
 ) -> Result<Outcome> {
     let mine = format!("nodes/{}/", node_slug(&node));
     let own = format!("{mine}backups/{}/", ts_key(ts));
-    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut files: Vec<(String, u64, String)> = Vec::new();
     let (mut copied, mut present, mut bytes, mut shards) = (0usize, 0usize, 0u64, 0usize);
-    let put = |key: String, data: &[u8], files: &mut Vec<(String, u64)>| -> Result<()> {
+    let put = |key: String, data: &[u8], files: &mut Vec<(String, u64, String)>| -> Result<()> {
         target.store.put(&target.key(&key), data)?;
-        files.push((key, data.len() as u64));
+        files.push((key, data.len() as u64, hex(&sha256(data))));
         Ok(())
     };
     for (name, shard_list) in &colls {
@@ -186,7 +189,7 @@ fn run(
                         bytes += data.len() as u64;
                     }
                 }
-                files.push((key, data.len() as u64));
+                files.push((key, data.len() as u64, hex(&sha256(&data))));
             }
             for (id, log) in &ex.deletes {
                 if let Some(data) = log {
@@ -208,9 +211,12 @@ fn run(
     if let Some(k) = &key {
         put(format!("{own}KEY"), k, &mut files)?;
     }
-    let mut record = format!("celastro backup\nversion 1\nts {ts}\nnode {node}\n");
-    for (key, len) in &files {
-        record.push_str(&format!("{key}\t{len}\n"));
+    // Version 2 of the record: a SHA-256 beside every size, so a restore
+    // and VERIFY BACKUP can tell a damaged object from an intact one of the
+    // same length. A version 1 record (no third field) is still read.
+    let mut record = format!("celastro backup\nversion 2\nts {ts}\nnode {node}\n");
+    for (key, len, hash) in &files {
+        record.push_str(&format!("{key}\t{len}\t{hash}\n"));
     }
     target.store.put(&target.key(&format!("{own}BACKUP")), record.as_bytes())?;
     target.store.put(&target.key(&format!("{mine}LATEST")), format!("{ts}\n").as_bytes())?;
@@ -231,6 +237,8 @@ pub(crate) struct Fetched {
     pub(crate) catalog: Vec<u8>,
     pub(crate) key: Option<Vec<u8>>,
     pub(crate) collections: BackupShards,
+    /// Every object the record names: (key, size, SHA-256 hex or empty).
+    pub(crate) files: Vec<(String, u64, String)>,
 }
 
 /// The nodes a destination holds backups of.
@@ -314,17 +322,18 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
             target.display
         )));
     }
-    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut files: Vec<(String, u64, String)> = Vec::new();
     for line in lines {
-        if let Some((key, len)) = line.split_once('\t') {
+        if let Some((key, rest)) = line.split_once('\t') {
+            let (len, hash) = rest.split_once('\t').unwrap_or((rest, ""));
             let len = len.parse::<u64>().map_err(|_| {
                 Error::Storage(format!("{own}BACKUP: `{line}` is not a file entry"))
             })?;
-            files.push((key.to_string(), len));
+            files.push((key.to_string(), len, hash.to_string()));
         }
     }
     // Every object at its recorded size, before anything is written.
-    for (key, len) in &files {
+    for (key, len, _) in &files {
         match target.store.size(&target.key(key))? {
             Some(n) if n == *len => {}
             Some(n) => {
@@ -342,7 +351,7 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
         }
     }
     let catalog = target.store.get(&target.key(&format!("{own}CATALOG")))?;
-    let key = if files.iter().any(|(k, _)| *k == format!("{own}KEY")) {
+    let key = if files.iter().any(|(k, _, _)| *k == format!("{own}KEY")) {
         Some(target.store.get(&target.key(&format!("{own}KEY")))?)
     } else {
         None
@@ -351,7 +360,7 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
     // `pool/<coll>/shard-NNNN/<id>.seg`; an own key `nodes/<n>/backups/<ts>/<coll>/
     // shard-NNNN/<rest>`.
     let mut collections: BackupShards = Vec::new();
-    for (key, len) in &files {
+    for (key, len, hash) in &files {
         let (coll, shard, rest) = if let Some(r) = key.strip_prefix("pool/") {
             let mut it = r.splitn(3, '/');
             match (it.next(), it.next(), it.next()) {
@@ -386,9 +395,73 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
                 entry.1.last_mut().expect("just pushed")
             }
         };
-        shard_entry.1.push((rest, key.clone(), *len));
+        shard_entry.1.push((rest, key.clone(), *len, hash.clone()));
     }
-    Ok(Fetched { ts, catalog, key, collections })
+    Ok(Fetched { ts, catalog, key, collections, files })
+}
+
+/// An object read back against its record: the size always, the SHA-256
+/// when the record has one. The error names the object.
+fn checked(key: &str, data: &[u8], len: u64, hash: &str) -> Result<()> {
+    if data.len() as u64 != len {
+        return Err(Error::Storage(format!(
+            "backup is damaged: {key} is {} bytes, the record says {len}",
+            data.len()
+        )));
+    }
+    if !hash.is_empty() && hex(&sha256(data)) != hash {
+        return Err(Error::Storage(format!(
+            "backup is damaged: {key} does not match its recorded checksum"
+        )));
+    }
+    Ok(())
+}
+
+/// The work `VERIFY BACKUP` leaves for after the lock: every object read
+/// back and checked.
+pub(crate) fn verify_job(target: Target, slug: String, fetched: Fetched) -> Deferred {
+    Deferred::new(move || verify(target, &slug, fetched))
+}
+
+fn verify(target: Target, slug: &str, fetched: Fetched) -> Result<Outcome> {
+    let mut bytes = 0u64;
+    let mut unchecked = 0usize;
+    let mut damaged: Vec<String> = Vec::new();
+    for (key, len, hash) in &fetched.files {
+        let data = target.store.get(&target.key(key))?;
+        if hash.is_empty() {
+            unchecked += 1;
+        }
+        if let Err(e) = checked(key, &data, *len, hash) {
+            damaged.push(e.to_string());
+            if damaged.len() >= 5 {
+                break;
+            }
+        }
+        bytes += data.len() as u64;
+    }
+    if !damaged.is_empty() {
+        return Err(Error::Storage(format!(
+            "VERIFY BACKUP {} of node `{slug}` at {}: {}{}",
+            fetched.ts,
+            target.display,
+            damaged.join("; "),
+            if damaged.len() >= 5 { "; and possibly more" } else { "" }
+        )));
+    }
+    let note = if unchecked > 0 {
+        format!(
+            "; {unchecked} object(s) checked by size only (written before checksums were recorded)"
+        )
+    } else {
+        String::new()
+    };
+    Ok(Outcome::Ack(format!(
+        "verified backup {} of node `{slug}` at {}: {} object(s), {bytes} bytes, every one as recorded{note}",
+        fetched.ts,
+        target.display,
+        fetched.files.len()
+    )))
 }
 
 /// Write one shard's files under `sdir` (created), `MANIFEST` last so a
@@ -398,13 +471,14 @@ pub(crate) fn write_shard(target: &Target, sdir: &Path, files: &ShardFiles) -> R
     std::fs::create_dir_all(sdir.join("deletes"))?;
     std::fs::create_dir_all(sdir.join("archive"))?;
     let mut bytes = 0u64;
-    let mut manifest: Option<&(String, String, u64)> = None;
+    let mut manifest: Option<&(String, String, u64, String)> = None;
     for f in files {
         if f.0 == "MANIFEST" {
             manifest = Some(f);
             continue;
         }
         let data = target.store.get(&target.key(&f.1))?;
+        checked(&f.1, &data, f.2, &f.3)?;
         crate::shard::atomic_write(&sdir.join(&f.0), &data)?;
         bytes += data.len() as u64;
     }
@@ -415,6 +489,7 @@ pub(crate) fn write_shard(target: &Target, sdir: &Path, files: &ShardFiles) -> R
         )));
     };
     let data = target.store.get(&target.key(&m.1))?;
+    checked(&m.1, &data, m.2, &m.3)?;
     crate::shard::atomic_write(&sdir.join("MANIFEST"), &data)?;
     bytes += data.len() as u64;
     crate::shard::sync_dir(&sdir.join("segments"))?;

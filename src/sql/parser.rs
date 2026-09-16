@@ -196,35 +196,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("RESTORE") {
             self.expect_kw("FROM")?;
-            let from = self.destination()?;
-            let node = if self.eat_kw("NODE") {
-                match self.literal()? {
-                    Value::Str(s) => Some(s),
-                    other => {
-                        return Err(Error::Sql(format!(
-                            "NODE wants the address a node backed up as, like 'tcp://host:port', not {}",
-                            crate::json::to_string(&other)
-                        )))
-                    }
-                }
-            } else {
-                None
-            };
-            let as_of = if self.eat_kw("AS") {
-                self.expect_kw("OF")?;
-                match self.literal()? {
-                    Value::Int(n) if n >= 0 => Some(n as u64),
-                    other => {
-                        return Err(Error::Sql(format!(
-                            "AS OF wants a backup's instant, the integer BACKUP reported, not {}",
-                            crate::json::to_string(&other)
-                        )))
-                    }
-                }
-            } else {
-                None
-            };
+            let (from, node, as_of) = self.backup_source()?;
             return Ok(Statement::Restore { from, node, as_of });
+        }
+        if self.eat_kw("VERIFY") {
+            self.expect_kw("BACKUP")?;
+            let (from, node, as_of) = self.backup_source()?;
+            return Ok(Statement::VerifyBackup { from, node, as_of });
         }
         if self.eat_kw("EXPLAIN") {
             let analyze = self.eat_kw("ANALYZE");
@@ -701,6 +679,40 @@ impl<'a> Parser<'a> {
     }
 
     /// A backup destination: a quoted path or `s3://bucket/prefix`.
+    /// `[NODE '<address>'] [AS OF <ts>]` after a backup's source, as RESTORE
+    /// and VERIFY BACKUP take it.
+    fn backup_source(&mut self) -> Result<(String, Option<String>, Option<u64>)> {
+        let from = self.destination()?;
+        let node = if self.eat_kw("NODE") {
+            match self.literal()? {
+                Value::Str(s) => Some(s),
+                other => {
+                    return Err(Error::Sql(format!(
+                    "NODE wants the address a node backed up as, like 'tcp://host:port', not {}",
+                    crate::json::to_string(&other)
+                )))
+                }
+            }
+        } else {
+            None
+        };
+        let as_of = if self.eat_kw("AS") {
+            self.expect_kw("OF")?;
+            match self.literal()? {
+                Value::Int(n) if n >= 0 => Some(n as u64),
+                other => {
+                    return Err(Error::Sql(format!(
+                        "AS OF wants a backup's instant, the integer BACKUP reported, not {}",
+                        crate::json::to_string(&other)
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        Ok((from, node, as_of))
+    }
+
     fn destination(&mut self) -> Result<String> {
         match self.literal()? {
             Value::Str(s) if !s.trim().is_empty() => Ok(s),

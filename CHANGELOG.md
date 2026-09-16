@@ -8,6 +8,22 @@ repository.
 
 ## Unreleased
 
+**`VERIFY BACKUP '<dest>' [NODE '<address>'] [AS OF <ts>]`.** Every
+object the backup's record names is read back and checked against its
+recorded size and, for a backup written from this version on, its
+SHA-256 -- the record now carries one per object -- and a restore checks
+the same as it writes, so a byte flipped in the pool is named and refused
+rather than restored. A record from an earlier version verifies by size
+and says so. The reading runs after the statement let go of the lock.
+
+**Measured: recovery after `kill -9`.** On the survey corpus with nothing
+sealing, a node killed after 4,000, 12,000 and 21,000 acknowledged rows
+reopened with exactly those rows in 0.29, 0.80 and 1.41 s; all 50,000
+unsealed replayed from a 67 MB WAL in 3.3 s at 335 MB, and reopened in
+0.05 s once sealed. The seal of that memtable built its graph under the
+write lock for 146 s, which is what `CELASTRO_MEMTABLE_MAX_VECTORS`
+bounds; docs/tuning.md says so.
+
 **`GET /api/metrics`.** The process's counters -- statements run and
 failed, their total and longest time, requests refused, compactions the
 maintenance thread installed and their time, connections served, TLS

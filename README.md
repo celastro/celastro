@@ -312,8 +312,11 @@ the rows that were still in memory, plus a record naming every object it
 needs. The copy runs after the statement let go of the node's lock, so
 other statements are answered meanwhile. `RESTORE FROM` takes the newest
 complete backup, or the one `AS OF` the instant `BACKUP` reported, verifies
-every object is there at its recorded size, and only then writes; the
-shards come back placed on the restoring node. Each node backs up under
+every object is there at its recorded size, and only then writes,
+checking each object's SHA-256 against the record as it goes; the
+shards come back placed on the restoring node. `VERIFY BACKUP '<dest>'`
+reads every object back and checks it without writing anything, which
+is what a restore drill's first step is. Each node backs up under
 its own name (`CELASTRO_NODE`, or `local`), so a cluster's pods share one
 destination and each restores its own; `NODE '<address>'` takes another
 node's. With `CELASTRO_BACKUP_DIR`
