@@ -20,95 +20,50 @@ Releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
-Documents are JSON. A collection declares the primary key and any typed
-columns, an index declares how a path is searched, and the SELECT list picks
-the fields that come back. Put this in `quickstart.sql`:
+A server on a directory, and a client talking to it. Locally or in a
+cluster, that is the whole loop.
 
-```sql
+```sh
+cat > quickstart.sql <<'EOF'
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT);
 CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
 CREATE INDEX notes_emb ON notes USING vector (embedding) WITH (dims = 4, metric = 'cosine');
-
-INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency and document length","embedding":[0.9,0.1,0.0,0.0]}');
-INSERT INTO notes VALUES ('{"id":"n2","topic":"search","body":"Vector search finds the nearest neighbours in embedding space","embedding":[0.1,0.9,0.0,0.0]}');
-INSERT INTO notes VALUES ('{"id":"n3","topic":"storage","body":"An LSM tree seals a memtable into immutable segments","embedding":[0.0,0.0,0.9,0.1]}');
-INSERT INTO notes VALUES ('{"id":"n4","topic":"storage","body":"Compaction merges segments and drops dead versions","embedding":[0.0,0.0,0.1,0.9]}');
-
--- a structured predicate
-SELECT id, topic FROM notes WHERE topic = 'storage';
--- full text: text_match in WHERE is a must
-SELECT id FROM notes WHERE text_match(body, 'segments');
--- nearest neighbours
-SELECT id FROM notes ORDER BY embedding <=> [0.8,0.2,0.0,0.0] LIMIT 2;
--- a distance threshold is a filter; this one is exact match for cosine
-SELECT id FROM notes WHERE embedding <=> [0.9,0.1,0.0,0.0] < 0.000001;
--- all three in one plan, fused with reciprocal rank fusion
-SELECT id, topic FROM notes
-ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf')
-LIMIT 3;
+INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency","embedding":[0.9,0.1,0.0,0.0]}');
+INSERT INTO notes VALUES ('{"id":"n2","topic":"storage","body":"An LSM tree seals a memtable into segments","embedding":[0.0,0.0,0.9,0.1]}');
+EOF
+celastro-cli --dir ./data run quickstart.sql
+celastro-cli --dir ./data serve
 ```
 
-
-Run it against a directory, so the data is there next time:
-
 ```
-$ celastro-cli --dir ./data run quickstart.sql
-collection `notes` created with 1 shard(s)
-...
-key | score    | id | topic
-----+----------+----+--------
-n1  | 0.032787 | n1 | search
-n2  | 0.032258 | n2 | search
-n3  | 0.015873 | n3 | storage
-3 row(s)
+http://127.0.0.1:8787/?t=31beccfc...        # the console's URL; the token follows ?t=
 ```
 
-Or serve it and talk to it over HTTP, which is what an application does —
-locally just the same as in a cluster:
+From another terminal, with that token, one statement at a time or over
+HTTP as an application would:
 
-```
-$ celastro-cli --dir ./data serve
-http://127.0.0.1:8787/?t=0a1b...            # the console, token included
-$ export CELASTRO_TOKEN=0a1b...
-$ celastro-cli send http://127.0.0.1:8787 "SELECT id FROM notes WHERE topic = 'storage'"
-$ curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" http://127.0.0.1:8787/api/query \
-       -d '{"sql":"SELECT id FROM notes WHERE text_match(body, ''segments'')"}'
-{"ok":true,"kind":"rows","count":2,"rows":[...]}
-```
-
-`key` is the row's primary key and `score` or `distance` its rank, whichever
-the query produced. A distance in `WHERE` is a filter in the units the
-`distance` column shows (cosine: exact match is a small threshold; L2: `<= 0`).
-Every write is on the disk before it is acknowledged. `EXPLAIN ANALYZE` in
-front of any query prints the plan that ran — shards scanned, the vector
-strategy chosen from measured selectivity, and where the fusion happened:
-
-```
-$ celastro-cli --dir ./data exec "EXPLAIN ANALYZE SELECT * FROM notes ORDER BY hybrid(text_match(body, 'search documents'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf') LIMIT 3"
-Query plan  (snapshot ts=7328898005345050624, limit=3, k'=100)
-  scatter: 1 of 1 shard(s) scanned, 0 pruned by partition key
-  term statistics: cached approximate
-  shard 0 (manifest v0, 0.01 ms):
-    memtable       docs=4       visible=4       survivors=4       s=1.0000  0.01 ms
-      text[text(body)]: block-max WAND, terms=["search", "document"], candidates=2
-      vector[vector(embedding)]: strategy=brute_force tier=Flat s=1.0000 survivors=4 ef=0 amp=0.0x reranked=4 reprobes=0
-  fusion at coordinator: method=rrf sources=["text(body)", "vector(embedding)"] candidates=[2, 4] union=4
-  fetch: 3 payload(s) from winning shards only, 0.00 ms
-  total: 0.04 ms
+```sh
+export CELASTRO_TOKEN=31beccfc...
+celastro-cli send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'segments')"
+curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" -H "Content-Type: application/json" \
+     http://127.0.0.1:8787/api/query -d @- <<'EOF'
+{"sql": "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), embedding <=> [0.8,0.2,0.0,0.0], method => 'rrf') LIMIT 3"}
+EOF
 ```
 
+```
+{"ok":true,"kind":"rows","count":1,...,"rows":[{"key":"n2","score":null,"distance":null,"doc":{"id":"n2"}}]}
+{"ok":true,"kind":"rows","count":2,...,"rows":[{"key":"n1","score":0.0328,"distance":null,"doc":{"id":"n1","topic":"search"}},{"key":"n2",...}]}
+```
 
-`celastro-cli demo` builds a 400-document corpus over three shards in memory
-and walks through the same ideas at a size where the plan has choices to
-make.
-
-Three things worth knowing early. A prefix such as `text_match(body,
-'comp*')` expands to at most `prefix_expansion` dictionary terms (512; a
-per-collection setting), and an answer that was cut says so with a
-`TRUNCATED` line — a `DELETE` whose predicate was cut is refused outright.
-Documents nest at most 128 deep, and a field whose name contains a dot is
-unreachable by a path. `DROP INDEX` and `DROP COLLECTION` are final. The
-[design notes](docs/design.md) have the reasoning behind each.
+The second query is text and vector in one plan, fused by reciprocal rank
+fusion; `WHERE` takes structured predicates, `text_match`, and a distance
+threshold. `celastro-cli --dir ./data exec "<SQL>"` runs a statement without
+a server, `EXPLAIN ANALYZE` in front of a query prints the plan that ran,
+and `celastro-cli demo` is a guided tour in memory. Every write is on the
+disk before it is acknowledged. Two limits worth knowing early: a prefix
+such as `text_match(body, 'comp*')` expands to at most 512 dictionary terms
+and says `TRUNCATED` when cut, and `DROP` is final.
 
 ## Counting and summing
 
@@ -195,34 +150,18 @@ the engine is single-writer. `/api/health` names the node that answered.
 A `serve` also compacts on its own — one job at a time, built outside the
 lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 
-## Encryption in transit
+## Encryption
 
-Off by default. `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
-(PEM; all three or none) put the console and the wire on TLS 1.3, every
-peer verified against the CA by the name it was dialled; the tokens stay.
-`celastro-cli tls init ./tls <name>` makes a CA and a certificate that fit,
-and the chart makes them for you. The TLS is written in this repository and
-unaudited: one suite, X25519, an Ed25519 certificate for the node (the CA
-may be RSA or P-256), no resumption yet; [SECURITY.md](SECURITY.md) has the
-scope and the reasoning.
-
-## Encryption at rest
-
-```
-$ celastro-cli key master ./master.key
-$ CELASTRO_MASTER_KEY_FILE=./master.key celastro-cli --dir ./data serve
-```
-
-With a master key every file under `--dir`, every object the archived tier
-puts in a store and every backup and export are ChaCha20-Poly1305 frames
-under a data key that `<dir>/KEY` holds wrapped under the master; without
-the master the directory is refused. A cluster's pods share one data key
-(`celastro-cli key init`, `CELASTRO_KEY_FILE`; the chart's
-`encryption.existingSecret`) so shards move and backups restore between
-them; `key rekey` rotates the master in one small write. An existing plain
-database takes a key by `export` and `import` into a fresh directory
-opened with one. [SECURITY.md](SECURITY.md) has what it protects and what
-it does not.
+In transit: `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
+(PEM) put the console and the wire on TLS 1.3; `celastro-cli tls init
+./tls <name>` makes a set, and the chart's `tls.enabled` does it for you.
+At rest: `celastro-cli key master ./master.key`, then
+`CELASTRO_MASTER_KEY_FILE=./master.key` on every start, encrypts every file
+under `--dir`, the archived tier, backups and exports; a cluster shares one
+data key (`celastro-cli key init`, `CELASTRO_KEY_FILE`, the chart's
+`encryption.existingSecret`). Both are written in this repository and
+unaudited; [SECURITY.md](SECURITY.md) says what each protects and what it
+does not.
 
 ## Two or more nodes
 
