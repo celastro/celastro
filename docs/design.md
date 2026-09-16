@@ -1202,6 +1202,29 @@ rather than blocking on it, because a blocking accept is restarted after the
 handler runs. Only `serve` installs it: at a REPL a handled Ctrl-C would be
 swallowed by the restarted read. The route is recorded in `src/signal.rs`.
 
+**A statement is all or nothing on the log, and a seal is nobody's
+statement.** Measured on a 48 MB tmpfs filled by inserts (0.43.1): the
+batch whose append hit `ENOSPC` had the 289 records that fit replayed at
+the next reopen, for a statement the client was told had failed; and a
+seal that failed inside a batch's mutation loop failed the statement with
+384 of its rows applied in memory and all 500 on the log, so the running
+node showed rows a reopen did not. Two rules follow. The log is marked
+before a statement's records and cut back to the mark (`set_len`, which
+needs no space) when an append or the sync fails, so a refused statement
+leaves nothing to replay. And the seal a write triggers runs after the
+whole batch is applied and cannot fail the write: the write is on the log
+and in memory, which is what was promised; the seal's failure is counted
+on the shard (`seal_failures`, in `/api/metrics`) and the next write
+tries again -- on a disk that stays full, each following append is
+refused cleanly instead. A directory that vanished under a running node
+(unmounted, removed) is the third case the same run showed: the log's
+open descriptor accepts bytes into a file no reopen can find, so a write
+is refused when the `LOCK` this process holds is not where it was, and
+the health probe says the node is not well so its supervisor restarts it
+where the missing directory can be seen. Tests inject the failures
+through the durability probe (`fail_next`, `fail_after`) at the append,
+the temporary file's fsync and by renaming the directory aside.
+
 **Durability is unix-shaped, and every mover is inside it.** The guarantee
 rests on fsyncing the directory a rename landed in, which is a POSIX
 operation; off unix `sync_dir` is a no-op and the guarantee weakens to what
@@ -1360,6 +1383,7 @@ guarantee:
 | a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
+| a refused write leaves no record and no row; a failed seal does not fail the write and is retried; a vanished directory refuses writes and is not well | `shard::tests::a_write_the_log_refuses_leaves_no_record_and_no_row` (an append that fails at the third record of a batch: the log cut back, memory untouched, a reopen with the acknowledged rows; the same for one document and a delete), `shard::tests::a_seal_that_fails_leaves_the_write_acknowledged_and_is_retried` (the segment's temporary fsync fails: the batch acknowledged and visible, the failure counted, the next write seals, a reopen has every row), `engine::tests::a_vanished_directory_refuses_writes_and_is_not_well` |
 | a backup's record carries a checksum per object; `VERIFY BACKUP` reads everything back, a restore checks as it writes, and a flipped byte is named and refused | `backup::verify_backup_reads_every_object_back_and_a_flipped_byte_is_named_and_refused` (`tests/backup.rs`: the verify's ack, a pool segment with one byte flipped named by VERIFY and refused by RESTORE with nothing adopted, a version-1 record verified by size with a note) |
 | a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
 | every parser that reads the network or a file answers `Ok` or `Err` to thousands of mutants of valid input, never panics or aborts | `fuzz::*` is the seeded mutator (`src/fuzz.rs`, tests only); the targets are `x509::tests::fuzz_certificate_parsing_never_panics`, `pem::tests::fuzz_pem_decoding_never_panics`, `tls13::tests::fuzz_handshake_message_parsing_never_panics` (hellos, Certificate, NewSessionTicket, and a mutated ticket never opens), `serve::tests::fuzz_request_heads_never_panic`, `objstore::tests::fuzz_store_responses_never_panic`, `wire::tests::fuzz_wire_answers_never_panic`, `shard::tests::fuzz_manifest_and_wal_never_panic`, `mvcc::tests::fuzz_delete_logs_and_ordinals_never_panic`, `engine::tests::fuzz_catalog_decoding_never_panics`, `segment::tests::fuzz_segment_and_component_decoding_never_panics`, `hnsw::tests::fuzz_graph_decoding_never_panics`, `quant::tests::fuzz_code_decoding_never_panics`, `variant::tests::fuzz_variant_decoding_never_panics`, `json::tests::fuzz_json_parsing_never_panics`, `parser::tests::fuzz_sql_parsing_never_panics`, `query::tests::fuzz_text_query_parsing_never_panics`. First run: the wire's answers and the manifest reserved a `Vec` for a count read from the input, and a count of 2^50 aborted the process on the allocation -- `codec::get_count` now refuses a count larger than the bytes left |

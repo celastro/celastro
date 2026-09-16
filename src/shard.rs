@@ -775,6 +775,8 @@ pub(crate) mod durable {
     // compiled -- which is the point: the seam costs a release build nothing.
     #[cfg_attr(not(test), allow(unused_variables))]
     pub(crate) fn sync_file(f: &fs::File, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        probe::check(probe::Op::TempSync, path)?;
         f.sync_all()?;
         #[cfg(test)]
         probe::note_sync(probe::Op::TempSync, path);
@@ -1034,16 +1036,40 @@ pub(crate) mod durable {
         /// through.
         pub(crate) fn fail_next(op: Op, path: &Path) {
             ARMED.with(|a| *a.borrow_mut() = Some((op, path.to_path_buf())));
+            SKIP.with(|s| *s.borrow_mut() = 0);
+        }
+
+        /// Fail the operation after `skip` matching ones have gone through:
+        /// the third record of a batch, say.
+        pub(crate) fn fail_after(op: Op, path: &Path, skip: usize) {
+            fail_next(op, path);
+            SKIP.with(|s| *s.borrow_mut() = skip);
+        }
+
+        thread_local! {
+            static SKIP: RefCell<usize> = const { RefCell::new(0) };
         }
 
         /// Called immediately before the syscall, and returns the injected
         /// error in its place. Private to [`super`] for the same reason
         /// [`note_sync`] is: a call site that could arm and answer its own
         /// failures could pass the tests that exist to follow a real one out.
-        pub(super) fn check(op: Op, path: &Path) -> Result<()> {
+        pub(crate) fn check(op: Op, path: &Path) -> Result<()> {
             let armed = ARMED.with(|a| {
                 let hit = matches!(&*a.borrow(), Some((o, p)) if *o == op && p == path);
                 if hit {
+                    let skipping = SKIP.with(|s| {
+                        let mut s = s.borrow_mut();
+                        if *s > 0 {
+                            *s -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if skipping {
+                        return false;
+                    }
                     *a.borrow_mut() = None;
                 }
                 hit
@@ -1202,6 +1228,13 @@ pub(crate) struct WalRecord {
     pub segment_id: u64,
 }
 
+/// A position in the log a statement can be rolled back to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WalMark {
+    len: u64,
+    records: u64,
+}
+
 pub(crate) struct Wal {
     file: fs::File,
     path: PathBuf,
@@ -1258,7 +1291,25 @@ impl Wal {
         Ok(Wal { file, path: path.to_path_buf(), cipher, id, records })
     }
 
+    /// Where the log ends now: what a statement takes before its records,
+    /// so a statement that fails partway can be taken back off the log.
+    pub(crate) fn mark(&self) -> Result<WalMark> {
+        Ok(WalMark { len: self.file.metadata()?.len(), records: self.records })
+    }
+
+    /// Cut the log back to `mark`: the records a refused statement wrote
+    /// are gone, and a reopen replays only what was acknowledged. Best
+    /// effort on a disk that is full -- shrinking a file needs no space --
+    /// and on one that is gone, where the failure is the caller's anyway.
+    pub(crate) fn rollback(&mut self, mark: WalMark) -> Result<()> {
+        self.file.set_len(mark.len)?;
+        self.records = mark.records;
+        Ok(())
+    }
+
     pub(crate) fn append(&mut self, r: &WalRecord) -> Result<()> {
+        #[cfg(test)]
+        durability_probe::check(durability_probe::Op::WalAppend, &self.path)?;
         let mut body = Vec::new();
         body.push(r.kind);
         put_str(&mut body, &r.key);
@@ -1493,6 +1544,10 @@ pub struct Shard {
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
     pub(crate) flushes: u64,
+    /// Seals that failed and were left for the next write to retry, and
+    /// the last one's reason: a disk that is full or gone, seen here first.
+    pub(crate) seal_failures: u64,
+    pub(crate) last_seal_error: Option<String>,
     pub(crate) compactions: u64,
     /// The horizon the last version-collecting operation actually ran at,
     /// maxed over every flush and compaction since this shard was opened. At
@@ -1557,6 +1612,8 @@ impl Shard {
             dir: None,
             wal: None,
             flushes: 0,
+            seal_failures: 0,
+            last_seal_error: None,
             compactions: 0,
             retain_floor: 0,
             retiring: Vec::new(),
@@ -1826,14 +1883,24 @@ impl Shard {
         let ts = self.clock.now();
         let prev = self.locate(&key, MAX_TS);
         if let Some(w) = self.wal.as_mut() {
-            w.append(&WalRecord {
+            let mark = w.mark()?;
+            let record = WalRecord {
                 kind: WAL_INSERT,
                 key: key.clone(),
                 ts,
                 doc: Some(doc.clone()),
                 supersedes: prev.is_some(),
                 segment_id: 0,
-            })?;
+            };
+            // A record that could not be written whole, or synced, is taken
+            // back off the log: a statement that was refused must not come
+            // back on the next reopen as if it had been acknowledged. This
+            // is what a full disk showed: the appends that fit were replayed
+            // for a statement the client was told had failed.
+            if let Err(e) = w.append(&record).and_then(|_| w.sync()) {
+                let _ = w.rollback(mark);
+                return Err(e);
+            }
             // `append` ends at `write_all`, which reaches the page cache and
             // stops there, so without this the timestamp returned below names a
             // commit that a power loss still takes back. The record is framed
@@ -1847,16 +1914,8 @@ impl Shard {
             //
             // It also sits above the mutations below rather than after them,
             // so a sync that fails returns `Err` with the in-memory shard
-            // exactly as it was, instead of having already superseded the
-            // previous version for a record that was never made durable. The
-            // LOG is not as it was: `append` completed its `write_all` on the
-            // line above, so the record is whole and its CRC checks out, and a
-            // writeback that later succeeds anyway makes a rejected document
-            // live again on the next reopen. That is the honest statement of
-            // what this ordering buys -- the process keeps serving the state it
-            // reported, and the failed write is not compounded by a supersede
-            // for a record nobody can vouch for.
-            w.sync()?;
+            // exactly as it was, and the log cut back to where it was, so a
+            // rejected document does not live again on the next reopen.
         }
         if let Some(p) = prev {
             self.mark_superseded(p, ts);
@@ -1864,8 +1923,20 @@ impl Shard {
         self.coll.observe_doc(&doc);
         self.unsealed.observe_doc(&doc);
         self.memtable.insert(key, ts, doc)?;
-        self.maybe_flush()?;
+        self.seal_if_due();
         Ok(ts)
+    }
+
+    /// Seal the memtable if its thresholds say so. A seal that fails --
+    /// the disk is full, the directory is gone -- does not fail the write
+    /// that triggered it: that write is on the log and in memory, which is
+    /// what it was promised, and the seal is tried again by the next one.
+    /// The failure is counted and kept, for the metrics and the log.
+    fn seal_if_due(&mut self) {
+        if let Err(e) = self.maybe_flush() {
+            self.seal_failures += 1;
+            self.last_seal_error = Some(e.to_string());
+        }
     }
 
     /// `insert`, for the documents of one statement: every document is
@@ -1902,19 +1973,31 @@ impl Shard {
             return Ok(out);
         }
         if let Some(w) = self.wal.as_mut() {
-            for (key, ts, doc, prev) in &prepared {
-                w.append(&WalRecord {
-                    kind: WAL_INSERT,
-                    key: key.clone(),
-                    ts: *ts,
-                    doc: Some(doc.clone()),
-                    supersedes: prev.is_some(),
-                    segment_id: 0,
-                })?;
+            let mark = w.mark()?;
+            let written: Result<()> = 'log: {
+                for (key, ts, doc, prev) in &prepared {
+                    if let Err(e) = w.append(&WalRecord {
+                        kind: WAL_INSERT,
+                        key: key.clone(),
+                        ts: *ts,
+                        doc: Some(doc.clone()),
+                        supersedes: prev.is_some(),
+                        segment_id: 0,
+                    }) {
+                        break 'log Err(e);
+                    }
+                }
+                // Above the mutations, as in `insert`: a sync that fails
+                // leaves the shard's memory as it was for every document.
+                w.sync()
+            };
+            // All or nothing on the log too: the records that fit before the
+            // disk filled are taken back, so the statement the client was
+            // told had failed does not come back on the next reopen.
+            if let Err(e) = written {
+                let _ = w.rollback(mark);
+                return Err(e);
             }
-            // Above the mutations, as in `insert`: a sync that fails leaves
-            // the shard's memory as it was for every document of the batch.
-            w.sync()?;
         }
         let mut out = Vec::with_capacity(prepared.len());
         for (key, ts, doc, prev) in prepared {
@@ -1924,9 +2007,12 @@ impl Shard {
             self.coll.observe_doc(&doc);
             self.unsealed.observe_doc(&doc);
             self.memtable.insert(key, ts, doc)?;
-            self.maybe_flush()?;
             out.push(ts);
         }
+        // After every document, not between them: a seal that fails in the
+        // middle of a batch used to fail the statement with half of it
+        // applied in memory and all of it on the log.
+        self.seal_if_due();
         Ok(out)
     }
 
@@ -1968,19 +2054,24 @@ impl Shard {
         let ts = self.clock.now();
         let Some(prev) = self.locate(key, MAX_TS) else { return Ok(None) };
         if let Some(w) = self.wal.as_mut() {
-            w.append(&WalRecord {
+            let mark = w.mark()?;
+            let record = WalRecord {
                 kind: WAL_DELETE,
                 key: key.to_string(),
                 ts,
                 doc: None,
                 supersedes: true,
                 segment_id: 0,
-            })?;
+            };
             // Durable before `mark_superseded` below makes the removal visible,
             // for the same reason as in `insert` and more sharply: this shard
             // would otherwise drop the old version for a delete the log never
-            // recorded, and a reopen would resurrect the document.
-            w.sync()?;
+            // recorded, and a reopen would resurrect the document. A record
+            // that did not make it is taken back off the log.
+            if let Err(e) = w.append(&record).and_then(|_| w.sync()) {
+                let _ = w.rollback(mark);
+                return Err(e);
+            }
         }
         self.mark_superseded(prev, ts);
         Ok(Some(ts))
@@ -4607,6 +4698,79 @@ mod tests {
     /// survived the previous round, `sync_data` deleted and the counter next to
     /// it left alone -- returns `Ok(())` here and this goes red.
     ///
+    /// A statement refused on the log -- an append that fails, as a full
+    /// disk fails it -- leaves no record and no row: the log is cut back to
+    /// where it was, memory is untouched, and a reopen has exactly the
+    /// acknowledged rows.
+    #[test]
+    fn a_write_the_log_refuses_leaves_no_record_and_no_row() {
+        let dir = std::env::temp_dir().join(format!("celastro-refused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        let doc = |i: usize| {
+            crate::json::parse(&format!(r#"{{"id":"doc-{i:03}","tenant_id":"t1","n":{i}}}"#))
+                .unwrap()
+        };
+        s.insert_many((0..3).map(doc).collect()).unwrap();
+        let wal = dir.join("wal.log");
+        let len_before = fs::metadata(&wal).unwrap().len();
+        durability_probe::start();
+        // The third record of the batch fails to append: the first two were
+        // written whole, and must go.
+        durability_probe::fail_after(durability_probe::Op::WalAppend, &wal, 2);
+        let e = s.insert_many((3..8).map(doc).collect()).unwrap_err().to_string();
+        assert!(e.contains("injected"), "{e}");
+        assert_eq!(fs::metadata(&wal).unwrap().len(), len_before, "the log was cut back");
+        assert_eq!(s.num_docs(MAX_TS), 3, "memory is as it was");
+        // The same for one document, and for a delete.
+        durability_probe::fail_next(durability_probe::Op::WalAppend, &wal);
+        assert!(s.insert(doc(9)).is_err());
+        durability_probe::fail_next(durability_probe::Op::WalAppend, &wal);
+        assert!(s.delete("t1\u{1}doc-001").is_err());
+        assert_eq!(fs::metadata(&wal).unwrap().len(), len_before);
+        assert!(s.contains("t1\u{1}doc-001", MAX_TS));
+        drop(s);
+        let _ = durability_probe::take();
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.num_docs(MAX_TS), 3, "a reopen has the acknowledged rows and no other");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seal that fails does not fail the write that was already on the
+    /// log and in memory: the write is acknowledged, the failure is counted,
+    /// the next write seals, and a reopen has every row.
+    #[test]
+    fn a_seal_that_fails_leaves_the_write_acknowledged_and_is_retried() {
+        let dir = std::env::temp_dir().join(format!("celastro-sealfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut opts = ShardOpts::default();
+        opts.thresholds.max_bytes = 1;
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), opts, &dir).unwrap();
+        let doc = |i: usize| {
+            crate::json::parse(&format!(r#"{{"id":"doc-{i:03}","tenant_id":"t1","n":{i}}}"#))
+                .unwrap()
+        };
+        durability_probe::start();
+        // The first segment's temporary file fails its fsync: the seal fails.
+        let tmp = dir.join("segments").join("0000000000000001.tmp");
+        durability_probe::fail_next(durability_probe::Op::TempSync, &tmp);
+        let ts = s.insert_many((0..3).map(doc).collect()).unwrap();
+        assert_eq!(ts.len(), 3, "the write was acknowledged");
+        assert_eq!(s.seal_failures, 1, "{:?}", s.last_seal_error);
+        assert!(s.last_seal_error.as_deref().is_some_and(|e| e.contains("injected")));
+        assert_eq!(s.num_docs(MAX_TS), 3, "and every row is visible");
+        assert!(s.segments.is_empty(), "nothing was sealed");
+        // The next write seals what the failed one left, and itself.
+        s.insert(doc(3)).unwrap();
+        assert!(!s.segments.is_empty(), "the seal was retried");
+        assert_eq!(s.num_docs(MAX_TS), 4);
+        drop(s);
+        let _ = durability_probe::take();
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.num_docs(MAX_TS), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Linux-only because it names the descriptors: fsync on `/dev/null` and on
     /// a procfs directory is `EINVAL` there, since neither has a filesystem
     /// behind it to flush. The production code is not Linux-only.
@@ -4911,18 +5075,16 @@ mod tests {
             "the document was removed for a delete record that was never made durable"
         );
 
-        // The other half of what that comment says, and the reason it no longer
-        // claims the shard is untouched: `append` completed before the sync was
-        // reached, so the log DOES hold a record for a write the caller was
-        // told had failed, and a reopen replays it. Pinned rather than fixed --
-        // fencing it means truncating the log back or poisoning the `Wal`, and
-        // that is a different change -- but pinned, so that the day it is
-        // fenced this test says so.
+        // The other half: `append` completed before the sync was reached, so
+        // the log held a record for a write the caller was told had failed,
+        // and a reopen replayed it. Fenced since a full disk showed it in
+        // the wild: the log is cut back to where the statement found it, so
+        // only the first insert's record is there.
         assert_eq!(
             Wal::replay(&log, &None, "t/wal.log").unwrap().len(),
-            3,
-            "the first insert, the rejected insert and the rejected delete: the records of the \
-             two rejected writes are in the log, which is what the comment in `insert` says"
+            1,
+            "the first insert only: the records of the two rejected writes were taken back off \
+             the log"
         );
 
         // And the arming is one shot, so this is the control: the same insert

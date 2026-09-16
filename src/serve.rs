@@ -231,6 +231,21 @@ fn metrics_text(db: &Db) -> String {
         "",
         db.collection_count().to_string(),
     );
+    let (seal_failures, _) = db.seal_failures();
+    line(
+        "celastro_seal_failures_total",
+        "counter",
+        "Seals that failed and were left for a later write to retry.",
+        "",
+        seal_failures.to_string(),
+    );
+    line(
+        "celastro_directory_present",
+        "gauge",
+        "1 while the data directory is where it was opened.",
+        "",
+        if db.directory_present() { "1" } else { "0" }.to_string(),
+    );
     line(
         "celastro_attached_nodes",
         "gauge",
@@ -1676,6 +1691,14 @@ fn health_json(db: &Db) -> String {
     // Verified since start, for a readiness probe: a node that has not yet
     // reached its peers can coordinate nothing that lives on them.
     let attached = db.attached_count();
+    // A node whose data directory is gone is not well, whatever else it can
+    // still answer from memory: the probe that asks should restart it, and
+    // the restart will say the directory is missing where it can be seen.
+    if !db.directory_present() {
+        return format!(
+            r#"{{"ok":false,"error":"the data directory is gone","name":"celastro","version":{version},"node":{node}}}"#
+        );
+    }
     format!(
         r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections},"node":{node},"attached":{attached}}}"#
     )

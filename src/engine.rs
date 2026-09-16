@@ -1570,6 +1570,34 @@ impl Db {
 
     /// How many collections the catalog holds. What a health probe asks,
     /// because answering it means the catalog is there to be read.
+    /// The data directory, or `None` in memory.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    /// Whether the data directory is still where it was opened: `true` in
+    /// memory, and on disk while the `LOCK` this process holds is there. A
+    /// health probe asks, so a node whose volume went away is not well.
+    pub fn directory_present(&self) -> bool {
+        self.dir.as_ref().map(|d| d.join("LOCK").exists()).unwrap_or(true)
+    }
+
+    /// Seals that failed and were left for a later write to retry, over
+    /// every shard held here, with the last reason seen.
+    pub fn seal_failures(&self) -> (u64, Option<String>) {
+        let mut n = 0;
+        let mut last = None;
+        for shards in self.shards.values() {
+            for s in shards {
+                n += s.seal_failures;
+                if s.last_seal_error.is_some() {
+                    last = s.last_seal_error.clone();
+                }
+            }
+        }
+        (n, last)
+    }
+
     pub fn collection_count(&self) -> usize {
         self.catalog.collections.len()
     }
@@ -3065,6 +3093,22 @@ impl Db {
 
     pub fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
         let stmt = sql::parse(sql, params)?;
+        // A directory that vanished under a running node -- unmounted,
+        // removed, renamed -- must not be written to: the log's descriptor
+        // still accepts bytes into a file no reopen can find, and that is a
+        // write acknowledged into nothing. The LOCK this process holds is
+        // the cheapest witness that the directory is still where it was.
+        if !Db::is_read(&stmt) {
+            if let Some(dir) = &self.dir {
+                if !dir.join("LOCK").exists() {
+                    return Err(Error::Storage(format!(
+                        "the data directory {} is gone (its LOCK is not there); nothing was \
+                         written, and this node should be stopped",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         // Every statement runs under the default deadline, not only a SELECT
         // (which re-arms with its own WITH). A forwarded write or a DDL that
         // reaches other nodes waits on them, and a wait with no bound is a
@@ -5070,6 +5114,31 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A directory that vanishes under a running node: writes are refused
+    /// naming it, reads still answer from memory, and the node says it is
+    /// not well.
+    #[test]
+    fn a_vanished_directory_refuses_writes_and_is_not_well() {
+        let dir = tmp("vanished");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("notes", Value::obj(vec![("id".into(), Value::Str("a".into()))])).unwrap();
+        assert!(db.directory_present());
+        let aside = dir.with_extension("aside");
+        let _ = fs::remove_dir_all(&aside);
+        fs::rename(&dir, &aside).unwrap();
+        assert!(!db.directory_present());
+        let e = db
+            .execute("INSERT INTO notes VALUES ('{\"id\":\"b\"}')")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("is gone") && e.contains("nothing was written"), "{e}");
+        assert_eq!(db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 1);
+        drop(db);
+        let _ = fs::remove_dir_all(&aside);
+    }
 
     #[test]
     fn fuzz_catalog_decoding_never_panics() {

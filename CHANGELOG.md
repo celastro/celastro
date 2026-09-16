@@ -8,6 +8,27 @@ repository.
 
 ## Unreleased
 
+**A refused write leaves no record and no row.** A full disk showed the
+gap: a batch whose log append failed partway had the records that fit
+replayed on the next reopen -- 289 rows of a statement the client was
+told had failed -- and a seal that failed in the middle of a batch failed
+the statement with half of it applied in memory and all of it on the log,
+so the running node showed 384 rows a reopen did not. Now the log is
+marked before a statement's records and cut back to the mark when an
+append or the sync fails, so nothing of a refused statement survives; a
+seal that fails does not fail the write that triggered it (that write is
+on the log and in memory, which is what was promised) but is counted
+(`celastro_seal_failures_total`) and retried by the next write; and the
+seal runs after a batch's documents, not between them.
+
+**A directory that vanishes under a running node is refused.** The log's
+descriptor still accepts bytes into a file no reopen can find, so a write
+was acknowledged into nothing and `/api/health` said ok. Now a write is
+refused naming the directory when its `LOCK` is not where it was, reads
+still answer from memory, `/api/health` answers `ok:false` with the
+reason so a probe restarts the node, and `celastro_directory_present` is
+0 in the metrics.
+
 **`VERIFY BACKUP '<dest>' [NODE '<address>'] [AS OF <ts>]`.** Every
 object the backup's record names is read back and checked against its
 recorded size and, for a backup written from this version on, its
