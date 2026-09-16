@@ -128,6 +128,65 @@ fn a_backup_restores_what_was_there_at_the_pin_and_a_second_one_copies_only_what
     }
 }
 
+/// `KEEP n` after a backup removes this node's older backups and the pool
+/// segments no remaining backup names, and nothing a remaining backup needs.
+#[test]
+fn keep_removes_older_backups_and_the_pool_segments_nobody_references() {
+    let src = dir("keep-src");
+    let dest = dir("keep-dest");
+    let mut db = open(&src);
+    setup(&mut db, 20);
+    let first = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let ts1: u64 = first.split_whitespace().nth(1).unwrap().parse().unwrap();
+    // Segments only the first backup names: enough flushes for a compaction
+    // to merge them into one, which is what the second backup then names.
+    let pool = dest.join("pool").join("items").join("shard-0000");
+    let pool_after_first: Vec<_> =
+        std::fs::read_dir(&pool).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(!pool_after_first.is_empty());
+    db.execute("FLUSH items").unwrap();
+    for round in 0..3 {
+        for i in 100 + round * 10..110 + round * 10 {
+            db.insert("items", doc(i)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+    }
+    ack(&mut db, "COMPACT items");
+    let second = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let ts2: u64 = second.split_whitespace().nth(1).unwrap().parse().unwrap();
+    for i in 200..205 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    let third = ack(&mut db, &format!("BACKUP TO '{}' KEEP 2", dest.display()));
+    assert!(third.contains("kept 2, removed 1 older backup(s)"), "{third}");
+    assert!(third.contains("pool segment(s) nobody references"), "{third}");
+    // The oldest instant is gone; the two newest are there.
+    let d2 = dir("keep-dst");
+    let mut db2 = open(&d2);
+    let e = db2
+        .execute(&format!("RESTORE FROM '{}' AS OF {ts1}", dest.display()))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("no complete backup") && e.contains(&ts2.to_string()), "{e}");
+    let m = ack(&mut db, &format!("VERIFY BACKUP '{}'", dest.display()));
+    assert!(m.contains("every one as recorded"), "{m}");
+    let m = ack(&mut db, &format!("VERIFY BACKUP '{}' AS OF {ts2}", dest.display()));
+    assert!(m.contains("every one as recorded"), "{m}");
+    ack(&mut db2, &format!("RESTORE FROM '{}'", dest.display()));
+    assert_eq!(ids(&mut db2, "SELECT id FROM items LIMIT 1000").len(), 20 + 5 - 1 + 30 + 5);
+    // The compacted-away segments the first backup alone named are gone from
+    // the pool; what the second and third share is still there.
+    let pool_now: Vec<_> = std::fs::read_dir(&pool).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(
+        pool_after_first.iter().any(|p| !pool_now.contains(p)),
+        "an unreferenced pool segment went"
+    );
+    for p in [&src, &dest, &d2] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 /// `VERIFY BACKUP` reads every object back against the record's size and
 /// checksum; a byte flipped in a pool segment -- the same size, so the
 /// size check passes -- is named by the verify and refused by a restore.

@@ -145,8 +145,9 @@ pub(crate) fn job(
     catalog: Vec<u8>,
     key: Option<Vec<u8>>,
     colls: Exported,
+    keep: Option<usize>,
 ) -> Deferred {
-    Deferred::new(move || run(target, ts, node, catalog, key, colls))
+    Deferred::new(move || run(target, ts, node, catalog, key, colls, keep))
 }
 
 fn run(
@@ -156,6 +157,7 @@ fn run(
     catalog: Vec<u8>,
     key: Option<Vec<u8>>,
     colls: Exported,
+    keep: Option<usize>,
 ) -> Result<Outcome> {
     let mine = format!("nodes/{}/", node_slug(&node));
     let own = format!("{mine}backups/{}/", ts_key(ts));
@@ -220,12 +222,77 @@ fn run(
     }
     target.store.put(&target.key(&format!("{own}BACKUP")), record.as_bytes())?;
     target.store.put(&target.key(&format!("{mine}LATEST")), format!("{ts}\n").as_bytes())?;
-    Ok(Outcome::Ack(format!(
+    let mut ack = format!(
         "backup {ts} to {}: {} collection(s), {shards} shard(s), {copied} segment(s) copied \
          ({bytes} bytes), {present} already there",
         target.display,
         colls.len()
-    )))
+    );
+    if let Some(keep) = keep {
+        let held: Vec<String> = colls
+            .iter()
+            .flat_map(|(name, shards)| {
+                shards.iter().map(move |(index, _)| format!("{name}/shard-{index:04}"))
+            })
+            .collect();
+        let (pruned, freed) = prune(&target, &mine, keep, &held)?;
+        ack.push_str(&format!("; kept {keep}, removed {pruned} older backup(s) and {freed} pool segment(s) nobody references"));
+    }
+    Ok(Outcome::Ack(ack))
+}
+
+/// Retention: remove this node's backups at the destination beyond the
+/// newest `keep`, then the pool segments of the shards this node holds
+/// that no remaining backup -- of any node at the destination -- still
+/// names. Returns how many backups and how many pool segments went.
+///
+/// The record goes first, so a prune that stops halfway leaves an
+/// incomplete backup rather than a complete one with holes. The pool is
+/// swept only under the shards this node holds now, because those are the
+/// ones this node alone writes; another node's backup in flight cannot be
+/// putting segments there. A shard that moved away is swept by its new
+/// holder, whose records name what it needs.
+fn prune(target: &Target, mine: &str, keep: usize, held: &[String]) -> Result<(usize, usize)> {
+    let all = instants(target, mine)?;
+    let drop: Vec<u64> =
+        if all.len() > keep { all[..all.len() - keep].to_vec() } else { Vec::new() };
+    let mut pruned = 0usize;
+    for ts in &drop {
+        let own = target.key(&format!("{mine}backups/{}/", ts_key(*ts)));
+        target.store.delete(&format!("{own}BACKUP"))?;
+        for key in target.store.list(&own)? {
+            target.store.delete(&key)?;
+        }
+        pruned += 1;
+    }
+    // What every remaining backup at the destination still names.
+    let mut referenced = std::collections::BTreeSet::new();
+    for node in nodes(target)? {
+        let theirs = format!("nodes/{node}/");
+        for ts in instants(target, &theirs)? {
+            let record =
+                target.store.get(&target.key(&format!("{theirs}backups/{}/BACKUP", ts_key(ts))))?;
+            for line in String::from_utf8_lossy(&record).lines() {
+                if let Some((key, _)) = line.split_once('\t') {
+                    if key.starts_with("pool/") {
+                        referenced.insert(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut freed = 0usize;
+    for shard in held {
+        let prefix = target.key(&format!("pool/{shard}/"));
+        for key in target.store.list(&prefix)? {
+            let rest = &key[target.prefix.len()..];
+            if !referenced.contains(rest) {
+                target.store.delete(&key)?;
+                freed += 1;
+            }
+        }
+    }
+    Ok((pruned, freed))
 }
 
 /// A backup read back and verified: its instant, its catalog and data key

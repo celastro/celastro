@@ -37,7 +37,7 @@ spec:
               args:
                 - send
                 - "{{ if $.Values.tls.enabled }}https{{ else }}http{{ end }}://{{ include "celastro.fullname" $ }}-{{ $i }}.{{ include "celastro.fullname" $ }}:{{ $.Values.port }}"
-                - "BACKUP TO '{{ $.Values.backup.to | replace "'" "''" }}'"
+                - "BACKUP TO '{{ $.Values.backup.to | replace "'" "''" }}'{{ if $.Values.backup.keep }} KEEP {{ int $.Values.backup.keep }}{{ end }}"
               env:
                 - name: CELASTRO_TOKEN
                   valueFrom:

@@ -192,7 +192,21 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("BACKUP") {
             self.expect_kw("TO")?;
-            return Ok(Statement::Backup { to: self.destination()? });
+            let to = self.destination()?;
+            let keep = if self.eat_kw("KEEP") {
+                match self.literal()? {
+                    Value::Int(n) if n >= 1 => Some(n as usize),
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "KEEP wants how many backups to keep, a positive integer, not {}",
+                            crate::json::to_string(&other)
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(Statement::Backup { to, keep });
         }
         if self.eat_kw("RESTORE") {
             self.expect_kw("FROM")?;
@@ -1550,7 +1564,7 @@ mod tests {
     #[test]
     fn backup_and_restore_take_a_destination_and_restore_an_instant() {
         match parse("BACKUP TO '/mnt/backups'", &[]).unwrap() {
-            Statement::Backup { to } => assert_eq!(to, "/mnt/backups"),
+            Statement::Backup { to, .. } => assert_eq!(to, "/mnt/backups"),
             other => panic!("{other:?}"),
         }
         match parse("restore from 's3://b/p' node 'tcp://a:1' as of 42", &[]).unwrap() {

@@ -52,10 +52,13 @@ pub enum Statement {
     DropLifecyclePolicy {
         name: String,
     },
-    /// `BACKUP TO '<path or s3://bucket/prefix>'` -- the shards this node
-    /// holds, pinned at one instant, copied incrementally.
+    /// `BACKUP TO '<path or s3://bucket/prefix>' [KEEP <n>]` -- the shards
+    /// this node holds, pinned at one instant, copied incrementally; with
+    /// `KEEP`, this node's backups at the destination beyond the newest `n`
+    /// are removed afterwards, and the pool's segments nobody references.
     Backup {
         to: String,
+        keep: Option<usize>,
     },
     /// `RESTORE FROM '<path or s3://bucket/prefix>' [NODE '<address>'] [AS OF
     /// <ts>]` -- into an empty database, this node's newest complete backup

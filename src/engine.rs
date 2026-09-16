@@ -1125,7 +1125,7 @@ impl Db {
     /// credentials. Only the segment files the destination lacks are
     /// written, so a second backup of a database that did not change copies
     /// nothing but its record. See `crate::backup` for the layout.
-    pub fn backup(&mut self, dest: &str) -> Result<Outcome> {
+    pub fn backup(&mut self, dest: &str, keep: Option<usize>) -> Result<Outcome> {
         if self.dir.is_none() {
             return Err(Error::Plan("BACKUP needs a persistent database (--dir)".into()));
         }
@@ -1149,7 +1149,7 @@ impl Db {
             colls.push((name, shards));
         }
         let node = self.opts.node.clone().unwrap_or_default();
-        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls)))
+        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls, keep)))
     }
 
     /// `VERIFY BACKUP '<src>' [NODE '<address>'] [AS OF <ts>]`: read every
@@ -3424,7 +3424,7 @@ impl Db {
                 let n = self.flush(&collection)?;
                 Ok(Outcome::Ack(format!("{n} shard(s) flushed")))
             }
-            Statement::Backup { to } => self.backup(&to),
+            Statement::Backup { to, keep } => self.backup(&to, keep),
             Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
             Statement::VerifyBackup { from, node, as_of } => {
                 self.verify_backup(&from, node.as_deref(), as_of)

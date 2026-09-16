@@ -8,6 +8,13 @@ repository.
 
 ## Unreleased
 
+**`BACKUP TO '<dest>' KEEP <n>`.** After the copy, this node's backups at
+the destination beyond the newest `n` are removed -- the record first, so
+a prune that stops halfway leaves an incomplete backup rather than a
+complete one with holes -- and then the pool segments of the shards this
+node holds that no remaining backup of any node names. The chart's
+`backup.keep` puts it on the CronJob.
+
 **A refused write leaves no record and no row.** A full disk showed the
 gap: a batch whose log append failed partway had the records that fit
 replayed on the next reopen -- 289 rows of a statement the client was

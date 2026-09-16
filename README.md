@@ -303,6 +303,8 @@ BACKUP TO '/mnt/backups/nightly';          -- or 's3://bucket/prefix'
 RESTORE FROM '/mnt/backups/nightly';       -- into an empty --dir; AS OF <ts> for an older one
 ```
 
+`BACKUP TO ... KEEP 7` removes this node's older backups at the destination
+after the copy, and the pool's segments no remaining backup names.
 `BACKUP TO` pins every shard this node holds at one instant and copies it
 to a directory (any mount) or a bucket (through the archive's endpoint and
 credentials, the bucket the destination names). Sealed segments go into a

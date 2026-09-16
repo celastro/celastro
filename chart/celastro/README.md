@@ -230,7 +230,7 @@ changelog; those need every pod restarted together
 | `archive.existingSecret` | empty | a `Secret` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` |
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
 | `archive.existingClaim`, `archive.mountPath` | empty, `/archive` | a ReadWriteMany claim (NFS, typically) mounted on every pod: the `archived` tier in `<mountPath>/tier` unless a bucket is configured, backups under `<mountPath>/backups` |
-| `backup.schedule`, `backup.to` | empty, `nightly` | with a schedule, a CronJob sends `BACKUP TO '<to>'` to every pod's console: a name under the claim's `backups`, or `s3://bucket/prefix` |
+| `backup.schedule`, `backup.to`, `backup.keep` | empty, `nightly`, empty | with a schedule, a CronJob sends `BACKUP TO '<to>' [KEEP <keep>]` to every pod's console: a name under the claim's `backups`, or `s3://bucket/prefix`; `keep` removes each pod's older backups after the run |
 | `tls.enabled` | `false` | the wire and the console over TLS 1.3, one Ed25519 certificate per release, every pod verified against one CA; without the next two, a hook Job makes the material once |
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro tls init`, naming every pod, both Services and `localhost` |

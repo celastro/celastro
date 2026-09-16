@@ -126,6 +126,10 @@ archive:
 backup:
   schedule: ""
   to: nightly
+  # How many of each pod's backups to keep at the destination; empty keeps
+  # every one. `BACKUP TO ... KEEP n` removes the older ones after each
+  # run, and the pool segments no remaining backup names.
+  keep: ""
 
 # Performance tunables, one CELASTRO_* variable each, set on every pod; the
 # binary's docs/tuning.md lists them with their defaults. For example:
