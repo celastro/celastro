@@ -257,6 +257,9 @@ the node it reaches, so a cluster is backed up by sending it to each node
 (the chart's CronJob does), and `LOCAL` prefixes a statement to the one
 node it reaches.
 
+`SHOW HEALTH` from any node names every node with whether it answers and
+every shard with whether its holder does.
+
 ## Kubernetes and containers
 
 `chart/celastro` runs one pod or a cluster: a `StatefulSet` whose pods attach

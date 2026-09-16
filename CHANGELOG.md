@@ -8,6 +8,12 @@ repository.
 
 ## Unreleased
 
+**`SHOW HEALTH`.** From any node: this node (version, collections, shards
+held, whether its directory is still there, seal failures), every
+attached node dialled once with whether it answered and how fast, every
+shard with its holder and whether that holder answered, and a summary --
+what an operator asks first when a statement was refused naming a shard.
+
 **Structured logs.** What `serve` and the wire say -- a connection
 dropped, an accept failing, a compaction done or not installed or
 failed, a wire connection that could not be set up, a seal that failed

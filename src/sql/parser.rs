@@ -375,6 +375,9 @@ impl<'a> Parser<'a> {
             if self.eat_kw("LIFECYCLE") {
                 return Ok(Statement::ShowLifecycle);
             }
+            if self.eat_kw("HEALTH") {
+                return Ok(Statement::ShowHealth);
+            }
             return Err(Error::Sql(
                 "expected SEGMENTS, CATALOG, RESIDENCY or LIFECYCLE after SHOW".into(),
             ));

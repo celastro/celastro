@@ -137,6 +137,43 @@ const QUERIES: &[&str] = &[
      'linear') LIMIT 8",
 ];
 
+/// `SHOW HEALTH` names every node with whether it answers and every shard
+/// with whether its holder does; a node that went away is DOWN and its
+/// shard UNREACHABLE, from any other node.
+#[test]
+fn show_health_names_every_node_and_shard_and_a_lost_node_is_down() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("health-a");
+    let b = Node::start("health-b");
+    let c = Node::start("health-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    let text = a.ack("SHOW HEALTH");
+    assert!(text.starts_with(&format!("this node: {}", a.url)), "{text}");
+    for n in [&b, &c] {
+        assert!(text.contains(&format!("node {}: up, celastro ", n.url)), "{text}");
+    }
+    assert!(text.contains("shard 0 of `items`: on") && text.contains("reachable"), "{text}");
+    assert!(text.ends_with("3 of 3 node(s) answer; 0 shard(s) unreachable"), "{text}");
+    let c_url = c.url.clone();
+    let c_dir = c.dir.clone();
+    drop(c);
+    settle();
+    let text = b.ack("SHOW HEALTH");
+    assert!(text.contains(&format!("node {c_url}: DOWN")), "{text}");
+    assert!(text.contains(&format!("shard 2 of `items`: on {c_url}, UNREACHABLE")), "{text}");
+    assert!(text.ends_with("2 of 3 node(s) answer; 1 shard(s) unreachable"), "{text}");
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&c_dir);
+}
+
 /// An aggregate over shards on three nodes is the aggregate over the rows:
 /// each holder folds its own, the coordinator merges the partials, and
 /// every node answers what one process answers.

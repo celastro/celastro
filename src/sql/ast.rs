@@ -31,6 +31,9 @@ pub enum Statement {
     ShowCatalog {
         collection: Option<String>,
     },
+    /// `SHOW HEALTH` -- this node, every attached node dialled, and every
+    /// shard's holder with whether it answers.
+    ShowHealth,
     /// `ALTER INDEX <name> ON <collection> SET TIER <tier>` — move one index
     /// between tiers by hand, outside any policy.
     AlterIndexTier {

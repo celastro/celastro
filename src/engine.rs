@@ -1575,6 +1575,85 @@ impl Db {
 
     /// How many collections the catalog holds. What a health probe asks,
     /// because answering it means the catalog is there to be read.
+    /// `SHOW HEALTH`: this node, every attached node dialled once with the
+    /// wire's timeout, and every collection's shards with their holder and
+    /// whether that holder answered -- what an operator asks first when a
+    /// statement is refused naming a shard. One line each, a summary last.
+    pub fn show_health(&self) -> String {
+        let here = self.opts.node.clone().unwrap_or_else(|| "local".to_string());
+        let mut out = String::new();
+        let (seal_failures, last_seal) = self.seal_failures();
+        out.push_str(&format!(
+            "this node: {here}, celastro {}, {} collection(s), {} shard(s) held, directory {}{}\n",
+            env!("CARGO_PKG_VERSION"),
+            self.catalog.collections.len(),
+            self.shards.values().map(|s| s.len()).sum::<usize>(),
+            if self.directory_present() { "present" } else { "GONE" },
+            if seal_failures > 0 {
+                format!(
+                    ", {seal_failures} seal failure(s), last: {}",
+                    last_seal.unwrap_or_default()
+                )
+            } else {
+                String::new()
+            }
+        ));
+        let mut up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        up.insert(here.clone());
+        // Every node this one knows of: the ones it attached, and every
+        // holder a placement names, since a node that was attached by
+        // another still holds shards this one's statements reach.
+        let mut known: std::collections::BTreeSet<String> =
+            self.catalog.nodes.iter().cloned().collect();
+        for tablets in self.catalog.placement.values() {
+            for t in tablets {
+                if !t.node.is_empty() {
+                    known.insert(t.node.clone());
+                }
+            }
+        }
+        let mut peers = 0usize;
+        for url in &known {
+            if *url == here {
+                continue;
+            }
+            peers += 1;
+            let started = std::time::Instant::now();
+            let answer = self.node_conn(url).and_then(|n| n.hello());
+            match answer {
+                Ok(h) => {
+                    up.insert(url.clone());
+                    out.push_str(&format!(
+                        "node {url}: up, celastro {}, {} ms\n",
+                        h.version,
+                        started.elapsed().as_millis()
+                    ));
+                }
+                Err(e) => out.push_str(&format!("node {url}: DOWN: {e}\n")),
+            }
+        }
+        let mut unreachable = 0usize;
+        for (name, tablets) in &self.catalog.placement {
+            for (i, t) in tablets.iter().enumerate() {
+                let holder = if t.node.is_empty() { here.clone() } else { t.node.clone() };
+                let ok = up.contains(&holder);
+                if !ok {
+                    unreachable += 1;
+                }
+                out.push_str(&format!(
+                    "shard {i} of `{name}`: on {holder}, {}\n",
+                    if ok { "reachable" } else { "UNREACHABLE" }
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "{} of {} node(s) answer; {unreachable} shard(s) unreachable",
+            up.len(),
+            peers + 1
+        ));
+        out
+    }
+
     /// The data directory, or `None` in memory.
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
@@ -3480,6 +3559,7 @@ impl Db {
                 }
                 Ok(Outcome::Ack(out))
             }
+            Statement::ShowHealth => Ok(Outcome::Ack(self.show_health())),
             Statement::ShowCatalog { collection } => {
                 let names: Vec<String> = match collection {
                     Some(c) => vec![c],
