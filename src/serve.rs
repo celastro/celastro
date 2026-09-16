@@ -117,6 +117,12 @@ pub struct Server {
     auto_compact: bool,
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        crate::cipher::wipe_string(&mut self.token);
+    }
+}
+
 /// Where the console is reachable from, which decides two of the guards.
 /// On loopback the `Host` allow-list refuses a rebound name and a browser's
 /// `Origin` must be this machine's. On a network the console is reached by

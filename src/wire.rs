@@ -529,6 +529,12 @@ fn error_from(kind: u8, m: String) -> Error {
 
 /// One other node, reached over one connection that is opened on demand and
 /// dropped on any failure. Shared by every remote shard that node holds.
+impl Drop for Node {
+    fn drop(&mut self) {
+        crate::cipher::wipe_string(&mut self.token);
+    }
+}
+
 pub struct Node {
     url: String,
     addr: String,

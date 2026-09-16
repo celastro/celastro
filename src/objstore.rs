@@ -110,6 +110,15 @@ pub struct S3Store {
     session_token: Option<String>,
 }
 
+impl Drop for S3Store {
+    fn drop(&mut self) {
+        crate::cipher::wipe_string(&mut self.secret_key);
+        if let Some(t) = &mut self.session_token {
+            crate::cipher::wipe_string(t);
+        }
+    }
+}
+
 impl fmt::Debug for S3Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never the secret.

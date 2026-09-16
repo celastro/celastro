@@ -178,7 +178,7 @@ pub struct DbOpts {
     /// as hex). With it, `<dir>/KEY` is made at the first open of an empty
     /// directory and opened at every later one; without it an encrypted
     /// database is refused. Never written anywhere.
-    pub master_key: Option<[u8; 32]>,
+    pub master_key: Option<crate::cipher::Secret<32>>,
     /// A wrapped data key to adopt when the directory has none
     /// (`CELASTRO_KEY_FILE`): how the pods of a cluster share one data key,
     /// so a shard moves between them and a backup restores on any of them.

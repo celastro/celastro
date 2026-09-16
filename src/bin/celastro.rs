@@ -2123,7 +2123,8 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     }
     o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
     o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
-    o.master_key = celastro::cipher::master_from_env(&var).map_err(|e| e.to_string())?;
+    o.master_key =
+        celastro::cipher::master_from_env(&var).map_err(|e| e.to_string())?.map(Into::into);
     o.key_file = var("CELASTRO_KEY_FILE").map(PathBuf::from);
     if o.key_file.is_some() && o.master_key.is_none() {
         return Err("CELASTRO_KEY_FILE needs the master key that wraps it: set \

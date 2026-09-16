@@ -255,6 +255,27 @@ fn parse_new_session_ticket(body: &[u8]) -> io::Result<NewSessionTicket> {
     Ok(NewSessionTicket { lifetime, age_add, nonce, ticket })
 }
 
+impl Drop for Keys {
+    fn drop(&mut self) {
+        crate::cipher::wipe(&mut self.key);
+        crate::cipher::wipe(&mut self.iv);
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        crate::cipher::wipe(&mut self.psk);
+    }
+}
+
+impl Drop for TlsStream {
+    fn drop(&mut self) {
+        if let Some(m) = &mut self.res_master {
+            crate::cipher::wipe(m);
+        }
+    }
+}
+
 fn finished_verify(base: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
     let fk = expand_label(base, "finished", &[], 32);
     let mut key = [0u8; 32];

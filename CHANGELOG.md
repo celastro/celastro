@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.43.1 — 2026-09-16
+
+Secrets wipe themselves when dropped; a patch.
+
+**Zeroised on drop.** The data key, the master key (now
+`cipher::Secret<32>` in `DbOpts::master_key`, which prints as nothing and
+converts from `[u8; 32]`), TLS traffic keys and IVs, session tickets and
+the resumption secret, the node's Ed25519 seed, S3 credentials, and the
+console's token and the wire client's overwrite themselves with zeros when they
+go out of scope, by a volatile write per byte the optimiser does not
+remove. Nothing changes for a caller except the type of `master_key`,
+which takes `.into()`.
+
 ## 0.43.0 — 2026-09-16
 
 The console's token on a network, hence a minor.

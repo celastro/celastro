@@ -82,6 +82,15 @@ can carry nothing else. Tokens compare in constant time, and a source
 address that was refused waits a hundred milliseconds more per refusal in
 the last minute, two seconds at most, before it is answered again.
 
+### Secrets in memory
+
+The data key, the master key, TLS traffic keys, session tickets, the
+node's private key, S3 credentials and the tokens overwrite themselves
+with zeros when they are dropped (`cipher::wipe`, a volatile write per
+byte), so a key does not outlive its use in freed memory that a later
+allocation, a core dump or a swap file could show. A running process
+holds them; that is the boundary.
+
 ## What is not in scope
 
 - Anything requiring write access to the data directory. A caller who can

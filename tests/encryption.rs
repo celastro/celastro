@@ -33,7 +33,7 @@ fn master(seed: u8) -> [u8; 32] {
 
 fn opts(master: Option<[u8; 32]>) -> DbOpts {
     let mut o = DbOpts::default();
-    o.master_key = master;
+    o.master_key = master.map(Into::into);
     o
 }
 

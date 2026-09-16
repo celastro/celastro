@@ -296,6 +296,61 @@ fn aad(id: &str, index: u64) -> Vec<u8> {
 /// files carries.
 pub type Shared = Option<Arc<Cipher>>;
 
+/// Overwrite `bytes` with zeros in a way the optimiser does not remove: a
+/// volatile write per byte and a fence after. What every secret does to
+/// itself when it is dropped, so a key does not outlive its use in freed
+/// memory a later allocation, a core dump or a swap file could show.
+pub fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, exclusive reference into `bytes`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Wipe a string's bytes before it is dropped.
+pub fn wipe_string(s: &mut String) {
+    // SAFETY: zeros are valid UTF-8, and the string is cleared right after.
+    wipe(unsafe { s.as_bytes_mut() });
+    s.clear();
+}
+
+/// `N` secret bytes that wipe themselves when dropped and print as
+/// nothing: the master key as the options hold it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret<const N: usize>([u8; N]);
+
+impl<const N: usize> From<[u8; N]> for Secret<N> {
+    fn from(b: [u8; N]) -> Self {
+        Secret(b)
+    }
+}
+
+impl<const N: usize> std::ops::Deref for Secret<N> {
+    type Target = [u8; N];
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> std::fmt::Debug for Secret<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Secret<{N}>(..)")
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+impl Drop for Cipher {
+    fn drop(&mut self) {
+        wipe(&mut self.data_key);
+    }
+}
+
 /// A new master key, as `key master` writes it: 64 hex digits.
 pub fn new_master_hex() -> Result<String> {
     Ok(crate::crypto::hex(&crate::crypto::random::array32()?))
@@ -354,6 +409,19 @@ pub fn master_from_env(var: &dyn Fn(&str) -> Option<String>) -> Result<Option<[u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_secret_wipes_itself_and_prints_nothing() {
+        let mut b = [7u8; 40];
+        wipe(&mut b);
+        assert_eq!(b, [0u8; 40]);
+        let mut st = String::from("hunter2");
+        wipe_string(&mut st);
+        assert!(st.is_empty());
+        let s: Secret<32> = [9u8; 32].into();
+        assert_eq!(format!("{s:?}"), "Secret<32>(..)");
+        assert_eq!(*s, [9u8; 32]);
+    }
+
     use super::*;
 
     fn master(b: u8) -> [u8; 32] {

@@ -369,6 +369,12 @@ pub fn verify_chain(
 }
 
 /// A key pair: the 32-byte seed and the public key.
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        crate::cipher::wipe(&mut self.seed);
+    }
+}
+
 #[derive(Clone)]
 pub struct KeyPair {
     pub seed: [u8; 32],
