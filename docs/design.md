@@ -940,6 +940,25 @@ list is only valid for the dictionary it came from. Over the bound the statement
 is refused rather than quietly trimmed — a silent aggregate cap would be the
 same failure one level up.
 
+**The graph build is not bound by reading the vectors; building over
+the SQ8 codes was tried and does not pay.** After 0.35.0 the build's
+profile was distance evaluations on random vectors, and a software
+prefetch and AVX2 had gained little and 18%, so the reading looked like
+cache misses and the lever like fewer bytes per evaluation. Measured on
+the survey's corpus (50,000 vectors of 128 dimensions, `COMPACT` over
+the flat segments): links measured between SQ8 codes decoded on the way,
+scalar, 379 s against 92 s over the full vectors; the same with the
+per-vector terms folded out and the cross term as one AVX2 weighted byte
+dot (eight codes widened per step, a quarter of the bytes read), 106 s;
+recall@10 0.885 against 0.865 both times, which is two hits in a
+thousand. The bytes were not the bound: a quarter of them at two and a
+half times the instructions came out slower, so the evaluation is
+arithmetic and the graph's bookkeeping, and the lever left is fewer
+evaluations -- `CELASTRO_HNSW_EF_CONSTRUCTION`, already a knob, with
+`MEASURE RECALL` to say what it costs -- or a different candidate
+structure, which is a design and not a kernel. The code was not kept:
+a knob that trades 14% of the build for noise is a trap.
+
 **An aggregate is a scan whose hits are partials, so it crosses the wire
 as a scan.** `count(*)`, `count(path)`, `sum`, `min`, `max`, `avg` and
 `GROUP BY` fold on the shard: `aggregate_on` walks the same filtered
