@@ -295,12 +295,27 @@ impl Certificate {
         self.not_before <= now && now <= self.not_after
     }
 
-    /// Whether the certificate names `host`: a DNS name, case-insensitively
-    /// and exactly (no wildcards), or an IP address literal.
+    /// Whether the certificate names `host`: a DNS name, case-insensitively,
+    /// exactly or by a wildcard in the leftmost label only (`*.example.com`
+    /// names `a.example.com`, not `example.com` or `a.b.example.com`, as RFC
+    /// 6125 has it), or an IP address literal.
     pub fn names(&self, host: &str) -> bool {
         let lower = host.to_ascii_lowercase();
         if self.dns_names.contains(&lower) {
             return true;
+        }
+        if host.parse::<std::net::IpAddr>().is_err() {
+            if let Some((_, parent)) = lower.split_once('.') {
+                if !parent.is_empty()
+                    && parent.contains('.')
+                    && self
+                        .dns_names
+                        .iter()
+                        .any(|n| n.strip_prefix("*.").is_some_and(|rest| rest == parent))
+                {
+                    return true;
+                }
+            }
         }
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             let bytes: Vec<u8> = match ip {

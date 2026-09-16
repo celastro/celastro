@@ -98,16 +98,20 @@ persistence:
 # `existingClaim` names a ReadWriteMany claim -- an NFS volume, typically --
 # mounted at `mountPath` on every pod: the tier lives in `<mountPath>/tier`
 # and backups under `<mountPath>/backups`. With an endpoint the tier is an
-# S3-compatible bucket instead, reached over plain HTTP (the archive client
-# carries no TLS), the credentials from a Secret with the keys
-# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY: name an existing one, or give
-# the pair here and the chart makes one; a claim named as well then carries
-# the backups only.
+# S3-compatible bucket instead, `http://host:port` or `https://host`, the
+# credentials from a Secret with the keys AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY: name an existing one, or give the pair here and the
+# chart makes one; a claim named as well then carries the backups only. An
+# https endpoint is verified by a CA bundle: the image carries no system
+# bundle, so `caSecret` names a Secret whose key `ca.crt` is the PEM bundle
+# to trust -- a public root for a cloud bucket, or your own CA for a store
+# in the cluster.
 archive:
   endpoint: ""
   bucket: ""
   prefix: ""
   region: ""
+  caSecret: ""
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""

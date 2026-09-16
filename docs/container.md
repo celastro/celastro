@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.41.0
+docker pull ghcr.io/celastro/celastro:0.42.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -149,7 +149,9 @@ answer executes nothing. The Helm chart uses it for both probes.
 
 ## The archived tier can live in an object store
 
-`CELASTRO_ARCHIVE_ENDPOINT` (`host:port`, plain HTTP) and
+`CELASTRO_ARCHIVE_ENDPOINT` (`http://host:port`, or `https://host` verified
+by the PEM bundle in `CELASTRO_ARCHIVE_CA` -- the image has no system
+bundle, so mount one) and
 `CELASTRO_ARCHIVE_BUCKET`, with `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` (`CELASTRO_ARCHIVE_PREFIX` and `_REGION` optional),
 make the `archived` tier an S3-compatible bucket instead of a directory in the

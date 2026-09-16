@@ -93,6 +93,10 @@ spec:
               value: {{ .Values.archive.prefix | quote }}
             - name: CELASTRO_ARCHIVE_REGION
               value: {{ .Values.archive.region | quote }}
+            {{- if .Values.archive.caSecret }}
+            - name: CELASTRO_ARCHIVE_CA
+              value: /archive-ca/ca.crt
+            {{- end }}
             {{- end }}
             {{- if .Values.archive.existingClaim }}
             {{- if not .Values.archive.endpoint }}
@@ -158,12 +162,22 @@ spec:
               mountPath: /keys
               readOnly: true
             {{- end }}
+            {{- if .Values.archive.caSecret }}
+            - name: archive-ca
+              mountPath: /archive-ca
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- if or .Values.tls.enabled .Values.archive.existingClaim .Values.encryption.existingSecret }}
+      {{- if or .Values.tls.enabled .Values.archive.existingClaim .Values.encryption.existingSecret .Values.archive.caSecret }}
       volumes:
+        {{- if .Values.archive.caSecret }}
+        - name: archive-ca
+          secret:
+            secretName: {{ .Values.archive.caSecret | quote }}
+        {{- end }}
         {{- if .Values.tls.enabled }}
         - name: tls
           secret:

@@ -40,6 +40,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::hex;
@@ -75,6 +76,11 @@ pub struct ArchiveOpts {
     pub prefix: String,
     /// The region the signature names; MinIO accepts any, S3 wants its own.
     pub region: String,
+    /// The CA bundle (PEM) an `https://` endpoint is verified by
+    /// (`CELASTRO_ARCHIVE_CA`). Absent, the system's bundle is looked for
+    /// in the usual places; a container `FROM scratch` has none, so the
+    /// chart mounts one.
+    pub ca: Option<std::path::PathBuf>,
 }
 
 /// A store and the key prefix every object of this database carries. What
@@ -88,7 +94,15 @@ pub struct ArchiveHandle {
 
 /// An S3-compatible store over plain HTTP.
 pub struct S3Store {
+    /// `host:port`, dialled.
     endpoint: String,
+    /// What the `host` header says: the host, and the port unless it is
+    /// the scheme's default -- what the signature covers, so what the
+    /// server must see.
+    host_header: String,
+    /// The anchors an `https://` endpoint's chain must reach, and the name
+    /// it must carry; `None` for plain HTTP.
+    tls: Option<Arc<ArchiveTls>>,
     bucket: String,
     region: String,
     access_key: String,
@@ -107,22 +121,105 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE: &str = "s3";
 
+/// What an `https://` endpoint is verified by.
+struct ArchiveTls {
+    anchors: Vec<crate::crypto::x509::Certificate>,
+    host: String,
+}
+
+/// `scheme://host[:port]/` or bare `host:port` into (dial address, host
+/// header, https?): the port defaults to the scheme's, and the host header
+/// leaves a default port out.
+fn parse_endpoint(endpoint: &str) -> Result<(String, String, bool)> {
+    let (https, rest) = match (endpoint.strip_prefix("https://"), endpoint.strip_prefix("http://"))
+    {
+        (Some(r), _) => (true, r),
+        (_, Some(r)) => (false, r),
+        _ => (false, endpoint),
+    };
+    let host_port = rest.split('/').next().unwrap_or("").trim();
+    if host_port.is_empty() {
+        return Err(Error::Storage(format!("archive: `{endpoint}` names no host")));
+    }
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => {
+            (h.to_string(), Some(p.to_string()))
+        }
+        _ => (host_port.to_string(), None),
+    };
+    let default = if https { "443" } else { "80" };
+    let port = port.unwrap_or_else(|| default.to_string());
+    let dial = format!("{host}:{port}");
+    let header = if port == default { host } else { dial.clone() };
+    Ok((dial, header, https))
+}
+
+/// The usual places a system keeps its CA bundle.
+const SYSTEM_CA_BUNDLES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+];
+
+/// The anchors an https endpoint is verified by: `ca` when named, else
+/// the first system bundle that is there. A certificate in a bundle this
+/// parser cannot read is skipped -- public bundles carry a long tail of
+/// shapes -- and only a bundle with no usable anchor at all is an error.
+fn archive_anchors(ca: Option<&std::path::Path>) -> Result<Vec<crate::crypto::x509::Certificate>> {
+    let (pem, from) = match ca {
+        Some(p) => (
+            std::fs::read_to_string(p).map_err(|e| {
+                Error::Storage(format!("archive: CELASTRO_ARCHIVE_CA {}: {e}", p.display()))
+            })?,
+            p.display().to_string(),
+        ),
+        None => {
+            let Some((text, path)) = SYSTEM_CA_BUNDLES
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok().map(|t| (t, p.to_string())))
+            else {
+                return Err(Error::Storage(
+                    "archive: an https:// endpoint needs a CA bundle: set CELASTRO_ARCHIVE_CA to a \
+                     PEM file (no system bundle was found)"
+                        .into(),
+                ));
+            };
+            (text, path)
+        }
+    };
+    let mut anchors = Vec::new();
+    for der in crate::crypto::pem::decode_all(&pem, "CERTIFICATE")? {
+        if let Ok(c) = crate::crypto::x509::parse(&der) {
+            anchors.push(c);
+        }
+    }
+    if anchors.is_empty() {
+        return Err(Error::Storage(format!("archive: no usable certificate in {from}")));
+    }
+    Ok(anchors)
+}
+
 impl S3Store {
     /// Build from the options and the environment. The credentials are read
-    /// here and held in memory; they are never written anywhere.
+    /// here and held in memory; they are never written anywhere. An
+    /// `https://` endpoint is verified by the bundle `ca` names, or the
+    /// system's.
     pub fn from_env(opts: &ArchiveOpts) -> Result<S3Store> {
         let Some(endpoint) = opts.endpoint.clone() else {
             return Err(Error::Storage("archive: no endpoint configured".into()));
         };
-        let endpoint =
-            endpoint.strip_prefix("http://").unwrap_or(&endpoint).trim_end_matches('/').to_string();
-        if endpoint.starts_with("https://") {
-            return Err(Error::Storage(
-                "archive: the endpoint must be plain http; this crate carries no TLS -- \
-                 put a TLS-terminating proxy in front of the bucket"
-                    .into(),
-            ));
-        }
+        let (dial, host_header, https) = parse_endpoint(&endpoint)?;
+        let tls = if https {
+            let host = host_header.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_header);
+            Some(Arc::new(ArchiveTls {
+                anchors: archive_anchors(opts.ca.as_deref())?,
+                host: host.to_string(),
+            }))
+        } else {
+            None
+        };
+        let endpoint = dial;
         if opts.bucket.is_empty() {
             return Err(Error::Storage("archive: no bucket configured".into()));
         }
@@ -135,6 +232,8 @@ impl S3Store {
         };
         Ok(S3Store {
             endpoint,
+            host_header,
+            tls,
             bucket: opts.bucket.clone(),
             region: if opts.region.is_empty() {
                 "us-east-1".to_string()
@@ -155,12 +254,12 @@ impl S3Store {
         access_key: &str,
         secret_key: &str,
     ) -> S3Store {
+        let endpoint =
+            endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/').to_string();
         S3Store {
-            endpoint: endpoint
-                .strip_prefix("http://")
-                .unwrap_or(endpoint)
-                .trim_end_matches('/')
-                .to_string(),
+            host_header: endpoint.clone(),
+            endpoint,
+            tls: None,
             bucket: bucket.to_string(),
             region: region.to_string(),
             access_key: access_key.to_string(),
@@ -181,7 +280,7 @@ impl S3Store {
         let payload_hash = hex(&sha256(body));
         let date = amz_date(now_secs());
         let mut headers: Vec<(String, String)> = vec![
-            ("host".into(), self.endpoint.clone()),
+            ("host".into(), self.host_header.clone()),
             ("x-amz-content-sha256".into(), payload_hash.clone()),
             ("x-amz-date".into(), date.clone()),
         ];
@@ -212,11 +311,11 @@ impl S3Store {
             "authorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         ));
-        let mut stream = connect(&self.endpoint)?;
+        let mut stream = connect(&self.endpoint, self.tls.as_deref())?;
         stream.write_all(req.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()?;
-        read_response(&mut stream, method == "HEAD")
+        read_response(stream.as_mut(), method == "HEAD")
     }
 
     fn fail(&self, what: &str, key: &str, r: &Response) -> Error {
@@ -487,23 +586,53 @@ impl Response {
     }
 }
 
-fn connect(endpoint: &str) -> Result<TcpStream> {
-    let addr = endpoint
+/// A connection to the endpoint: plain, or TLS verified against the
+/// anchors by the endpoint's name. The handshake happens on the first
+/// write; a chain that does not reach the anchors fails the request with
+/// the reason.
+fn connect(endpoint: &str, tls: Option<&ArchiveTls>) -> Result<Box<dyn crate::tls::Stream>> {
+    // Every address the name resolves to, in order: `localhost` is often
+    // `::1` first and `127.0.0.1` second, and a store on one of them must
+    // not be missed for the other.
+    let addrs: Vec<_> = endpoint
         .to_socket_addrs()
         .map_err(|e| Error::Storage(format!("archive: cannot resolve {endpoint}: {e}")))?
-        .next()
-        .ok_or_else(|| Error::Storage(format!("archive: {endpoint} resolves to nothing")))?;
-    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| Error::Storage(format!("archive: cannot connect to {endpoint}: {e}")))?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::Storage(format!("archive: {endpoint} resolves to nothing")));
+    }
+    let mut last = None;
+    let mut connected = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let s = connected.ok_or_else(|| {
+        Error::Storage(format!(
+            "archive: cannot connect to {endpoint}: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    })?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(s)
+    match tls {
+        None => Ok(Box::new(s)),
+        Some(t) => {
+            use crate::crypto::tls13::{ClientSide, TlsStream};
+            Ok(Box::new(TlsStream::client(s, ClientSide { anchors: &t.anchors, host: &t.host })))
+        }
+    }
 }
 
 /// Read one HTTP/1.1 response in full: a status line, headers to the blank
 /// line, then a body sized by `content-length`, by chunked framing, or by the
 /// close of the connection (which the request asked for).
-fn read_response(stream: &mut TcpStream, head_only: bool) -> Result<Response> {
+fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Response> {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
     let head_end = find(&raw, b"\r\n\r\n")

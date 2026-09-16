@@ -5,11 +5,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::residency::ArchivedAccess;
+use celastro::tls::Tls;
 use celastro::value::Value;
 
 const ACCESS_KEY: &str = "AKIAFAKEFAKEFAKEFAKE";
@@ -24,8 +25,47 @@ struct FakeS3 {
     requests: Arc<Mutex<Vec<String>>>,
 }
 
+/// A CA and a `localhost` certificate it signed, made once per process by
+/// the crate's own generator, for the https fake.
+fn fixture(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("celastro-s3-tls-{}", std::process::id()));
+    if !dir.join("ca.crt").exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = celastro::tls::make_material(
+            "localhost",
+            &["localhost".to_string()],
+            &["127.0.0.1".parse().unwrap()],
+            30,
+        )
+        .unwrap();
+        std::fs::write(dir.join("ca.crt"), m.ca_cert).unwrap();
+        std::fs::write(dir.join("localhost.crt"), m.cert).unwrap();
+        std::fs::write(dir.join("localhost.key"), m.key).unwrap();
+        let other = celastro::tls::make_material("localhost", &[], &[], 30).unwrap();
+        std::fs::write(dir.join("other-ca.crt"), other.ca_cert).unwrap();
+    }
+    dir.join(name).display().to_string()
+}
+
 impl FakeS3 {
     fn start() -> FakeS3 {
+        FakeS3::start_with(None)
+    }
+
+    /// The same fake behind TLS, serving the fixture's `localhost` certificate.
+    fn start_tls() -> FakeS3 {
+        let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("CELASTRO_TLS_CERT", fixture("localhost.crt"));
+        std::env::set_var("CELASTRO_TLS_KEY", fixture("localhost.key"));
+        std::env::set_var("CELASTRO_TLS_CA", fixture("ca.crt"));
+        let tls = Arc::new(Tls::from_env().unwrap().unwrap());
+        std::env::remove_var("CELASTRO_TLS_CERT");
+        std::env::remove_var("CELASTRO_TLS_KEY");
+        std::env::remove_var("CELASTRO_TLS_CA");
+        FakeS3::start_with(Some(tls))
+    }
+
+    fn start_with(tls: Option<Arc<Tls>>) -> FakeS3 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let objects: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
@@ -34,6 +74,7 @@ impl FakeS3 {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (o, r) = (o.clone(), r.clone());
+                let Ok(stream) = celastro::tls::accept(tls.as_ref(), stream) else { continue };
                 std::thread::spawn(move || serve(stream, o, r));
             }
         });
@@ -52,7 +93,7 @@ impl FakeS3 {
 }
 
 fn serve(
-    mut s: TcpStream,
+    mut s: Box<dyn celastro::tls::Stream>,
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     requests: Arc<Mutex<Vec<String>>>,
 ) {
@@ -88,7 +129,7 @@ fn serve(
         };
         body.extend_from_slice(&buf[..n]);
     }
-    let reply = |s: &mut TcpStream, code: u16, reason: &str, body: &[u8], len_only: bool| {
+    let reply = |s: &mut dyn Write, code: u16, reason: &str, body: &[u8], len_only: bool| {
         let mut out = format!(
             "HTTP/1.1 {code} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -418,15 +459,76 @@ fn credentials_come_from_the_environment_and_are_never_written_down() {
 /// could not be one: there is no TLS here, and the message says what to put
 /// in front of the bucket instead.
 #[test]
-fn an_https_endpoint_is_refused_with_the_reason() {
+fn the_archived_tier_over_https_verifies_the_store_by_the_ca_it_is_given() {
+    let fake = FakeS3::start_tls();
+    let port = fake.addr.rsplit(':').next().unwrap();
     let mut o = DbOpts::default();
-    o.archive.endpoint = Some("https://bucket.example".into());
+    o.archive.endpoint = Some(format!("https://localhost:{port}"));
+    o.archive.bucket = "b".into();
+    o.archive.prefix = "celastro/".into();
+    o.archive.region = "us-east-1".into();
+    o.archive.ca = Some(fixture("ca.crt").into());
+    let d = dir("https");
+    let mut db = open(&d, o.clone()).unwrap();
+    setup(&mut db, 120);
+    archive_all(&mut db);
+    assert!(!fake.keys().is_empty(), "the objects went over TLS: {:?}", fake.keys());
+    let rows = db.query("SELECT id FROM items WHERE text_match(body, 'number') LIMIT 200").unwrap();
+    assert_eq!(rows.rows.len(), 120, "ranged reads over TLS answer the query");
+    drop(db);
+    let mut db = open(&d, o.clone()).unwrap();
+    let rows = db.query("SELECT id FROM items WHERE kind = 'note' LIMIT 200").unwrap();
+    assert!(!rows.rows.is_empty());
+    drop(db);
+    // Another CA: the chain does not reach it, and the first request says so.
+    let mut wrong = o.clone();
+    wrong.archive.ca = Some(fixture("other-ca.crt").into());
+    let d2 = dir("https-wrong");
+    // A segment moves once every index on it is archived, so the third
+    // ALTER is the one that reaches the store.
+    let first_error = |db: &mut Db| -> String {
+        for i in ["items_body", "items_emb", "items_kind"] {
+            if let Err(e) = db.execute(&format!("ALTER INDEX {i} ON items SET TIER 'archived'")) {
+                return e.to_string();
+            }
+        }
+        String::new()
+    };
+    let mut db = open(&d2, wrong).unwrap();
+    setup(&mut db, 20);
+    let e = first_error(&mut db);
+    assert!(e.contains("does not reach"), "{e}");
+    assert!(
+        std::fs::read_dir(d2.join("collections/items/shard-0000/segments")).unwrap().count() > 0
+    );
+    // No CA named: the system's bundle if there is one (which does not hold
+    // this CA), or the variable is named.
+    let mut none = o.clone();
+    none.archive.ca = None;
+    let d3 = dir("https-none");
+    match open(&d3, none) {
+        Ok(mut db) => {
+            setup(&mut db, 5);
+            let e = first_error(&mut db);
+            assert!(e.contains("does not reach"), "{e}");
+        }
+        Err(e) => assert!(e.to_string().contains("CELASTRO_ARCHIVE_CA"), "{e}"),
+    }
+    for p in [&d, &d2, &d3] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[test]
+fn a_bad_endpoint_is_refused_with_the_reason() {
+    let mut o = DbOpts::default();
+    o.archive.endpoint = Some("https://".into());
     o.archive.bucket = "b".into();
     let _g = ENV.lock().unwrap();
     std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake-secret");
-    let e = Db::open(&dir("https"), o).err().map(|e| e.to_string()).unwrap();
-    assert!(e.contains("plain http") && e.contains("TLS"), "{e}");
+    let e = Db::open(&dir("https-bad"), o).err().map(|e| e.to_string()).unwrap();
+    assert!(e.contains("names no host"), "{e}");
 }
 
 /// The same tier over a directory: `CELASTRO_ARCHIVE_DIR` names it, the

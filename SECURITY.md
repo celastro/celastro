@@ -112,8 +112,11 @@ issued under. No client certificates, no HelloRetryRequest, no 0-RTT, no
 key update; a stock client speaks that subset. Every primitive is pinned against its RFC
 vectors and the key schedule against RFC 8448; nothing branches on or
 indexes by a secret, by masks rather than by asking the compiler. The
-archive client to an S3 store is plain HTTP. A finding against any of
-this is in scope.
+archive client reaches an `https://` store over the same TLS, verifying
+the chain against the bundle `CELASTRO_ARCHIVE_CA` names or the system's,
+with wildcard names in the leftmost label as RFC 6125 has them; a plain
+`http://` endpoint is what it says. A finding against any of this is in
+scope.
 
 ## Encryption at rest, and what it is
 

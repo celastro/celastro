@@ -6,6 +6,23 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.42.0 — 2026-09-16
+
+The archive client speaks TLS, hence a minor.
+
+**`CELASTRO_ARCHIVE_ENDPOINT=https://...`.** The `archived` tier and
+`BACKUP TO 's3://...'` reach an S3-compatible store over the in-tree TLS,
+the chain verified against the PEM bundle `CELASTRO_ARCHIVE_CA` names or,
+absent that, the system's bundle in its usual places; a certificate the
+parser cannot read in a bundle is skipped, a wildcard in the leftmost
+label names what RFC 6125 says it does, and every address the endpoint
+resolves to is tried in turn. The chart's `archive.caSecret` mounts the
+bundle, since the image carries none. Checked against a TLS fake in the
+tests and against `s3.us-east-1.amazonaws.com` from the tree: the
+handshake verified Amazon's chain against the system bundle and the
+signed request came back with the 403 a made-up key earns. A plain
+`http://` endpoint is unchanged; a bare `host:port` still means http.
+
 ## 0.41.0 — 2026-09-16
 
 The command is `celastro`, hence a minor.

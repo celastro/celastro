@@ -88,7 +88,8 @@ be RSA or P-256), from one of three places:
 
 Clients verify the console against `ca.crt` from the Secret, as the notes
 say. The tokens stay in force
-with TLS on; the archive endpoint stays plain HTTP.
+with TLS on. An `https://` archive endpoint is verified by the bundle in
+the Secret `archive.caSecret` names (key `ca.crt`).
 
 A pod that has just restarted has a new address; a dial that fails is
 retried for two seconds, which covers a restart, and the other pods may
@@ -155,8 +156,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.41.0 .
-kind load docker-image celastro:0.41.0        # for a kind cluster
+docker build -t celastro:0.42.0 .
+kind load docker-image celastro:0.42.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -223,7 +224,8 @@ changelog; those need every pod restarted together
 | `console.service.type` | `ClusterIP` | that Service's type |
 | `console.token`, `console.existingSecret` | empty | the console token (at least sixteen characters), or a `Secret` with the key `CELASTRO_TOKEN`; both empty generates one, kept across upgrades |
 | `persistence.size`, `persistence.storageClass` | `10Gi`, the cluster default | the data volume |
-| `archive.endpoint` | empty | `host:port` of an S3-compatible store, plain HTTP; empty keeps the `archived` tier in the data volume |
+| `archive.endpoint` | empty | `http://host:port` or `https://host` of an S3-compatible store; empty keeps the `archived` tier in the data volume |
+| `archive.caSecret` | empty | a `Secret` whose `ca.crt` is the PEM bundle an `https://` endpoint is verified by (the image carries no system bundle) |
 | `archive.bucket`, `archive.prefix`, `archive.region` | empty | the bucket, and optional key prefix and region |
 | `archive.existingSecret` | empty | a `Secret` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` |
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
@@ -238,9 +240,9 @@ changelog; those need every pod restarted together
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because a probe waits behind a statement that changes something |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
 
-The archive endpoint is plain HTTP (the TLS covers the wire and the
-console, not that client): point it at a store in the cluster, or at a
-TLS-terminating proxy in front of a bucket.
+An `https://` archive endpoint is verified by the CA bundle in
+`archive.caSecret`: a cloud bucket's public root, or your own CA for a
+store in the cluster. Without it the endpoint has to be `http://`.
 
 ## What was verified, and how
 

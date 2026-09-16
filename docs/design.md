@@ -422,7 +422,7 @@ did not reach. The
 `archived` tier is an S3-compatible object store when one is configured, a
 directory on any mount when one is named (`CELASTRO_ARCHIVE_DIR`; the same
 trait, so NFS is the cluster's business), and the shard-local directory
-otherwise; the client is in-tree and plain HTTP: the TLS (0.28.0) encrypts
+otherwise; the client is in-tree, plain HTTP or, since 0.42.0, HTTPS over the in-tree TLS (`CELASTRO_ARCHIVE_CA`, or the system bundle): the TLS (0.28.0) encrypts
 the wire and the console, not the archive client, yet. Backups (0.30.0)
 go through the same trait: `BACKUP TO` and `RESTORE FROM` in `backup.rs`.
 
@@ -1082,7 +1082,7 @@ liveness check.
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
 stands in for, `PUT`, ranged `GET`, `HEAD` and `DELETE`, path-style and signed
-with Signature Version 4, over plain HTTP: the TLS covers the wire and the
+with Signature Version 4, over plain HTTP or the in-tree TLS (0.42.0; verified against `CELASTRO_ARCHIVE_CA` or the system bundle, wildcard names allowed in the leftmost label, every resolved address tried in turn): the TLS covers the wire and the
 console, not this client, yet.
 SHA-256, HMAC, the signer and a small HTTP/1.1 client are in-tree and pinned
 against the published vectors, AWS's own worked example included. A remote
@@ -1130,7 +1130,7 @@ to keep that -- there is no `black_box` in the floor's `std` -- so the code
 keeps it by having no branch to remove. It was written for a crate that
 takes no dependency, by the user's decision after rustls had shipped
 behind a feature and been withdrawn; it is unaudited, and the README says
-so. What would move it forward: the archive client over the same stream.
+so. The archive client speaks it since 0.42.0.
 
 **Encryption at rest is a property of the bytes a file holds, so every
 path is either a content path or a copy path.** A content path makes or

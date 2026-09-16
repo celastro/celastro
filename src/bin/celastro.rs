@@ -2119,6 +2119,7 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         o.archive.bucket = var("CELASTRO_ARCHIVE_BUCKET").unwrap_or_default();
         o.archive.prefix = var("CELASTRO_ARCHIVE_PREFIX").unwrap_or_default();
         o.archive.region = var("CELASTRO_ARCHIVE_REGION").unwrap_or_default();
+        o.archive.ca = var("CELASTRO_ARCHIVE_CA").map(PathBuf::from);
     }
     o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
     o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
