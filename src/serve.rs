@@ -513,7 +513,10 @@ impl Server {
                             match server.serve_one(s, db) {
                                 Ok(Next::Serve) => {}
                                 Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
-                                Err(e) => eprintln!("celastro: connection dropped: {e}"),
+                                Err(e) => crate::log::warn(
+                                    "connection_dropped",
+                                    &[("error", e.to_string())],
+                                ),
                             }
                             active.fetch_sub(1, AtomicOrdering::AcqRel);
                         });
@@ -522,7 +525,7 @@ impl Server {
                         crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
                     }
                     Err(e) => {
-                        eprintln!("celastro: accept failed: {e}");
+                        crate::log::warn("accept_failed", &[("error", e.to_string())]);
                         match accept_backoff(e.kind(), failures + 1) {
                             // Nothing of ours went wrong, and it will not repeat by
                             // itself: the run of failures starts over.
@@ -533,7 +536,10 @@ impl Server {
                             }
                             Backoff::GiveUp => {
                                 let run = failures + 1;
-                                eprintln!("celastro: {run} accept failures in a row, stopping");
+                                crate::log::error(
+                                    "accept_failing",
+                                    &[("failures", run.to_string())],
+                                );
                                 return Err(e.into());
                             }
                         }
@@ -1480,13 +1486,25 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
                 COUNTERS
                     .compaction_millis
                     .fetch_add(started.elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
-                eprintln!("celastro: compacted {what} in {:.1} s", started.elapsed().as_secs_f64())
+                crate::log::info(
+                    "compacted",
+                    &[
+                        ("what", what.clone()),
+                        ("seconds", format!("{:.1}", started.elapsed().as_secs_f64())),
+                    ],
+                )
             }
             Ok(false) => {}
-            Err(e) => eprintln!("celastro: compaction of {what} could not be installed: {e}"),
+            Err(e) => crate::log::warn(
+                "compaction_not_installed",
+                &[("what", what.clone()), ("error", e.to_string())],
+            ),
         },
         Ok(None) => {}
-        Err(e) => eprintln!("celastro: compaction of {what} failed: {e}"),
+        Err(e) => crate::log::warn(
+            "compaction_failed",
+            &[("what", what.clone()), ("error", e.to_string())],
+        ),
     }
     true
 }
@@ -1922,9 +1940,21 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// Persist is a no-op for an in-memory database, so this costs nothing where
 /// there is nothing to lose; and when it fails the client is told, because an
 /// ack that claims a durability the disk does not have is worse than an error.
+/// Seal failures seen so far, so each new one is logged once.
+static SEALS_FAILED_SEEN: AtomicU64 = AtomicU64::new(0);
+
 fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let started = Instant::now();
     let response = run_sql_untimed(db, sql);
+    // A seal that failed inside that statement did not fail it (the write
+    // is on the log); it is the operator's to hear about.
+    let (failed, last) = read(db).seal_failures();
+    if failed > SEALS_FAILED_SEEN.swap(failed, AtomicOrdering::Relaxed) {
+        crate::log::warn(
+            "seal_failed",
+            &[("failures", failed.to_string()), ("error", last.unwrap_or_default())],
+        );
+    }
     let micros = started.elapsed().as_micros() as u64;
     COUNTERS.statements.fetch_add(1, AtomicOrdering::Relaxed);
     if !response.body.starts_with(r#"{"ok":true"#) {

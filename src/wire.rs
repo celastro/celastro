@@ -1034,7 +1034,7 @@ pub fn serve(
                 let s = match tls::accept(tls.as_ref(), s) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("celastro: a wire connection could not be set up: {e}");
+                        crate::log::warn("wire_connection_failed", &[("error", e.to_string())]);
                         continue;
                     }
                 };

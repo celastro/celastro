@@ -97,6 +97,9 @@ answer rendered as it would be locally. The token is CELASTRO_TOKEN, or the
 cluster's nodes all coordinate, so the URL may name any node's console or a
 load balancer in front of them.
 
+LOG: `serve` writes one line per event to stderr with a timestamp and a
+level; CELASTRO_LOG=json makes them JSON lines for a collector.
+
 TUNING: the CELASTRO_* variables in docs/tuning.md (insert batch, memtable
 and residency budgets, compaction, the vector build, the console's
 connection cap) are read at start; a value that does not parse is refused.
@@ -545,6 +548,7 @@ fn bad_port(given: &str) -> String {
 // --------------------------------------------------------------------------
 
 fn main() {
+    celastro::log::from_env();
     match parse_args(std::env::args().skip(1)) {
         Cli::Help { json } => print!("{}", help_output(json)),
         Cli::Version { json } => println!("{}", version_output(json)),

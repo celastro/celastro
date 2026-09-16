@@ -8,6 +8,13 @@ repository.
 
 ## Unreleased
 
+**Structured logs.** What `serve` and the wire say -- a connection
+dropped, an accept failing, a compaction done or not installed or
+failed, a wire connection that could not be set up, a seal that failed
+-- is one line per event on stderr with an ISO 8601 timestamp, a level
+and `key="value"` fields, or a JSON line each with `CELASTRO_LOG=json`.
+`celastro::log` for the library.
+
 **Backpressure.** A shard holding more flat segments than
 `CELASTRO_COMPACTION_DEBT` (32) makes each write to it wait
 `CELASTRO_COMPACTION_DEBT_WAIT_MS` (20) per segment past the debt, a

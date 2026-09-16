@@ -238,6 +238,10 @@ serve TLS 1.3, with the CA verifying every peer. The chart's `console.expose`
 and `tls.enabled` are these two, with the token and the certificates in
 Secrets and a Service over the pods.
 
+Logs: `serve` writes one line per event to stderr, timestamped and
+levelled; `CELASTRO_LOG=json` makes them JSON lines, which is what a
+cluster's log collector wants.
+
 Encryption at rest: mount a master key and set `CELASTRO_MASTER_KEY_FILE`
 to it (`celastro key master` writes one), and every file under
 `/data`, the tier and the backups are encrypted under a data key kept

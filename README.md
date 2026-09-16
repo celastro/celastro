@@ -166,7 +166,10 @@ and a per-run token every request needs. `POST /api/shutdown` with the token
 stops it after a clean save; `GET /api/metrics` is the process's counters
 (statements and their time, refusals, compactions, connections, resumed
 handshakes) and what it holds per collection, in the text format a
-Prometheus scraper reads.
+Prometheus scraper reads. What the server has to say -- a connection
+dropped, a compaction done or failed, a seal that failed -- is one line
+per event on stderr with a timestamp and a level, or JSON lines with
+`CELASTRO_LOG=json`.
 
 `serve --bind 0.0.0.0` puts it on a network, for nodes behind a Service or a
 load balancer: the console then answers the token in `CELASTRO_TOKEN` (yours,
