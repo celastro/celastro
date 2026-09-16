@@ -81,6 +81,8 @@ pub mod deadline;
 pub(crate) mod dirlock;
 pub mod engine;
 pub mod error;
+#[cfg(test)]
+pub(crate) mod fuzz;
 pub mod harness;
 pub mod json;
 pub mod lifecycle;

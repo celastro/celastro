@@ -82,6 +82,15 @@ pub fn encode(label: &str, der: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_pem_decoding_never_panics() {
+        let m = crate::crypto::x509::make("localhost", &[], &[], 30).unwrap();
+        crate::fuzz::sweep_text(7, &[&m.cert, &m.ca_cert, &m.key], 4000, |t| {
+            let _ = decode_all(t, "CERTIFICATE");
+            let _ = decode_all(t, "PRIVATE KEY");
+        });
+    }
     use super::*;
 
     #[test]

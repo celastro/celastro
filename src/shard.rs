@@ -571,7 +571,7 @@ impl Manifest {
         let mut i = 0usize;
         let version = get_u64(b, &mut i).ok_or_else(bad)?;
         let next_segment_id = get_u64(b, &mut i).ok_or_else(bad)?;
-        let n = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+        let n = crate::codec::get_count(b, &mut i).ok_or_else(bad)?;
         let mut segments = Vec::with_capacity(n);
         for _ in 0..n {
             segments.push(SegmentMeta {
@@ -3218,6 +3218,57 @@ fn gallop(keys: &[String], from: usize, target: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_manifest_and_wal_never_panic() {
+        let m = Manifest {
+            version: 3,
+            segments: vec![SegmentMeta {
+                id: 1,
+                level: 0,
+                num_docs: 10,
+                num_vectors: 4,
+                min_key: "a".into(),
+                max_key: "z".into(),
+            }],
+            next_segment_id: 2,
+        };
+        let mut manifest = m.encode();
+        put_u32(&mut manifest, crc32(&m.encode()));
+        crate::fuzz::sweep(31, &[manifest], 6000, |b| {
+            let _ = Manifest::decode(b);
+        });
+        let dir = std::env::temp_dir().join(format!("celastro-fuzz-wal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        {
+            let mut w = Wal::open(&log, None, "t/wal.log".into()).unwrap();
+            for i in 0..5u64 {
+                w.append(&WalRecord {
+                    kind: (i % 2) as u8,
+                    key: format!("k{i}"),
+                    ts: 100 + i,
+                    doc: Some(
+                        crate::json::parse(&format!(
+                            r#"{{"id":"k{i}","n":{i},"t":["a",{{"b":null}}]}}"#
+                        ))
+                        .unwrap(),
+                    ),
+                    supersedes: i % 2 == 1,
+                    segment_id: i,
+                })
+                .unwrap();
+            }
+        }
+        let sample = fs::read(&log).unwrap();
+        let mutant = dir.join("mutant.log");
+        crate::fuzz::sweep(32, &[sample], 3000, |b| {
+            fs::write(&mutant, b).unwrap();
+            let _ = Wal::replay(&mutant, &None, "t/wal.log");
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     use crate::catalog::{ColumnDef, IndexDef, IndexKind, Metric};

@@ -1514,6 +1514,25 @@ fn cap_option(key: &str, v: Value) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_sql_parsing_never_panics() {
+        let samples = [
+            "SELECT id, topic FROM notes WHERE topic = 'storage' AND n > 3 OR NOT (x IN ('a', 'b')) ORDER BY n DESC LIMIT 5 OFFSET 2",
+            "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'a b*'), embedding <=> [0.5,0.5,0.0,0.0], method => 'rrf', weights => [1, 2]) LIMIT 3 WITH (partial_results, deadline_ms = 10)",
+            "SELECT tenant, count(*) AS n, avg(w) FROM t WHERE id WITHIN 2 HOPS OF 'p1' VIA cites GROUP BY tenant ORDER BY n DESC",
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT NOT NULL) PARTITION BY (topic) WITH (splits = ['m', 't'])",
+            "CREATE INDEX i ON notes USING vector (embedding) WITH (dims = 4, metric = 'cosine', tier = 'archived')",
+            "INSERT INTO notes VALUES ('{\"id\":\"n1\",\"body\":\"x''y\"}'), ('{\"id\":\"n2\"}')",
+            "DELETE FROM notes WHERE text_match(body, 'comp*') COLLAPSE BY parent",
+            "CREATE LIFECYCLE POLICY p ON notes MOVE INDEX i TO 'archived' AFTER 30 days",
+            "BACKUP TO 's3://b/p'; RESTORE FROM 'x' AS OF 12345 NODE 'tcp://a:2352'",
+            "MOVE SHARD 1 OF notes TO 'tcp://h:2352'; ALTER INDEX i ON notes SET TIER 'active'",
+        ];
+        crate::fuzz::sweep_text(111, &samples, 6000, |t| {
+            let _ = parse(t, &[Value::Int(1), Value::Str("p".into())]);
+        });
+    }
     use super::*;
 
     #[test]

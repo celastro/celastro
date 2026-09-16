@@ -1254,6 +1254,81 @@ impl TlsStream {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 8448 section 4: the resumed ClientHello up to its binders list.
+    const RFC8448_RESUMED_CLIENT_HELLO_PREFIX: &str = "010001fc03031bc3ceb6bbe39cff938355b5a50adb6db21b7a6af649d7b4bc419d7876487d95000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00140012001d00170018001901000101010201030104003300260024001d0020e4ffb68ac05f8d96c99da26698346c6be16482badddafe051a66b4f18d668f0b002a0000002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c0002400100150057000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002900dd00b800b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafcd0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e5bfbc388e93343694093934ae4d357fad6aacb";
+
+    #[test]
+    fn fuzz_handshake_message_parsing_never_panics() {
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        let mut ch = unhex(RFC8448_RESUMED_CLIENT_HELLO_PREFIX);
+        ch.extend_from_slice(&[0, 0x21, 0x20]);
+        ch.extend_from_slice(&[0x3a; 32]);
+        let ch_body = ch[4..].to_vec();
+        // A ServerHello as this server writes one, PSK selected.
+        let mut sh = Vec::new();
+        sh.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
+        sh.extend_from_slice(&[0x11; 32]);
+        sh.push(32);
+        sh.extend_from_slice(&[0x22; 32]);
+        sh.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
+        sh.push(0);
+        let mut exts = Vec::new();
+        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &VERSION_13.to_be_bytes());
+        let mut ks = Vec::new();
+        ks.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        ks.extend_from_slice(&32u16.to_be_bytes());
+        ks.extend_from_slice(&[0x33; 32]);
+        extension(&mut exts, EXT_KEY_SHARE, &ks);
+        extension(&mut exts, EXT_PRE_SHARED_KEY, &0u16.to_be_bytes());
+        sh.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        sh.extend_from_slice(&exts);
+        // A Certificate message from a real chain, and a NewSessionTicket.
+        let m = x509::make("localhost", &[], &[], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let mut cert = vec![0u8];
+        let mut list = Vec::new();
+        for c in &chain_der {
+            list.extend_from_slice(&(c.len() as u32).to_be_bytes()[1..]);
+            list.extend_from_slice(c);
+            list.extend_from_slice(&[0, 0]);
+        }
+        cert.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
+        cert.extend_from_slice(&list);
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let tkey = ticket_key(&key);
+        let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7).unwrap();
+        let mut nst = Vec::new();
+        nst.extend_from_slice(&86_400u32.to_be_bytes());
+        nst.extend_from_slice(&7u32.to_be_bytes());
+        nst.push(1);
+        nst.push(0);
+        nst.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+        nst.extend_from_slice(&ticket);
+        nst.extend_from_slice(&[0, 0]);
+        assert!(open_ticket(&tkey, &ticket).is_some());
+        crate::fuzz::sweep(1, &[ch_body], 5000, |b| {
+            let _ = parse_client_hello(b);
+        });
+        crate::fuzz::sweep(2, &[sh], 5000, |b| {
+            let _ = parse_server_hello(b);
+        });
+        crate::fuzz::sweep(3, &[cert], 4000, |b| {
+            let _ = parse_certificate_message(b);
+        });
+        crate::fuzz::sweep(4, &[nst], 4000, |b| {
+            let _ = parse_new_session_ticket(b);
+        });
+        // A mutated ticket never opens, and never panics.
+        crate::fuzz::sweep(5, std::slice::from_ref(&ticket), 4000, |b| {
+            if b != ticket.as_slice() {
+                assert!(open_ticket(&tkey, b).is_none());
+            }
+        });
+        let _ = tickets_held();
+    }
     use super::*;
     use crate::crypto::pem;
     use std::net::TcpListener;
@@ -1346,7 +1421,7 @@ mod tests {
             crate::crypto::hex(&binder_key),
             "69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256"
         );
-        let prefix = unhex("010001fc03031bc3ceb6bbe39cff938355b5a50adb6db21b7a6af649d7b4bc419d7876487d95000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00140012001d00170018001901000101010201030104003300260024001d0020e4ffb68ac05f8d96c99da26698346c6be16482badddafe051a66b4f18d668f0b002a0000002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c0002400100150057000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002900dd00b800b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafcd0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e5bfbc388e93343694093934ae4d357fad6aacb");
+        let prefix = unhex(RFC8448_RESUMED_CLIENT_HELLO_PREFIX);
         assert_eq!(prefix.len(), 477);
         let hash = sha256(&prefix);
         assert_eq!(

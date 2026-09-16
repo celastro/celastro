@@ -1196,10 +1196,9 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
     let started = Instant::now();
     match Db::compaction_build(&ticket) {
         Ok(Some(built)) => match write(db).compaction_install(ticket, built) {
-            Ok(true) => eprintln!(
-                "celastro: compacted {what} in {:.1} s",
-                started.elapsed().as_secs_f64()
-            ),
+            Ok(true) => {
+                eprintln!("celastro: compacted {what} in {:.1} s", started.elapsed().as_secs_f64())
+            }
             Ok(false) => {}
             Err(e) => eprintln!("celastro: compaction of {what} could not be installed: {e}"),
         },
@@ -1692,6 +1691,19 @@ fn text_json(kind: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_request_heads_never_panic() {
+        let samples = [
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nX-Celastro-Token: abc\r\nConnection: close\r\n\r\n",
+            "POST /api/query?t=0123456789abcdef HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 12\r\nOrigin: http://h\r\n\r\n",
+            "GET /?t=x HTTP/1.0\r\n\r\n",
+            "OPTIONS * HTTP/1.1\r\nHost: a:1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ];
+        crate::fuzz::sweep_text(11, &samples, 8000, |t| {
+            let _ = parse_head(t);
+        });
+    }
     use super::*;
     use crate::plan::exec::Row;
     use crate::text::scorer::PREFIX_EXPANSION_LIMIT;

@@ -455,6 +455,19 @@ fn write_json_string(s: &str, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_json_parsing_never_panics() {
+        let samples = [
+            r#"{"id":"x","n":-7,"f":1.5e3,"b":true,"z":null,"t":["a","b",{"c":[1,[2,[3]]]}]}"#,
+            r#""\u00e9\n\t\"\\""#,
+            "[[[[[[[[[[1]]]]]]]]]]",
+            "-0.0e-00",
+        ];
+        crate::fuzz::sweep_text(101, &samples, 8000, |t| {
+            let _ = parse(t);
+        });
+    }
     use super::*;
 
     #[test]

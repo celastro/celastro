@@ -231,7 +231,15 @@ fn get_u8(b: &[u8], i: &mut usize) -> Result<u8> {
     Ok(v)
 }
 
+/// A count of items that follow: refused when larger than the bytes left,
+/// so a hostile count never sizes an allocation.
 fn get_count(b: &[u8], i: &mut usize) -> Result<usize> {
+    crate::codec::get_count(b, i).ok_or_else(truncated)
+}
+
+/// A number that is not a count of items -- an index, a cap, a depth --
+/// and so is not bounded by what follows it.
+fn get_num(b: &[u8], i: &mut usize) -> Result<usize> {
     Ok(get_uvarint(b, i).ok_or_else(truncated)? as usize)
 }
 
@@ -359,7 +367,8 @@ fn get_stats(b: &[u8], i: &mut usize) -> Result<BTreeMap<String, GlobalStats>> {
             e.used = used;
             g.expansions.insert(leaf, e);
         }
-        g.prefix_cap = get_count(b, i)?;
+        // A cap, not a count of items: not bounded by the bytes left.
+        g.prefix_cap = get_uvarint(b, i).ok_or_else(truncated)? as usize;
         g.exact = get_bool(b, i)?;
         out.insert(path, g);
     }
@@ -376,7 +385,7 @@ fn put_explain(out: &mut Vec<u8>, sx: &ShardExplain) {
 
 fn get_explain(b: &[u8], i: &mut usize) -> Result<ShardExplain> {
     let mut sx = ShardExplain::default();
-    sx.index = get_count(b, i)?;
+    sx.index = get_num(b, i)?;
     sx.manifest_version = get_u64(b, i).ok_or_else(truncated)?;
     sx.micros = get_u64(b, i).ok_or_else(truncated)? as u128;
     sx.timed_out = get_bool(b, i)?;
@@ -448,7 +457,7 @@ fn get_scan(b: &[u8], i: &mut usize) -> Result<ShardScan> {
         let sort = get_values(b, i)?;
         let key = get_string(b, i)?;
         let doc = if get_bool(b, i)? { Some(get_value(b, i)?) } else { None };
-        let ui = get_count(b, i)?;
+        let ui = get_num(b, i)?;
         let ord = get_u32(b, i).ok_or_else(truncated)?;
         let parent = if get_bool(b, i)? {
             Some(get_bytes(b, i).ok_or_else(truncated)?.to_vec())
@@ -978,7 +987,7 @@ impl ShardService for Remote {
         let b = self.call(Call::Expand, &body)?;
         let mut i = 0;
         let pairs = get_pairs(&b, &mut i)?;
-        let scanned = get_count(&b, &mut i)?;
+        let scanned = get_num(&b, &mut i)?;
         Ok(HopExpansion { pairs, scanned })
     }
 
@@ -1153,7 +1162,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
     let call = Call::from_u8(get_u8(frame, &mut i)?)
         .ok_or_else(|| Error::Storage("wire: unknown call".into()))?;
     let collection = get_string(frame, &mut i)?;
-    let shard = get_count(frame, &mut i)?;
+    let shard = get_num(frame, &mut i)?;
     let deadline_ms = if get_bool(frame, &mut i)? {
         Some(get_uvarint(frame, &mut i).ok_or_else(truncated)?)
     } else {
@@ -1343,7 +1352,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
                     let path = get_string(body, &mut j)?;
                     let prefix = get_string(body, &mut j)?;
                     let ts = get_ts(body, &mut j)?;
-                    let limit = get_count(body, &mut j)?;
+                    let limit = get_num(body, &mut j)?;
                     let key_prefix = get_opt(body, &mut j)?;
                     let terms =
                         local.prefix_terms(&path, &prefix, ts, limit, key_prefix.as_deref())?;
@@ -1354,7 +1363,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
                     let params = get_values(body, &mut j)?;
                     let ts = get_ts(body, &mut j)?;
                     let prefix = get_opt(body, &mut j)?;
-                    let k_prime = get_count(body, &mut j)?;
+                    let k_prime = get_num(body, &mut j)?;
                     let stats = get_stats(body, &mut j)?;
                     let analyze = get_bool(body, &mut j)?;
                     let frontiers = get_frontiers(body, &mut j)?;
@@ -1383,7 +1392,9 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
                     let prefix = get_opt(body, &mut j)?;
                     let stats = get_stats(body, &mut j)?;
                     let analyze = get_bool(body, &mut j)?;
-                    let keep = get_count(body, &mut j)?;
+                    // A row cap, not a count of items that follow: it may
+                    // exceed the body's length, so it is not bounded by it.
+                    let keep = get_uvarint(body, &mut j).ok_or_else(truncated)? as usize;
                     let after = get_opt(body, &mut j)?;
                     let nf = get_count(body, &mut j)?;
                     let mut fields = Vec::with_capacity(nf);
@@ -1414,7 +1425,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
                     let n = get_count(body, &mut j)?;
                     let mut handles = Vec::with_capacity(n);
                     for _ in 0..n {
-                        let ui = get_count(body, &mut j)?;
+                        let ui = get_num(body, &mut j)?;
                         let ord = get_u32(body, &mut j).ok_or_else(truncated)?;
                         handles.push((ui, ord));
                     }
@@ -1437,10 +1448,10 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
                     let ts = get_ts(body, &mut j)?;
                     let frontier = get_strs(body, &mut j)?;
                     let limit =
-                        if get_bool(body, &mut j)? { Some(get_count(body, &mut j)?) } else { None };
+                        if get_bool(body, &mut j)? { Some(get_num(body, &mut j)?) } else { None };
                     let reverse = get_bool(body, &mut j)?;
-                    let wi = get_count(body, &mut j)?;
-                    let hop = get_count(body, &mut j)?;
+                    let wi = get_num(body, &mut j)?;
+                    let hop = get_num(body, &mut j)?;
                     let sel = select_of(&sql, &params)?;
                     let hops = walk::walks_of(&sel);
                     let Some(Expr::Hops { via, filters, .. }) = hops.get(wi) else {
@@ -1506,6 +1517,61 @@ fn select_of(sql: &str, params: &[Value]) -> Result<Select> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_wire_answers_never_panic() {
+        let hit = ScanHit {
+            sort: vec![Value::Int(3), Value::Str("s".into())],
+            key: "k".into(),
+            doc: Some(Value::obj(vec![(
+                "a".into(),
+                Value::Array(vec![Value::Null, Value::Float(1.5)]),
+            )])),
+            handle: (1, 2),
+            parent: Some(vec![1, 2, 3]),
+        };
+        let mut scan = Vec::new();
+        put_scan(
+            &mut scan,
+            &ShardScan { hits: vec![hit], explain: ShardExplain::default(), timed_out: true },
+        );
+        let mut cands = Vec::new();
+        put_candidates(
+            &mut cands,
+            &ShardCandidates {
+                per_source: vec![vec![Candidate { key: "a".into(), raw_score: 0.5 }], vec![]],
+                explain: ShardExplain::default(),
+                timed_out: false,
+            },
+        );
+        let mut tablets = Vec::new();
+        put_tablets(
+            &mut tablets,
+            &[Tablet { node: "tcp://a:2352".into(), lo: None, hi: Some("m".into()) }],
+        );
+        let mut values = Vec::new();
+        put_values(&mut values, &[Value::Str("x".into()), Value::Timestamp(7), Value::Bool(true)]);
+        let mut frontiers = Vec::new();
+        put_frontiers(&mut frontiers, &[vec!["a".into(), "b".into()], vec![]]);
+        let mut pairs = Vec::new();
+        put_pairs(&mut pairs, &[("k".into(), "v".into())]);
+        crate::fuzz::sweep(21, &[scan], 5000, |b| {
+            let _ = get_scan(b, &mut 0);
+        });
+        crate::fuzz::sweep(22, &[cands], 5000, |b| {
+            let _ = get_candidates(b, &mut 0);
+        });
+        crate::fuzz::sweep(23, &[tablets, values, frontiers, pairs], 6000, |b| {
+            let _ = get_tablets(b, &mut 0);
+            let _ = get_values(b, &mut 0);
+            let _ = get_frontiers(b, &mut 0);
+            let _ = get_pairs(b, &mut 0);
+            let _ = get_strs(b, &mut 0);
+            let _ = get_opt(b, &mut 0);
+            let _ = get_ts(b, &mut 0);
+            let _ = get_explain(b, &mut 0);
+        });
+    }
     use super::*;
 
     #[test]

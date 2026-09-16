@@ -328,6 +328,24 @@ impl Codes {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_code_decoding_never_panics() {
+        let (n, dims) = (64usize, 16usize);
+        let mut rng = crate::codec::Rng::new(5);
+        let data: Vec<f32> = (0..n * dims).map(|_| rng.next_normal()).collect();
+        let sq8 = Codes::build(Quantizer::Sq8, dims, &data).encode_bytes();
+        let one = Codes::build(Quantizer::OneBit, dims, &data).encode_bytes();
+        crate::fuzz::sweep(81, &[sq8, one], 5000, |b| {
+            if let Ok(c) = Codes::decode_bytes(b) {
+                let q = vec![0.5f32; c.dims];
+                if c.count > 0 {
+                    let _ = c.distance(Metric::L2, &q, 0);
+                    let _ = c.distance(Metric::Cosine, &q, c.count - 1);
+                }
+            }
+        });
+    }
     use super::*;
     use crate::codec::Rng;
     use crate::vector::distance;

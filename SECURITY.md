@@ -116,7 +116,11 @@ archive client reaches an `https://` store over the same TLS, verifying
 the chain against the bundle `CELASTRO_ARCHIVE_CA` names or the system's,
 with wildcard names in the leftmost label as RFC 6125 has them; a plain
 `http://` endpoint is what it says. A finding against any of this is in
-scope.
+scope. Every parser -- X.509, PEM, the handshake messages, the console's
+request heads, the store's responses, the wire's frames, and every file
+format -- is fuzzed in the test suite with a seeded mutator
+(`src/fuzz.rs`), and a decoder that reserves memory for a count it read
+is bounded by the bytes that remain.
 
 ## Encryption at rest, and what it is
 

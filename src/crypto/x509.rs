@@ -558,6 +558,38 @@ pub fn make(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_certificate_parsing_never_panics() {
+        let m = make("localhost", &["a.example".to_string()], &["127.0.0.1".parse().unwrap()], 30)
+            .unwrap();
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for pem_text in [&m.cert, &m.ca_cert] {
+            samples.extend(crate::crypto::pem::decode_all(pem_text, "CERTIFICATE").unwrap());
+        }
+        for text in [
+            include_str!("../../tests/pki/rsa-ca.crt"),
+            include_str!("../../tests/pki/ec-ca.crt"),
+            include_str!("../../tests/pki/leaf-by-rsa.crt"),
+            include_str!("../../tests/pki/leaf-by-ec.crt"),
+        ] {
+            samples.extend(crate::crypto::pem::decode_all(text, "CERTIFICATE").unwrap());
+        }
+        let anchor = parse(&samples[1]).unwrap();
+        crate::fuzz::sweep(0x5eed_c0de, &samples, 6000, |b| {
+            if let Ok(c) = parse(b) {
+                // Whatever parsed is also verified and named without panicking.
+                let _ = verify_chain(
+                    std::slice::from_ref(&c),
+                    std::slice::from_ref(&anchor),
+                    "localhost",
+                    1_800_000_000,
+                );
+                let _ = c.names("a.example");
+                let _ = c.signed_by(&anchor);
+            }
+        });
+    }
     use super::*;
 
     #[test]

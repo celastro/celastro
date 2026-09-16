@@ -35,6 +35,21 @@ pub fn get_uvarint(b: &[u8], i: &mut usize) -> Option<u64> {
     }
 }
 
+/// A count of items that follow, as a uvarint, refused when it is more
+/// than the bytes left: every item is at least a byte, so a larger count
+/// is a corrupt or hostile input, and a decoder that reserved for it
+/// before reading would abort the process on the allocation rather than
+/// return an error. Every `with_capacity` sized from the input goes
+/// through this.
+pub fn get_count(b: &[u8], i: &mut usize) -> Option<usize> {
+    let n = get_uvarint(b, i)?;
+    let left = b.len().saturating_sub(*i) as u64;
+    if n > left {
+        return None;
+    }
+    Some(n as usize)
+}
+
 pub fn get_ivarint(b: &[u8], i: &mut usize) -> Option<i64> {
     let u = get_uvarint(b, i)?;
     Some(((u >> 1) as i64) ^ -((u & 1) as i64))

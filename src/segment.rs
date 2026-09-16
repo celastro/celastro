@@ -1325,6 +1325,38 @@ pub fn extract_vector(v: &Value) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_segment_and_component_decoding_never_panics() {
+        let (s, _c) = seg();
+        let bytes = s.encode().unwrap();
+        crate::fuzz::sweep(61, &[bytes], 1500, |b| {
+            if let Ok(seg) = Segment::decode(b) {
+                // Whatever decoded is also read without panicking.
+                let _ = seg.column("status");
+                let _ = seg.column("tags");
+                let _ = seg.num_docs();
+            }
+        });
+        let col = s.column("status").unwrap().expect("a status column").encode();
+        let tags = s.column("tags").unwrap().expect("a tags column").encode();
+        crate::fuzz::sweep(62, &[col, tags], 5000, |b| {
+            let _ = Column::decode(b);
+        });
+        let adj = AdjIndex::build(vec![
+            ("a".into(), 1),
+            ("a".into(), 5),
+            ("b".into(), 2),
+            ("zz".into(), 9),
+        ])
+        .encode();
+        crate::fuzz::sweep(63, &[adj], 5000, |b| {
+            if let Ok(a) = AdjIndex::decode(b) {
+                let _ = a.probe("a");
+                let _ = a.probe("nope");
+            }
+        });
+    }
     use super::*;
     use crate::bitmap::Bitmap;
     use crate::catalog::{ColumnDef, IndexDef};

@@ -199,6 +199,17 @@ fn skip_at(b: &[u8], i: &mut usize, depth: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_variant_decoding_never_panics() {
+        let v = crate::json::parse(
+            r#"{"id":"x","n":-7,"f":1.5e3,"b":true,"z":null,"t":["a","b",{"c":[1,[2,[3]]]}],"s":"caf\u00e9 \ud83d\ude00"}"#,
+        )
+        .unwrap();
+        crate::fuzz::sweep(91, &[encode_to_vec(&v)], 8000, |b| {
+            let _ = decode(b, &mut 0);
+        });
+    }
     use super::*;
 
     fn sample() -> Value {

@@ -6,6 +6,26 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.42.1 — 2026-09-16
+
+Two crashes a mutated input could cause, found by a fuzzer that now runs
+in the test suite; a patch.
+
+**A count read from the input no longer sizes an allocation unchecked.**
+The wire's decoders (a scan answer, a candidate list, a tablet map) and
+the shard manifest reserved a `Vec` for the count they had just read; a
+count of 2^50 -- a corrupt manifest, or a frame from a peer holding the
+wire token -- aborted the process on the allocation before any bounds
+check. `codec::get_count` refuses a count larger than the bytes left.
+
+**Every parser is fuzzed.** `src/fuzz.rs` (tests only) is a seeded
+mutator; sixteen tests feed thousands of mutants of valid input to every
+parser that reads the network or a file -- X.509, PEM, the handshake
+messages and tickets, the console's request heads, the S3 responses, the
+wire's answers, the manifest, the WAL, delete logs, the catalog,
+segments and their columns and adjacency indexes, the graph, the codes,
+the variant, JSON, SQL and text queries -- and ask only that they return.
+
 ## 0.42.0 — 2026-09-16
 
 The archive client speaks TLS, hence a minor.

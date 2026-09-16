@@ -785,6 +785,32 @@ pub(crate) fn amz_date(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_store_responses_never_panic() {
+        let samples: Vec<Vec<u8>> = [
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"x\"\r\n\r\nhello",
+            "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n1;ext\r\ne\r\n0\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n\r\nno length at all",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        crate::fuzz::sweep(12, &samples, 8000, |b| {
+            let _ = read_response(&mut &b[..], false);
+            let _ = read_response(&mut &b[..], true);
+            let _ = dechunk(b);
+        });
+        crate::fuzz::sweep_text(
+            13,
+            &["http://h:1", "https://a.b.c/", "h:9", "https://[::1]:8"],
+            3000,
+            |t| {
+                let _ = parse_endpoint(t);
+            },
+        );
+    }
     use super::*;
 
     fn temp(tag: &str) -> std::path::PathBuf {

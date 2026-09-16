@@ -1132,6 +1132,23 @@ takes no dependency, by the user's decision after rustls had shipped
 behind a feature and been withdrawn; it is unaudited, and the README says
 so. The archive client speaks it since 0.42.0.
 
+**Every parser is fuzzed, because a panic is an abort.** `panic = "abort"`
+makes a reachable panic in a parser a crash a peer or a corrupt file can
+cause, so `src/fuzz.rs` (tests only) is a seeded mutator -- bits flipped,
+bytes set to edge values, ranges cut or doubled, inserts, truncation,
+splices of two samples, and a length-shaped window set to a huge or tiny
+integer -- and every parser that reads the network or a file has a test
+that feeds it thousands of mutants of valid input and asks only that it
+return. The first run found the class the length mutation exists for: a
+decoder that reserves a `Vec` for a count it has just read aborts the
+process on the allocation when the count is 2^50, before any bounds check
+runs. `codec::get_count` refuses a count larger than the bytes that
+remain, since every item is at least a byte, and every count-sized
+reservation reads through it or through `bounded_len`. The sweeps are
+deterministic by seed and bounded in rounds, so a failure is a repeatable
+input and the suite's time is known; a real crash found later is a new
+sample for the sweep that missed it.
+
 **Encryption at rest is a property of the bytes a file holds, so every
 path is either a content path or a copy path.** A content path makes or
 reads a file's meaning -- a segment sealed or opened, a manifest, a delete
@@ -1344,6 +1361,7 @@ guarantee:
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
 | a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
+| every parser that reads the network or a file answers `Ok` or `Err` to thousands of mutants of valid input, never panics or aborts | `fuzz::*` is the seeded mutator (`src/fuzz.rs`, tests only); the targets are `x509::tests::fuzz_certificate_parsing_never_panics`, `pem::tests::fuzz_pem_decoding_never_panics`, `tls13::tests::fuzz_handshake_message_parsing_never_panics` (hellos, Certificate, NewSessionTicket, and a mutated ticket never opens), `serve::tests::fuzz_request_heads_never_panic`, `objstore::tests::fuzz_store_responses_never_panic`, `wire::tests::fuzz_wire_answers_never_panic`, `shard::tests::fuzz_manifest_and_wal_never_panic`, `mvcc::tests::fuzz_delete_logs_and_ordinals_never_panic`, `engine::tests::fuzz_catalog_decoding_never_panics`, `segment::tests::fuzz_segment_and_component_decoding_never_panics`, `hnsw::tests::fuzz_graph_decoding_never_panics`, `quant::tests::fuzz_code_decoding_never_panics`, `variant::tests::fuzz_variant_decoding_never_panics`, `json::tests::fuzz_json_parsing_never_panics`, `parser::tests::fuzz_sql_parsing_never_panics`, `query::tests::fuzz_text_query_parsing_never_panics`. First run: the wire's answers and the manifest reserved a `Vec` for a count read from the input, and a count of 2^50 aborted the process on the allocation -- `codec::get_count` now refuses a count larger than the bytes left |
 | an aggregate is the fold over every admitted row, on one node or three, and refuses what it cannot mean | `aggregates::*` (`tests/aggregates.rs`: every function over a flushed segment and a memtable with a delete, nulls skipped, the empty fold, `GROUP BY` with `ORDER BY` an alias and a page, the null group, the refusals), `wire::an_aggregate_over_three_nodes_answers_what_one_process_answers`, `parser::tests::aggregates_parse_with_their_names_and_the_group_by_path` |
 | an encrypted database writes no plaintext anywhere and opens under its master only | `encryption::an_encrypted_database_holds_no_plaintext_and_opens_under_its_master_only` (a marker string grepped for under the directory, the store, a backup and an export after seals, a delete, a compaction and a tier move both ways; reopen through the WAL; no master and another master refused), `encryption::a_plain_database_with_data_is_not_encrypted_in_place`, `encryption::a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended`, `encryption::a_backup_restores_under_the_same_master_and_is_refused_without_it`, `encryption::an_import_crosses_key_regimes_which_is_how_a_database_takes_or_changes_a_key`, `encryption::a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves`, `cipher::tests::*` (frames round-trip, a ranged read opens only its frames, the wrong key, index or identity fails, the wrapped key opens under its master only, a torn record log stops at the tear) |
 | the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |

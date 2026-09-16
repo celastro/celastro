@@ -330,6 +330,20 @@ fn fold_prefix(analyzer: Analyzer, w: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_text_query_parsing_never_panics() {
+        let samples = [
+            "graph search",
+            "\"exact phrase\" +must -not comp* OR (a b)",
+            "caf\u{e9} \u{1f600} ***",
+            "",
+        ];
+        let analyzer = crate::text::analyzer::Analyzer::parse("english");
+        crate::fuzz::sweep_text(121, &samples, 6000, |t| {
+            let _ = TextQuery::parse(t, analyzer);
+        });
+    }
     use super::*;
 
     #[test]

@@ -5045,6 +5045,25 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_catalog_decoding_never_panics() {
+        let mut db = Db::in_memory();
+        for sql in [
+            "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT) PARTITION BY (tenant) WITH (splits = ['m'])",
+            "CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english')",
+            "CREATE INDEX items_emb ON items USING vector (embedding) WITH (dims = 4, metric = 'cosine', tier = 'cached')",
+            "CREATE INDEX items_n ON items USING secondary (n)",
+            "CREATE COLLECTION edges (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) WITH (nodes_of = 'items')",
+            "CREATE INDEX edges_adj ON edges USING adjacency (src, dst)",
+        ] {
+            db.execute(sql).unwrap();
+        }
+        let sample = db.catalog.encode();
+        crate::fuzz::sweep(51, &[sample], 6000, |b| {
+            let _ = Catalog::decode(b);
+        });
+    }
     use super::*;
 
     use crate::shard::durability_probe::{self, Op};

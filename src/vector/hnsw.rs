@@ -718,6 +718,23 @@ impl Hnsw {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_graph_decoding_never_panics() {
+        let (n, dims) = (300usize, 8usize);
+        let mut rng = Rng::new(4);
+        let data: Vec<f32> = (0..n * dims).map(|_| rng.next_normal()).collect();
+        let dist = |a: u32, b: u32| {
+            crate::vector::distance::l2_squared(
+                &data[a as usize * dims..(a as usize + 1) * dims],
+                &data[b as usize * dims..(b as usize + 1) * dims],
+            )
+        };
+        let g = Hnsw::build(n, HnswParams::default(), &dist);
+        crate::fuzz::sweep(71, &[g.encode()], 3000, |b| {
+            let _ = Hnsw::decode(b);
+        });
+    }
     use super::*;
     use crate::catalog::Metric;
     use crate::vector::distance;

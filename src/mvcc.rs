@@ -350,6 +350,24 @@ pub fn visibility(ords: &Ordinals, dlog: &DeleteLog, t: Timestamp) -> Bitmap {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fuzz_delete_logs_and_ordinals_never_panic() {
+        let mut dl = DeleteLog::new();
+        for i in 0..40u32 {
+            dl.mark(i * 3, 1000 + i as u64);
+        }
+        let mut ords = Ordinals::default();
+        for i in 0..30u32 {
+            ords.push(format!("t{}\u{1}doc-{i:04}", i % 3), 500 + i as u64);
+        }
+        crate::fuzz::sweep(41, &[dl.encode()], 6000, |b| {
+            let _ = DeleteLog::decode(b);
+        });
+        crate::fuzz::sweep(42, &[ords.encode()], 6000, |b| {
+            let _ = Ordinals::decode(b);
+        });
+    }
     use super::*;
 
     fn ords() -> Ordinals {
