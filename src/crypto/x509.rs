@@ -1,6 +1,6 @@
 //! X.509, RFC 5280 as far as a node needs it: parse a certificate, verify
 //! a leaf against a CA by signature, validity, issuer and name, and build
-//! a CA and a leaf for `celastro-cli tls init`. A node's own certificate is
+//! a CA and a leaf for `celastro tls init`. A node's own certificate is
 //! Ed25519, the one scheme this crate signs with; a chain another issuer
 //! signed may be RSA (PKCS#1 v1.5, SHA-256) or ECDSA P-256 (SHA-256) at any
 //! link, since those are only verified.
@@ -494,7 +494,7 @@ pub fn issue(
     Ok(der::sequence(&[&tbs, &der::ed25519_algorithm(), &der::bit_string(&signature)]))
 }
 
-/// The files `celastro-cli tls init` writes: a CA and a leaf it signed,
+/// The files `celastro tls init` writes: a CA and a leaf it signed,
 /// each as PEM certificate and PKCS#8 key.
 pub struct Material {
     pub ca_cert: String,

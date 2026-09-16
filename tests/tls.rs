@@ -37,7 +37,7 @@ fn fixture(name: &str) -> String {
 }
 
 /// The test CA and the `localhost` certificate it signed, from the
-/// environment as `celastro-cli` reads them.
+/// environment as `celastro` reads them.
 fn material() -> Arc<Tls> {
     std::env::set_var(CERT_ENV, fixture("localhost.crt"));
     std::env::set_var(KEY_ENV, fixture("localhost.key"));

@@ -1,6 +1,6 @@
 [package]
 name = "celastro"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Hybrid document database: SQL, BM25 and vector retrieval in a single query plan"
@@ -42,8 +42,9 @@ path = "src/lib.rs"
 name = "celastro"
 path = "src/bin/celastro.rs"
 
-# The full command-line tool. `celastro` above stays what it has always been —
-# a REPL and script runner — because its interface is documented and in use.
+# The name the tool had until 0.40.0: a few lines that say so and exec the
+# `celastro` beside them, so a script or a chart that still says it keeps
+# working for a release or two.
 [[bin]]
 name = "celastro-cli"
 path = "src/bin/celastro-cli.rs"

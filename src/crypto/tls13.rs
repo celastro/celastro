@@ -1384,7 +1384,6 @@ mod tests {
     /// old one is not offered at all.
     #[test]
     fn a_second_connection_resumes_and_a_ticket_the_server_cannot_open_falls_back() {
-        forget_tickets();
         let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
         let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
         let key =
@@ -1421,9 +1420,13 @@ mod tests {
             assert_eq!(got, b"hello");
             c.resumed()
         };
+        let tag = |a: &Certificate| crate::crypto::hex(&sha256(&a.der)[..8]);
         let (addr, server) = start(chain_der.clone(), key.clone(), 3);
+        let key1 = format!("127.0.0.1|{addr}|{}", tag(&anchor));
         assert!(!talk(addr, &anchor, "127.0.0.1"), "the first handshake is full");
-        assert_eq!(tickets_held(), 1, "and it left a ticket");
+        // Other tests in this process hold tickets of their own, so the
+        // check is for this server's, not for the count.
+        assert!(ticket_store(|t| t.contains_key(&key1)), "and it left a ticket");
         assert!(talk(addr, &anchor, "127.0.0.1"), "the second resumes");
         assert!(talk(addr, &anchor, "127.0.0.1"), "and so does the third, on the new ticket");
         assert_eq!(server.join().unwrap(), vec![false, true, true]);
@@ -1440,8 +1443,6 @@ mod tests {
         // Make the client hold a ticket under the new server's store key by
         // moving the one it has.
         let (addr2, server2) = start(other_chain, other_key, 2);
-        let tag = |a: &Certificate| crate::crypto::hex(&sha256(&a.der)[..8]);
-        let key1 = format!("127.0.0.1|{addr}|{}", tag(&anchor));
         let key2 = format!("127.0.0.1|{addr2}|{}", tag(&other_anchor));
         ticket_store(|t| {
             let ticket = t.remove(&key1).expect("a ticket from the first server");

@@ -2,7 +2,7 @@
 
 Every knob that changes how fast celastro runs or how much memory it takes,
 where it is read from, its default, and when to move it. All of them are
-environment variables read once when `celastro-cli` starts (`serve`, `exec`,
+environment variables read once when `celastro` starts (`serve`, `exec`,
 `run`, `repl`); a value that does not parse stops the start with the
 variable's name. In the chart they are the `tuning:` map, one entry per
 variable, set on every pod. Sizes take a `K`, `M` or `G` suffix (binary:

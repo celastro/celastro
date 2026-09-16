@@ -1,4 +1,4 @@
-//! `celastro-cli --url`: `exec`, `run`, `repl` and `catalog` as clients of a
+//! `celastro --url`: `exec`, `run`, `repl` and `catalog` as clients of a
 //! console another process serves, rendered as they would be locally, the
 //! token taken from the URL `serve` printed.
 
@@ -7,19 +7,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 fn dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("celastro-cli-url-{tag}-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("celastro-url-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
 
 /// A console on a free port; its URL with the token, as `serve` prints it.
 fn serve(d: &Path) -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .args(["--json", "--dir", d.to_str().unwrap(), "serve", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn celastro-cli");
+        .expect("spawn celastro");
     let mut first = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
@@ -28,7 +28,7 @@ fn serve(d: &Path) -> (Child, String) {
 }
 
 fn cli(args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_celastro-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_celastro"));
     cmd.args(args).env_remove("CELASTRO_TOKEN");
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

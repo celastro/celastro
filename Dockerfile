@@ -59,11 +59,11 @@ ENV RUSTFLAGS="-C strip=symbols"
 # appears in Cargo.toml fails here, loudly, instead of quietly resolving.
 # --locked refuses to rewrite Cargo.lock, which CONTRIBUTING.md requires.
 #
-# Only celastro-cli is built. It is a superset of the older `celastro` binary
-# (--dir D -> --dir D repl, --file F -> run F, --demo -> demo) and each binary
-# would statically link its own copy of std, so shipping both would roughly
-# double the image for no new function.
-RUN cargo build --release --locked --offline --bin celastro-cli
+# `celastro` is the tool; `celastro-cli` is the same source under the name it
+# had until 0.40.0, kept for a release or two so a chart or a script that
+# still says it keeps working. Each is a static binary with its own copy of
+# std, so the image is about twice what it will be once the alias goes.
+RUN cargo build --release --locked --offline --bin celastro --bin celastro-cli
 
 # The licence and the copyright notice are staged here rather than COPYed
 # straight into `scratch` so their mode is fixed by this file instead of by
@@ -94,6 +94,8 @@ LABEL org.opencontainers.image.title="celastro" \
 # inside the container can write it. Giving it to 65532 would hand the running
 # process write access to its own executable, which is a capability with no use
 # and one obvious misuse.
+COPY --from=build /src/target/release/celastro /celastro
+# The old name, for a chart or a script from before 0.41.0; goes away later.
 COPY --from=build /src/target/release/celastro-cli /celastro-cli
 
 # AGPL-3.0-only asks that the licence and the notices travel with the object
@@ -122,5 +124,5 @@ WORKDIR /data
 #
 # No VOLUME /data either: it would create an anonymous volume on every run that
 # forgot -v, and they accumulate unnoticed.
-ENTRYPOINT ["/celastro-cli"]
+ENTRYPOINT ["/celastro"]
 CMD ["repl"]

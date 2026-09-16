@@ -124,9 +124,9 @@ spec:
           readinessProbe:
             exec:
               {{- if gt (int .Values.replicas) 1 }}
-              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health", "--attached", {{ sub (int .Values.replicas) 1 | toString | quote }}]
+              command: ["/celastro", "--port", {{ .Values.port | quote }}, "health", "--attached", {{ sub (int .Values.replicas) 1 | toString | quote }}]
               {{- else }}
-              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
+              command: ["/celastro", "--port", {{ .Values.port | quote }}, "health"]
               {{- end }}
             # The console serves one request at a time, so a probe that lands
             # behind a statement waits for it; the default second was seen
@@ -136,7 +136,7 @@ spec:
             failureThreshold: {{ .Values.probes.failureThreshold }}
           livenessProbe:
             exec:
-              command: ["/celastro-cli", "--port", {{ .Values.port | quote }}, "health"]
+              command: ["/celastro", "--port", {{ .Values.port | quote }}, "health"]
             initialDelaySeconds: 10
             timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}

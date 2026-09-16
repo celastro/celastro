@@ -27,12 +27,12 @@ const SIGTERM: i32 = 15;
 fn sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives() {
     let dir = std::env::temp_dir().join(format!("celastro-sigterm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .args(["--json", "--dir", dir.to_str().unwrap(), "serve", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn celastro-cli");
+        .expect("spawn celastro");
     let mut first = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
@@ -85,12 +85,12 @@ fn sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives() {
 fn a_connection_is_accepted_when_it_arrives_and_not_when_a_clock_says() {
     let dir = std::env::temp_dir().join(format!("celastro-accept-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .args(["--json", "--dir", dir.to_str().unwrap(), "serve", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn celastro-cli");
+        .expect("spawn celastro");
     let mut first = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");

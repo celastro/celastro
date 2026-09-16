@@ -324,7 +324,7 @@ impl Server {
                             match server.serve_one(s, db) {
                                 Ok(Next::Serve) => {}
                                 Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
-                                Err(e) => eprintln!("celastro-cli: connection dropped: {e}"),
+                                Err(e) => eprintln!("celastro: connection dropped: {e}"),
                             }
                             active.fetch_sub(1, AtomicOrdering::AcqRel);
                         });
@@ -333,7 +333,7 @@ impl Server {
                         crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
                     }
                     Err(e) => {
-                        eprintln!("celastro-cli: accept failed: {e}");
+                        eprintln!("celastro: accept failed: {e}");
                         match accept_backoff(e.kind(), failures + 1) {
                             // Nothing of ours went wrong, and it will not repeat by
                             // itself: the run of failures starts over.
@@ -344,7 +344,7 @@ impl Server {
                             }
                             Backoff::GiveUp => {
                                 let run = failures + 1;
-                                eprintln!("celastro-cli: {run} accept failures in a row, stopping");
+                                eprintln!("celastro: {run} accept failures in a row, stopping");
                                 return Err(e.into());
                             }
                         }
@@ -1197,14 +1197,14 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
     match Db::compaction_build(&ticket) {
         Ok(Some(built)) => match write(db).compaction_install(ticket, built) {
             Ok(true) => eprintln!(
-                "celastro-cli: compacted {what} in {:.1} s",
+                "celastro: compacted {what} in {:.1} s",
                 started.elapsed().as_secs_f64()
             ),
             Ok(false) => {}
-            Err(e) => eprintln!("celastro-cli: compaction of {what} could not be installed: {e}"),
+            Err(e) => eprintln!("celastro: compaction of {what} could not be installed: {e}"),
         },
         Ok(None) => {}
-        Err(e) => eprintln!("celastro-cli: compaction of {what} failed: {e}"),
+        Err(e) => eprintln!("celastro: compaction of {what} failed: {e}"),
     }
     true
 }
@@ -1428,7 +1428,7 @@ fn health_json(db: &Db) -> String {
 
 /// Ask the console on `port` whether it is serving: `Ok(true)` for a 200
 /// that says so, `Ok(false)` for any other answer, `Err` for no answer.
-/// What `celastro-cli health` runs, and what a container's probe runs,
+/// What `celastro health` runs, and what a container's probe runs,
 /// because the image has no shell and no curl and the console binds
 /// loopback, which a probe from outside the pod cannot reach.
 pub fn probe_health(port: u16, tls: Option<&Arc<Tls>>) -> Result<bool> {
@@ -1438,7 +1438,7 @@ pub fn probe_health(port: u16, tls: Option<&Arc<Tls>>) -> Result<bool> {
 }
 
 /// How many other nodes the console on `port` has verified since it
-/// started, from the same answer: what `celastro-cli health --attached N`
+/// started, from the same answer: what `celastro health --attached N`
 /// compares, so a readiness probe can wait for a node's peers. `Ok(0)` for
 /// a console whose answer does not carry the count.
 pub fn probe_attached(port: u16, tls: Option<&Arc<Tls>>) -> Result<u64> {
@@ -1608,7 +1608,7 @@ fn sql_from_body(body: &[u8]) -> std::result::Result<String, Reject> {
 /// statement is content, not protocol.
 ///
 /// A statement that changed something is durable before it is acknowledged.
-/// Without that, `celastro-cli --dir ./data serve` writes through the console
+/// Without that, `celastro --dir ./data serve` writes through the console
 /// and loses every one of those writes to a Ctrl-C or a closed terminal, which
 /// is the worst thing this tool could do to somebody.
 ///
@@ -2984,7 +2984,7 @@ mod tests {
 
     #[test]
     fn a_statement_that_changed_something_is_on_disk_before_it_is_acknowledged() {
-        // Otherwise `celastro-cli --dir ./data serve` takes writes through the
+        // Otherwise `celastro --dir ./data serve` takes writes through the
         // console all afternoon and loses them to the Ctrl-C that stops it.
         let tag = format!("celastro-serve-durable-{}", std::process::id());
         let dir = std::env::temp_dir().join(tag);

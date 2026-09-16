@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.41.0 — 2026-09-16
+
+The command is `celastro`, hence a minor.
+
+**`celastro-cli` is now `celastro`.** The tool is the only binary anyone
+uses, so it takes the crate's name; the older `celastro` REPL, a subset
+of it (`--dir D` was `--dir D repl`, `--file F` was `run F`, `--demo` was
+`demo`), is gone. `cargo install celastro` installs `celastro` and, for a
+release or two, `celastro-cli`, a few lines that print one to stderr
+saying the name changed and exec the `celastro` beside them; the image carries both `/celastro`
+(its entrypoint now) and `/celastro-cli`, so a chart or a script from
+before this release keeps working until it is updated. Every document
+and the chart say `celastro`.
+
 ## 0.40.0 — 2026-09-16
 
 TLS session resumption, hence a minor. Nothing changes for a plain

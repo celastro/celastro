@@ -43,7 +43,7 @@ that answered. Plain HTTP with the token as the only guard: keep the Service
 inside a network you trust, put an ingress in front of it
 (`console.service.type`), or set `tls.enabled`. From a workstation,
 `kubectl port-forward svc/celastro-console 8787` and then
-`celastro-cli --url http://127.0.0.1:8787 repl` with the token in
+`celastro --url http://127.0.0.1:8787 repl` with the token in
 `CELASTRO_TOKEN` is a session against the cluster, any pod coordinating.
 
 ### Encryption in transit
@@ -57,7 +57,7 @@ certificate and verifies every other pod against one CA. The certificate is
 Ed25519 (the binary's TLS signs with nothing else; the CA above it may also
 be RSA or P-256), from one of three places:
 
-- Nothing named, as above: a pre-install hook Job runs `celastro-cli tls
+- Nothing named, as above: a pre-install hook Job runs `celastro tls
   secret` in the cluster, which makes a CA and a certificate naming every
   pod, both Services and `localhost`, and writes them as the Secret
   `<release>-tls` through the API (a ServiceAccount and a Role that may `get`
@@ -72,7 +72,7 @@ be RSA or P-256), from one of three places:
   made by the binary and loaded with `kubectl`:
 
   ```
-  celastro-cli tls init ./tls celastro celastro-0.celastro,celastro-1.celastro,celastro-2.celastro,celastro-console,celastro.default.svc,celastro-console.default.svc
+  celastro tls init ./tls celastro celastro-0.celastro,celastro-1.celastro,celastro-2.celastro,celastro-console,celastro.default.svc,celastro-console.default.svc
   kubectl create secret generic celastro-tls --from-file=./tls/tls.crt --from-file=./tls/tls.key --from-file=./tls/ca.crt
   helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true --set tls.existingSecret=celastro-tls
   ```
@@ -101,8 +101,8 @@ A client that retries rides it out; measured below.
 ### Encryption at rest
 
 ```
-celastro-cli key master ./master.key
-CELASTRO_MASTER_KEY_FILE=./master.key celastro-cli key init ./KEY
+celastro key master ./master.key
+CELASTRO_MASTER_KEY_FILE=./master.key celastro key init ./KEY
 kubectl create secret generic celastro-keys --from-file=master.key=./master.key --from-file=KEY=./KEY
 helm install celastro chart/celastro --set replicas=3 --set encryption.existingSecret=celastro-keys
 ```
@@ -112,7 +112,7 @@ under the one data key in `KEY`, wrapped under `master.key`, so a shard
 moves between pods and a backup restores on any of them; the Secret is
 mounted read-only at `/keys`. Set it at install: a pod that has written
 plain data refuses a master key, and one that has written under a key
-refuses to start without it. To rotate the master, `celastro-cli key
+refuses to start without it. To rotate the master, `celastro key
 rekey ./KEY ./new-master.key` with the old master in the environment,
 then replace both keys in the Secret and restart the pods; the data is
 not touched.
@@ -135,7 +135,7 @@ every pod backs up the shards it holds; the first run copies everything,
 later runs only the segments that are new. `backup.to` may also be
 `s3://bucket/prefix`, through the archive's endpoint and credentials. To
 restore, start an empty release (a new name, or the same one with its
-volumes gone), mount the same claim, and run on each pod — `celastro-cli
+volumes gone), mount the same claim, and run on each pod — `celastro
 send` from a pod with the token, or the console UI — `RESTORE FROM
 'nightly'`: every pod backs up under its own address, so a pod restores
 what its namesake wrote (`NODE 'tcp://<pod>.<release>:2352'` for another
@@ -155,8 +155,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.40.0 .
-kind load docker-image celastro:0.40.0        # for a kind cluster
+docker build -t celastro:0.41.0 .
+kind load docker-image celastro:0.41.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -185,7 +185,7 @@ prints say the same with the release's names filled in.
 
 ## Probes
 
-Both probes run `/celastro-cli --port 8787 health` inside the pod: the image
+Both probes run `/celastro --port 8787 health` inside the pod: the image
 has no shell and no curl, and the binary asks the console itself, over TLS
 when it is on. The answer comes from the database, so a process up with a
 database it could not open is not ready; the path needs no token. With more
@@ -231,9 +231,9 @@ changelog; those need every pod restarted together
 | `backup.schedule`, `backup.to` | empty, `nightly` | with a schedule, a CronJob sends `BACKUP TO '<to>'` to every pod's console: a name under the claim's `backups`, or `s3://bucket/prefix` |
 | `tls.enabled` | `false` | the wire and the console over TLS 1.3, one Ed25519 certificate per release, every pod verified against one CA; without the next two, a hook Job makes the material once |
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
-| `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro-cli tls init`, naming every pod, both Services and `localhost` |
+| `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro tls init`, naming every pod, both Services and `localhost` |
 | `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` (Ed25519) is emitted for it |
-| `encryption.existingSecret` | empty | a `Secret` with `master.key` (`celastro-cli key master`) and `KEY` (`celastro-cli key init`): encryption at rest on every pod under one shared data key |
+| `encryption.existingSecret` | empty | a `Secret` with `master.key` (`celastro key master`) and `KEY` (`celastro key init`): encryption at rest on every pod under one shared data key |
 | `tuning` | `{}` | `CELASTRO_*` performance variables set on every pod, e.g. `tuning.CELASTRO_INSERT_BATCH=5000`; the binary's `docs/tuning.md` lists them |
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because a probe waits behind a statement that changes something |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |
@@ -288,7 +288,7 @@ built from the tree at the time:
   from a CA `ClusterIssuer`. Rendered without `tls.enabled`, the manifests
   contain no TLS.
 - **The in-tree TLS** (chart 0.6.0, celastro 0.28.0): material from
-  `celastro-cli tls init` through `tls.existingSecret` — three pods ready, no
+  `celastro tls init` through `tls.existingSecret` — three pods ready, no
   restarts; `tls.enabled` without a source refused at install. From a client
   pod, python's `ssl` verified the console as `celastro-console` against the
   CA, refused `elsewhere.example`, got a TLS alert for plain HTTP, and shook

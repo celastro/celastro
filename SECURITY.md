@@ -21,7 +21,7 @@ backported fixes to earlier tags.
 ## The two trust boundaries
 
 For the library and the two REPLs the boundary is **untrusted input**, not
-untrusted callers. `celastro-cli serve` adds a second: an HTTP listener that
+untrusted callers. `celastro serve` adds a second: an HTTP listener that
 executes arbitrary SQL, so there the caller is untrusted too — on loopback by
 default, on a network with `--bind`, and over TLS when certificates are
 given.
@@ -38,7 +38,7 @@ given.
   check is in scope.
 - **MVCC visibility.** Any way to read a version a snapshot should not see.
 
-### The console (`celastro-cli serve`)
+### The console (`celastro serve`)
 
 On loopback the console is guarded by a per-run token from `/dev/urandom`
 (`?t=` or `X-Celastro-Token`), a `Host` allow-list and a same-origin check;

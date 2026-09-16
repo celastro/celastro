@@ -25,7 +25,7 @@ pub const KEY_ENV: &str = "CELASTRO_TLS_KEY";
 /// against.
 pub const CA_ENV: &str = "CELASTRO_TLS_CA";
 
-/// The four PEM files `celastro-cli tls init` writes: a CA, its key, and a
+/// The four PEM files `celastro tls init` writes: a CA, its key, and a
 /// certificate it signed with its key.
 pub struct Material {
     pub ca_cert: String,
@@ -196,8 +196,8 @@ pub struct HttpRequest<'a> {
 /// the server verified against the CA in `ca_pem` as `server_name`,
 /// `timeout` on the connect and each read (zero: no bound on the reads).
 /// The status and the body come back; a chunked body is joined. What
-/// `celastro-cli tls secret` uses to reach a cluster's API from inside a
-/// pod, and `celastro-cli send` a console over TLS.
+/// `celastro tls secret` uses to reach a cluster's API from inside a
+/// pod, and `celastro send` a console over TLS.
 pub fn https_request(
     addr: &str,
     server_name: &str,
@@ -225,7 +225,7 @@ pub fn https_request(
 
 /// How many TLS handshakes this process has served that resumed from a
 /// session ticket rather than running in full. A client that connects
-/// again within a day -- `celastro-cli --url`, a browser, a node dialling
+/// again within a day -- `celastro --url`, a browser, a node dialling
 /// a peer -- resumes; the count says it did.
 pub fn resumed_handshakes() -> u64 {
     crate::crypto::tls13::resumed_handshakes()

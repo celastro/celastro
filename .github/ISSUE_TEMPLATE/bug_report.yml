@@ -23,10 +23,10 @@ body:
     attributes:
       label: Where you hit it
       options:
-        - celastro-cli exec / run
-        - celastro-cli repl
-        - celastro-cli serve (browser console)
-        - celastro-cli demo / catalog
+        - celastro exec / run
+        - celastro repl
+        - celastro serve (browser console)
+        - celastro demo / catalog
         - celastro (the original REPL binary)
         - the library, used directly
         - the container image
@@ -39,8 +39,8 @@ body:
       label: Reproduction
       description: >-
         The smallest SQL that shows it. A single statement is fine as
-        `celastro-cli exec 'SELECT ...'`; anything longer is best as a script
-        run with `celastro-cli run repro.sql`. Add `--json` if the shape of the
+        `celastro exec 'SELECT ...'`; anything longer is best as a script
+        run with `celastro run repro.sql`. Add `--json` if the shape of the
         output is part of the report.
       render: sql
     validations:
@@ -50,7 +50,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `celastro-cli --version`.
+      description: Output of `celastro --version`.
     validations:
       required: true
 

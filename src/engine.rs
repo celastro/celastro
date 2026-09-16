@@ -190,7 +190,7 @@ pub struct DbOpts {
     /// This node's advertised wire address, `tcp://host:port`: its name in
     /// every placement map, and what other nodes connect to. `None` is a
     /// single node that places every shard on itself and can attach nobody.
-    /// `celastro-cli` reads it from `CELASTRO_NODE`.
+    /// `celastro` reads it from `CELASTRO_NODE`.
     pub node: Option<String>,
     /// Encryption in transit, when the process was given certificates
     /// (`crate::tls`): what the wire to another node is wrapped in. `None`

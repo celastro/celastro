@@ -186,12 +186,12 @@ fn a_damaged_destination_is_refused_before_anything_is_written_and_paths_are_con
 fn the_console_runs_a_backup_without_holding_its_lock_and_send_carries_the_statement() {
     let src = dir("console-src");
     let dest = dir("console-dest");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .args(["--json", "--dir", src.to_str().unwrap(), "serve", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn celastro-cli");
+        .expect("spawn celastro");
     let mut first = String::new();
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
@@ -219,7 +219,7 @@ fn the_console_runs_a_backup_without_holding_its_lock_and_send_carries_the_state
     assert!(post(&format!("INSERT INTO items VALUES {}", docs.join(","))).contains("\"ok\":true"));
     assert!(post("FLUSH items").contains("\"ok\":true"));
 
-    let sent = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let sent = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .env("CELASTRO_TOKEN", &token)
         .args(["send", &format!("http://{addr}"), &format!("BACKUP TO '{}'", dest.display())])
         .output()
@@ -235,7 +235,7 @@ fn the_console_runs_a_backup_without_holding_its_lock_and_send_carries_the_state
     let _ = child.wait();
 
     let d2 = dir("console-dst");
-    let restored = Command::new(env!("CARGO_BIN_EXE_celastro-cli"))
+    let restored = Command::new(env!("CARGO_BIN_EXE_celastro"))
         .args([
             "--dir",
             d2.to_str().unwrap(),

@@ -7,7 +7,7 @@ plan**, not orchestrated across services. Rust, **zero dependencies outside
 TLS are all in the tree.
 
 ```sh
-cargo install celastro        # `celastro-cli`, and the older `celastro` REPL
+cargo install celastro        # the `celastro` command
 ```
 
 **Status.** Single-writer nodes; a collection's shards can be spread over
@@ -31,8 +31,8 @@ CREATE INDEX notes_emb ON notes USING vector (embedding) WITH (dims = 4, metric 
 INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency","embedding":[0.9,0.1,0.0,0.0]}');
 INSERT INTO notes VALUES ('{"id":"n2","topic":"storage","body":"An LSM tree seals a memtable into segments","embedding":[0.0,0.0,0.9,0.1]}');
 EOF
-celastro-cli --dir ./data run quickstart.sql
-celastro-cli --dir ./data serve
+celastro --dir ./data run quickstart.sql
+celastro --dir ./data serve
 ```
 
 ```
@@ -44,7 +44,7 @@ HTTP as an application would:
 
 ```sh
 export CELASTRO_TOKEN=31beccfc...
-celastro-cli send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'segments')"
+celastro send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'segments')"
 curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" -H "Content-Type: application/json" \
      http://127.0.0.1:8787/api/query -d @- <<'EOF'
 {"sql": "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), embedding <=> [0.8,0.2,0.0,0.0], method => 'rrf') LIMIT 3"}
@@ -58,9 +58,9 @@ EOF
 
 The second query is text and vector in one plan, fused by reciprocal rank
 fusion; `WHERE` takes structured predicates, `text_match`, and a distance
-threshold. `celastro-cli --dir ./data exec "<SQL>"` runs a statement without
+threshold. `celastro --dir ./data exec "<SQL>"` runs a statement without
 a server, `EXPLAIN ANALYZE` in front of a query prints the plan that ran,
-and `celastro-cli demo` is a guided tour in memory. Every write is on the
+and `celastro demo` is a guided tour in memory. Every write is on the
 disk before it is acknowledged. Two limits worth knowing early: a prefix
 such as `text_match(body, 'comp*')` expands to at most 512 dictionary terms
 and says `TRUNCATED` when cut, and `DROP` is final.
@@ -114,7 +114,7 @@ language, no unbounded paths, no analytics.
 
 ## The command line
 
-`celastro-cli` is the tool. Without `--dir` the database is in memory.
+`celastro` is the tool. Without `--dir` the database is in memory.
 
 | command | what it does |
 |---|---|
@@ -143,8 +143,8 @@ other nodes; the sections that follow have each option's details.
 
 | option | how | data | clients | notes |
 |---|---|---|---|---|
-| **one process** | `celastro-cli --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
-| **a container** | `docker run ... ghcr.io/celastro/celastro:0.40.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **one process** | `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:0.41.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
 
@@ -158,7 +158,7 @@ is acknowledged.
 
 ## The console
 
-`celastro-cli --dir ./data serve` prints a URL with a token on stdout and
+`celastro --dir ./data serve` prints a URL with a token on stdout and
 serves a browser console on `127.0.0.1:8787`: SQL, the catalog, `EXPLAIN
 ANALYZE` rendered. The endpoint executes arbitrary SQL, so on loopback three
 guards sit in front of it — the bind, a `Host` check against DNS rebinding,
@@ -179,12 +179,12 @@ lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 
 In transit: `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
 (PEM) put the console and the wire on TLS 1.3, with session tickets so a
-client's next connection skips the certificate; `celastro-cli tls init
+client's next connection skips the certificate; `celastro tls init
 ./tls <name>` makes a set, and the chart's `tls.enabled` does it for you.
-At rest: `celastro-cli key master ./master.key`, then
+At rest: `celastro key master ./master.key`, then
 `CELASTRO_MASTER_KEY_FILE=./master.key` on every start, encrypts every file
 under `--dir`, the archived tier, backups and exports; a cluster shares one
-data key (`celastro-cli key init`, `CELASTRO_KEY_FILE`, the chart's
+data key (`celastro key init`, `CELASTRO_KEY_FILE`, the chart's
 `encryption.existingSecret`). Both are written in this repository and
 unaudited; [SECURITY.md](SECURITY.md) says what each protects and what it
 does not.
@@ -195,7 +195,7 @@ Each node is its own process and directory, started with an address and the
 secret every node shares, serving its shards to the others:
 
 ```
-CELASTRO_NODE=tcp://10.0.0.2:2352 CELASTRO_WIRE_TOKEN=... celastro-cli --dir ./data serve --shard-bind 0.0.0.0
+CELASTRO_NODE=tcp://10.0.0.2:2352 CELASTRO_WIRE_TOKEN=... celastro --dir ./data serve --shard-bind 0.0.0.0
 ```
 
 ```sql
@@ -229,8 +229,8 @@ the shared token, and the CLI is such a client:
 
 ```sh
 export CELASTRO_TOKEN=...                      # the token every node was started with
-celastro-cli --url http://10.0.0.2:8787 repl   # or exec, run, catalog; https:// with CELASTRO_TLS_CA
-celastro-cli send http://10.0.0.3:8787 "SELECT tenant, count(*) FROM notes GROUP BY tenant"
+celastro --url http://10.0.0.2:8787 repl   # or exec, run, catalog; https:// with CELASTRO_TLS_CA
+celastro send http://10.0.0.3:8787 "SELECT tenant, count(*) FROM notes GROUP BY tenant"
 ```
 
 On VMs, start each node with `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`,
@@ -265,11 +265,11 @@ helm install celastro chart/celastro --set replicas=3 --set console.expose=true 
 ```
 
 Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
-`celastro-cli` in an image `FROM scratch`, nothing running as root.
+`celastro` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.40.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.40.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.41.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.41.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -313,7 +313,7 @@ destination and each restores its own; `NODE '<address>'` takes another
 node's. With `CELASTRO_BACKUP_DIR`
 set, a bare name resolves under it and no path may leave it — what a
 console reachable over a network should have. A cluster is backed up node
-by node; `celastro-cli send <URL> "BACKUP TO '…'"` sends the statement to
+by node; `celastro send <URL> "BACKUP TO '…'"` sends the statement to
 a running console, which is what the chart's CronJob runs on every pod.
 
 ## How it works

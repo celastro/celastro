@@ -1,7 +1,7 @@
 # Running in a container
 
 `Dockerfile` builds the image in two stages: a musl toolchain compiles one
-statically linked `celastro-cli`, and the image that
+statically linked `celastro`, and the image that
 ships is `FROM scratch` — the binary, the licence, the copyright notice, and
 nothing else.
 
@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.40.0
+docker pull ghcr.io/celastro/celastro:0.41.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -138,7 +138,7 @@ name any pair of numbers.
 
 ## A probe from inside the image
 
-`celastro-cli health` asks the console on `--port` whether it is serving —
+`celastro health` asks the console on `--port` whether it is serving —
 over TLS when the certificates are in the environment — and exits 0 only for
 a 200 that says so; `--attached N` also requires `N` peers verified since
 start, for a readiness probe. It exists because the image has no shell and no
@@ -164,7 +164,7 @@ open.
 
 ## The console binds loopback, and `-p` therefore cannot reach it
 
-By default `celastro-cli serve` puts the console on `127.0.0.1` and nothing
+By default `celastro serve` puts the console on `127.0.0.1` and nothing
 else: the endpoint executes arbitrary SQL, so a bind reachable from a network
 is a remote shell, and three guards sit in front of it — the loopback bind, a
 `Host` allow-list against DNS rebinding (`localhost`, `127.0.0.1`, `[::1]`),
@@ -196,7 +196,7 @@ interface:
 
 ```
 $ docker run --rm --network host -v celastro-data:/data celastro --dir /data serve
-celastro-cli serving on 127.0.0.1:8787 — Ctrl-C, SIGTERM or POST /api/shutdown to stop
+celastro serving on 127.0.0.1:8787 — Ctrl-C, SIGTERM or POST /api/shutdown to stop
 The token in that URL is the only thing protecting this database. Anyone who can
 read this terminal, this process's environment or its command line can use it, and
 the server answers every request that carries it. Treat the URL as a password, and
@@ -231,16 +231,16 @@ $ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0
 
 Plain HTTP unless the image is also given certificates: mount them and set
 `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM,
-Ed25519 — `celastro-cli tls init` makes a set) and the console and the wire
+Ed25519 — `celastro tls init` makes a set) and the console and the wire
 serve TLS 1.3, with the CA verifying every peer. The chart's `console.expose`
 and `tls.enabled` are these two, with the token and the certificates in
 Secrets and a Service over the pods.
 
 Encryption at rest: mount a master key and set `CELASTRO_MASTER_KEY_FILE`
-to it (`celastro-cli key master` writes one), and every file under
+to it (`celastro key master` writes one), and every file under
 `/data`, the tier and the backups are encrypted under a data key kept
 wrapped in `/data/KEY`; a cluster's pods also take `CELASTRO_KEY_FILE`, the
-one wrapped data key `celastro-cli key init` wrote, so they share it. The
+one wrapped data key `celastro key init` wrote, so they share it. The
 chart's `encryption.existingSecret` mounts both.
 
 ## `panic = "abort"` makes the container the unit of recovery
