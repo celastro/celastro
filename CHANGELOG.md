@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.43.0 — 2026-09-16
+
+The console's token on a network, hence a minor.
+
+**On a network bind the API takes the token in the header only.** With
+`--bind` off loopback, `/api/*` refuses a token given as `?t=` in the
+URL, since that URL is written into every proxy's and balancer's access
+log on the way; `X-Celastro-Token` is the way, as `celastro --url`,
+`send`, the chart's probes and CronJob already do. The page and its two
+assets still take `?t=`, because a `<link>` and a `<script>` can carry
+nothing else; on loopback nothing changes and the URL `serve` prints
+stays the way in. **A refused source waits**: a hundred milliseconds more
+per refusal in the last minute, two seconds at most, so a token is not
+guessed at line rate; the table is bounded to a thousand sources.
+
 ## 0.42.1 — 2026-09-16
 
 Two crashes a mutated input could cause, found by a fuzzer that now runs

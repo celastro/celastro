@@ -31,7 +31,7 @@ use crate::crypto::hex;
 use crate::sql;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -356,6 +356,15 @@ impl Server {
 
     fn serve_one(&self, stream: TcpStream, db: &RwLock<Db>) -> std::io::Result<Next> {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        // A source that has been refused lately waits before it is answered
+        // again: a sixteen-byte token is not guessed at line rate.
+        let peer = stream.peer_addr().ok().map(|a| a.ip());
+        if let Some(ip) = peer {
+            let wait = throttle(|t| t.penalty(ip, Instant::now()));
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
         let stream = tls::accept(self.tls.as_ref(), stream)?;
         // The read side is armed per read, from the deadline, by `Wire::arm`.
         let deadlines = Deadlines::from_now();
@@ -363,6 +372,11 @@ impl Server {
         // The lock is taken inside `answer`, around the statement and nothing
         // else; the socket is never read or written under it.
         let served = answer(&mut io, &self.token, self.addr.port(), self.reach, db, deadlines);
+        if served.response.status == 401 {
+            if let Some(ip) = peer {
+                throttle(|t| t.refused(ip, Instant::now()));
+            }
+        }
         let socket = io.get_mut();
         served.response.write_to(socket)?;
         socket.flush()?;
@@ -410,6 +424,61 @@ fn accept_backoff(kind: ErrorKind, consecutive: u32) -> Backoff {
         ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => Backoff::Now,
         _ if consecutive >= MAX_ACCEPT_FAILURES => Backoff::GiveUp,
         _ => Backoff::After(ACCEPT_BACKOFF),
+    }
+}
+
+/// Refusals per source address, and the wait they earn: a hundred
+/// milliseconds per refusal in the last minute, two seconds at most, so a
+/// wrong token costs the guesser time and nobody else anything. Forgotten
+/// after a minute without a refusal; bounded in size by dropping the
+/// oldest entries when it grows past a thousand sources.
+struct Throttle {
+    refused: std::collections::HashMap<std::net::IpAddr, (u32, Instant)>,
+}
+
+const THROTTLE_STEP: Duration = Duration::from_millis(100);
+const THROTTLE_CAP: Duration = Duration::from_secs(2);
+const THROTTLE_FORGET: Duration = Duration::from_secs(60);
+const THROTTLE_SOURCES: usize = 1000;
+
+static THROTTLE: Mutex<Option<Throttle>> = Mutex::new(None);
+
+fn throttle<T>(f: impl FnOnce(&mut Throttle) -> T) -> T {
+    let mut g = THROTTLE.lock().unwrap_or_else(|p| p.into_inner());
+    f(g.get_or_insert_with(|| Throttle { refused: std::collections::HashMap::new() }))
+}
+
+impl Throttle {
+    /// The wait a request from `ip` earns right now.
+    fn penalty(&mut self, ip: std::net::IpAddr, now: Instant) -> Duration {
+        match self.refused.get(&ip) {
+            Some((n, last)) if now.duration_since(*last) < THROTTLE_FORGET => {
+                THROTTLE_STEP.saturating_mul(*n).min(THROTTLE_CAP)
+            }
+            Some(_) => {
+                self.refused.remove(&ip);
+                Duration::ZERO
+            }
+            None => Duration::ZERO,
+        }
+    }
+
+    /// One more refusal for `ip`.
+    fn refused(&mut self, ip: std::net::IpAddr, now: Instant) {
+        if self.refused.len() >= THROTTLE_SOURCES && !self.refused.contains_key(&ip) {
+            // Drop what has gone quiet first; if nothing has, the oldest.
+            self.refused.retain(|_, (_, last)| now.duration_since(*last) < THROTTLE_FORGET);
+            if self.refused.len() >= THROTTLE_SOURCES {
+                if let Some(oldest) =
+                    self.refused.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
+                {
+                    self.refused.remove(&oldest);
+                }
+            }
+        }
+        let e = self.refused.entry(ip).or_insert((0, now));
+        e.0 = e.0.saturating_add(1);
+        e.1 = now;
     }
 }
 
@@ -1122,6 +1191,18 @@ fn dispatch_for(
     if !token_matches(token, given) {
         return Err(Reject::Unauthorized);
     }
+    // On a network the API takes the token in the header only: a `?t=` in
+    // the URL is written into every proxy's and balancer's access log on
+    // the way, and into a browser's history. The page and its two assets
+    // still take it, because a `<link>` and a `<script>` can carry nothing
+    // else; on loopback nothing is logged between the browser and the
+    // console, and the URL `serve` prints stays the way in.
+    if reach == Reach::Network
+        && head.header("x-celastro-token").is_none()
+        && head.path.starts_with("/api/")
+    {
+        return Err(Reject::Unauthorized);
+    }
     match (head.method.as_str(), head.path.as_str()) {
         ("GET", "/") => Ok(page(token)),
         ("GET", "/app.js") => Ok(asset(CT_JS, APP_JS)),
@@ -1691,6 +1772,63 @@ fn text_json(kind: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// On a network bind the API takes the token in the header only, while
+    /// the page and its assets still take `?t=`; on loopback both work
+    /// everywhere, as they always have.
+    #[test]
+    fn on_a_network_the_api_takes_the_token_in_the_header_only() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let head = |line: &str, extra: &str| {
+            parse_head(&format!("{line} HTTP/1.1\r\nHost: h:8787\r\n{extra}\r\n")).unwrap()
+        };
+        let by_query = |path: &str| head(&format!("GET {path}?t={token}"), "");
+        let by_header =
+            |path: &str| head(&format!("GET {path}"), &format!("X-Celastro-Token: {token}\r\n"));
+        for (h, want_ok) in [
+            (by_query("/api/catalog"), false),
+            (by_header("/api/catalog"), true),
+            (by_query("/"), true),
+            (by_query("/app.js"), true),
+            (by_query("/style.css"), true),
+        ] {
+            let got = dispatch_for(&h, token, 8787, Reach::Network);
+            assert_eq!(got.is_ok(), want_ok, "{} {}", h.method, h.path);
+            if !want_ok {
+                assert!(matches!(got, Err(Reject::Unauthorized)));
+            }
+        }
+        // Loopback keeps the URL as the way in, for the line `serve` prints
+        // (its Host check wants a local name, which is a different guard).
+        let local = parse_head(&format!(
+            "GET /api/catalog?t={token} HTTP/1.1\r\nHost: localhost:8787\r\n\r\n"
+        ))
+        .unwrap();
+        assert!(dispatch_for(&local, token, 8787, Reach::Loopback).is_ok());
+    }
+
+    /// Refusals earn a wait that grows a step per refusal, caps at two
+    /// seconds, and is forgotten after a quiet minute; the table is bounded.
+    #[test]
+    fn a_refused_source_waits_longer_each_time_and_is_forgotten_after_a_minute() {
+        let mut t = Throttle { refused: Default::default() };
+        let ip: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let t0 = Instant::now();
+        assert_eq!(t.penalty(ip, t0), Duration::ZERO);
+        for n in 1..=3 {
+            t.refused(ip, t0);
+            assert_eq!(t.penalty(ip, t0), THROTTLE_STEP * n);
+        }
+        for _ in 0..100 {
+            t.refused(ip, t0);
+        }
+        assert_eq!(t.penalty(ip, t0), THROTTLE_CAP);
+        assert_eq!(t.penalty(ip, t0 + THROTTLE_FORGET), Duration::ZERO, "forgotten");
+        assert!(t.refused.is_empty());
+        for i in 0..THROTTLE_SOURCES as u32 + 50 {
+            t.refused(std::net::IpAddr::V4(std::net::Ipv4Addr::from(i)), t0);
+        }
+        assert!(t.refused.len() <= THROTTLE_SOURCES, "{}", t.refused.len());
+    }
 
     #[test]
     fn fuzz_request_heads_never_panic() {

@@ -72,6 +72,16 @@ executor without it is a serious finding:
   certificate does not carry accepted, a plain connection served where TLS
   was configured, or a weakness in the in-tree TLS itself (below).
 
+### The token, on a network
+
+With `--bind` off loopback the API (`/api/*`) takes the token in the
+`X-Celastro-Token` header only: a `?t=` in a URL is written into every
+proxy's and balancer's access log and into a browser's history. The page
+and its two assets still take `?t=`, since a `<link>` and a `<script>`
+can carry nothing else. Tokens compare in constant time, and a source
+address that was refused waits a hundred milliseconds more per refusal in
+the last minute, two seconds at most, before it is answered again.
+
 ## What is not in scope
 
 - Anything requiring write access to the data directory. A caller who can
