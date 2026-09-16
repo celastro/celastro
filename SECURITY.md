@@ -23,7 +23,8 @@ backported fixes to earlier tags.
 For the library and the two REPLs the boundary is **untrusted input**, not
 untrusted callers. `celastro-cli serve` adds a second: an HTTP listener that
 executes arbitrary SQL, so there the caller is untrusted too — on loopback by
-default, on a network with `--bind`, and over TLS with the `tls` feature.
+default, on a network with `--bind`, and over TLS when certificates are
+given.
 
 ### Untrusted input
 
@@ -67,9 +68,9 @@ executor without it is a serious finding:
 - **Bypassing the limits.** The 1 MiB body cap, the per-request deadline and
   the connection cap are what keep the listener from being held open. A
   request that evades one is in scope.
-- **TLS.** With the `tls` feature: a peer accepted without a chain to the
-  CA, a name the certificate does not carry accepted, or a plain connection
-  served where TLS was configured.
+- **TLS.** A peer accepted without a chain to the CA, a name the
+  certificate does not carry accepted, a plain connection served where TLS
+  was configured, or a weakness in the in-tree TLS itself (below).
 
 ## What is not in scope
 
@@ -87,3 +88,42 @@ executor without it is a serious finding:
   query governor, and that is a known absence rather than a vulnerability.
 - Missing features listed under "What is deliberately not here" in the README.
   No replication means no replication vulnerabilities.
+
+## The TLS, and what it is
+
+The TLS is written in this repository (`src/crypto`), because the crate
+carries no dependency, and **nobody outside it has reviewed it**. What it
+is: TLS 1.3 only; one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`; X25519
+key exchange; the node's own certificate is Ed25519 (material from
+cert-manager needs `privateKey.algorithm: Ed25519`); the CA above it and
+any intermediate may be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256) or
+ECDSA P-256, and as a client the node accepts servers signing with those
+too, which is how it reaches a Kubernetes API and answers its
+`CertificateRequest` with an empty certificate. No session resumption, no
+client certificates, no HelloRetryRequest, no 0-RTT, no key update; a
+stock client speaks that subset. Every primitive is pinned against its RFC
+vectors and the key schedule against RFC 8448; nothing branches on or
+indexes by a secret, by masks rather than by asking the compiler. The
+archive client to an S3 store is plain HTTP. A finding against any of
+this is in scope.
+
+## Encryption at rest, and what it is
+
+With `CELASTRO_MASTER_KEY_FILE` or `CELASTRO_MASTER_KEY` set, every file
+the database writes -- segments, delete logs, manifests, the write-ahead
+log, `RANGE`, `CATALOG`, the objects an archived tier puts in a store,
+backups and exports -- is a sequence of ChaCha20-Poly1305 frames (64 KiB
+of plaintext each, a fresh random nonce per frame, the file's identity and
+the frame's index authenticated) under a key HKDF derives per file from
+one data key; the data key is drawn at the first open and kept in
+`<dir>/KEY` wrapped under the master key, which is never written. The
+same in-tree, unaudited primitives as the TLS.
+
+What it protects against: a copied volume, a lost disk, a bucket or a
+backup read by someone without the master key -- none of it is readable
+or quietly alterable, and a file cannot be swapped for another. What it
+does not: a caller with the master key, or with the running process (the
+data key is in memory, and every row a query touches is plaintext there);
+the sizes and names of files and the shape of the directory, which are
+not hidden; a torn frame at the WAL's tail, which is dropped as a torn
+record is. A finding against any of this is in scope.

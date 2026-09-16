@@ -173,6 +173,16 @@ pub struct DbOpts {
     /// load and more records unsynced at any one moment (the statement is
     /// not acknowledged until all of them are); 1000 by default.
     pub insert_batch: usize,
+    /// Encryption at rest: the master key that wraps the database's data
+    /// key (`CELASTRO_MASTER_KEY_FILE`, 32 bytes, or `CELASTRO_MASTER_KEY`
+    /// as hex). With it, `<dir>/KEY` is made at the first open of an empty
+    /// directory and opened at every later one; without it an encrypted
+    /// database is refused. Never written anywhere.
+    pub master_key: Option<[u8; 32]>,
+    /// A wrapped data key to adopt when the directory has none
+    /// (`CELASTRO_KEY_FILE`): how the pods of a cluster share one data key,
+    /// so a shard moves between them and a backup restores on any of them.
+    pub key_file: Option<PathBuf>,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -203,6 +213,8 @@ impl Default for DbOpts {
             archive: crate::objstore::ArchiveOpts::default(),
             backup_dir: None,
             insert_batch: 1000,
+            master_key: None,
+            key_file: None,
             node: None,
             tls: None,
         }
@@ -213,14 +225,22 @@ impl Default for DbOpts {
 /// be written as a database directory of its own by [`write_to`](Self::write_to).
 /// Holding it holds the source's segment files: drop it when done.
 pub struct CollectionExport {
+    /// `CATALOG` as the export directory holds it, and `KEY` when the
+    /// database is encrypted: the export is then encrypted under the same
+    /// data key, and opens or imports wherever that key's master is.
+    catalog_bytes: Vec<u8>,
+    key: Option<Vec<u8>>,
     name: String,
     ts: Timestamp,
-    catalog: Catalog,
     shards: Vec<ExportShard>,
 }
 
 pub(crate) struct ExportShard {
-    pub(crate) range: (Option<String>, Option<String>),
+    /// `RANGE` as the file holds it -- see [`range_file`] -- and every
+    /// other byte string here likewise: framed under the cipher when the
+    /// database has one, so a copy of an export moves bytes and never
+    /// reads them.
+    pub(crate) range: Vec<u8>,
     pub(crate) sealed: Vec<Arc<SegmentHandle>>,
     pub(crate) deletes: Vec<(u64, Option<Vec<u8>>)>,
     pub(crate) fresh: Option<(u64, Vec<u8>)>,
@@ -230,10 +250,13 @@ pub(crate) struct ExportShard {
 /// The bytes of a sealed segment wherever they are: a file, a byte buffer,
 /// or an object in the store.
 pub(crate) fn handle_bytes(h: &SegmentHandle) -> Result<Vec<u8>> {
-    Ok(match h.segment.source() {
+    // The bytes as they lie -- encrypted frames stay frames: a copy moves
+    // them, it does not read them.
+    Ok(match h.segment.source().unwrapped().clone() {
         SegmentSource::File(p) | SegmentSource::Archive(p) => fs::read(&p)?,
         SegmentSource::Bytes(b) => b.as_ref().clone(),
         SegmentSource::Remote { store, key, .. } => store.get(&key)?,
+        SegmentSource::Encrypted { .. } => unreachable!("unwrapped above"),
     })
 }
 
@@ -282,19 +305,17 @@ impl CollectionExport {
 
     fn write_tree(&self, root: &Path) -> Result<()> {
         fs::create_dir_all(root)?;
-        crate::shard::atomic_write(&root.join("CATALOG"), &self.catalog.encode())?;
+        crate::shard::atomic_write(&root.join("CATALOG"), &self.catalog_bytes)?;
+        if let Some(k) = &self.key {
+            crate::shard::atomic_write(&root.join("KEY"), k)?;
+        }
         let cdir = root.join("collections").join(&self.name);
         for (i, sh) in self.shards.iter().enumerate() {
             let sdir = cdir.join(format!("shard-{i:04}"));
             fs::create_dir_all(sdir.join("segments"))?;
             fs::create_dir_all(sdir.join("deletes"))?;
             fs::create_dir_all(sdir.join("archive"))?;
-            let (lo, hi) = &sh.range;
-            crate::shard::atomic_write(
-                &sdir.join("RANGE"),
-                format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default())
-                    .as_bytes(),
-            )?;
+            crate::shard::atomic_write(&sdir.join("RANGE"), &sh.range)?;
             for h in &sh.sealed {
                 let bytes = handle_bytes(h)?;
                 let name = format!("{:016x}.seg", h.id());
@@ -374,13 +395,26 @@ pub(crate) fn export_shard(
     let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1).encode();
     let crc = crc32(&manifest);
     put_u32(&mut manifest, crc);
-    Ok(ExportShard {
-        range: s.key_range.clone().unwrap_or((None, None)),
-        sealed,
-        deletes,
-        fresh,
-        manifest,
-    })
+    // Into the file regime: what a shard directory would hold, so the
+    // export, the backup and the move copy these bytes as they are.
+    let deletes = deletes
+        .into_iter()
+        .map(|(id, log)| {
+            let sealed = match log {
+                Some(b) => Some(s.seal_content(&format!("{id:016x}.dlog"), &b)?),
+                None => None,
+            };
+            Ok((id, sealed))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fresh = match fresh {
+        Some((id, b)) => Some((id, s.seal_content(&format!("{id:016x}.seg"), &b)?)),
+        None => None,
+    };
+    let manifest = s.seal_content("MANIFEST", &manifest)?;
+    let range =
+        s.seal_content("RANGE", &range_file(&s.key_range.clone().unwrap_or((None, None))))?;
+    Ok(ExportShard { range, sealed, deletes, fresh, manifest })
 }
 
 /// The shards pinned for moves, by `(collection, index)`, shared between
@@ -409,20 +443,14 @@ pub const MOVE_CHUNK: u64 = 4 << 20;
 impl MoveOut {
     fn from_export(to: &str, ex: ExportShard) -> Result<MoveOut> {
         let mut files = Vec::new();
-        let (lo, hi) = &ex.range;
-        files.push((
-            "RANGE".to_string(),
-            MoveFile::Bytes(
-                format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default())
-                    .into_bytes(),
-            ),
-        ));
+        files.push(("RANGE".to_string(), MoveFile::Bytes(ex.range.clone())));
         for h in &ex.sealed {
             let name = format!("segments/{:016x}.seg", h.id());
-            let f = match h.segment.source() {
+            let f = match h.segment.source().unwrapped().clone() {
                 SegmentSource::File(p) | SegmentSource::Archive(p) => MoveFile::Path(p),
                 SegmentSource::Bytes(b) => MoveFile::Bytes(b.as_ref().clone()),
                 SegmentSource::Remote { store, key, .. } => MoveFile::Bytes(store.get(&key)?),
+                SegmentSource::Encrypted { .. } => unreachable!("unwrapped above"),
             };
             files.push((name, f));
         }
@@ -485,19 +513,57 @@ impl MoveOut {
 }
 
 /// Copy a directory tree, every file published durably.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &dest)?;
-        } else {
-            crate::shard::atomic_write(&dest, &fs::read(entry.path())?)?;
+/// Copy a collection's tree from `from` to `to`, every file opened under
+/// `src` and sealed under `dst` on the way -- a plain copy when both are
+/// `None`. The file identity is what [`Shard`] gives it: the shard
+/// directory's name and the file's own, whichever of `segments/`,
+/// `archive/` or `deletes/` holds it.
+fn recode_tree(
+    from: &Path,
+    to: &Path,
+    src: &crate::cipher::Shared,
+    dst: &crate::cipher::Shared,
+) -> Result<()> {
+    fn walk(
+        from: &Path,
+        to: &Path,
+        shard: Option<&str>,
+        src: &crate::cipher::Shared,
+        dst: &crate::cipher::Shared,
+    ) -> Result<()> {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let dest = to.join(&name);
+            if entry.file_type()?.is_dir() {
+                let shard = if shard.is_none() && name.starts_with("shard-") {
+                    Some(name.as_str())
+                } else {
+                    shard
+                };
+                walk(&entry.path(), &dest, shard, src, dst)?;
+                continue;
+            }
+            let mut bytes = fs::read(entry.path())?;
+            if src.is_some() || dst.is_some() {
+                let id = match shard {
+                    Some(s) => format!("{s}/{name}"),
+                    None => name.clone(),
+                };
+                if let Some(c) = src {
+                    bytes = c.open_file(&id, &bytes)?;
+                }
+                if let Some(c) = dst {
+                    bytes = c.seal_file(&id, &bytes)?;
+                }
+            }
+            crate::shard::atomic_write(&dest, &bytes)?;
         }
+        crate::shard::sync_dir(to)?;
+        Ok(())
     }
-    crate::shard::sync_dir(to)?;
-    Ok(())
+    walk(from, to, None, src, dst)
 }
 
 /// Thirty seconds: long enough that no statement the quick start or the demo
@@ -743,6 +809,8 @@ pub struct Db {
     /// The directory's lock, for as long as this `Db` is open; `None` in
     /// memory.
     lock: Option<crate::dirlock::DirLock>,
+    /// Encryption at rest, when the database has a data key.
+    cipher: crate::cipher::Shared,
     budget: Arc<MemtableBudget>,
     residency: Arc<ResidencyManager>,
     /// The statistics cache. Behind a lock, not `&mut self`: a read fills
@@ -842,6 +910,7 @@ impl Db {
             opts,
             dir: None,
             lock: None,
+            cipher: None,
             budget,
             residency,
             stats: Mutex::new(BTreeMap::new()),
@@ -889,10 +958,11 @@ impl Db {
         fs::create_dir_all(dir)?;
         db.lock = Some(crate::dirlock::take(dir)?);
         db.dir = Some(dir.to_path_buf());
+        db.cipher = open_key(dir, &db.opts)?;
         // Absent is a fresh database. Unreadable is not: read as absent it
         // opened a database with no collections, and the next DDL published
         // that catalog over the real one.
-        if let Some(b) = crate::shard::read_optional(&dir.join("CATALOG"))? {
+        if let Some(b) = crate::shard::read_content(&db.cipher, "CATALOG", &dir.join("CATALOG"))? {
             db.catalog = Catalog::decode(&b)?;
         }
         // A drop is complete once the collection's directory has been renamed
@@ -956,7 +1026,8 @@ impl Db {
                 let mut t = Vec::new();
                 let mut i = 0usize;
                 while cdir.join(format!("shard-{i:04}")).exists() {
-                    let (lo, hi) = read_range(&cdir.join(format!("shard-{i:04}")), i, name)?;
+                    let (lo, hi) =
+                        read_range(&db.cipher, &cdir.join(format!("shard-{i:04}")), i, name)?;
                     t.push(Tablet { node: db.opts.node.clone().unwrap_or_default(), lo, hi });
                     i += 1;
                 }
@@ -976,7 +1047,7 @@ impl Db {
                     "shard-{i:04} of `{name}` is placed on this node but its directory is missing"
                 )));
             }
-            let (lo, hi) = read_range(&sdir, i, name)?;
+            let (lo, hi) = read_range(&db.cipher, &sdir, i, name)?;
             let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
             sh.key_range = Some((lo, hi));
             sh.index = i;
@@ -997,6 +1068,7 @@ impl Db {
             residency: Some(self.residency.clone()),
             placement: self.opts.placement.clone(),
             archive: self.archive.clone(),
+            cipher: self.cipher.clone(),
         }
     }
 
@@ -1041,7 +1113,9 @@ impl Db {
         for s in self.shards(name)? {
             shards.push(export_shard(&coll, s, ts, self.opts.build)?);
         }
-        Ok(CollectionExport { name: name.to_string(), ts, catalog, shards })
+        let catalog_bytes = self.seal_root("CATALOG", &catalog.encode())?;
+        let key = self.key_bytes()?;
+        Ok(CollectionExport { catalog_bytes, key, name: name.to_string(), ts, shards })
     }
 
     /// `BACKUP TO '<dest>'`: every shard this node holds, pinned at one
@@ -1062,7 +1136,8 @@ impl Db {
         for name in &names {
             self.absorb_shard_catalogs(name)?;
         }
-        let catalog = self.persisted_catalog().encode();
+        let catalog = self.seal_root("CATALOG", &self.persisted_catalog().encode())?;
+        let key = self.key_bytes()?;
         let mut colls: crate::backup::Exported = Vec::new();
         for name in names {
             let coll = self.catalog.get(&name)?.clone();
@@ -1074,7 +1149,7 @@ impl Db {
             colls.push((name, shards));
         }
         let node = self.opts.node.clone().unwrap_or_default();
-        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, colls)))
+        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls)))
     }
 
     /// `RESTORE FROM '<src>' [AS OF <ts>]`: the newest complete backup at
@@ -1104,7 +1179,50 @@ impl Db {
             crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), src)?;
         let here = self.opts.node.clone().unwrap_or_default();
         let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), as_of)?;
-        let mut catalog = fetched.catalog.clone();
+        // The backup's key regime has to be this database's: its files are
+        // copied as they are, so an encrypted backup needs the master that
+        // wraps its data key, and a plain one cannot land in an encrypted
+        // directory. The backup's KEY replaces the one made at open -- the
+        // database is empty, nothing was written under that one -- so the
+        // files that follow open under it.
+        self.cipher =
+            match (&fetched.key, &self.opts.master_key) {
+                (Some(wrapped), Some(master)) => {
+                    let cipher = crate::cipher::Cipher::unwrap(wrapped, master).map_err(|e| {
+                        Error::Storage(format!(
+                            "RESTORE: the backup's KEY does not open under this master key: {e}"
+                        ))
+                    })?;
+                    crate::shard::atomic_write(&dir.join("KEY"), wrapped)?;
+                    Some(Arc::new(cipher))
+                }
+                (Some(_), None) => {
+                    return Err(Error::Storage(
+                        "RESTORE: the backup is encrypted; set CELASTRO_MASTER_KEY_FILE (or \
+                     CELASTRO_MASTER_KEY) to the master key that wraps its data key"
+                            .into(),
+                    ))
+                }
+                (None, Some(_)) => return Err(Error::Storage(
+                    "RESTORE: the backup is not encrypted and this database is; restore it into \
+                     a plain database, then export and import into this one"
+                        .into(),
+                )),
+                (None, None) => None,
+            };
+        let catalog_bytes = match &self.cipher {
+            Some(c) => c.open_file("CATALOG", &fetched.catalog)?,
+            None => fetched.catalog.clone(),
+        };
+        let mut catalog = Catalog::decode(&catalog_bytes)?;
+        for (name, _) in &fetched.collections {
+            if !catalog.collections.contains_key(name) {
+                return Err(Error::Storage(format!(
+                    "backup {} carries files of `{name}`, which its catalog does not name",
+                    fetched.ts
+                )));
+            }
+        }
         let mut shards_restored = 0usize;
         let mut bytes = 0u64;
         let mut elsewhere: Vec<String> = Vec::new();
@@ -1174,8 +1292,30 @@ impl Db {
         let Some(dir) = self.dir.clone() else {
             return Err(Error::Plan("import needs a persistent database (--dir)".into()));
         };
+        // The export's key regime need not be this database's: an export
+        // under one data key imports into a plain database, or one under
+        // another key, or a plain export into an encrypted database --
+        // which is how a database takes a key. Every file is opened under
+        // the export's cipher and sealed under this one as it is copied.
+        let src = match crate::shard::read_optional(&from.join("KEY"))? {
+            Some(wrapped) => match &self.opts.master_key {
+                Some(master) => Some(Arc::new(crate::cipher::Cipher::unwrap(&wrapped, master)?)),
+                None => {
+                    return Err(Error::Storage(format!(
+                        "{} is an encrypted export; set CELASTRO_MASTER_KEY_FILE (or \
+                         CELASTRO_MASTER_KEY) to the master key that wraps its data key",
+                        from.display()
+                    )))
+                }
+            },
+            None => None,
+        };
         let bytes = fs::read(from.join("CATALOG"))
             .map_err(|e| Error::Storage(format!("{}: CATALOG: {e}", from.display())))?;
+        let bytes = match &src {
+            Some(c) => c.open_file("CATALOG", &bytes)?,
+            None => bytes,
+        };
         let exported = Catalog::decode(&bytes)?;
         let (name, coll) = match exported.collections.iter().next() {
             Some((n, c)) if exported.collections.len() == 1 => (n.clone(), c.clone()),
@@ -1187,11 +1327,12 @@ impl Db {
         if let Some(n) = coll.prefix_expansion {
             check_prefix_cap(n)?;
         }
-        let src = from.join("collections").join(&name);
+        let src_dir = from.join("collections").join(&name);
         let dest = dir.join("collections").join(&name);
         let tmp = dir.join("collections").join(format!("{name}.import.tmp"));
         let _ = fs::remove_dir_all(&tmp);
-        if let Err(e) = copy_tree(&src, &tmp) {
+        let dst = self.cipher.clone();
+        if let Err(e) = recode_tree(&src_dir, &tmp, &src, &dst) {
             let _ = fs::remove_dir_all(&tmp);
             return Err(e);
         }
@@ -1599,7 +1740,9 @@ impl Db {
                 // durably -- so an atomic, synced write, not a bare
                 // `fs::write` that a crash could disagree with the catalog
                 // about.
-                crate::shard::atomic_write(
+                crate::shard::write_content(
+                    &self.cipher,
+                    &format!("shard-{i:04}/RANGE"),
                     &sdir.join("RANGE"),
                     format!("{}\n{}", lo.unwrap_or_default(), hi.unwrap_or_default()).as_bytes(),
                 )?;
@@ -1960,7 +2103,7 @@ impl Db {
         }
         self.catalog.placement.insert(name.clone(), tablets.to_vec());
         let def = self.catalog.get(&name)?.clone();
-        let (lo, hi) = read_range(&sdir, shard, &name)?;
+        let (lo, hi) = read_range(&self.cipher, &sdir, shard, &name)?;
         let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
         sh.key_range = Some((lo, hi));
         sh.index = shard;
@@ -2084,6 +2227,24 @@ impl Db {
     /// would count them again at every reopen. A side effect worth having: an
     /// insert no longer changes these bytes, so a persist after one is a skip
     /// rather than a rewrite of CATALOG.
+    /// `plain` as the root file `name` holds it: framed under the cipher
+    /// when there is one.
+    fn seal_root(&self, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
+        match &self.cipher {
+            Some(c) => c.seal_file(name, plain),
+            None => Ok(plain.to_vec()),
+        }
+    }
+
+    /// The wrapped data key, `KEY`, when the database is encrypted: what an
+    /// export and a backup carry so they open where the master key is.
+    fn key_bytes(&self) -> Result<Option<Vec<u8>>> {
+        match (&self.cipher, &self.dir) {
+            (Some(_), Some(dir)) => crate::shard::read_optional(&dir.join("KEY")),
+            _ => Ok(None),
+        }
+    }
+
     fn persisted_catalog(&self) -> Catalog {
         let mut catalog = self.catalog.clone();
         for (name, shards) in &self.shards {
@@ -2113,16 +2274,23 @@ impl Db {
             // replaced underneath a single handle: `still_published` compares
             // the bytes on disk, and a save that can no longer be written has
             // to say so rather than skipping its way to success.
-            if self.published_catalog.as_deref() == Some(bytes.as_slice())
-                && crate::shard::still_published(&p, &bytes)
-            {
-                return Ok(());
+            // The cache holds what reached the file -- framed, under a
+            // cipher -- so that is what the file is compared against; the
+            // plaintext is compared by opening the cache.
+            if let Some(w) = self.published_catalog.as_deref() {
+                let same = match &self.cipher {
+                    Some(c) => c.open_file("CATALOG", w).map(|p| p == bytes).unwrap_or(false),
+                    None => w == bytes.as_slice(),
+                };
+                if same && crate::shard::still_published(&p, w) {
+                    return Ok(());
+                }
             }
             // Not `fs::write`: that truncates in place, so a crash partway
             // through leaves a catalog that will not decode and a database
             // that will not open, with every segment file intact.
-            crate::shard::atomic_write(&p, &bytes)?;
-            self.published_catalog = Some(bytes);
+            let written = crate::shard::write_content(&self.cipher, "CATALOG", &p, &bytes)?;
+            self.published_catalog = Some(written);
         }
         Ok(())
     }
@@ -4593,6 +4761,45 @@ fn cache_key(collection: &str, path: &str) -> String {
 /// defect wearing the opposite disguise, and it used to be read as success:
 /// an `unwrap_or_default()` turned it into `""`, which splits into ONE empty
 /// part, and a shard with no bounds owns every key. It has to fail here.
+/// The database's cipher, from `KEY` and the options: opened under the
+/// master key when `KEY` is there; made -- or adopted from `key_file` --
+/// when the directory is empty and a master key is given; refused with the
+/// reason when an encrypted database has no master key, or a plain database
+/// with data is asked to be encrypted (that is a rewrite: export, and import
+/// into a fresh directory opened with the key).
+fn open_key(dir: &Path, opts: &DbOpts) -> Result<crate::cipher::Shared> {
+    let key_path = dir.join("KEY");
+    let key_file = crate::shard::read_optional(&key_path)?;
+    match (key_file, &opts.master_key) {
+        (Some(wrapped), Some(master)) => {
+            Ok(Some(Arc::new(crate::cipher::Cipher::unwrap(&wrapped, master)?)))
+        }
+        (Some(_), None) => Err(Error::Storage(format!(
+            "{} is encrypted; set CELASTRO_MASTER_KEY_FILE (or CELASTRO_MASTER_KEY) to open it",
+            dir.display()
+        ))),
+        (None, None) => Ok(None),
+        (None, Some(master)) => {
+            let has_data = dir.join("CATALOG").exists() || dir.join("collections").exists();
+            if has_data {
+                return Err(Error::Storage(format!(
+                    "{} holds plain data and a master key was given; encrypting existing data is \
+                     an export, and an import into a fresh directory opened with the key",
+                    dir.display()
+                )));
+            }
+            let wrapped = match &opts.key_file {
+                Some(p) => fs::read(p)
+                    .map_err(|e| Error::Storage(format!("key file {}: {e}", p.display())))?,
+                None => crate::cipher::Cipher::generate()?.wrap(master)?,
+            };
+            let cipher = crate::cipher::Cipher::unwrap(&wrapped, master)?;
+            crate::shard::atomic_write(&key_path, &wrapped)?;
+            Ok(Some(Arc::new(cipher)))
+        }
+    }
+}
+
 /// The tablet index a shard directory's name carries: `shard-0003` is 3.
 fn shard_index(dir: Option<&Path>, name: &str) -> Result<usize> {
     dir.and_then(|d| d.file_name())
@@ -4602,9 +4809,17 @@ fn shard_index(dir: Option<&Path>, name: &str) -> Result<usize> {
         .ok_or_else(|| Error::Storage(format!("a shard of `{name}` has no directory to name it")))
 }
 
-fn read_range(sdir: &Path, i: usize, name: &str) -> Result<(Option<String>, Option<String>)> {
-    let ranges = fs::read_to_string(sdir.join("RANGE"))
-        .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?;
+fn read_range(
+    cipher: &crate::cipher::Shared,
+    sdir: &Path,
+    i: usize,
+    name: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let bytes =
+        crate::shard::read_content(cipher, &format!("shard-{i:04}/RANGE"), &sdir.join("RANGE"))
+            .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?
+            .ok_or_else(|| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE is missing")))?;
+    let ranges = String::from_utf8_lossy(&bytes).to_string();
     let parts: Vec<&str> = ranges.split('\n').collect();
     if parts.len() != 2 {
         return Err(Error::Storage(format!(
@@ -6465,7 +6680,9 @@ mod tests {
         // at import, before anything is adopted. Written by hand, because no
         // build with this ceiling can write one.
         let mut over = db.export_collection("notes").unwrap();
-        over.catalog.collections.get_mut("notes").unwrap().prefix_expansion = Some(5000);
+        let mut catalog = Catalog::decode(&over.catalog_bytes).unwrap();
+        catalog.collections.get_mut("notes").unwrap().prefix_expansion = Some(5000);
+        over.catalog_bytes = catalog.encode();
         let over_dir = tmp("prefix-cap-export-over");
         over.write_to(&over_dir).unwrap();
         let mut third = Db::open(&tmp("prefix-cap-import-over"), DbOpts::default()).unwrap();

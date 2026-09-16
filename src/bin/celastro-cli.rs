@@ -67,6 +67,10 @@ COMMANDS:
         [--attached N]           and has verified N other nodes since it started
   export <COLLECTION> <DIR>  copy a collection, as of now, into a new database directory
   import <DIR>               adopt a collection an export wrote into this database
+  key master <FILE>          write a new master key (64 hex digits) to FILE, readable by you only
+  key init <FILE>            write a new data key to FILE, wrapped under the master key: the KEY
+                             every node of an encrypted cluster starts with (CELASTRO_KEY_FILE)
+  key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER
   tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
                              write a CA and a certificate for NAME (and NAMES, comma-separated
                              DNS names and IP addresses) into DIR, valid DAYS days (3650)
@@ -121,6 +125,15 @@ as `localhost`, which the certificate has to name. `tls init` makes such a set.
 the whole answer: a failure that ends the command is written there too, as
 {\"ok\":false,\"error\":...}, so a pipeline never has to read stderr to find out
 what went wrong.
+
+Encryption at rest: with CELASTRO_MASTER_KEY_FILE (a file `key master` wrote,
+or 32 raw bytes) or CELASTRO_MASTER_KEY (the hex itself), `--dir` makes an
+encrypted database -- every file under it, and every backup and export it
+writes, framed under a data key that `<DIR>/KEY` holds wrapped under the master
+-- and opens one made before; without the master an encrypted database is
+refused. A cluster's nodes share one data key: `key init` writes it, and
+CELASTRO_KEY_FILE names it at every node's first start. SECURITY.md has the
+rest.
 
 The `archived` tier is a local directory unless CELASTRO_ARCHIVE_ENDPOINT
 (`host:port`, plain HTTP) and CELASTRO_ARCHIVE_BUCKET name an S3-compatible
@@ -184,6 +197,17 @@ enum Cmd {
     },
     Import {
         from: PathBuf,
+    },
+    /// `key master <FILE>`, `key init <FILE>`, `key rekey <KEY> <MASTER>`.
+    KeyMaster {
+        file: PathBuf,
+    },
+    KeyInit {
+        file: PathBuf,
+    },
+    KeyRekey {
+        key: PathBuf,
+        master: PathBuf,
     },
     /// `tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: a CA and a certificate.
     TlsInit {
@@ -395,6 +419,22 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 )
             }
         },
+        "key" => match (rest.first().map(String::as_str), rest.len()) {
+            (Some("master"), 2) => Cmd::KeyMaster { file: PathBuf::from(&rest[1]) },
+            (Some("init"), 2) => Cmd::KeyInit { file: PathBuf::from(&rest[1]) },
+            (Some("rekey"), 3) => {
+                Cmd::KeyRekey { key: PathBuf::from(&rest[1]), master: PathBuf::from(&rest[2]) }
+            }
+            _ => {
+                return Cli::Usage(
+                    "`key master <FILE>`: write a new master key to FILE. `key init <FILE>`: write \
+                     a new data key to FILE, wrapped under the master key in CELASTRO_MASTER_KEY_FILE \
+                     or CELASTRO_MASTER_KEY. `key rekey <KEY> <MASTER>`: rewrap the data key in KEY \
+                     under the master key in the file MASTER"
+                        .to_string(),
+                )
+            }
+        },
         "export" => match rest.len() {
             2 => Cmd::Export { collection: rest[0].clone(), to: PathBuf::from(&rest[1]) },
             _ => {
@@ -538,6 +578,15 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::TlsInit { dir, name, names, days } = cmd {
         return tls_init(&dir, &name, &names, days, json);
     }
+    if let Cmd::KeyMaster { file } = cmd {
+        return key_master(&file, json);
+    }
+    if let Cmd::KeyInit { file } = cmd {
+        return key_init(&file, json);
+    }
+    if let Cmd::KeyRekey { key, master } = cmd {
+        return key_rekey(&key, &master, json);
+    }
     if let Cmd::TlsSecret { secret, name, names, days } = cmd {
         return tls_secret(&secret, &name, &names, days, json);
     }
@@ -569,7 +618,12 @@ fn run(dir: Option<PathBuf>, json: bool, cmd: Cmd) -> i32 {
             EXIT_OK
         }
         Cmd::Health { .. } => unreachable!("answered before the database was opened"),
-        Cmd::TlsInit { .. } | Cmd::TlsSecret { .. } | Cmd::Send { .. } => {
+        Cmd::TlsInit { .. }
+        | Cmd::TlsSecret { .. }
+        | Cmd::Send { .. }
+        | Cmd::KeyMaster { .. }
+        | Cmd::KeyInit { .. }
+        | Cmd::KeyRekey { .. } => {
             unreachable!("answered before the database was opened")
         }
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
@@ -1111,6 +1165,88 @@ fn tls_secret(secret: &str, name: &str, names: &[String], days: i64, json: bool)
         }
         Err(e) => fail(json, &format!("reaching the API at {addr}: {e}")),
     }
+}
+
+/// `key master <FILE>`: 32 random bytes as hex, written readable by the
+/// owner only, never over a file that is there.
+fn key_master(file: &Path, json: bool) -> i32 {
+    if file.exists() {
+        return fail(json, &format!("{} exists; not overwriting a key", file.display()));
+    }
+    let key = match celastro::cipher::new_master_hex() {
+        Ok(k) => k,
+        Err(e) => return fail(json, &format!("could not draw a key: {e}")),
+    };
+    if let Err(e) = write_private(file, &format!("{key}\n"), true) {
+        return fail(json, &format!("could not write {}: {e}", file.display()));
+    }
+    ack(json, &format!("wrote a master key to {}", file.display()));
+    EXIT_OK
+}
+
+/// `key init <FILE>`: a new data key wrapped under the environment's master
+/// key -- what every node of a cluster is given as `CELASTRO_KEY_FILE`, so
+/// they all write under one key.
+fn key_init(file: &Path, json: bool) -> i32 {
+    if file.exists() {
+        return fail(json, &format!("{} exists; not overwriting a key", file.display()));
+    }
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let master =
+        match celastro::cipher::master_from_env(&var) {
+            Ok(Some(m)) => m,
+            Ok(None) => return fail(
+                json,
+                "`key init` wraps the data key under the master key: set CELASTRO_MASTER_KEY_FILE \
+                 or CELASTRO_MASTER_KEY",
+            ),
+            Err(e) => return fail(json, &e.to_string()),
+        };
+    let wrapped = match celastro::cipher::Cipher::generate().and_then(|c| c.wrap(&master)) {
+        Ok(w) => w,
+        Err(e) => return fail(json, &format!("could not make the key: {e}")),
+    };
+    if let Err(e) = std::fs::write(file, &wrapped) {
+        return fail(json, &format!("could not write {}: {e}", file.display()));
+    }
+    ack(json, &format!("wrote a data key, wrapped under the master key, to {}", file.display()));
+    EXIT_OK
+}
+
+/// `key rekey <KEY> <MASTER>`: the data key in KEY, opened under the
+/// environment's master key, rewrapped under the one in the file MASTER
+/// and written back in place. The data is untouched -- it is under the
+/// data key, which does not change -- so a master key rotates in the time
+/// it takes to write one small file, and every node then starts with the
+/// new master.
+fn key_rekey(key: &Path, master: &Path, json: bool) -> i32 {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let old = match celastro::cipher::master_from_env(&var) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return fail(
+                json,
+                "`key rekey` opens the key under the current master: set \
+                 CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY",
+            )
+        }
+        Err(e) => return fail(json, &e.to_string()),
+    };
+    let new = match std::fs::read(master)
+        .map_err(|e| e.to_string())
+        .and_then(|b| celastro::cipher::parse_master(&b).map_err(|e| e.to_string()))
+    {
+        Ok(m) => m,
+        Err(e) => return fail(json, &format!("{}: {e}", master.display())),
+    };
+    if let Err(e) = celastro::cipher::rekey_file(key, &old, &new) {
+        return fail(json, &format!("could not rekey {}: {e}", key.display()));
+    }
+    ack(
+        json,
+        &format!("{} is now wrapped under the master key in {}", key.display(), master.display()),
+    );
+    EXIT_OK
 }
 
 fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> i32 {
@@ -1785,6 +1921,13 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     }
     o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
     o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
+    o.master_key = celastro::cipher::master_from_env(&var).map_err(|e| e.to_string())?;
+    o.key_file = var("CELASTRO_KEY_FILE").map(PathBuf::from);
+    if o.key_file.is_some() && o.master_key.is_none() {
+        return Err("CELASTRO_KEY_FILE needs the master key that wraps it: set \
+                    CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY"
+            .into());
+    }
     Ok(o)
 }
 

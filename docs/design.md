@@ -48,6 +48,7 @@ test that pins it.
 | a bounded graph walk, resolved before the scatter | `plan::walk` | `WITHIN k HOPS OF` as a filter or a `hops(...)` source; `expand` and `present` on `ShardService` |
 | the wire between nodes, a shard's move | `wire`, `engine` "moves" | length-prefixed frames of the crate's codec, a shared token, one holder per shard |
 | encryption in transit | `tls`, `crypto` | an in-tree TLS 1.3 under the wire and the console; `CELASTRO_TLS_*` |
+| encryption at rest | `cipher`, `shard`, `engine` | ChaCha20-Poly1305 frames per file under a data key `KEY` holds wrapped under the master; `CELASTRO_MASTER_KEY_FILE` |
 | the console and its guards | `serve` | a token on every request, loopback or `--bind`, a thread per connection |
 | a seeded fault schedule on the shard boundary | `sim` | drops, restarts, reorder; "a fault can shorten an answer only by saying so" |
 | scatter-gather, query-then-fetch | `plan::exec` | shards return `(pk, source, raw score)` |
@@ -1081,6 +1082,50 @@ takes no dependency, by the user's decision after rustls had shipped
 behind a feature and been withdrawn; it is unaudited, and the README says
 so. What would move it forward: the archive client over the same stream.
 
+**Encryption at rest is a property of the bytes a file holds, so every
+path is either a content path or a copy path.** A content path makes or
+reads a file's meaning -- a segment sealed or opened, a manifest, a delete
+log, the WAL, `RANGE`, `CATALOG` -- and goes through `cipher::Cipher`:
+`seal_file` frames the plaintext (64 KiB per frame, `nonce | ciphertext |
+tag`, the file's identity and the frame's index in the AAD), `open_file`
+and `read_range` open it, the latter only the frames a ranged read
+touches, so an archived segment faults in component by component as it
+did. A copy path -- a backup, an export, a move over the wire, a tier
+move into the store and back -- moves the framed bytes as they lie and
+never reads them; an `ExportShard` is therefore already in the file
+regime when it is built, and a restore, a move or an import that lands
+its files where they came from needs the same data key, which is why a
+cluster's pods are given one (`CELASTRO_KEY_FILE`, `key init`) and a
+backup and an export carry `KEY`. The one path that crosses regimes is
+`import_collection`: it opens each file under the export's key and seals
+it under the database's, which is how a plain database takes a key and
+how one changes keys. A file's identity is its shard directory's name and
+its own (`shard-0003/00000000000000a1.seg`), the same in `segments/`,
+`archive/` and the store, so a file cannot stand in for another and a
+tier move needs no rewrite; root files are their bare names. The WAL is
+length-prefixed frames, one per record, the record's ordinal in the AAD,
+so a torn tail ends the replay where the CRC would have and a frame
+cannot be replayed from another log. The data key is per database, drawn
+at the first open of an empty directory and kept in `KEY` wrapped under
+the master (`CELK1 | nonce | ciphertext | tag`); per-file keys are HKDF
+of it and the identity; the master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes
+or 64 hex digits, or `CELASTRO_MASTER_KEY`) is never written, and `key
+rekey` rewraps `KEY` under a new one without touching a data file. A
+directory with `KEY` and no master is refused, and so is a plain
+directory with data offered a master: encrypting in place would be a
+rewrite of every file behind a running database's back, and the export
+and import say the same thing honestly. Backups and exports of an
+encrypted database are encrypted (`KEY` alongside), a restore into a
+plain database or under another master is refused before a byte is
+written, and the console's token is what it was: the key protects the
+bytes at rest, the token the console. What it costs, on the survey's
+corpus (0.37.0): the batched load 23% longer (a seal is one more pass
+over each segment, and every WAL record is a frame), `COMPACT` 2%, the
+reopen twice as long at a quarter of a second, and the reads -- point
+lookups, BM25, vector, hybrid, the walk -- within noise: a segment's
+components are opened once into the residency cache, and the frames are
+opened on the way in.
+
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
 running `serve` could only be stopped by the ten-second SIGKILL or by
@@ -1249,6 +1294,7 @@ guarantee:
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
 | a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro-cli send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
+| an encrypted database writes no plaintext anywhere and opens under its master only | `encryption::an_encrypted_database_holds_no_plaintext_and_opens_under_its_master_only` (a marker string grepped for under the directory, the store, a backup and an export after seals, a delete, a compaction and a tier move both ways; reopen through the WAL; no master and another master refused), `encryption::a_plain_database_with_data_is_not_encrypted_in_place`, `encryption::a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended`, `encryption::a_backup_restores_under_the_same_master_and_is_refused_without_it`, `encryption::an_import_crosses_key_regimes_which_is_how_a_database_takes_or_changes_a_key`, `encryption::a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves`, `cipher::tests::*` (frames round-trip, a ranged read opens only its frames, the wrong key, index or identity fails, the wrapped key opens under its master only, a torn record log stops at the tear) |
 | the archived tier works against an S3-compatible store exactly as against a directory | `archive_s3::*` (an in-process S3 that checks every request is signed: a tier move puts and later deletes the object, a reopen with nothing local asks the store and answers, `Refuse` never touches it, a retired segment's object is deleted, credentials come only from the environment, an https endpoint is refused with the reason), `objstore::tests::*` (SHA-256, HMAC and the SigV4 signer against the published vectors) |
 | a health probe measures the database, needs no token, and stays behind the Host check | `serve::tests::the_health_probe_needs_no_token_and_reports_the_database`, `serve::tests::the_probe_tells_serving_from_unwell_from_absent` (the client half: serving, unwell and absent are three answers), `celastro-cli::tests::health_takes_a_port_and_nothing_else`; the chart itself is verified by hand against a `kind` cluster, as its README records |
 | a copy is the source at its pinned instant, absent or complete, and adoptable elsewhere | `engine::tests::a_copy_is_the_source_at_its_pinned_instant_whatever_happens_after` (three shards, sealed and memtable rows, deletes on both; inserts, deletes, updates, a flush and a compaction between the pin and the write; the copy answers the source's pinned rows byte for byte and the source no longer does), `engine::tests::an_interrupted_copy_leaves_no_destination_to_open_by_mistake`, `engine::tests::an_import_adds_the_collection_to_another_instance`, `celastro-cli::tests::export_and_import_take_their_arguments_and_no_more` |
@@ -1289,6 +1335,7 @@ src/
   serve.rs serve/                the console: loopback by default, --bind for a network
   wire.rs sim.rs                 the wire between nodes; the seeded fault simulator
   tls.rs crypto/                 encryption in transit: the TLS 1.3 and its primitives
+  cipher.rs                      encryption at rest: frames per file under a wrapped data key
   backup.rs                      BACKUP TO and RESTORE FROM over the object store trait
   signal.rs deadline.rs          SIGTERM for PID 1; the per-statement deadline
   bin/celastro.rs                REPL, script runner, demo
@@ -1298,5 +1345,6 @@ tests/
   tiering.rs                     tiers, residency, lifecycle policies
   wire.rs                        three nodes in one process, every node answering what one does
   tls.rs                         the console and the wire over TLS
+  encryption.rs                  no plaintext at rest; refusals; backup, import and move under a key
   pki/                           RSA and P-256 chains and signatures from openssl
 ```

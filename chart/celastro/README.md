@@ -95,6 +95,25 @@ statement they coordinate over its shards fails naming the shard (`did not
 answer`), `WITH (partial_results)` being the opt-in to an answer without it.
 A client that retries rides it out; measured below.
 
+### Encryption at rest
+
+```
+celastro-cli key master ./master.key
+CELASTRO_MASTER_KEY_FILE=./master.key celastro-cli key init ./KEY
+kubectl create secret generic celastro-keys --from-file=master.key=./master.key --from-file=KEY=./KEY
+helm install celastro chart/celastro --set replicas=3 --set encryption.existingSecret=celastro-keys
+```
+
+Every pod then writes every file on its volume, the tier and its backups
+under the one data key in `KEY`, wrapped under `master.key`, so a shard
+moves between pods and a backup restores on any of them; the Secret is
+mounted read-only at `/keys`. Set it at install: a pod that has written
+plain data refuses a master key, and one that has written under a key
+refuses to start without it. To rotate the master, `celastro-cli key
+rekey ./KEY ./new-master.key` with the old master in the environment,
+then replace both keys in the Secret and restart the pods; the data is
+not touched.
+
 ### Backups, and the archived tier on a mount
 
 ```
@@ -133,8 +152,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.36.0 .
-kind load docker-image celastro:0.36.0        # for a kind cluster
+docker build -t celastro:0.37.0 .
+kind load docker-image celastro:0.37.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 
@@ -211,6 +230,7 @@ changelog; those need every pod restarted together
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro-cli tls init`, naming every pod, both Services and `localhost` |
 | `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` (Ed25519) is emitted for it |
+| `encryption.existingSecret` | empty | a `Secret` with `master.key` (`celastro-cli key master`) and `KEY` (`celastro-cli key init`): encryption at rest on every pod under one shared data key |
 | `tuning` | `{}` | `CELASTRO_*` performance variables set on every pod, e.g. `tuning.CELASTRO_INSERT_BATCH=5000`; the binary's `docs/tuning.md` lists them |
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because a probe waits behind a statement that changes something |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |

@@ -6,6 +6,48 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.37.0 — 2026-09-16
+
+Encryption at rest, hence a minor. Nothing changes for a database opened
+without a master key.
+
+**Every file under `--dir` can be encrypted.** With
+`CELASTRO_MASTER_KEY_FILE` (32 bytes, or 64 hex digits; `celastro-cli key
+master` writes one) or `CELASTRO_MASTER_KEY` set, an empty directory
+draws a data key, keeps it in `<dir>/KEY` wrapped under the master, and
+from then on writes every segment, delete log, manifest, WAL record,
+`RANGE` and `CATALOG` -- and every object the archived tier puts in a
+store, every backup and every export -- as ChaCha20-Poly1305 frames under
+a per-file key derived from it. Opening without the master is refused,
+and so is offering a master to a plain directory that holds data: a plain
+database takes a key by `celastro-cli export` and `import` into a fresh
+directory opened with one, and an import between two encrypted databases
+recodes from one key to the other. Backups of an encrypted database are
+encrypted and carry `KEY`; `RESTORE FROM` adopts it under the same master
+and refuses a plain database or another master. A cluster's pods share
+one data key: `celastro-cli key init <FILE>` writes it wrapped, and
+`CELASTRO_KEY_FILE` names it at every pod's first start, so `MOVE SHARD`,
+`REBALANCE` and a restore on another pod work as before; the chart's
+`encryption.existingSecret` mounts the master and that key. `celastro-cli
+key rekey <KEY> <MASTER>` rewraps the data key under a new master without
+touching a data file. `DbOpts::master_key` and `DbOpts::key_file` for the
+library; `Segment`'s source gains an `Encrypted` wrapper that opens only
+the frames a ranged read touches, so an archived segment faults in as it
+did. SECURITY.md says what it protects and what it does not. Measured on
+the survey's corpus (50,000 documents with text and 128-d vectors, 250,000
+edges, one node): the batched load 18.1 s plain and 22.2 s encrypted,
+`COMPACT` 92 s and 94 s, the reopen 0.24 s and 0.43 s, and every read
+class -- point lookups, BM25, vector, hybrid, a two-hop walk -- within
+noise of plain at concurrency 1 and 16. Verified on kind: three pods
+sharing one key from `encryption.existingSecret`, a shard moved, a backup
+taken, no plaintext on the node's disk, a pod restarted opening under
+the key, and the same pod refusing to start with the Secret removed.
+
+**Smaller.** The README's quick start shows a server and a client on the
+same machine, and its transport-encryption section is a paragraph
+pointing at SECURITY.md, which now states what the TLS does not do
+(resumption, client certificates, HelloRetryRequest, 0-RTT, key update).
+
 ## 0.36.0 — 2026-09-15
 
 Compaction runs itself, hence a minor.

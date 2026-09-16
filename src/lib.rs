@@ -72,6 +72,7 @@
 pub mod backup;
 pub mod bitmap;
 pub mod catalog;
+pub mod cipher;
 pub mod codec;
 pub mod column;
 pub mod compaction;

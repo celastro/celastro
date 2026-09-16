@@ -29,8 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::catalog::Catalog;
-use crate::engine::{handle_bytes, range_file, Deferred, ExportShard, Outcome};
+use crate::engine::{handle_bytes, Deferred, ExportShard, Outcome};
 use crate::error::{Error, Result};
 use crate::objstore::{ArchiveOpts, DirStore, ObjectStore, S3Store};
 
@@ -141,9 +140,10 @@ pub(crate) fn job(
     ts: u64,
     node: String,
     catalog: Vec<u8>,
+    key: Option<Vec<u8>>,
     colls: Exported,
 ) -> Deferred {
-    Deferred::new(move || run(target, ts, node, catalog, colls))
+    Deferred::new(move || run(target, ts, node, catalog, key, colls))
 }
 
 fn run(
@@ -151,6 +151,7 @@ fn run(
     ts: u64,
     node: String,
     catalog: Vec<u8>,
+    key: Option<Vec<u8>>,
     colls: Exported,
 ) -> Result<Outcome> {
     let mine = format!("nodes/{}/", node_slug(&node));
@@ -196,11 +197,17 @@ fn run(
                 put(format!("{own}{sdir}/segments/{id:016x}.seg"), data, &mut files)?;
                 bytes += data.len() as u64;
             }
-            put(format!("{own}{sdir}/RANGE"), &range_file(&ex.range), &mut files)?;
+            put(format!("{own}{sdir}/RANGE"), &ex.range, &mut files)?;
             put(format!("{own}{sdir}/MANIFEST"), &ex.manifest, &mut files)?;
         }
     }
     put(format!("{own}CATALOG"), &catalog, &mut files)?;
+    // The wrapped data key travels with an encrypted backup: every file
+    // above is framed under it, and a restore anywhere needs it -- and the
+    // master that wraps it -- before it can read a byte.
+    if let Some(k) = &key {
+        put(format!("{own}KEY"), k, &mut files)?;
+    }
     let mut record = format!("celastro backup\nversion 1\nts {ts}\nnode {node}\n");
     for (key, len) in &files {
         record.push_str(&format!("{key}\t{len}\n"));
@@ -215,12 +222,14 @@ fn run(
     )))
 }
 
-/// A backup read back and verified: its instant, its catalog, and per
-/// collection and shard the files to write, each as (name under the shard
-/// directory, key, size).
+/// A backup read back and verified: its instant, its catalog and data key
+/// as the store holds them (the catalog is framed when the key is there,
+/// and the engine opens it), and per collection and shard the files to
+/// write, each as (name under the shard directory, key, size).
 pub(crate) struct Fetched {
     pub(crate) ts: u64,
-    pub(crate) catalog: Catalog,
+    pub(crate) catalog: Vec<u8>,
+    pub(crate) key: Option<Vec<u8>>,
     pub(crate) collections: BackupShards,
 }
 
@@ -332,8 +341,12 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
             }
         }
     }
-    let catalog_bytes = target.store.get(&target.key(&format!("{own}CATALOG")))?;
-    let catalog = Catalog::decode(&catalog_bytes)?;
+    let catalog = target.store.get(&target.key(&format!("{own}CATALOG")))?;
+    let key = if files.iter().any(|(k, _)| *k == format!("{own}KEY")) {
+        Some(target.store.get(&target.key(&format!("{own}KEY")))?)
+    } else {
+        None
+    };
     // Group the files by collection and shard. A pool key is
     // `pool/<coll>/shard-NNNN/<id>.seg`; an own key `nodes/<n>/backups/<ts>/<coll>/
     // shard-NNNN/<rest>`.
@@ -375,14 +388,7 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
         };
         shard_entry.1.push((rest, key.clone(), *len));
     }
-    for (name, _) in &collections {
-        if !catalog.collections.contains_key(name) {
-            return Err(Error::Storage(format!(
-                "backup {ts} carries files of `{name}`, which its catalog does not name"
-            )));
-        }
-    }
-    Ok(Fetched { ts, catalog, collections })
+    Ok(Fetched { ts, catalog, key, collections })
 }
 
 /// Write one shard's files under `sdir` (created), `MANIFEST` last so a

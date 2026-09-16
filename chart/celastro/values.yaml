@@ -44,6 +44,17 @@ tls:
   # Validity of the certificate the Job makes, in days.
   days: 3650
 
+# Encryption at rest: every file on every pod's volume, the tier and the
+# backups under a data key the pods share, wrapped under a master key.
+# Name a Secret with two keys: `master.key`, from `celastro-cli key master`
+# (64 hex digits), and `KEY`, from `celastro-cli key init` run with that
+# master (the wrapped data key every pod starts with, so a shard moves
+# between pods and a backup restores on any of them). Empty is plain.
+# Set at install: a pod that has written plain data refuses a master key,
+# and one that has written under a key refuses to start without it.
+encryption:
+  existingSecret: ""
+
 image:
   repository: ghcr.io/celastro/celastro
   # Empty means the chart's appVersion.

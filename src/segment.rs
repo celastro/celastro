@@ -110,11 +110,23 @@ pub enum SegmentSource {
     /// `GET`: the footer at open, then each component as it faults in --
     /// the chain of dependent round trips the design budgets for.
     Remote { store: Arc<dyn crate::objstore::ObjectStore>, key: String, size: u64 },
+    /// A source whose bytes are the frames of `crate::cipher`: every read is
+    /// a ranged read of the frames covering it, opened under the file's
+    /// key. Wraps a file, an archived file or an object alike.
+    Encrypted { inner: Box<SegmentSource>, cipher: Arc<crate::cipher::Cipher>, id: String },
 }
 
 impl SegmentSource {
     fn read(&self, off: u64, len: u64) -> Result<Vec<u8>> {
         match self {
+            SegmentSource::Encrypted { inner, cipher, id } => {
+                let size = inner.len()?;
+                let read = |o: u64, l: u64| -> Result<Vec<u8>> {
+                    let l = l.min(size.saturating_sub(o));
+                    inner.read(o, l)
+                };
+                cipher.read_range(id, &read, off, len)
+            }
             SegmentSource::Bytes(b) => off
                 .checked_add(len)
                 .and_then(|end| b.get(off as usize..end as usize))
@@ -968,14 +980,28 @@ impl Segment {
 impl SegmentSource {
     fn len(&self) -> Result<u64> {
         Ok(match self {
+            SegmentSource::Encrypted { inner, .. } => {
+                crate::cipher::Cipher::plain_len(inner.len()?)?
+            }
             SegmentSource::Bytes(b) => b.len() as u64,
             SegmentSource::File(p) | SegmentSource::Archive(p) => std::fs::metadata(p)?.len(),
             SegmentSource::Remote { size, .. } => *size,
         })
     }
 
+    /// The source under any encryption: where the bytes are, whatever they
+    /// are. What a copy -- a backup, a move, an archive put -- reads, since
+    /// it moves the frames as they are.
+    pub fn unwrapped(&self) -> &SegmentSource {
+        match self {
+            SegmentSource::Encrypted { inner, .. } => inner.unwrapped(),
+            other => other,
+        }
+    }
+
     pub fn path(&self) -> Option<&Path> {
         match self {
+            SegmentSource::Encrypted { inner, .. } => inner.path(),
             SegmentSource::Bytes(_) | SegmentSource::Remote { .. } => None,
             SegmentSource::File(p) | SegmentSource::Archive(p) => Some(p),
         }

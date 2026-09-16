@@ -54,29 +54,7 @@ Run it against a directory, so the data is there next time:
 ```
 $ celastro-cli --dir ./data run quickstart.sql
 collection `notes` created with 1 shard(s)
-index `notes_body` created on the active tier
-index `notes_emb` created on the active tier
-1 document(s) written at ts 7328898005277564928
 ...
-key | id | topic
-----+----+--------
-n3  | n3 | storage
-n4  | n4 | storage
-2 row(s)
-key | id
-----+---
-n3  | n3
-n4  | n4
-2 row(s)
-key | distance | id
-----+----------+---
-n1  | 0.009008 | n1
-n2  | 0.651813 | n2
-2 row(s)
-key | id
-----+---
-n1  | n1
-1 row(s)
 key | score    | id | topic
 ----+----------+----+--------
 n1  | 0.032787 | n1 | search
@@ -85,6 +63,18 @@ n3  | 0.015873 | n3 | storage
 3 row(s)
 ```
 
+Or serve it and talk to it over HTTP, which is what an application does —
+locally just the same as in a cluster:
+
+```
+$ celastro-cli --dir ./data serve
+http://127.0.0.1:8787/?t=0a1b...            # the console, token included
+$ export CELASTRO_TOKEN=0a1b...
+$ celastro-cli send http://127.0.0.1:8787 "SELECT id FROM notes WHERE topic = 'storage'"
+$ curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" http://127.0.0.1:8787/api/query \
+       -d '{"sql":"SELECT id FROM notes WHERE text_match(body, ''segments'')"}'
+{"ok":true,"kind":"rows","count":2,"rows":[...]}
+```
 
 `key` is the row's primary key and `score` or `distance` its rank, whichever
 the query produced. A distance in `WHERE` is a filter in the units the
@@ -193,34 +183,32 @@ lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 
 ## Encryption in transit
 
-Off by default. Three PEM files from the environment, all three or none, turn
-it on:
+Off by default. `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
+(PEM; all three or none) put the console and the wire on TLS 1.3, every
+peer verified against the CA by the name it was dialled; the tokens stay.
+`celastro-cli tls init ./tls <name>` makes a CA and a certificate that fit,
+and the chart makes them for you. The TLS is written in this repository and
+unaudited: one suite, X25519, an Ed25519 certificate for the node (the CA
+may be RSA or P-256), no resumption yet; [SECURITY.md](SECURITY.md) has the
+scope and the reasoning.
+
+## Encryption at rest
 
 ```
-CELASTRO_TLS_CERT=/tls/tls.crt   # this node's certificate chain, leaf first
-CELASTRO_TLS_KEY=/tls/tls.key    # its private key, PKCS#8
-CELASTRO_TLS_CA=/tls/ca.crt      # the CA every node's certificate chains to
+$ celastro-cli key master ./master.key
+$ CELASTRO_MASTER_KEY_FILE=./master.key celastro-cli --dir ./data serve
 ```
 
-With them the console and the wire serve TLS 1.3, every peer is verified
-against the CA by the name it was dialled, and `celastro-cli health` verifies
-its own console as `localhost`, which the certificate has to name. The tokens
-stay: a certificate says which node is talking, the token says it may.
-`celastro-cli tls init ./tls celastro-0.celastro` makes a CA and a certificate
-that fit.
-
-**The TLS is in the tree and unaudited.** It is TLS 1.3 only, one cipher
-suite (`TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange, and the node's
-own certificate is **Ed25519** — material from cert-manager needs
-`privateKey.algorithm: Ed25519`. The CA above it, and any intermediate, may
-be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256) or ECDSA P-256; as a
-client the node also accepts servers signing with those, which is how it
-reaches a Kubernetes API. No resumption, no client certificates, no
-HelloRetryRequest. Every primitive
-is pinned against its RFC vectors and the key schedule against RFC 8448, and
-the code branches on no secret, but nobody outside this repository has
-reviewed it; that is the price of zero dependencies, chosen knowingly. The
-archive client to an S3 store is still plain HTTP.
+With a master key every file under `--dir`, every object the archived tier
+puts in a store and every backup and export are ChaCha20-Poly1305 frames
+under a data key that `<dir>/KEY` holds wrapped under the master; without
+the master the directory is refused. A cluster's pods share one data key
+(`celastro-cli key init`, `CELASTRO_KEY_FILE`; the chart's
+`encryption.existingSecret`) so shards move and backups restore between
+them; `key rekey` rotates the master in one small write. An existing plain
+database takes a key by `export` and `import` into a fresh directory
+opened with one. [SECURITY.md](SECURITY.md) has what it protects and what
+it does not.
 
 ## Two or more nodes
 
@@ -272,8 +260,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro-cli` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.36.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.36.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.37.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.37.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

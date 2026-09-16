@@ -55,6 +55,12 @@ spec:
             - name: CELASTRO_TLS_CA
               value: /tls/ca.crt
             {{- end }}
+            {{- if .Values.encryption.existingSecret }}
+            - name: CELASTRO_MASTER_KEY_FILE
+              value: /keys/master.key
+            - name: CELASTRO_KEY_FILE
+              value: /keys/KEY
+            {{- end }}
             {{- if .Values.console.expose }}
             - name: CELASTRO_TOKEN
               valueFrom:
@@ -147,16 +153,26 @@ spec:
               mountPath: /tls
               readOnly: true
             {{- end }}
+            {{- if .Values.encryption.existingSecret }}
+            - name: keys
+              mountPath: /keys
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- if or .Values.tls.enabled .Values.archive.existingClaim }}
+      {{- if or .Values.tls.enabled .Values.archive.existingClaim .Values.encryption.existingSecret }}
       volumes:
         {{- if .Values.tls.enabled }}
         - name: tls
           secret:
             secretName: {{ include "celastro.tlsSecretName" . }}
+        {{- end }}
+        {{- if .Values.encryption.existingSecret }}
+        - name: keys
+          secret:
+            secretName: {{ .Values.encryption.existingSecret | quote }}
         {{- end }}
         {{- if .Values.archive.existingClaim }}
         - name: archive

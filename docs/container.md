@@ -1,7 +1,7 @@
 # Running in a container
 
 `Dockerfile` builds the image in two stages: a musl toolchain compiles one
-statically linked `celastro-cli` with the `tls` feature, and the image that
+statically linked `celastro-cli`, and the image that
 ships is `FROM scratch` — the binary, the licence, the copyright notice, and
 nothing else.
 
@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.36.0
+docker pull ghcr.io/celastro/celastro:0.37.0
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume
@@ -235,6 +235,13 @@ Ed25519 — `celastro-cli tls init` makes a set) and the console and the wire
 serve TLS 1.3, with the CA verifying every peer. The chart's `console.expose`
 and `tls.enabled` are these two, with the token and the certificates in
 Secrets and a Service over the pods.
+
+Encryption at rest: mount a master key and set `CELASTRO_MASTER_KEY_FILE`
+to it (`celastro-cli key master` writes one), and every file under
+`/data`, the tier and the backups are encrypted under a data key kept
+wrapped in `/data/KEY`; a cluster's pods also take `CELASTRO_KEY_FILE`, the
+one wrapped data key `celastro-cli key init` wrote, so they share it. The
+chart's `encryption.existingSecret` mounts both.
 
 ## `panic = "abort"` makes the container the unit of recovery
 

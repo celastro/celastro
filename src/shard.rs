@@ -609,6 +609,58 @@ impl Manifest {
 /// durability of the new directory entry is left to the platform. That is a
 /// real difference in what this function promises, and it is written here
 /// rather than left to be discovered.
+/// Write `plain` as the content of `path`: framed under the cipher when
+/// there is one, as it is otherwise. Returns the bytes that reached the
+/// file, which is what `still_published` compares against later. The
+/// copy paths (a backup, a move, an archive put) do not come here: they
+/// move bytes as they lie.
+pub(crate) fn write_content(
+    cipher: &crate::cipher::Shared,
+    id: &str,
+    path: &Path,
+    plain: &[u8],
+) -> Result<Vec<u8>> {
+    let bytes = match cipher {
+        Some(c) => c.seal_file(id, plain)?,
+        None => plain.to_vec(),
+    };
+    atomic_write(path, &bytes)?;
+    Ok(bytes)
+}
+
+/// `write_content` without the directory fsync, as `publish` is to
+/// `atomic_write`.
+pub(crate) fn publish_content(
+    cipher: &crate::cipher::Shared,
+    id: &str,
+    path: &Path,
+    plain: &[u8],
+) -> Result<Vec<u8>> {
+    let bytes = match cipher {
+        Some(c) => c.seal_file(id, plain)?,
+        None => plain.to_vec(),
+    };
+    publish(path, &bytes)?;
+    Ok(bytes)
+}
+
+/// The content of `path`, opened under the cipher when there is one;
+/// `None` when the file is absent.
+pub(crate) fn read_content(
+    cipher: &crate::cipher::Shared,
+    id: &str,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(bytes) = read_optional(path)? else { return Ok(None) };
+    match cipher {
+        Some(c) => c
+            .open_file(id, &bytes)
+            .map(Some)
+            .map_err(|e| Error::Storage(format!("{}: {e}", path.display()))),
+        None => Ok(Some(bytes)),
+    }
+}
+
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     publish(path, bytes)?;
     sync_dir_of(path)
@@ -1153,6 +1205,12 @@ pub(crate) struct WalRecord {
 pub(crate) struct Wal {
     file: fs::File,
     path: PathBuf,
+    /// Encryption at rest: each appended record is a length-prefixed frame
+    /// under the log's key with its ordinal in the AAD; `records` counts
+    /// the frames in the file, so the next one continues the sequence.
+    cipher: crate::cipher::Shared,
+    id: String,
+    records: u64,
 }
 
 /// Empty `path`, and record that it happened, in one statement.
@@ -1186,11 +1244,18 @@ impl Wal {
     /// a directory made durable before it named the log, so the first
     /// acknowledged insert is fdatasync'd into a file whose name a crash still
     /// takes. Recording the creation is what lets a test tell those apart.
-    pub(crate) fn open(path: &Path) -> Result<Wal> {
+    pub(crate) fn open(path: &Path, cipher: crate::cipher::Shared, id: String) -> Result<Wal> {
         let file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
         #[cfg(test)]
         durability_probe::note_create(path);
-        Ok(Wal { file, path: path.to_path_buf() })
+        let records = match &cipher {
+            Some(c) => match read_optional(path)? {
+                Some(b) => c.open_records(&id, &b).len() as u64,
+                None => 0,
+            },
+            None => 0,
+        };
+        Ok(Wal { file, path: path.to_path_buf(), cipher, id, records })
     }
 
     pub(crate) fn append(&mut self, r: &WalRecord) -> Result<()> {
@@ -1211,6 +1276,10 @@ impl Wal {
         put_u32(&mut out, body.len() as u32);
         put_u32(&mut out, crc32(&body));
         out.extend_from_slice(&body);
+        if let Some(c) = &self.cipher {
+            out = c.seal_record(&self.id, self.records, &out)?;
+            self.records += 1;
+        }
         self.file.write_all(&out)?;
         // Recorded so that a test can assert the sync below happens AFTER this.
         // Syncing before the append is not a missing sync -- the count is the
@@ -1241,8 +1310,20 @@ impl Wal {
     /// Replay. A torn tail — a record whose length or checksum does not check
     /// out — ends the replay rather than failing it: the process died mid-write
     /// and everything before that point is still good.
-    pub(crate) fn replay(path: &Path) -> Result<Vec<WalRecord>> {
+    pub(crate) fn replay(
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        id: &str,
+    ) -> Result<Vec<WalRecord>> {
         let Some(b) = read_optional(path)? else { return Ok(Vec::new()) };
+        // Under a cipher the log is frames, each holding one record as the
+        // plain log holds it. Opened in order and joined, the parse below
+        // applies unchanged; a torn or foreign frame ends the replay where
+        // a bad CRC would have.
+        let b: Vec<u8> = match cipher {
+            Some(c) => c.open_records(id, &b).concat(),
+            None => b,
+        };
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + 8 <= b.len() {
@@ -1299,6 +1380,7 @@ impl Wal {
         // `self.file` closes the first at the second assignment.
         self.file = truncate_file(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        self.records = 0;
         Ok(())
     }
 }
@@ -1329,6 +1411,9 @@ pub struct ShardOpts {
     /// The object store the `archived` tier lives in, and the key prefix.
     /// `None` keeps the local `archive/` directory as the stand-in.
     pub archive: Option<crate::objstore::ArchiveHandle>,
+    /// Encryption at rest, when the database has a key: every file this
+    /// shard writes is framed under it and every read opens the frames.
+    pub cipher: crate::cipher::Shared,
 }
 
 /// What a seal wrote. The ids are ascending, so the last is the segment
@@ -1442,6 +1527,16 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// `plain` as a file of this shard named `name` holds it: framed under
+    /// the cipher when there is one, itself otherwise. What an export, a
+    /// backup and a move carry for the files they make rather than copy.
+    pub(crate) fn seal_content(&self, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
+        match &self.opts.cipher {
+            Some(c) => c.seal_file(&self.file_id(name), plain),
+            None => Ok(plain.to_vec()),
+        }
+    }
+
     pub(crate) fn new(coll: Collection, clock: Arc<Hlc>, opts: ShardOpts) -> Shard {
         let memtable = Memtable::new(&coll, opts.budget.clone());
         Shard {
@@ -1493,7 +1588,14 @@ impl Shard {
         fs::create_dir_all(dir.join("segments"))?;
         fs::create_dir_all(dir.join("archive"))?;
         fs::create_dir_all(dir.join("deletes"))?;
-        self.wal = Some(Wal::open(&dir.join("wal.log"))?);
+        // The directory first: the log's identity under the cipher is the
+        // directory's name, and the log is opened under it.
+        self.dir = Some(dir.to_path_buf());
+        self.wal = Some(Wal::open(
+            &dir.join("wal.log"),
+            self.opts.cipher.clone(),
+            self.file_id("wal.log"),
+        )?);
         // Every one of those creations is a new entry in `dir`, and a directory
         // entry is dirty metadata like any other. The WAL's own fdatasync
         // flushes the record and cannot create the name that reaches it, so
@@ -1505,7 +1607,6 @@ impl Shard {
         // caller's to sync, because only the caller knows where the tree stops:
         // see `Db::build_shards`.
         sync_dir(dir)?;
-        self.dir = Some(dir.to_path_buf());
         // The lowest id this shard may use is what the DIRECTORY holds, and it
         // is decided here rather than in `Shard::open` because `open` is not
         // the only way in: `Db::build_shards` attaches without opening, and
@@ -2023,11 +2124,14 @@ impl Shard {
                 // agrees, since a tier change with no file move must still
                 // switch fault-in accounting.
                 if to.exists() {
-                    h.segment.set_source(if want_archive {
-                        SegmentSource::Archive(to.clone())
-                    } else {
-                        SegmentSource::File(to.clone())
-                    });
+                    h.segment.set_source(self.wrap_source(
+                        h.id(),
+                        if want_archive {
+                            SegmentSource::Archive(to.clone())
+                        } else {
+                            SegmentSource::File(to.clone())
+                        },
+                    ));
                     h.set_path(Some(to.clone()));
                 }
                 continue;
@@ -2039,11 +2143,14 @@ impl Shard {
             fs::rename(from, to)?;
             #[cfg(test)]
             durability_probe::note_rename(to);
-            h.segment.set_source(if want_archive {
-                SegmentSource::Archive(to.clone())
-            } else {
-                SegmentSource::File(to.clone())
-            });
+            h.segment.set_source(self.wrap_source(
+                h.id(),
+                if want_archive {
+                    SegmentSource::Archive(to.clone())
+                } else {
+                    SegmentSource::File(to.clone())
+                },
+            ));
             h.set_path(Some(to.clone()));
             moved += 1;
         }
@@ -2085,7 +2192,8 @@ impl Shard {
             let name = format!("{:016x}.seg", handle.id());
             let local = dir.join("segments").join(&name);
             let legacy = dir.join("archive").join(&name);
-            let is_remote = matches!(handle.segment.source(), SegmentSource::Remote { .. });
+            let is_remote =
+                matches!(handle.segment.source().unwrapped(), SegmentSource::Remote { .. });
             if want_archive {
                 let from = if local.exists() {
                     local.clone()
@@ -2101,11 +2209,10 @@ impl Shard {
                 let bytes = fs::read(&from)?;
                 h.store.put(&key, &bytes)?;
                 let size = bytes.len() as u64;
-                handle.segment.set_source(SegmentSource::Remote {
-                    store: h.store.clone(),
-                    key: key.clone(),
-                    size,
-                });
+                handle.segment.set_source(self.wrap_source(
+                    handle.id(),
+                    SegmentSource::Remote { store: h.store.clone(), key: key.clone(), size },
+                ));
                 handle.set_path(None);
                 fs::remove_file(&from)?;
                 #[cfg(test)]
@@ -2117,7 +2224,9 @@ impl Shard {
                 let bytes = h.store.get(&key)?;
                 publish(&local, &bytes)?;
                 sync_dir(&dir.join("segments"))?;
-                handle.segment.set_source(SegmentSource::File(local.clone()));
+                handle
+                    .segment
+                    .set_source(self.wrap_source(handle.id(), SegmentSource::File(local.clone())));
                 handle.set_path(Some(local.clone()));
                 h.store.delete(&key)?;
                 moved += 1;
@@ -2363,9 +2472,9 @@ impl Shard {
         // Durable before the manifest names it, and long before the WAL that
         // could rebuild it is truncated.
         let bytes = seg.encode()?;
-        atomic_write(&p, &bytes)?;
+        write_content(&self.opts.cipher, &self.segment_file_id(seg.id), &p, &bytes)?;
         // The local file is now the source; the in-memory copy can go.
-        seg.set_source(crate::segment::SegmentSource::File(p.clone()));
+        seg.set_source(self.wrap_source(seg.id, crate::segment::SegmentSource::File(p.clone())));
         Ok(Some(p))
     }
 
@@ -2474,8 +2583,13 @@ impl Shard {
             {
                 continue;
             }
-            publish(&p, &d)?;
-            published.push((h.id(), d));
+            let written = publish_content(
+                &self.opts.cipher,
+                &self.file_id(&format!("{:016x}.dlog", h.id())),
+                &p,
+                &d,
+            )?;
+            published.push((h.id(), written));
         }
         if !published.is_empty() {
             // One fsync of `deletes/` for the whole batch rather than one per
@@ -2513,10 +2627,10 @@ impl Shard {
         {
             return Ok(());
         }
-        atomic_write(&p, &body)?;
+        let written = write_content(&self.opts.cipher, &self.file_id("MANIFEST"), &p, &body)?;
         // Only after the rename is durable: a failed write must leave the next
         // call willing to try again.
-        *self.published_manifest.write().unwrap() = Some(body);
+        *self.published_manifest.write().unwrap() = Some(written);
         Ok(())
     }
 
@@ -2532,7 +2646,9 @@ impl Shard {
         // `Some` or an error, never "absent" for a file that is there and
         // cannot be read: that opened a shard with zero segments over a
         // directory full of them, and the next flush published the empty set.
-        if let Some(b) = read_optional(&dir.join("MANIFEST"))? {
+        if let Some(b) =
+            read_content(&s.opts.cipher, &s.file_id("MANIFEST"), &dir.join("MANIFEST"))?
+        {
             if b.len() < 4 {
                 return Err(Error::Storage("manifest: truncated".into()));
             }
@@ -2574,14 +2690,18 @@ impl Shard {
                 } else {
                     return Err(missing());
                 };
-                let seg = Segment::open(src)?;
+                let seg = Segment::open(s.wrap_source(meta.id, src))?;
                 s.adopt_segment(&seg);
                 // An empty delete log is never written, so absent means no
                 // deletions. Unreadable does not: it used to, and every
                 // document the log recorded as deleted came back. Neither
                 // does damaged, which is reported with the file's name.
                 let dpath = dir.join("deletes").join(format!("{:016x}.dlog", meta.id));
-                let dl = match read_optional(&dpath)? {
+                let dl = match read_content(
+                    &s.opts.cipher,
+                    &s.file_id(&format!("{:016x}.dlog", meta.id)),
+                    &dpath,
+                )? {
                     Some(d) => DeleteLog::decode(&d).map_err(|e| match e {
                         Error::Storage(m) => Error::Storage(format!("{}: {m}", dpath.display())),
                         e => e,
@@ -2595,7 +2715,7 @@ impl Shard {
             let live: Vec<u64> = m.segments.iter().map(|meta| meta.id).collect();
             reclaim_orphans(dir, &live);
         }
-        let records = Wal::replay(&dir.join("wal.log"))?;
+        let records = Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?;
         for r in records {
             s.clock.observe(r.ts);
             match r.kind {
@@ -2752,7 +2872,8 @@ impl Shard {
             // A retired segment that lived in the object store is deleted
             // there; nothing else ever will, since orphans are reclaimed
             // only where a directory can be listed.
-            if let SegmentSource::Remote { store, key, .. } = h.segment.source() {
+            if let SegmentSource::Remote { store, key, .. } = h.segment.source().unwrapped().clone()
+            {
                 let _ = store.delete(&key);
             }
             let _ = fs::remove_file(dir.join("deletes").join(format!("{:016x}.dlog", h.id())));
@@ -2815,6 +2936,36 @@ pub(crate) fn collect_from_handles(
 }
 
 impl Shard {
+    /// The identity a file of this shard is encrypted under: the shard's
+    /// directory name and the file's, so a segment keeps its key whether it
+    /// sits in `segments/`, `archive/` or the store, and a file cannot
+    /// stand in for another.
+    pub(crate) fn file_id(&self, name: &str) -> String {
+        let shard = self
+            .dir
+            .as_ref()
+            .and_then(|d| d.file_name())
+            .and_then(|f| f.to_str())
+            .unwrap_or("shard");
+        format!("{shard}/{name}")
+    }
+
+    fn segment_file_id(&self, id: u64) -> String {
+        self.file_id(&format!("{id:016x}.seg"))
+    }
+
+    /// `src`, framed under the shard's cipher when it has one.
+    fn wrap_source(&self, id: u64, src: SegmentSource) -> SegmentSource {
+        match &self.opts.cipher {
+            Some(c) => SegmentSource::Encrypted {
+                inner: Box::new(src),
+                cipher: c.clone(),
+                id: self.segment_file_id(id),
+            },
+            None => src,
+        }
+    }
+
     pub fn segment_summary(&self, t: Timestamp) -> Vec<(u64, u32, usize, usize, f64)> {
         self.segments
             .iter()
@@ -4417,7 +4568,7 @@ mod tests {
         // note written above its syscall rather than below it records a
         // durability that failed, and every assertion downstream believes it.
         durability_probe::start();
-        let mut w = Wal::open(null).unwrap();
+        let mut w = Wal::open(null, None, "t/wal.log".into()).unwrap();
         w.append(&WalRecord {
             kind: WAL_INSERT,
             key: "k".into(),
@@ -4717,7 +4868,7 @@ mod tests {
         // that is a different change -- but pinned, so that the day it is
         // fenced this test says so.
         assert_eq!(
-            Wal::replay(&log).unwrap().len(),
+            Wal::replay(&log, &None, "t/wal.log").unwrap().len(),
             3,
             "the first insert, the rejected insert and the rejected delete: the records of the \
              two rejected writes are in the log, which is what the comment in `insert` says"
@@ -4859,7 +5010,7 @@ mod tests {
             "the log was emptied for a manifest that was never published: {ev:?}"
         );
         assert_eq!(
-            Wal::replay(&dir.join("wal.log")).unwrap().len(),
+            Wal::replay(&dir.join("wal.log"), &None, "t/wal.log").unwrap().len(),
             40,
             "the only surviving copy of the sealed documents was thrown away"
         );
@@ -5086,7 +5237,7 @@ mod tests {
         }
         let good = fs::read(&log).unwrap();
         // The control: all three records are there and all three replay.
-        let replayed = Wal::replay(&log).unwrap();
+        let replayed = Wal::replay(&log, &None, "t/wal.log").unwrap();
         assert_eq!(replayed.len(), 3);
         assert_eq!(replayed[0].key, format!("t1{KEY_SEP}d0001"));
 
@@ -5099,7 +5250,7 @@ mod tests {
         assert_eq!(torn.len(), good.len(), "the damage is one flipped bit, not a truncation");
         fs::write(&log, &torn).unwrap();
 
-        let replayed = Wal::replay(&log).unwrap();
+        let replayed = Wal::replay(&log, &None, "t/wal.log").unwrap();
         assert_eq!(
             replayed.len(),
             1,
