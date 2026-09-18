@@ -46,6 +46,24 @@ inside a network you trust, put an ingress in front of it
 `celastro --url http://127.0.0.1:8787 repl` with the token in
 `CELASTRO_TOKEN` is a session against the cluster, any pod coordinating.
 
+### Dedicated coordinators
+
+```
+helm install celastro chart/celastro --set replicas=6 --set coordinators.replicas=1 --set console.expose=true
+```
+
+`coordinators.replicas` adds a second StatefulSet, `<release>-coord`, of
+pods started with `CELASTRO_ROLE=coordinator`: they hold no shards -- a
+placement, `REBALANCE` and `MOVE SHARD` never land one on them -- and only
+coordinate, so the fusion, the fetch and a walk's frontier run on cores
+with no seal or compaction of their own. Every pod of both roles attaches
+every other; every definition reaches the coordinators; the console
+Service spreads clients over the coordinators alone. Each keeps only its
+catalog, on `coordinators.persistence.size` (1Gi). Zero, the default,
+keeps every data pod coordinating what reaches it. One coordinator per
+four to eight data pods is the starting point for search traffic; the
+binary's docs/design.md says how the ratio is measured.
+
 ### Encryption in transit
 
 ```
@@ -231,6 +249,7 @@ changelog; those need every pod restarted together
 | `archive.accessKeyId`, `archive.secretAccessKey` | empty | the pair, if the chart is to make the `Secret` |
 | `archive.existingClaim`, `archive.mountPath` | empty, `/archive` | a ReadWriteMany claim (NFS, typically) mounted on every pod: the `archived` tier in `<mountPath>/tier` unless a bucket is configured, backups under `<mountPath>/backups` |
 | `backup.schedule`, `backup.to`, `backup.keep` | empty, `nightly`, empty | with a schedule, a CronJob sends `BACKUP TO '<to>' [KEEP <keep>]` to every pod's console: a name under the claim's `backups`, or `s3://bucket/prefix`; `keep` removes each pod's older backups after the run |
+| `coordinators.replicas`, `coordinators.persistence.size`, `coordinators.resources` | `0`, `1Gi`, empty | dedicated coordinator pods (`<release>-coord-N`), holding no shards; the console Service spreads over them alone when there are any |
 | `tls.enabled` | `false` | the wire and the console over TLS 1.3, one Ed25519 certificate per release, every pod verified against one CA; without the next two, a hook Job makes the material once |
 | `tls.days` | `3650` | the validity of the certificate the Job makes |
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro tls init`, naming every pod, both Services and `localhost` |

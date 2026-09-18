@@ -8,6 +8,21 @@
 # them off first (`MOVE SHARD`), then scale down.
 replicas: 1
 
+# Dedicated coordinators: pods that hold no shards and only coordinate,
+# so the fusion, the fetch and a walk's frontier run on cores with no
+# seal or compaction of their own. Zero means every data pod coordinates
+# the statements that reach it, as before. With any, the console Service
+# (`console.expose`) spreads clients over the coordinators alone, and the
+# data pods keep their consoles for probes and `kubectl port-forward`.
+# Each keeps only its catalog on a small volume. A ratio of one
+# coordinator per four to eight data pods is the starting point for
+# search traffic; measure before settling (the binary's docs say how).
+coordinators:
+  replicas: 0
+  persistence:
+    size: 1Gi
+  resources: {}
+
 # The wire between nodes: plain TCP with a shared token and no TLS, for a
 # network you trust. Served only when replicas is more than one. The token
 # comes from a Secret with the key CELASTRO_WIRE_TOKEN: name an existing

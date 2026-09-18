@@ -67,6 +67,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- range $i := until (int .Values.replicas) -}}
 {{- $peers = append $peers (printf "tcp://%s-%d.%s:%d" $name $i $name (int $port)) -}}
 {{- end -}}
+{{- $coord := printf "%s-coord" $name -}}
+{{- range $i := until (int .Values.coordinators.replicas) -}}
+{{- $peers = append $peers (printf "tcp://%s-%d.%s:%d" $coord $i $coord (int $port)) -}}
+{{- end -}}
 {{- join "," $peers -}}
 {{- end -}}
 

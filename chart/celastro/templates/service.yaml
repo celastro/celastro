@@ -28,10 +28,36 @@ spec:
       port: {{ .Values.wire.port }}
       targetPort: {{ .Values.wire.port }}
     {{- end }}
+{{- if gt (int .Values.coordinators.replicas) 0 }}
+---
+# The coordinators' headless service: their stable names, which the data
+# nodes attach and which resolve before the pods are ready, as above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "celastro.fullname" . }}-coord
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "celastro.selectorLabels" . | nindent 4 }}
+    celastro.io/role: coordinator
+  ports:
+    - name: console
+      port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+    - name: wire
+      port: {{ .Values.wire.port }}
+      targetPort: {{ .Values.wire.port }}
+{{- end }}
 {{- if .Values.console.expose }}
 ---
 # The console for clients: one address, requests spread over every ready
-# pod. Each request is its own connection, so the spread is per request.
+# pod -- over the coordinators alone when there are any, since that is
+# what they are for. Each request is its own connection, so the spread
+# is per request.
 apiVersion: v1
 kind: Service
 metadata:
@@ -42,6 +68,9 @@ spec:
   type: {{ .Values.console.service.type }}
   selector:
     {{- include "celastro.selectorLabels" . | nindent 4 }}
+    {{- if gt (int .Values.coordinators.replicas) 0 }}
+    celastro.io/role: coordinator
+    {{- end }}
   ports:
     - name: console
       port: {{ .Values.port }}

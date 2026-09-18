@@ -16,7 +16,9 @@ the data nodes' shards exactly as they do, and `FLUSH`, `COMPACT` and a
 lifecycle run go to the holders only. Its role travels in the wire's
 `hello`, is kept in the catalog (format 6; a catalog from an earlier
 version reads as before), and shows in `SHOW HEALTH`. A node from
-before roles is a data node. `DbOpts::role`, `engine::Role`.
+before roles is a data node. `DbOpts::role`, `engine::Role`. The chart's
+`coordinators.replicas` runs them as a second StatefulSet with the
+console Service over them alone.
 
 ## 0.44.0 — 2026-09-18
 
