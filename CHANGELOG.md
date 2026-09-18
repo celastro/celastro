@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.50.1 — 2026-09-18
+
+**A pooled connection to a superseded process is let go.** 0.50.0
+checked fresh connections only; the drill on real machines found a
+write riding a connection that a hello had just shown to be the older
+process. A hello that shows an epoch older than the newest seen at the
+address now drops the connection it came over, and a pooled connection
+whose process has since been superseded is dropped before the next call;
+either way the next call dials afresh and is refused.
+
 ## 0.50.0 — 2026-09-18
 
 The zombie fence's client half, hence a minor.

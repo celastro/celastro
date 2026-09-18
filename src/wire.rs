@@ -572,6 +572,11 @@ pub struct Node {
     /// the address -- a pod replaced while its predecessor still runs --
     /// and is refused before a statement reaches it.
     max_epoch: std::sync::atomic::AtomicU64,
+    /// The epoch of the process behind the pooled connection, from the
+    /// hello that checked it; zero when unknown. A connection to a process
+    /// older than the newest seen since is dropped before the next call,
+    /// which then dials afresh and is refused.
+    conn_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Node {
@@ -627,6 +632,7 @@ impl Node {
             dial_failed: Mutex::new(None),
             peer_format: std::sync::atomic::AtomicU8::new(0),
             max_epoch: std::sync::atomic::AtomicU64::new(0),
+            conn_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -698,6 +704,7 @@ impl Node {
                 )));
             }
             self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
+            self.conn_epoch.store(h.epoch, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -706,6 +713,12 @@ impl Node {
         let deadline_ms = crate::deadline::remaining_ms();
         let req = self.request(call, collection, shard, body);
         let mut guard = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+        // A pooled connection to a process an older hello has since shown to
+        // be superseded is let go here; the redial below asks again.
+        let conn = self.conn_epoch.load(Ordering::Relaxed);
+        if guard.is_some() && conn > 0 && conn < self.max_epoch.load(Ordering::Relaxed) {
+            *guard = None;
+        }
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -809,9 +822,15 @@ impl Node {
         let b = self.call(Call::Hello, "", 0, &[])?;
         let h = self.decode_hello(&b)?;
         // Noted, not refused: `SHOW HEALTH` names an older process from
-        // what a hello says, and a hello is how it looks.
+        // what a hello says, and a hello is how it looks. But the connection
+        // it came over is to that process, and is let go if a newer one has
+        // been seen: the next call dials afresh and is refused.
         if h.epoch > 0 {
-            self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
+            let max = self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed).max(h.epoch);
+            self.conn_epoch.store(h.epoch, Ordering::Relaxed);
+            if h.epoch < max {
+                *self.stream.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
         }
         Ok(h)
     }

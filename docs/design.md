@@ -494,8 +494,11 @@ volume is empty). That was the divergence, and 0.50.0 closes the half of it
 that needs no wire change: a node asks a fresh connection for a hello
 before the first statement goes down it and refuses an epoch older than
 the newest it has seen at the address (`Node::check_fresh`), so a write
-toward the old process is refused rather than taken; the drill's assertion
-flipped and passes. What waits for the next wire version is the other
+toward the old process is refused rather than taken. The drill's flipped
+assertion failed once more first: the write rode a pooled connection that
+a hello had just shown to be the older process, so a hello that shows one
+now drops the connection it came over, and a pooled connection to a
+process since superseded is dropped before the next call (0.50.1). What waits for the next wire version is the other
 half, a holder refusing a call from a stale caller, which needs the
 caller's epoch in the frame. Hello answers without the database lock when
 a statement holds it, from the process's fixed identity: the pull of a

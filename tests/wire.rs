@@ -1373,12 +1373,16 @@ fn a_fresh_connection_to_an_older_process_is_refused() {
     b.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
     a.ack("SHOW HEALTH");
     b.db.write().unwrap().pretend(Some(epoch), 0);
-    // The pooled connection closes idle; the next call dials afresh.
-    std::thread::sleep(std::time::Duration::from_millis(1800));
-    let e = a.db.write().unwrap().insert("items", doc(1)).unwrap_err().to_string();
-    assert!(e.contains("an older process answers at") && e.contains("refused"), "{e}");
+    // A hello over the pooled connection shows the older process: the
+    // connection is let go, and the next call, dialling afresh, is refused.
     let h = a.ack("SHOW HEALTH");
     assert!(h.contains("AN OLDER PROCESS ANSWERS HERE TOO"), "{h}");
+    let e = a.db.write().unwrap().insert("items", doc(1)).unwrap_err().to_string();
+    assert!(e.contains("an older process answers at") && e.contains("refused"), "{e}");
+    // And with no hello in between, once the pooled connection closes idle.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let e = a.db.write().unwrap().insert("items", doc(1)).unwrap_err().to_string();
+    assert!(e.contains("an older process answers at"), "{e}");
     // The newer process again: served.
     b.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
     std::thread::sleep(std::time::Duration::from_millis(1800));
