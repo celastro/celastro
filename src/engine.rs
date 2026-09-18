@@ -1218,13 +1218,35 @@ impl Db {
     /// credentials. Only the segment files the destination lacks are
     /// written, so a second backup of a database that did not change copies
     /// nothing but its record. See `crate::backup` for the layout.
-    pub fn backup(&mut self, dest: &str, keep: Option<usize>) -> Result<Outcome> {
+    pub fn backup(
+        &mut self,
+        dest: &str,
+        keep: Option<usize>,
+        as_of: Option<Timestamp>,
+    ) -> Result<Outcome> {
         if self.dir.is_none() {
             return Err(Error::Plan("BACKUP needs a persistent database (--dir)".into()));
         }
         let target =
             crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), dest)?;
-        let ts = self.clock.peek().max(self.last_commit);
+        let ts = match as_of {
+            None => self.clock.peek().max(self.last_commit),
+            Some(t) => {
+                // An instant another node chose: within this node's clock
+                // and the skew ATTACH allows, or it is not an instant of
+                // this cluster. Observed, so every commit from here on is
+                // after it and the cut is exact.
+                let now = crate::time::physical_micros(self.clock.peek());
+                if crate::time::physical_micros(t) > now + CLOCK_REFUSE_MICROS {
+                    return Err(Error::Plan(format!(
+                        "AS OF {t} is more than {} s ahead of this node's clock",
+                        CLOCK_REFUSE_MICROS / 1_000_000
+                    )));
+                }
+                self.clock.observe(t);
+                t
+            }
+        };
         let names: Vec<String> = self.catalog.collections.keys().cloned().collect();
         for name in &names {
             self.absorb_shard_catalogs(name)?;
@@ -1243,6 +1265,56 @@ impl Db {
         }
         let node = self.opts.node.clone().unwrap_or_default();
         Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls, keep)))
+    }
+
+    /// `BACKUP CLUSTER TO '<dest>' [KEEP n]`: this node's backup at an
+    /// instant it chooses, then `LOCAL BACKUP ... AS OF` that instant on
+    /// every other data node, one after another, after this node's copy
+    /// and outside its lock. The set restores to one consistent cut with
+    /// `RESTORE FROM '<dest>' AS OF <instant>` on each node. A node that
+    /// did not take it is named; the others' backups stand.
+    pub fn backup_cluster(&mut self, dest: &str, keep: Option<usize>) -> Result<Outcome> {
+        let ts = self.clock.now();
+        let Outcome::Deferred(local) = self.backup(dest, keep, Some(ts))? else {
+            unreachable!("a backup is deferred work")
+        };
+        let mut peers = Vec::new();
+        for url in self.data_nodes() {
+            if !self.is_self(&url) {
+                peers.push((url.clone(), self.node_conn(&url)?));
+            }
+        }
+        let sql = format!(
+            "LOCAL BACKUP TO '{}'{} AS OF {ts}",
+            dest.replace('\'', "''"),
+            keep.map(|k| format!(" KEEP {k}")).unwrap_or_default()
+        );
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let mine = match local.finish()? {
+                Outcome::Ack(m) => m,
+                other => return Ok(other),
+            };
+            let mut done = Vec::new();
+            let mut failed = Vec::new();
+            for (url, node) in peers {
+                // A copy takes what it takes; the statement deadline is
+                // not the measure of it.
+                let _no_deadline = crate::deadline::arm(None);
+                match node.statement(&sql, &[]) {
+                    Ok(m) => done.push(format!("{url}: {m}")),
+                    Err(e) => failed.push(format!("{url}: {e}")),
+                }
+            }
+            Ok(Outcome::Ack(format!(
+                "{mine}; at the same instant {ts}{}{}",
+                if done.is_empty() { String::new() } else { format!(" on {}", done.join("; ")) },
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!("; NOT on {}", failed.join("; "))
+                }
+            )))
+        })))
     }
 
     /// `VERIFY BACKUP '<src>' [NODE '<address>'] [AS OF <ts>]`: read every
@@ -4084,7 +4156,13 @@ impl Db {
                 let n = self.flush(&collection)?;
                 Ok(Outcome::Ack(format!("{n} shard(s) flushed")))
             }
-            Statement::Backup { to, keep } => self.backup(&to, keep),
+            Statement::Backup { to, keep, as_of, cluster } => {
+                if cluster {
+                    self.backup_cluster(&to, keep)
+                } else {
+                    self.backup(&to, keep, as_of)
+                }
+            }
             Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
             Statement::VerifyBackup { from, node, as_of } => {
                 self.verify_backup(&from, node.as_deref(), as_of)

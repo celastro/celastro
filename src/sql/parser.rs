@@ -191,6 +191,7 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Rebalance { collection: self.ident()? });
         }
         if self.eat_kw("BACKUP") {
+            let cluster = self.eat_kw("CLUSTER");
             self.expect_kw("TO")?;
             let to = self.destination()?;
             let keep = if self.eat_kw("KEEP") {
@@ -206,7 +207,26 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            return Ok(Statement::Backup { to, keep });
+            let as_of = if self.eat_kw("AS") {
+                self.expect_kw("OF")?;
+                match self.literal()? {
+                    Value::Int(n) if n >= 0 => Some(n as u64),
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "AS OF wants an instant, the integer another BACKUP reported, not {}",
+                            crate::json::to_string(&other)
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            if cluster && as_of.is_some() {
+                return Err(Error::Sql(
+                    "BACKUP CLUSTER chooses the instant itself; AS OF is for one node".into(),
+                ));
+            }
+            return Ok(Statement::Backup { to, keep, as_of, cluster });
         }
         if self.eat_kw("RESTORE") {
             self.expect_kw("FROM")?;

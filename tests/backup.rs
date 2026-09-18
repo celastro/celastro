@@ -403,3 +403,36 @@ fn nodes_back_up_side_by_side_and_each_restores_its_own_unless_told_otherwise() 
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// `AS OF` pins a backup at an instant another backup chose: what a
+/// cluster-wide backup carries to every node. Rows written after the
+/// instant are not in it, and an instant ahead of this node's clock by
+/// more than the skew a cluster allows is refused.
+#[test]
+fn a_backup_as_of_an_earlier_instant_holds_what_was_visible_then() {
+    let src = dir("asof-src");
+    let dest = dir("asof-dest");
+    let dest2 = dir("asof-dest2");
+    let mut db = open(&src);
+    setup(&mut db, 20);
+    let before = ids(&mut db, "SELECT id FROM items LIMIT 1000");
+    let first = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let ts1: u64 = first.split_whitespace().nth(1).unwrap().parse().unwrap();
+    for i in 100..110 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    let again = ack(&mut db, &format!("BACKUP TO '{}' AS OF {ts1}", dest2.display()));
+    assert!(again.starts_with(&format!("backup {ts1} ")), "{again}");
+    let d2 = dir("asof-dst");
+    let mut db2 = open(&d2);
+    ack(&mut db2, &format!("RESTORE FROM '{}' AS OF {ts1}", dest2.display()));
+    assert_eq!(ids(&mut db2, "SELECT id FROM items LIMIT 1000"), before);
+    let ahead = celastro::time::from_micros(celastro::time::physical_micros(ts1) + 60_000_000);
+    let e = db.execute(&format!("BACKUP TO '{}' AS OF {ahead}", dest2.display())).unwrap_err();
+    assert!(e.to_string().contains("ahead of this node's clock"), "{e}");
+    let e = db.execute("BACKUP CLUSTER TO 'x' AS OF 1").unwrap_err();
+    assert!(e.to_string().contains("chooses the instant itself"), "{e}");
+    for d in [src, dest, dest2, d2] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

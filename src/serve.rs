@@ -305,6 +305,25 @@ fn metrics_text(db: &Db) -> String {
             &labels,
             docs.to_string(),
         );
+        // Per shard, so a hot one shows: the reads and writes each has
+        // served since the process started.
+        for s in shards {
+            let labels = format!("{{collection={},shard=\"{}\"}}", jstr(&name), s.index);
+            line(
+                "celastro_shard_reads_total",
+                "counter",
+                "Reads (scans, candidate searches, lookups, expansions) the shard served.",
+                &labels,
+                s.reads.load(Relaxed).to_string(),
+            );
+            line(
+                "celastro_shard_writes_total",
+                "counter",
+                "Documents written or deleted on the shard.",
+                &labels,
+                s.writes.load(Relaxed).to_string(),
+            );
+        }
     }
     out
 }
@@ -2173,6 +2192,10 @@ mod tests {
         assert!(text.contains("# TYPE celastro_statements_total counter"), "{text}");
         assert!(text.contains("celastro_collections 1"), "{text}");
         assert!(text.contains("celastro_shards{collection=\"notes\"} 1"), "{text}");
+        assert!(
+            text.contains("celastro_shard_writes_total{collection=\"notes\",shard=\"0\"} "),
+            "{text}"
+        );
         assert!(text.contains("celastro_documents{collection=\"notes\"} 1"), "{text}");
         assert!(text.contains("celastro_statement_seconds_sum "), "{text}");
         assert!(COUNTERS.statements.load(AtomicOrdering::Relaxed) >= before + 3);

@@ -49,6 +49,18 @@ raises the format writes a file the previous one cannot open. Hence
 build's for the first days on a release, at the cost of what the newer
 fields carry.
 
+**`BACKUP CLUSTER TO`: one instant on every node.** Backed up node by
+node, a cluster is a set of instants with no cut through it. `BACKUP
+CLUSTER TO '…'` sent to one node backs every data node up at one instant
+that node chooses and carries to the others; `BACKUP TO '…' AS OF <ts>`
+is the per-node form it runs there, and is refused for an instant further
+ahead of the node's clock than a cluster allows. The set restores with
+`RESTORE FROM '…' AS OF <ts>` on each node.
+
+**Per-shard counters.** `celastro_shard_reads_total` and
+`celastro_shard_writes_total`, by collection and shard, on the metrics
+page: what shows a hot shard.
+
 **A retry's contract is tested.** Every statement delivered twice with
 nothing written in between leaves what once leaves; the one shape a retry
 can change, a `DELETE ... WHERE` delivered again after a write it did not

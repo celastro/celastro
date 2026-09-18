@@ -59,9 +59,15 @@ pub enum Statement {
     /// this node holds, pinned at one instant, copied incrementally; with
     /// `KEEP`, this node's backups at the destination beyond the newest `n`
     /// are removed afterwards, and the pool's segments nobody references.
+    /// `BACKUP [CLUSTER] TO '<dest>' [KEEP n] [AS OF <ts>]`: this node's
+    /// shards at an instant -- now, or the one given -- or, with `CLUSTER`,
+    /// every data node's at one instant this node chooses and carries to
+    /// them, so the set restores to one consistent cut.
     Backup {
         to: String,
         keep: Option<usize>,
+        as_of: Option<u64>,
+        cluster: bool,
     },
     /// `RESTORE FROM '<path or s3://bucket/prefix>' [NODE '<address>'] [AS OF
     /// <ts>]` -- into an empty database, this node's newest complete backup

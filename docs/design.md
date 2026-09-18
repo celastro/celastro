@@ -370,6 +370,20 @@ which is inherent, so `CELASTRO_CATALOG_FORMAT` pins the written format for
 the first days on a new release and the README's Deployment section says
 so.
 
+A backup taken node by node is a set of instants with no cut through the
+cluster: an edge in one node's backup can point at a node the other's does
+not yet have. `BACKUP CLUSTER TO` chooses one instant on the node it
+reaches, takes that node's backup at it, and after its own copy sends
+`LOCAL BACKUP TO ... AS OF <instant>` to every other data node in turn,
+outside its lock and without a deadline. A node given an instant observes
+it on its clock, so every commit from then on is after it and the cut is
+exact; an instant further ahead of its clock than `ATTACH` allows for skew
+is refused. The set restores with `RESTORE FROM ... AS OF <instant>` on
+each node. Per-shard read and write counters on the metrics page
+(`celastro_shard_reads_total`, `celastro_shard_writes_total`, by collection
+and shard) are what shows a hot shard, which range partitioning with fixed
+split keys can make.
+
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
 in constant time), the call, and what is left of the statement's deadline,
@@ -1509,6 +1523,7 @@ guarantee:
 | random histories of creations and drops on three nodes, reconciled pairwise in random orders, converge on every node to what the instants say, indexes on dead incarnations included | `reconcile::random_histories_on_three_nodes_converge_to_the_last_word_on_each_name` |
 | every statement delivered twice with nothing written in between leaves what once leaves; a `DELETE ... WHERE` retried after a write takes the new row too, by contract | `retry::every_statement_delivered_twice_leaves_what_once_leaves`, `retry::a_delete_by_predicate_retried_after_a_write_takes_the_new_row_too` |
 | a write through one node is read through every other at once, counts through different nodes never go backwards, and a delete through one is gone through all | `wire::a_write_through_one_node_is_read_through_every_other_at_once` |
+| a backup `AS OF` an earlier instant holds what was visible then; an instant ahead of the clock is refused; `BACKUP CLUSTER` backs every node up at one instant, verifiable on each | `backup::a_backup_as_of_an_earlier_instant_holds_what_was_visible_then`, `wire::a_cluster_backup_is_one_instant_on_every_node` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |

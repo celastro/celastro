@@ -208,10 +208,12 @@ impl ShardService for Local<'_> {
     }
 
     fn candidates(&self, req: &CandidatesRequest<'_>) -> Result<ShardCandidates> {
+        self.shard.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         exec::candidates_on(self.shard, self.index, req)
     }
 
     fn scan(&self, req: &ScanRequest<'_>) -> Result<ShardScan> {
+        self.shard.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         exec::scan_on(self.shard, self.index, req)
     }
 
@@ -225,10 +227,12 @@ impl ShardService for Local<'_> {
     }
 
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>> {
+        self.shard.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.shard.get(key, ts)
     }
 
     fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
+        self.shard.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         walk::expand_on(self.shard, req)
     }
 

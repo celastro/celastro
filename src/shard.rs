@@ -1538,6 +1538,11 @@ pub struct Shard {
     /// moment.
     #[cfg(test)]
     pub(crate) terms_gathered: AtomicU64,
+    /// Reads and writes this shard has served since the process started:
+    /// `celastro_shard_reads_total` and `_writes_total` on the metrics
+    /// page, per shard, which is what shows a hot shard.
+    pub reads: AtomicU64,
+    pub writes: AtomicU64,
     pub(crate) clock: Arc<Hlc>,
     dir: Option<PathBuf>,
     wal: Option<Wal>,
@@ -1608,6 +1613,8 @@ impl Shard {
             opts,
             #[cfg(test)]
             terms_gathered: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
             clock,
             dir: None,
             wal: None,
@@ -1871,6 +1878,7 @@ impl Shard {
     /// delete-log entry invalidates that version across every index type at
     /// once (§4.4).
     pub(crate) fn insert(&mut self, mut doc: Value) -> Result<Timestamp> {
+        self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         self.coll.validate(&doc)?;
         self.coll.coerce(&mut doc);
         let key = sort_key(&self.coll, &doc)?;
@@ -1949,6 +1957,7 @@ impl Shard {
     /// `supersedes` is computed against the version the one before it made.
     /// Returns the timestamps in order.
     pub(crate) fn insert_many(&mut self, docs: Vec<Value>) -> Result<Vec<Timestamp>> {
+        self.writes.fetch_add(docs.len() as u64, AtomicOrdering::Relaxed);
         let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
             Vec::with_capacity(docs.len());
         let mut keys = std::collections::BTreeSet::new();
@@ -2051,6 +2060,7 @@ impl Shard {
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<Option<Timestamp>> {
+        self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         let ts = self.clock.now();
         let Some(prev) = self.locate(key, MAX_TS) else { return Ok(None) };
         if let Some(w) = self.wal.as_mut() {

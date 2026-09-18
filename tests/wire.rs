@@ -1170,3 +1170,45 @@ fn a_write_through_one_node_is_read_through_every_other_at_once() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// `BACKUP CLUSTER` backs every data node up at one instant this node
+/// chooses, so the set restores to one cut: each node's backup is
+/// verifiable at that instant.
+#[test]
+fn a_cluster_backup_is_one_instant_on_every_node() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("cb-a");
+    let b = Node::start("cb-b");
+    let c = Node::start("cb-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        [&a, &b, &c][i % 3].db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let dest = dir("cb-dest");
+    let out = a.exec(&format!("BACKUP CLUSTER TO '{}'", dest.display())).unwrap();
+    let m = match out.finished().unwrap() {
+        Outcome::Ack(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let ts: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert!(m.contains(&format!("at the same instant {ts} on {}: backup {ts} ", b.url)), "{m}");
+    assert!(m.contains(&format!("{}: backup {ts} ", c.url)) && !m.contains("NOT on"), "{m}");
+    for n in [&a, &b, &c] {
+        let sql = format!("VERIFY BACKUP '{}' NODE '{}' AS OF {ts}", dest.display(), n.url);
+        let v = match a.exec(&sql).unwrap().finished().unwrap() {
+            Outcome::Ack(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(v.starts_with(&format!("verified backup {ts} of node")), "{v}");
+    }
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+}

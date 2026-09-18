@@ -364,6 +364,13 @@ set, a bare name resolves under it and no path may leave it — what a
 console reachable over a network should have. A cluster is backed up node
 by node; `celastro send <URL> "BACKUP TO '…'"` sends the statement to
 a running console, which is what the chart's CronJob runs on every pod.
+Backed up that way, each node's backup is at its own instant. `BACKUP
+CLUSTER TO '…'` sent to one node backs every data node up at one instant
+that node chooses and carries to the others (`BACKUP TO '…' AS OF <ts>`
+is what each of them runs), so the set restores to one consistent cut:
+`RESTORE FROM '…' AS OF <ts>` on each node, the instant the answer
+reported. A node the statement did not reach is named; the others'
+backups stand.
 
 ## How it works
 
