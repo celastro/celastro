@@ -993,12 +993,13 @@ fn attach_peers(db: &RwLock<Db>, stop: &AtomicBool, peers: &[String]) {
             // Dialling under the lock held every statement and every probe
             // behind it for as long as the peers took to start, and a pod
             // failed its liveness probe on its own health that way.
-            let reachable = celastro::wire::Node::new(url, token.as_deref(), tls.clone())
-                .and_then(|n| n.hello());
-            let r = reachable.and_then(|_| {
-                db.write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .execute(&format!("ATTACH NODE '{}'", url.replace('\'', "''")))
+            // And the catalog too, so nothing is dialled under the lock: a
+            // peer that vanished between the dial and the attach -- a
+            // rolling restart -- held every statement for a deadline.
+            let dialled = celastro::wire::Node::new(url, token.as_deref(), tls.clone())
+                .and_then(|n| n.hello().map(|h| (h, n.catalog().ok())));
+            let r = dialled.and_then(|(hello, theirs)| {
+                db.write().unwrap_or_else(|p| p.into_inner()).attach_prepared(url, &hello, theirs)
             });
             match r {
                 Ok(_) => eprintln!("celastro: attached {url}"),

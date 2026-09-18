@@ -6,6 +6,26 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.47.1 — 2026-09-18
+
+Two fixes the resilience suite's first drills found.
+
+**A node attaching its peers at start dials nothing under the lock.** The
+mixed-version drill, run as a scenario of the resilience runner, found
+the console of the last pod rolled blocked for 45 s: `ATTACH` fetched the
+peer's hello and catalog under the write lock, and a peer that vanished
+between the dial and the attach -- the next pod of the rollout -- held
+every statement for a deadline. A node at start now fetches both first
+and attaches with `Db::attach_prepared`; the operator's `ATTACH NODE`
+still dials, bounded by its deadline.
+
+**`hello` reports the wall clock, not the HLC.** The HLC runs ahead of
+the wall by whatever a peer's timestamps pushed it to, which is not skew,
+and two pods on one kernel accused each other of ten seconds by it. `SHOW
+HEALTH` now names an HLC that runs more than a second ahead of the wall
+clock, since every commit from then on carries it; where the ten seconds
+came from in that drill is an open question in the design notes.
+
 ## 0.47.0 — 2026-09-18
 
 The reconciliation proven, mixed versions drilled, and a cluster-wide

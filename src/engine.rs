@@ -1767,6 +1767,14 @@ impl Db {
                 String::new()
             }
         ));
+        let lead = self.hlc_lead_micros();
+        if lead > 1_000_000 {
+            out.push_str(&format!(
+                "clock: the HLC runs {:.1} s ahead of the wall clock, pushed there by a peer's \
+                 timestamps; every commit from here on carries it\n",
+                lead as f64 / 1e6
+            ));
+        }
         if let Some(tls) = &self.opts.tls {
             let now = crate::time::now_micros() / 1_000_000;
             let describe = |what: &str, at: i64| -> String {
@@ -2096,9 +2104,19 @@ impl Db {
         self.pretend_epoch.unwrap_or(self.epoch)
     }
 
-    /// This node's clock as `hello` reports it, microseconds.
+    /// This node's wall clock as `hello` reports it, microseconds. The wall
+    /// clock and not the HLC: the HLC runs ahead of the wall by whatever a
+    /// peer's timestamps pushed it to, which is not skew, and a drill saw
+    /// two pods on one kernel accuse each other of ten seconds by it.
     pub fn clock_micros(&self) -> u64 {
-        (lifecycle::now_micros(&self.clock) as i64 + self.pretend_clock_micros).max(0) as u64
+        (crate::time::now_micros() + self.pretend_clock_micros).max(0) as u64
+    }
+
+    /// How far this node's HLC runs ahead of its wall clock, microseconds:
+    /// what a peer's timestamps pushed it to. Named by `SHOW HEALTH` past a
+    /// second, since every commit from here on carries it.
+    pub fn hlc_lead_micros(&self) -> i64 {
+        lifecycle::now_micros(&self.clock) as i64 - crate::time::now_micros()
     }
 
     /// Claim another epoch, or a clock this far off, in every `hello` from
@@ -2451,9 +2469,21 @@ impl Db {
     }
 
     /// Declare a node this one may place shards on. The node is asked who it
-    /// is, so a typo is refused now rather than at the first CREATE.
+    /// is, so a typo is refused now rather than at the first CREATE. The
+    /// asking happens under the caller's lock; a node attaching its peers
+    /// at start dials first and calls [`Db::attach_prepared`], so a peer
+    /// that vanished between the two does not hold every statement for a
+    /// deadline.
     pub fn attach_node(&mut self, url: &str) -> Result<()> {
         let _deadline = self.arm_default_deadline();
+        self.attachable(url)?;
+        let hello = self.node_conn(url)?.hello()?;
+        let theirs = self.node_conn(url).and_then(|n| n.catalog()).ok();
+        self.attach_prepared(url, &hello, theirs)
+    }
+
+    /// What `ATTACH` refuses before it dials.
+    fn attachable(&self, url: &str) -> Result<String> {
         let me = self.opts.node.clone().ok_or_else(|| {
             Error::Plan(
                 "this node has no address; start it with CELASTRO_NODE=tcp://host:port \
@@ -2465,7 +2495,18 @@ impl Db {
         if url == me {
             return Err(Error::Plan("a node cannot attach itself".into()));
         }
-        let hello = self.node_conn(url)?.hello()?;
+        Ok(me)
+    }
+
+    /// Attach a node whose hello, and catalog, the caller already fetched
+    /// without holding the lock. What a node at start does for each peer.
+    pub fn attach_prepared(
+        &mut self,
+        url: &str,
+        hello: &crate::wire::Hello,
+        theirs: Option<Catalog>,
+    ) -> Result<()> {
+        self.attachable(url)?;
         match hello.node.as_deref() {
             Some(a) if a == url => {}
             Some(a) => {
@@ -2499,7 +2540,7 @@ impl Db {
                 )));
             }
         }
-        for note in self.observe_peer(url, &hello) {
+        for note in self.observe_peer(url, hello) {
             crate::log::warn("peer", &[("node", url.to_string()), ("note", note)]);
         }
         self.attached.insert(url.to_string());
@@ -2520,7 +2561,7 @@ impl Db {
         // it from before its directory existed; `reconcile` refuses that
         // and says so. A peer from before this call answers nothing, and
         // nothing is adopted.
-        if let Ok(theirs) = self.node_conn(url).and_then(|n| n.catalog()) {
+        if let Some(theirs) = theirs {
             for note in self.reconcile(&theirs)? {
                 crate::log::info(
                     "catalog_reconciled",
