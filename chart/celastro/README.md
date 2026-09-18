@@ -129,6 +129,10 @@ A client that retries rides it out; measured below.
 
 ### Encryption at rest
 
+Off by default: `encryption.existingSecret` is empty and every pod
+writes its volume, the tier and its backups in the clear. To turn it on,
+at install:
+
 ```
 celastro key master ./master.key
 CELASTRO_MASTER_KEY_FILE=./master.key celastro key init ./KEY

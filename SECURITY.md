@@ -143,7 +143,9 @@ is bounded by the bytes that remain.
 
 ## Encryption at rest, and what it is
 
-With `CELASTRO_MASTER_KEY_FILE` or `CELASTRO_MASTER_KEY` set, every file
+Off by default: without a master key every file is written in the clear,
+and nothing warns about it beyond this sentence and the README's. With
+`CELASTRO_MASTER_KEY_FILE` or `CELASTRO_MASTER_KEY` set, every file
 the database writes -- segments, delete logs, manifests, the write-ahead
 log, `RANGE`, `CATALOG`, the objects an archived tier puts in a store,
 backups and exports -- is a sequence of ChaCha20-Poly1305 frames (64 KiB

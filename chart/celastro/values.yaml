@@ -64,7 +64,8 @@ tls:
 # Name a Secret with two keys: `master.key`, from `celastro key master`
 # (64 hex digits), and `KEY`, from `celastro key init` run with that
 # master (the wrapped data key every pod starts with, so a shard moves
-# between pods and a backup restores on any of them). Empty is plain.
+# between pods and a backup restores on any of them). Empty, the default,
+# is plain: no encryption at rest.
 # Set at install: a pod that has written plain data refuses a master key,
 # and one that has written under a key refuses to start without it.
 encryption:

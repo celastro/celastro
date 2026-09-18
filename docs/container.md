@@ -242,7 +242,8 @@ Logs: `serve` writes one line per event to stderr, timestamped and
 levelled; `CELASTRO_LOG=json` makes them JSON lines, which is what a
 cluster's log collector wants.
 
-Encryption at rest: mount a master key and set `CELASTRO_MASTER_KEY_FILE`
+Encryption at rest is off by default: the volume at `/data` is written in
+the clear. To turn it on, mount a master key and set `CELASTRO_MASTER_KEY_FILE`
 to it (`celastro key master` writes one), and every file under
 `/data`, the tier and the backups are encrypted under a data key kept
 wrapped in `/data/KEY`; a cluster's pods also take `CELASTRO_KEY_FILE`, the

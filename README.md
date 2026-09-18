@@ -35,6 +35,10 @@ celastro --dir ./data run quickstart.sql
 celastro --dir ./data serve
 ```
 
+`./data` is written in the clear and the console is plain HTTP on
+loopback: encryption at rest and TLS are both off by default, and the
+[Encryption](#encryption) section is how to turn either on.
+
 ```
 http://127.0.0.1:8787/?t=31beccfc...        # the console's URL; the token follows ?t=
 ```
@@ -125,7 +129,7 @@ language, no unbounded paths, no analytics.
 | `health [--port N] [--attached N]` | exit 0 if a console is serving — and has verified `N` peers; a container's probes |
 | `export <COLLECTION> <DIR>`, `import <DIR>` | copy a collection as of an instant, without stopping the source; adopt one |
 | `send <URL> <SQL>` | one statement to a running console, the answer as JSON — what a backup CronJob runs |
-| `key master <FILE>`, `key init <FILE>`, `key rekey <KEY> <MASTER>` | encryption at rest: a master key, a wrapped data key for a cluster, a master rotated |
+| `key master <FILE>`, `key init <FILE>`, `key rekey <KEY> <MASTER>` | encryption at rest, off until a master key is given: make one, a wrapped data key for a cluster, rotate the master |
 | `tls init <DIR> <NAME>`, `tls secret <SECRET> <NAME>` | a CA and a certificate, as files or as a Kubernetes Secret |
 | `version` | |
 
@@ -159,8 +163,10 @@ rollback possible through the first days on a new release, start it with
 the cost of what the newer fields carry, and lift the pin once the
 release is trusted.
 
-What is optional in every shape: TLS on the console and the wire
-(`CELASTRO_TLS_*`), encryption at rest (`CELASTRO_MASTER_KEY_FILE`), an
+What is optional in every shape, and off until asked for: TLS on the
+console and the wire (`CELASTRO_TLS_*`), encryption at rest
+(`CELASTRO_MASTER_KEY_FILE`; every example on this page writes its data
+in the clear unless it says otherwise), an
 S3-compatible store or a shared mount behind the `archived` tier and the
 backups (`CELASTRO_ARCHIVE_*`, `CELASTRO_BACKUP_DIR`), and the tunables in
 [docs/tuning.md](docs/tuning.md). What is not: one process per data
@@ -194,6 +200,10 @@ A `serve` also compacts on its own — one job at a time, built outside the
 lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 
 ## Encryption
+
+Both kinds are **off by default**: a data directory is written in the
+clear, and the console and the wire are plain HTTP and TCP, until the
+keys below are given. Nothing turns either on by itself.
 
 In transit: `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
 (PEM) put the console and the wire on TLS 1.3, with session tickets so a
