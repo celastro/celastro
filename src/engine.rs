@@ -130,6 +130,34 @@ fn check_prefix_cap(n: usize) -> Result<()> {
 /// catalog write.
 const ACTIVITY_PERSIST_MICROS: u64 = 60_000_000;
 
+/// What a node is for. A data node holds shards and coordinates the
+/// statements that reach it; a coordinator holds no shards and only
+/// coordinates, so the fusion, the fetch and a walk's frontier run on a
+/// node with no seal or compaction of its own to contend with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Data,
+    Coordinator,
+}
+
+impl Role {
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Data => "data",
+            Role::Coordinator => "coordinator",
+        }
+    }
+
+    /// `data` or `coordinator`, as `CELASTRO_ROLE` spells them.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "data" => Some(Role::Data),
+            "coordinator" => Some(Role::Coordinator),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DbOpts {
@@ -183,6 +211,10 @@ pub struct DbOpts {
     /// (`CELASTRO_KEY_FILE`): how the pods of a cluster share one data key,
     /// so a shard moves between them and a backup restores on any of them.
     pub key_file: Option<PathBuf>,
+    /// What this node is for: a data node holds shards and coordinates; a
+    /// coordinator holds no shards, takes none from a placement, a
+    /// rebalance or a move, and only coordinates (`CELASTRO_ROLE`).
+    pub role: Role,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -215,6 +247,7 @@ impl Default for DbOpts {
             insert_batch: 1000,
             master_key: None,
             key_file: None,
+            role: Role::Data,
             node: None,
             tls: None,
         }
@@ -1584,7 +1617,8 @@ impl Db {
         let mut out = String::new();
         let (seal_failures, last_seal) = self.seal_failures();
         out.push_str(&format!(
-            "this node: {here}, celastro {}, {} collection(s), {} shard(s) held, directory {}{}\n",
+            "this node: {here}, {}, celastro {}, {} collection(s), {} shard(s) held, directory {}{}\n",
+            self.opts.role.name(),
             env!("CARGO_PKG_VERSION"),
             self.catalog.collections.len(),
             self.shards.values().map(|s| s.len()).sum::<usize>(),
@@ -1624,7 +1658,8 @@ impl Db {
                 Ok(h) => {
                     up.insert(url.clone());
                     out.push_str(&format!(
-                        "node {url}: up, celastro {}, {} ms\n",
+                        "node {url}: up, {}, celastro {}, {} ms\n",
+                        h.role.name(),
                         h.version,
                         started.elapsed().as_millis()
                     ));
@@ -1711,6 +1746,49 @@ impl Db {
     }
 
     /// Whether a placement entry means this node.
+    /// This node's role.
+    pub fn role(&self) -> Role {
+        self.opts.role
+    }
+
+    /// The nodes a shard may be placed on: this one when it is a data
+    /// node, then every attached node that is not a coordinator, in the
+    /// order they were attached.
+    fn data_nodes(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(me) = &self.opts.node {
+            if self.opts.role == Role::Data {
+                v.push(me.clone());
+            }
+        }
+        v.extend(
+            self.catalog.nodes.iter().filter(|n| !self.catalog.coordinators.contains(*n)).cloned(),
+        );
+        v
+    }
+
+    /// Whether `node` is a coordinator: this one by its role, another by
+    /// what its `hello` said at `ATTACH`.
+    fn is_coordinator(&self, node: &str) -> bool {
+        if self.is_self(node) {
+            self.opts.role == Role::Coordinator
+        } else {
+            self.catalog.coordinators.contains(node)
+        }
+    }
+
+    /// The nodes a DDL reaches besides this one: every holder of the
+    /// collection, and every coordinator, which plans over it.
+    fn ddl_targets(&self, collection: &str) -> Vec<String> {
+        let mut v = self.holders(collection);
+        for c in &self.catalog.coordinators {
+            if !self.is_self(c) && !v.contains(c) {
+                v.push(c.clone());
+            }
+        }
+        v
+    }
+
     fn is_self(&self, node: &str) -> bool {
         node.is_empty() || Some(node) == self.opts.node.as_deref()
     }
@@ -1768,13 +1846,24 @@ impl Db {
                         "node {n} is not attached; ATTACH NODE '{n}' first"
                     )));
                 }
+                if self.is_coordinator(n) {
+                    return Err(Error::Plan(format!(
+                        "node {n} is a coordinator and holds no shards; name a data node"
+                    )));
+                }
             }
             nodes.to_vec()
         } else {
             match &self.opts.node {
-                Some(me) => {
-                    let mut v = vec![me.clone()];
-                    v.extend(self.catalog.nodes.iter().cloned());
+                Some(_) => {
+                    let v = self.data_nodes();
+                    if v.is_empty() {
+                        return Err(Error::Plan(
+                            "no data node to place shards on: this node is a coordinator and no \
+                             data node is attached; ATTACH NODE the data nodes first"
+                                .into(),
+                        ));
+                    }
                     v
                 }
                 None => vec![String::new()],
@@ -1797,7 +1886,9 @@ impl Db {
     fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<()> {
         self.adopt_collection(coll.clone(), tablets.clone())?;
         let mut failures = Vec::new();
-        for url in self.holders(&coll.name) {
+        // Every holder, and every coordinator: a coordinator holds none of
+        // it but plans over it, so it needs the definition and the map.
+        for url in self.ddl_targets(&coll.name) {
             if let Err(e) = self.node_conn(&url).and_then(|n| n.create_collection(&coll, &tablets))
             {
                 failures.push(format!("{url}: {e}"));
@@ -1884,6 +1975,11 @@ impl Db {
             shards.push(sh);
         }
         if let Some(dir) = &self.dir {
+            // A node that holds none of the collection's shards -- a
+            // coordinator, or a data node the placement skipped -- still
+            // gets the collection's directory, so the sync below has one
+            // to sync and a reopen finds the collection where it looks.
+            fs::create_dir_all(dir.join("collections").join(&coll.name))?;
             // The shard directories now hold durable files under durable
             // names. The names of the DIRECTORIES are a separate question:
             // `create_dir_all` leaves them as dirty metadata in their parents,
@@ -1936,6 +2032,11 @@ impl Db {
         self.attached.insert(url.to_string());
         if !self.catalog.nodes.iter().any(|n| n == url) {
             self.catalog.nodes.push(url.to_string());
+        }
+        if hello.role == Role::Coordinator {
+            self.catalog.coordinators.insert(url.to_string());
+        } else {
+            self.catalog.coordinators.remove(url);
         }
         self.persist_catalog()
     }
@@ -2088,6 +2189,11 @@ impl Db {
         if from == to || (self.is_self(&from) && self.is_self(to)) {
             return Err(Error::Plan(format!("shard {shard} of `{collection}` is already on {to}")));
         }
+        if self.is_coordinator(to) {
+            return Err(Error::Plan(format!(
+                "node {to} is a coordinator and holds no shards; move shard {shard} to a data node"
+            )));
+        }
         if self.dir.is_none() {
             return Err(Error::Plan("a move needs a persistent database (--dir)".into()));
         }
@@ -2138,6 +2244,12 @@ impl Db {
         }
         if !self.is_self(&from) {
             order.push(from.clone());
+        }
+        // The coordinators plan by the map, so they hear where the shard went.
+        for c in &self.catalog.coordinators {
+            if !self.is_self(c) && !order.contains(c) {
+                order.push(c.clone());
+            }
         }
         let sql = format!("PLACE SHARD {shard} OF {collection} ON '{to}'");
         let done = self.propagate(&order, &sql, &[])?;
@@ -2310,8 +2422,11 @@ impl Db {
         let me = self.opts.node.clone().ok_or_else(|| {
             Error::Plan("this node has no address; nothing to rebalance over".into())
         })?;
-        let mut nodes = vec![me];
-        nodes.extend(self.catalog.nodes.iter().cloned());
+        let _ = me;
+        let nodes = self.data_nodes();
+        if nodes.is_empty() {
+            return Err(Error::Plan("no data node to rebalance over".into()));
+        }
         let mut done = Vec::new();
         for (i, t) in tablets.iter().enumerate() {
             let target = &nodes[i % nodes.len()];
@@ -3311,22 +3426,30 @@ impl Db {
     /// a write and the node-local statements fan out through other means or
     /// not at all.
     fn fan_out_of(&self, stmt: &Statement) -> Vec<String> {
-        let collection = match stmt {
-            Statement::CreateIndex(c) => Some(c.collection.clone()),
+        // A definition changes on every node that plans over the
+        // collection, coordinators included; a seal, a compaction or a
+        // lifecycle run happens where the shards are.
+        let (collection, definition) = match stmt {
+            Statement::CreateIndex(c) => (Some(c.collection.clone()), true),
             Statement::AlterIndexTier { collection, .. }
             | Statement::AlterCollection { collection, .. }
-            | Statement::DropIndex { collection, .. }
-            | Statement::Flush { collection }
-            | Statement::Compact { collection } => Some(collection.clone()),
-            Statement::DropCollection { name } => Some(name.clone()),
-            Statement::CreateLifecyclePolicy(d) => Some(d.collection.clone()),
-            Statement::DropLifecyclePolicy { name } => {
-                self.catalog.policies.get(name).map(|p| p.collection.clone())
+            | Statement::DropIndex { collection, .. } => (Some(collection.clone()), true),
+            Statement::Flush { collection } | Statement::Compact { collection } => {
+                (Some(collection.clone()), false)
             }
-            Statement::RunLifecycle { collection: Some(c) } => Some(c.clone()),
-            _ => None,
+            Statement::DropCollection { name } => (Some(name.clone()), true),
+            Statement::CreateLifecyclePolicy(d) => (Some(d.collection.clone()), true),
+            Statement::DropLifecyclePolicy { name } => {
+                (self.catalog.policies.get(name).map(|p| p.collection.clone()), true)
+            }
+            Statement::RunLifecycle { collection: Some(c) } => (Some(c.clone()), false),
+            _ => (None, false),
         };
-        collection.map(|c| self.holders(&c)).unwrap_or_default()
+        match collection {
+            Some(c) if definition => self.ddl_targets(&c),
+            Some(c) => self.holders(&c),
+            None => Vec::new(),
+        }
     }
 
     fn run(

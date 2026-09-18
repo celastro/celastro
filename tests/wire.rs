@@ -37,10 +37,20 @@ impl Node {
     /// A node on a given port with a given directory: what a node that
     /// comes back after a restart is -- the same address, the same data.
     fn start_at(tag: &str, port: u16, reuse: Option<PathBuf>) -> Node {
+        Node::start_role(tag, port, reuse, celastro::engine::Role::Data)
+    }
+
+    fn start_role(
+        tag: &str,
+        port: u16,
+        reuse: Option<PathBuf>,
+        role: celastro::engine::Role,
+    ) -> Node {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let url = format!("tcp://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = reuse.unwrap_or_else(|| dir(tag));
         let mut opts = DbOpts::default();
+        opts.role = role;
         opts.node = Some(url.clone());
         let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -56,7 +66,7 @@ impl Node {
     }
 
     fn ack(&self, sql: &str) -> String {
-        match self.exec(sql).unwrap() {
+        match self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
             Outcome::Ack(m) => m,
             other => panic!("{sql}: {other:?}"),
         }
@@ -137,6 +147,68 @@ const QUERIES: &[&str] = &[
      'linear') LIMIT 8",
 ];
 
+/// A coordinator holds no shards: a placement, a rebalance and a move never
+/// land one on it; every DDL reaches it, so it plans and answers over the
+/// data nodes' shards exactly as they do; and `SHOW HEALTH` says what it is.
+#[test]
+fn a_coordinator_holds_no_shards_and_answers_over_the_data_nodes() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let c = Node::start_role("coord-c", 0, None, celastro::engine::Role::Coordinator);
+    let a = Node::start("coord-a");
+    let b = Node::start("coord-b");
+    // Everyone attaches everyone, as the chart does.
+    for (x, y) in [(&c, &a), (&c, &b), (&a, &b), (&a, &c), (&b, &a), (&b, &c)] {
+        x.ack(&format!("ATTACH NODE '{}'", y.url));
+    }
+    // Created at the coordinator: three shards over the two data nodes,
+    // none here.
+    let m = c.ack(CREATE);
+    assert!(m.contains("3 shard(s) on"), "{m}");
+    assert!(c.local_shards("items").is_empty(), "the coordinator holds nothing");
+    assert_eq!(a.local_shards("items").len() + b.local_shards("items").len(), 3);
+    // A DDL run at a data node reaches the coordinator's catalog.
+    a.ack(INDEXES[0]);
+    a.ack(INDEXES[1]);
+    let cat = c.ack("SHOW CATALOG items");
+    assert!(cat.contains("index items_body") && cat.contains("index items_emb"), "{cat}");
+    // Writes through the coordinator land on the owners; queries fan out.
+    for i in 0..60usize {
+        c.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    let one_dir = dir("coord-one");
+    let mut one = Db::open(&one_dir, DbOpts::default()).unwrap();
+    for sql in [CREATE, INDEXES[0], INDEXES[1]] {
+        one.execute(sql).unwrap();
+    }
+    for i in 0..60usize {
+        one.insert("items", doc(i)).unwrap();
+    }
+    for q in QUERIES {
+        let want = shape(&one.query(q).unwrap());
+        assert_eq!(shape(&c.query(q).unwrap()), want, "{q} at the coordinator");
+    }
+    // Nothing moves a shard onto it.
+    let e = a.exec(&format!("MOVE SHARD 0 OF items TO '{}'", c.url)).unwrap_err().to_string();
+    assert!(e.contains("is a coordinator"), "{e}");
+    let sql = format!("CREATE COLLECTION more (id TEXT PRIMARY KEY) WITH (nodes = ['{}'])", c.url);
+    let e = c.exec(&sql).unwrap_err().to_string();
+    assert!(e.contains("is a coordinator"), "{e}");
+    c.ack("REBALANCE items");
+    assert!(c.local_shards("items").is_empty(), "a rebalance skips the coordinator");
+    let health = a.ack("SHOW HEALTH");
+    assert!(health.contains(&format!("node {}: up, coordinator, ", c.url)), "{health}");
+    assert!(health.starts_with(&format!("this node: {}, data, ", a.url)), "{health}");
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&one_dir);
+}
+
 /// `SHOW HEALTH` names every node with whether it answers and every shard
 /// with whether its holder does; a node that went away is DOWN and its
 /// shard UNREACHABLE, from any other node.
@@ -153,7 +225,7 @@ fn show_health_names_every_node_and_shard_and_a_lost_node_is_down() {
     let text = a.ack("SHOW HEALTH");
     assert!(text.starts_with(&format!("this node: {}", a.url)), "{text}");
     for n in [&b, &c] {
-        assert!(text.contains(&format!("node {}: up, celastro ", n.url)), "{text}");
+        assert!(text.contains(&format!("node {}: up, data, celastro ", n.url)), "{text}");
     }
     assert!(text.contains("shard 0 of `items`: on") && text.contains("reachable"), "{text}");
     assert!(text.ends_with("3 of 3 node(s) answer; 0 shard(s) unreachable"), "{text}");

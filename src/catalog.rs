@@ -16,7 +16,7 @@
 //! * JSON has no date type. A path is a `TIMESTAMP` only when declared in DDL
 //!   or explicitly cast; undeclared ISO-8601 strings stay strings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::codec::*;
 use crate::error::{Error, Result};
@@ -30,7 +30,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 5;
+const CATALOG_VERSION: u8 = 6;
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
@@ -551,6 +551,11 @@ pub struct Catalog {
     /// the policies are evaluated against. Persisted, because "idle for seven
     /// days" must not be reset by a restart.
     pub activity: BTreeMap<(String, String), crate::lifecycle::IndexActivity>,
+    /// The attached nodes that are coordinators: they hold no shards and
+    /// take none from a placement, a rebalance or a move, but every DDL
+    /// reaches them so they can plan. Learned from a node's `hello` at
+    /// `ATTACH`. Format 6.
+    pub coordinators: BTreeSet<String>,
     /// The other nodes this one may place shards on, in the order they were
     /// attached, which is the order a default placement walks. Control
     /// plane, so it is here and not in a flag; membership is declared.
@@ -755,6 +760,12 @@ impl Catalog {
                     put_opt_str(&mut out, t.hi.as_deref());
                 }
             }
+            if format >= 6 {
+                put_uvarint(&mut out, self.coordinators.len() as u64);
+                for n in &self.coordinators {
+                    put_str(&mut out, n);
+                }
+            }
         }
         out
     }
@@ -858,6 +869,7 @@ impl Catalog {
         let activity = crate::lifecycle::decode_activity(b, &mut i)?;
         let mut nodes = Vec::new();
         let mut placement = BTreeMap::new();
+        let mut coordinators = BTreeSet::new();
         if format >= 4 {
             let nn = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
             for _ in 0..nn {
@@ -877,8 +889,14 @@ impl Catalog {
                 }
                 placement.insert(name, tablets);
             }
+            if format >= 6 {
+                let nc = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                for _ in 0..nc {
+                    coordinators.insert(get_str(b, &mut i).ok_or_else(bad)?);
+                }
+            }
         }
-        Ok(Catalog { collections, policies, activity, nodes, placement, version })
+        Ok(Catalog { collections, policies, activity, nodes, placement, coordinators, version })
     }
 }
 
@@ -1072,7 +1090,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 5"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 6"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

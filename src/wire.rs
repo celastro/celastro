@@ -561,6 +561,9 @@ pub struct Hello {
     /// The address the node was started with, its name in placement maps.
     pub node: Option<String>,
     pub version: String,
+    /// What the node is for; a node from before roles says nothing and is
+    /// a data node.
+    pub role: crate::engine::Role,
 }
 
 impl Node {
@@ -717,7 +720,15 @@ impl Node {
     pub fn hello(&self) -> Result<Hello> {
         let b = self.call(Call::Hello, "", 0, &[])?;
         let mut i = 0;
-        Ok(Hello { node: get_opt(&b, &mut i)?, version: get_string(&b, &mut i)? })
+        let node = get_opt(&b, &mut i)?;
+        let version = get_string(&b, &mut i)?;
+        let role = if i < b.len() {
+            crate::engine::Role::parse(&get_string(&b, &mut i)?)
+                .unwrap_or(crate::engine::Role::Data)
+        } else {
+            crate::engine::Role::Data
+        };
+        Ok(Hello { node, version, role })
     }
 
     /// The holder's clock and its write counter for a collection: what a
@@ -1278,6 +1289,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
         Call::Hello => {
             put_opt_str(&mut out, db.node());
             put_str(&mut out, env!("CARGO_PKG_VERSION"));
+            put_str(&mut out, db.role().name());
         }
         Call::Counters => {
             db.collection(&collection)?;

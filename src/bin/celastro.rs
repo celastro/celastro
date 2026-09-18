@@ -120,7 +120,9 @@ in every placement map, and CELASTRO_WIRE_TOKEN, the secret every node shares;
 no port is given, in addresses too), and CELASTRO_ATTACH=tcp://a,tcp://b:2352
 names the peers it attaches as they
 come up, its own address skipped, so every node of a cluster can be given the
-same list. ATTACH NODE, CREATE COLLECTION ... WITH (nodes = [...]), MOVE SHARD,
+same list. CELASTRO_ROLE=coordinator makes a node hold no shards -- a
+placement, REBALANCE and MOVE SHARD never land one on it -- and only
+coordinate; it is started and attached like any other node. ATTACH NODE, CREATE COLLECTION ... WITH (nodes = [...]), MOVE SHARD,
 REBALANCE and LOCAL are the statements that go with it; docs/design.md has the
 rest.
 
@@ -2118,6 +2120,10 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     tuning_into(&mut o, &var)?;
     o.node = var("CELASTRO_NODE");
+    if let Some(v) = var("CELASTRO_ROLE") {
+        o.role = celastro::engine::Role::parse(&v)
+            .ok_or_else(|| format!("CELASTRO_ROLE: `{v}` is not data or coordinator"))?;
+    }
     if let Some(endpoint) = var("CELASTRO_ARCHIVE_ENDPOINT") {
         o.archive.endpoint = Some(endpoint);
         o.archive.bucket = var("CELASTRO_ARCHIVE_BUCKET").unwrap_or_default();

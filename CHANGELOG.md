@@ -6,6 +6,18 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`CELASTRO_ROLE=coordinator`.** A node that holds no shards and only
+coordinates: a placement, `REBALANCE` and `MOVE SHARD` never land a
+shard on it (they refuse by name), every definition -- a collection, an
+index, a tier, a policy, a shard's move -- reaches it so it plans over
+the data nodes' shards exactly as they do, and `FLUSH`, `COMPACT` and a
+lifecycle run go to the holders only. Its role travels in the wire's
+`hello`, is kept in the catalog (format 6; a catalog from an earlier
+version reads as before), and shows in `SHOW HEALTH`. A node from
+before roles is a data node. `DbOpts::role`, `engine::Role`.
+
 ## 0.44.0 — 2026-09-18
 
 Operations: what a node says about itself and what it does when the

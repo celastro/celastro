@@ -257,8 +257,12 @@ the node it reaches, so a cluster is backed up by sending it to each node
 (the chart's CronJob does), and `LOCAL` prefixes a statement to the one
 node it reaches.
 
-`SHOW HEALTH` from any node names every node with whether it answers and
-every shard with whether its holder does.
+A node started with `CELASTRO_ROLE=coordinator` holds no shards -- a
+placement, a rebalance and a move never land one on it -- and only
+coordinates: every definition reaches it, so it plans over the data
+nodes' shards exactly as they do, on cores with no seal or compaction of
+their own. `SHOW HEALTH` from any node names every node with its role and
+whether it answers, and every shard with whether its holder does.
 
 ## Kubernetes and containers
 
