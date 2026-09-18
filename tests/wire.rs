@@ -1350,3 +1350,43 @@ fn the_wire_accepts_a_second_token_for_a_rotation() {
     settle();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Two processes at one address, the old one reached through a stale
+/// name: a fresh connection that answers with an older epoch than the
+/// newest seen there is refused before a statement goes down it, so a
+/// write cannot land on the zombie. A hello still answers, since that is
+/// how SHOW HEALTH names it.
+#[test]
+fn a_fresh_connection_to_an_older_process_is_refused() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    std::env::set_var("CELASTRO_WIRE_IDLE_SECS", "1");
+    let a = Node::start("fence-a");
+    let b = Node::start("fence-b");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::env::remove_var("CELASTRO_WIRE_IDLE_SECS");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    a.db.write().unwrap().insert("items", doc(1)).unwrap();
+    let epoch = b.db.read().unwrap().epoch();
+    // A newer process was seen at b's address; then the old one answers.
+    b.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
+    a.ack("SHOW HEALTH");
+    b.db.write().unwrap().pretend(Some(epoch), 0);
+    // The pooled connection closes idle; the next call dials afresh.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let e = a.db.write().unwrap().insert("items", doc(1)).unwrap_err().to_string();
+    assert!(e.contains("an older process answers at") && e.contains("refused"), "{e}");
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("AN OLDER PROCESS ANSWERS HERE TOO"), "{h}");
+    // The newer process again: served.
+    b.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    a.db.write().unwrap().insert("items", doc(2)).unwrap();
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

@@ -6,7 +6,25 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.50.0 — 2026-09-18
+
+The zombie fence's client half, hence a minor.
+
+**A fresh connection asks who answers.** Two processes at one address --
+a pod replaced while its predecessor still runs, the old one reached
+through a stale name -- took a write on the old one that the new one
+never saw; the drill on real machines showed it. A node now asks a
+fresh connection for a hello before the first statement goes down it,
+and refuses an answer whose epoch is older than the newest it has seen
+at the address: one round trip per connection, and connections are
+pooled. The statement is refused naming the older process, or the shard
+is missing under `partial_results`; `SHOW HEALTH` still names the
+process from a hello, since a hello is how it looks. The other half --
+a holder refusing a call from a stale caller -- needs the caller's epoch
+in the frame and waits for the next wire version. Hello itself answers
+without the database lock when a statement holds it, from the process's
+fixed identity, since the pull of a move asks it of a source that holds
+its lock for the whole move.
 
 **A drill-only clock offset.** `CELASTRO_CLOCK_OFFSET_MICROS` offsets
 every read of the wall clock in the process, so one node of a cluster on

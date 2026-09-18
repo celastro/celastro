@@ -490,8 +490,17 @@ close short so a redial follows the name. `SHOW HEALTH` named it, "AN
 OLDER PROCESS ANSWERS HERE TOO", and the finding stands as predicted: a
 write forwarded to the old process is taken there and the new process
 never sees it (a read through it lists the shard as missing, since its
-volume is empty), which is the divergence the epoch fence at the next wire
-version refuses.
+volume is empty). That was the divergence, and 0.50.0 closes the half of it
+that needs no wire change: a node asks a fresh connection for a hello
+before the first statement goes down it and refuses an epoch older than
+the newest it has seen at the address (`Node::check_fresh`), so a write
+toward the old process is refused rather than taken; the drill's assertion
+flipped and passes. What waits for the next wire version is the other
+half, a holder refusing a call from a stale caller, which needs the
+caller's epoch in the frame. Hello answers without the database lock when
+a statement holds it, from the process's fixed identity: the pull of a
+move asks it of a source that holds its lock for the whole move, and the
+first run with the check found that out.
 
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
@@ -1655,6 +1664,7 @@ guarantee:
 | a due seal with a sealer running freezes rather than builds: the rows stay readable and deletable in the frozen memtable, the log is rotated aside, and the install commits the segment with the delete made meanwhile and removes the rotated log | `shard::background_seal_tests::a_frozen_memtable_is_read_and_deleted_until_its_seal_is_installed` |
 | a seal frozen but not installed when the process ends replays from its rotated log with the live one, and the next seal covers both | `shard::background_seal_tests::a_seal_frozen_but_not_installed_replays_from_its_rotated_log` |
 | a point lookup through the console answers while a 20,000-vector seal builds off the lock | `resilience::a_point_lookup_answers_while_a_large_vector_seal_builds` (`--ignored`) |
+| a fresh connection to a process older than the newest seen at its address is refused before a statement goes down it, and a hello still names it | `wire::a_fresh_connection_to_an_older_process_is_refused` |
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |

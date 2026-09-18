@@ -567,6 +567,11 @@ pub struct Node {
     /// The newest catalog format the peer said it reads, from its hello;
     /// zero until then.
     peer_format: std::sync::atomic::AtomicU8,
+    /// The newest epoch a hello from this address has carried. A fresh
+    /// connection that answers with an older one is a second process at
+    /// the address -- a pod replaced while its predecessor still runs --
+    /// and is refused before a statement reaches it.
+    max_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Node {
@@ -621,6 +626,7 @@ impl Node {
             tls,
             dial_failed: Mutex::new(None),
             peer_format: std::sync::atomic::AtomicU8::new(0),
+            max_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -650,14 +656,14 @@ impl Node {
     /// call that failed before anything was read is retried once over a
     /// fresh connection — every call here is a read or is idempotent on the
     /// holder, so a connection the holder closed while idle costs nothing.
-    fn call(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Result<Vec<u8>> {
-        let deadline_ms = crate::deadline::remaining_ms();
+    /// A request frame: the head every call carries, then the body.
+    fn request(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Vec<u8> {
         let mut req = vec![WIRE_VERSION];
         put_str(&mut req, &self.token);
         req.push(call as u8);
         put_str(&mut req, collection);
         put_uvarint(&mut req, shard as u64);
-        match deadline_ms {
+        match crate::deadline::remaining_ms() {
             Some(ms) => {
                 put_bool(&mut req, true);
                 put_uvarint(&mut req, ms);
@@ -665,6 +671,40 @@ impl Node {
             None => put_bool(&mut req, false),
         }
         req.extend_from_slice(body);
+        req
+    }
+
+    /// A fresh connection is asked who answers before a statement goes
+    /// down it: a hello, whose epoch must not be older than the newest this
+    /// node has seen at the address. One round trip per connection, and
+    /// connections are pooled. What it refuses is the zombie: two processes
+    /// at one address, the old one reached through a stale name, taking a
+    /// write the new one never sees.
+    fn check_fresh(&self, s: &mut Box<dyn Stream>) -> Result<()> {
+        let req = self.request(Call::Hello, "", 0, &[]);
+        s.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+        write_frame(s, &req)?;
+        let resp = read_frame(s)?;
+        let h = self.decode_hello(&decode_response(resp)?)?;
+        if h.epoch > 0 {
+            let max = self.max_epoch.load(Ordering::Relaxed);
+            if h.epoch < max {
+                return Err(Error::Plan(format!(
+                    "an older process answers at {}: it started at {} while one started at {} was \
+                     seen there; two processes share the address, and this one is refused",
+                    self.url,
+                    crate::time::format_micros(h.epoch as i64),
+                    crate::time::format_micros(max as i64)
+                )));
+            }
+            self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn call(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Result<Vec<u8>> {
+        let deadline_ms = crate::deadline::remaining_ms();
+        let req = self.request(call, collection, shard, body);
         let mut guard = self.stream.lock().unwrap_or_else(|p| p.into_inner());
         let mut attempt = 0;
         loop {
@@ -682,8 +722,18 @@ impl Node {
                 let mut backoff = Duration::from_millis(100);
                 loop {
                     match self.connect() {
-                        Ok(s) => {
+                        Ok(mut s) => {
                             *self.dial_failed.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                            // A hello asks for itself; every other call
+                            // asks who answers first.
+                            if call != Call::Hello {
+                                if let Err(e) = self.check_fresh(&mut s) {
+                                    let why = format!("({e})");
+                                    return Err(Error::Deadline(
+                                        self.refusal(call, collection, shard, &why),
+                                    ));
+                                }
+                            }
                             *guard = Some(s);
                             break;
                         }
@@ -757,19 +807,28 @@ impl Node {
 
     pub fn hello(&self) -> Result<Hello> {
         let b = self.call(Call::Hello, "", 0, &[])?;
+        let h = self.decode_hello(&b)?;
+        // Noted, not refused: `SHOW HEALTH` names an older process from
+        // what a hello says, and a hello is how it looks.
+        if h.epoch > 0 {
+            self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
+        }
+        Ok(h)
+    }
+
+    fn decode_hello(&self, b: &[u8]) -> Result<Hello> {
         let mut i = 0;
-        let node = get_opt(&b, &mut i)?;
-        let version = get_string(&b, &mut i)?;
+        let node = get_opt(b, &mut i)?;
+        let version = get_string(b, &mut i)?;
         let role = if i < b.len() {
-            crate::engine::Role::parse(&get_string(&b, &mut i)?)
-                .unwrap_or(crate::engine::Role::Data)
+            crate::engine::Role::parse(&get_string(b, &mut i)?).unwrap_or(crate::engine::Role::Data)
         } else {
             crate::engine::Role::Data
         };
-        let now_micros = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
-        let epoch = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
+        let now_micros = if i < b.len() { get_u64(b, &mut i).ok_or_else(truncated)? } else { 0 };
+        let epoch = if i < b.len() { get_u64(b, &mut i).ok_or_else(truncated)? } else { 0 };
         let catalog_format = if i < b.len() {
-            get_u8(&b, &mut i)?
+            get_u8(b, &mut i)?
         } else {
             // What each release before the field read; a move or a create
             // sent in a newer format is refused by the peer as unreadable,
@@ -1149,9 +1208,19 @@ pub fn serve(
     tls: Option<Arc<Tls>>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let token = Arc::new(token);
-    let also = Arc::new(token_also_from_env());
-    let moves = db.read().unwrap_or_else(|p| p.into_inner()).moves();
+    let (moves, identity) = {
+        let g = db.read().unwrap_or_else(|p| p.into_inner());
+        (
+            g.moves(),
+            Arc::new(Identity {
+                node: g.node().map(String::from),
+                role: g.role(),
+                epoch: g.epoch(),
+                token,
+                also: token_also_from_env(),
+            }),
+        )
+    };
     let max_connections: usize = env_num("CELASTRO_WIRE_MAX_CONNECTIONS", WIRE_MAX_CONNECTIONS);
     let idle: u64 = env_num("CELASTRO_WIRE_IDLE_SECS", WIRE_IDLE_SECS);
     let idle = (idle > 0).then(|| Duration::from_secs(idle));
@@ -1188,14 +1257,13 @@ pub fn serve(
                     }
                 };
                 let db = db.clone();
-                let token = token.clone();
-                let also = also.clone();
                 let stop = stop.clone();
                 let moves = moves.clone();
+                let identity = identity.clone();
                 let open = open.clone();
                 open.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    serve_connection(s, &db, &moves, &token, also.as_deref(), &stop, idle);
+                    serve_connection(s, &db, &moves, &identity, &stop, idle);
                     open.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -1213,12 +1281,24 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 
 type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
 
+/// What a hello says of this process, fixed for its life: answered
+/// without the database lock when a statement holds it, since a peer's
+/// fresh connection asks before every statement -- including the pull of
+/// a move, whose source holds its lock for the whole statement.
+struct Identity {
+    node: Option<String>,
+    role: crate::engine::Role,
+    epoch: u64,
+    /// The wire token, and the second one a rotation accepts.
+    token: String,
+    also: Option<String>,
+}
+
 fn serve_connection(
     mut s: Box<dyn Stream>,
     db: &RwLock<Db>,
     moves: &Moves,
-    token: &str,
-    also: Option<&str>,
+    identity: &Identity,
     stop: &AtomicBool,
     idle: Option<Duration>,
 ) {
@@ -1250,7 +1330,7 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, token, also, &frame) {
+        match handle(db, moves, identity, &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -1321,13 +1401,7 @@ impl Held<'_> {
     }
 }
 
-fn handle(
-    db: &RwLock<Db>,
-    moves: &Moves,
-    token: &str,
-    also: Option<&str>,
-    frame: &[u8],
-) -> Result<Vec<u8>> {
+fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
     let _serving = Serving;
     let mut i = 0;
@@ -1339,6 +1413,7 @@ fn handle(
         )));
     }
     let given = get_string(frame, &mut i)?;
+    let (token, also) = (identity.token.as_str(), identity.also.as_deref());
     if !token_matches(token, &given) && !also.is_some_and(|a| token_matches(a, &given)) {
         return Err(Error::Plan(format!("wire token refused; both nodes read {TOKEN_ENV}")));
     }
@@ -1429,6 +1504,30 @@ fn handle(
     // documents, a hop -- take the shared lock and run beside each other
     // and beside this node's own reads; everything that changes something
     // takes the exclusive one.
+    if call == Call::Hello {
+        // Under the lock when it is free, so a test's pretended epoch or
+        // clock shows; from the fixed identity when a statement holds it.
+        let (node, role, clock, epoch) = match db.try_read() {
+            Ok(g) => (g.node().map(String::from), g.role(), g.clock_micros(), g.epoch()),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let g = p.into_inner();
+                (g.node().map(String::from), g.role(), g.clock_micros(), g.epoch())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => (
+                identity.node.clone(),
+                identity.role,
+                crate::time::now_micros().max(0) as u64,
+                identity.epoch,
+            ),
+        };
+        put_opt_str(&mut out, node.as_deref());
+        put_str(&mut out, env!("CARGO_PKG_VERSION"));
+        put_str(&mut out, role.name());
+        put_u64(&mut out, clock);
+        put_u64(&mut out, epoch);
+        out.push(CATALOG_VERSION);
+        return Ok(out);
+    }
     let read_call = matches!(
         call,
         Call::Hello
@@ -1452,14 +1551,7 @@ fn handle(
         Call::AbortMove => {
             db.exclusive().abort_move(&collection, shard);
         }
-        Call::Hello => {
-            put_opt_str(&mut out, db.node());
-            put_str(&mut out, env!("CARGO_PKG_VERSION"));
-            put_str(&mut out, db.role().name());
-            put_u64(&mut out, db.clock_micros());
-            put_u64(&mut out, db.epoch());
-            out.push(CATALOG_VERSION);
-        }
+        Call::Hello => unreachable!("answered above"),
         Call::Catalog => {
             put_bytes(&mut out, &db.catalog.encode());
         }
