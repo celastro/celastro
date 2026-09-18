@@ -230,7 +230,7 @@ CELASTRO_NODE=tcp://10.0.0.2:2352 CELASTRO_WIRE_TOKEN=... celastro --dir ./data 
 ATTACH NODE 'tcp://10.0.0.3';               -- port 2352 unless given
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
   PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per node
-MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';
+MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';  -- issue it to the source or the target, not a third node
 REBALANCE notes;
 ```
 

@@ -505,6 +505,22 @@ a statement holds it, from the process's fixed identity: the pull of a
 move asks it of a source that holds its lock for the whole move, and the
 first run with the check found that out.
 
+A shard moved under a write load, sixty thousand rows of half a kilobyte
+(`bigmove`): the move completes in under two seconds on one host, every
+acknowledged write is there afterwards, and the map agrees everywhere. Two
+things it showed about who issues the move. Issued to the source, which
+was also the node the load wrote through, no write was refused while the
+shard was pinned: the source holds its lock for the whole move, so the
+writes waited behind it -- for a large shard, a console blocked for the
+copy. Issued to a third node, the move took the whole thirty-second
+deadline and a lookup on the source waited it out too: the coordinator
+holds its lock for the move, the target's pull needs the target's lock,
+and that lock was held by a write forwarded from the load through the
+target to a shard on the coordinator, which waited on the coordinator's
+lock -- a cycle that only the deadline breaks. Until the copy runs off the
+coordinator's lock, as a backup's copy does, issue a move to its source or
+its target, and expect the source's console to wait for the copy.
+
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.
