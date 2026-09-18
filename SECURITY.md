@@ -127,6 +127,17 @@ release's values while set, which is why the third step clears it. The
 console token is per node and per client and rotates on its own terms:
 clients take the new one when the Secret changes and the pods restart.
 
+A certificate rotation has the same shape, and the CA file may hold
+several certificates for it: every node trusts the new CA too (a rollout),
+every node presents a leaf from the new CA and still trusts the old (a
+rollout), the old CA is dropped (a rollout). Give the new CA a different
+name: a node tries every anchor, but a client whose library matches an
+issuer by subject name alone -- OpenSSL, so curl and Python -- takes the
+first CA of that name in its bundle and fails the signature against it.
+The certificates carry no key identifiers yet, which is what would settle
+that for every client. A drill runs the three steps under TLS on the wire
+and the console and checks every count between them.
+
 ## The TLS, and what it is
 
 The TLS is written in this repository (`src/crypto`), because the crate

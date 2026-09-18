@@ -91,6 +91,14 @@ helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=
 is then your update of it. The resilience drill `rotation` runs these
 three by `kubectl set env` and checks every count after each.
 
+A certificate rotation with `tls.existingSecret` is the same three
+rollouts on the Secret's files: `ca.crt` holding both CAs; then the new
+`tls.crt` and `tls.key` with both CAs; then the new CA alone. Make the
+new material under a different name (`celastro tls init ./tls-next
+celastro-next ...`): a client that matches an issuer by name alone, as
+OpenSSL does, takes the first CA of that name and fails against it. The
+drill `certrotation` runs it.
+
 ### Encryption in transit
 
 ```
