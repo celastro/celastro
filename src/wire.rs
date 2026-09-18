@@ -583,6 +583,12 @@ pub struct Hello {
     /// The newest catalog format the node reads: what a catalog sent to it
     /// is encoded as. A node from before the field is placed by its version.
     pub catalog_format: u8,
+    /// This node's wall clock as the answer was read, microseconds: what
+    /// `now_micros` is compared against. Taken here and not by whoever
+    /// looks at the hello later, since a lock waited for or a call made in
+    /// between is not skew -- a sweep once accused a peer of eleven seconds
+    /// that way.
+    pub received_micros: u64,
 }
 
 impl Node {
@@ -763,7 +769,8 @@ impl Node {
             }
         };
         self.peer_format.store(catalog_format, Ordering::Relaxed);
-        Ok(Hello { node, version, role, now_micros, epoch, catalog_format })
+        let received_micros = crate::time::now_micros().max(0) as u64;
+        Ok(Hello { node, version, role, now_micros, epoch, catalog_format, received_micros })
     }
 
     /// A catalog as the peer reads it: the newest format it said it reads,

@@ -1825,7 +1825,7 @@ impl Db {
                     up.insert(url.clone());
                     let notes = self.observe_peer(url, &h);
                     let clock = if h.now_micros > 0 {
-                        let skew = h.now_micros as i64 - self.clock_micros() as i64;
+                        let skew = h.now_micros as i64 - self.received_at(&h) as i64;
                         format!(
                             ", clock {:+.1} s{}",
                             skew as f64 / 1e6,
@@ -2127,6 +2127,17 @@ impl Db {
         self.pretend_clock_micros = clock_offset_micros;
     }
 
+    /// When a hello was read, on this node's clock as `hello` reports it:
+    /// the receipt instant the wire stamped, offset like `clock_micros`
+    /// for a test that pretends, or now for a hello made by hand.
+    fn received_at(&self, hello: &crate::wire::Hello) -> u64 {
+        if hello.received_micros > 0 {
+            (hello.received_micros as i64 + self.pretend_clock_micros).max(0) as u64
+        } else {
+            self.clock_micros()
+        }
+    }
+
     /// What has been seen of a peer, if a hello from it was observed.
     pub fn peer_seen(&self, url: &str) -> Option<PeerSeen> {
         guard(&self.peers_seen).get(url).copied()
@@ -2158,7 +2169,7 @@ impl Db {
             entry.epoch = entry.epoch.max(hello.epoch);
         }
         if hello.now_micros > 0 {
-            entry.skew_micros = hello.now_micros as i64 - self.clock_micros() as i64;
+            entry.skew_micros = hello.now_micros as i64 - self.received_at(hello) as i64;
             if entry.skew_micros.abs() > CLOCK_WARN_MICROS {
                 notes.push(format!(
                     "the clock at {url} is {:+.1} s from this node's",
@@ -2528,7 +2539,7 @@ impl Db {
         // never ready, and the rollout never moved.
         let _ = &hello.version;
         if hello.now_micros > 0 {
-            let skew = hello.now_micros as i64 - self.clock_micros() as i64;
+            let skew = hello.now_micros as i64 - self.received_at(hello) as i64;
             if skew.abs() > CLOCK_REFUSE_MICROS {
                 return Err(Error::Plan(format!(
                     "the clock at {url} is {:+.1} s from this node's, more than {} s: every \

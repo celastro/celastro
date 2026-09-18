@@ -6,6 +6,14 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Clock skew is measured as the hello is read.** A sweep computed a
+peer's skew after the call that followed the hello, and accused a peer
+of eleven seconds that were a wait, not skew. The wire stamps the receipt
+instant on the hello, and `ATTACH`, `SHOW HEALTH` and the sweep compare
+against that.
+
 ## 0.47.1 — 2026-09-18
 
 Two fixes the resilience suite's first drills found.

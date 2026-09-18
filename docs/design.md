@@ -425,9 +425,20 @@ And a pod complained of a peer's clock ten seconds off, on one kernel:
 `hello` reported the HLC's physical part, which runs ahead of the wall by
 whatever a peer's timestamps pushed it to. It reports the wall clock now,
 and `SHOW HEALTH` names an HLC more than a second ahead of the wall.
-Where those ten seconds came from -- some timestamp ten seconds in the
-future observed by a node during a rolling upgrade with a move each way
--- is not known yet, and is the next thing the scenario asserts on.
+The ten seconds were the measurement: the sweep compared the peer's clock
+with its own after the call that followed the hello, and a call that
+waited was read as skew. The wire now stamps the receipt instant on the
+hello and every comparison uses it. And the 45 s was not the console at
+all: a restarted pod has a new address, the cluster's DNS keeps the old
+one for up to 30 s (the window the five-node experiment found), and the
+probe dialled a dead address until its own timeout. A rolling restart
+after two shard moves, on one version, reproduced both, and a runner that
+waits for every name to resolve to its pod's current address measured the
+window at 29 s; with that wait the mixed-version scenario passes end to
+end, the move each way included. The window is the cluster's to shorten
+(a shorter TTL on the headless service's records) and a client's to
+absorb (a connect timeout under the DNS TTL and a retry); the pods absorb
+it with the dial retry and the attach loop.
 
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
