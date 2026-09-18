@@ -475,6 +475,24 @@ the seal was a temporary in an `if let`, alive through the build and the
 install that takes the lock again -- which is the kind of thing this suite
 is for.
 
+Two scenarios need a machine per node, and ran on a cluster of four small
+virtual machines driven by a script of their own. The clock jump: one node's kernel
+clock set an hour ahead under the cluster, then two behind. The others
+flagged it within a sweep; a re-`ATTACH` was refused naming NTP; a write
+through it committed an hour ahead and read back through any node at once
+(a read's snapshot is the maximum of the holders' clocks); and the other
+nodes' HLCs did not follow it -- a node's jump stays its own, which was
+not what the plan predicted and is the better outcome. Set behind, the
+node's own HLC ran two hours ahead of its wall and `SHOW HEALTH` said so.
+The zombie: a second process claiming a node's address on the spare
+machine, the name repointed on the others and back, with the wire's idle
+close short so a redial follows the name. `SHOW HEALTH` named it, "AN
+OLDER PROCESS ANSWERS HERE TOO", and the finding stands as predicted: a
+write forwarded to the old process is taken there and the new process
+never sees it (a read through it lists the shard as missing, since its
+volume is empty), which is the divergence the epoch fence at the next wire
+version refuses.
+
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.

@@ -52,7 +52,7 @@ impl Hlc {
     }
 
     fn wall() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
+        now_micros().max(0) as u64
     }
 
     /// Issue a timestamp strictly greater than every timestamp this clock has
@@ -249,8 +249,21 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// A drill's offset on every read of the wall clock, microseconds:
+/// `CELASTRO_CLOCK_OFFSET_MICROS`, so one node of a cluster on kind sees
+/// a jumped clock without the kernel's clock moving. Zero outside a
+/// drill. It tests the code's reaction to a jump, not the operating
+/// system's; a VM per node is the real drill.
+static CLOCK_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_clock_offset(micros: i64) {
+    CLOCK_OFFSET.store(micros, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The wall clock, microseconds since the epoch, plus a drill's offset.
 pub fn now_micros() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
+        + CLOCK_OFFSET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]

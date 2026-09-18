@@ -2125,6 +2125,15 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         o.role = celastro::engine::Role::parse(&v)
             .ok_or_else(|| format!("CELASTRO_ROLE: `{v}` is not data or coordinator"))?;
     }
+    if let Some(v) = var("CELASTRO_CLOCK_OFFSET_MICROS") {
+        let off: i64 = v
+            .parse()
+            .map_err(|_| format!("CELASTRO_CLOCK_OFFSET_MICROS: `{v}` is not a number"))?;
+        celastro::time::set_clock_offset(off);
+        eprintln!(
+            "celastro: DRILL: the clock is offset by {off} us; not for a database anyone relies on"
+        );
+    }
     if let Some(v) = var("CELASTRO_CATALOG_FORMAT") {
         let f: u8 =
             v.parse().map_err(|_| format!("CELASTRO_CATALOG_FORMAT: `{v}` is not a number"))?;

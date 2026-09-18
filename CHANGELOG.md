@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A drill-only clock offset.** `CELASTRO_CLOCK_OFFSET_MICROS` offsets
+every read of the wall clock in the process, so one node of a cluster on
+kind sees a jumped clock without the kernel's moving; the start-up log
+says so, and it is never for a database anyone relies on. The clock-jump
+scenario runs with it on kind, and ran for real on a cluster of virtual
+machines with one node's kernel clock set an hour ahead and then two behind: the
+others flag the node within a sweep, an `ATTACH` of it is refused
+naming NTP, its writes commit an hour ahead and read back through any
+node, the other nodes' clocks do not follow it, and set behind its own
+HLC runs ahead of its wall until the wall catches up.
+
 ## 0.49.0 — 2026-09-18
 
 The seal builds off the lock, hence a minor.

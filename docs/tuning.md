@@ -66,6 +66,7 @@ process itself and the page cache the kernel reclaims under pressure.
 | `CELASTRO_WIRE_MAX_CONNECTIONS` | `1024` | Connections the wire serves at once; past it a connection is accepted and closed, and `celastro_wire_connections_refused_total` counts it. A thread per connection is what it bounds. |
 | `CELASTRO_WIRE_IDLE_SECS` | `300` | A wire connection that carried no frame for this long is closed; the peer's next call reconnects on its own. `0` keeps them. |
 | (the seal's build) | off the lock | With `serve`, a seal that is due freezes the memtable and the console's maintenance thread builds its segments holding no lock; two frozen seals it has not caught up with are the bound, past which a write builds inline. `FLUSH` seals inline. A library caller without the thread builds inline unless it sets `DbOpts::background_seal` and runs the triple itself. |
+| `CELASTRO_CLOCK_OFFSET_MICROS` | `0` | A drill's offset on every read of the wall clock, so one node sees a jumped clock without the kernel's moving; the start-up log says so. Never for a database anyone relies on. |
 | `CELASTRO_RECONCILE_SECS` | `30` | How often the console pulls every known peer's catalog and adopts the definitions and drops this node missed while they could not reach each other. `0` turns the sweep off; `ATTACH NODE` reconciles regardless. `celastro_catalog_reconciled_total` counts what it changed. |
 | `CELASTRO_COMPACTION_DEAD_RATIO` | `0.30` | A segment whose deleted or superseded share passes this is rewritten on its own, whatever its size class. |
 
