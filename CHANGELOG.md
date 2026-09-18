@@ -36,6 +36,19 @@ frame carries no epoch yet.
 over many unreachable peers takes one connect timeout and not one per
 peer.
 
+**Mixed versions: a catalog crosses the wire in the format the peer
+reads.** A drill with 0.45.0 and 0.46.0 in one cluster showed a shard
+move from the newer node to the older refused as "catalog format version
+7 is not readable": the move ships the definition as a catalog in the
+sender's format. `hello` now carries the newest format a node reads and a
+catalog sent to a peer is encoded in it; a peer from before the field is
+placed by its version. The same drill showed a rollback after the rollout
+crash-looping on the same message, which is inherent: a release that
+raises the format writes a file the previous one cannot open. Hence
+`CELASTRO_CATALOG_FORMAT`, which pins the written format below this
+build's for the first days on a release, at the cost of what the newer
+fields carry.
+
 **A retry's contract is tested.** Every statement delivered twice with
 nothing written in between leaves what once leaves; the one shape a retry
 can change, a `DELETE ... WHERE` delivered again after a write it did not

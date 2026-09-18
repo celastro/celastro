@@ -61,6 +61,7 @@ process itself and the page cache the kernel reclaims under pressure.
 | `CELASTRO_COMPACTION_SEGMENT_CAP` | `5000000` | The largest segment compaction makes, in documents. |
 | `CELASTRO_COMPACTION_DEBT` | `32` | Backpressure: flat (level 0) segments a shard may hold before each write to it waits, so a load cannot run further ahead of compaction than reads can bear. `celastro_backpressure_waits_total` in the metrics counts the waits. |
 | `CELASTRO_COMPACTION_DEBT_WAIT_MS` | `20` | The wait per flat segment past the debt, a second at most per write. |
+| `CELASTRO_CATALOG_FORMAT` | this build's | The catalog format written to disk, pinned below this build's so the previous release can still open the directory after a rollback. Costs what the newer fields carry: at 7 and 8, the tombstones and instants the reconciliation compares by, so a drop made while pinned does not reconcile after a restart. Lift it once the release is trusted. |
 | `CELASTRO_RECONCILE_SECS` | `30` | How often the console pulls every known peer's catalog and adopts the definitions and drops this node missed while they could not reach each other. `0` turns the sweep off; `ATTACH NODE` reconciles regardless. `celastro_catalog_reconciled_total` counts what it changed. |
 | `CELASTRO_COMPACTION_DEAD_RATIO` | `0.30` | A segment whose deleted or superseded share passes this is rewritten on its own, whatever its size class. |
 

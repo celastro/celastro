@@ -355,6 +355,21 @@ a `DELETE ... WHERE` delivered again after a write it did not see, which
 takes the new rows too, because a predicate is evaluated when it runs; a
 client that cannot know nothing wrote in between deletes by key.
 
+Mixed versions were drilled on kind: three pods on 0.45.0, one upgraded to
+0.46.0 by a partitioned rollout, DDL from each side, a move each way, the
+rollout finished, then a rollback attempted. DDL worked both ways, since the
+wire version is what gates a frame and it did not change. The move from the
+newer node to the older failed: the move ships the collection's definition
+as a catalog, encoded in the newer format, which the older refused as
+unreadable. So `hello` now carries the newest catalog format the node reads
+and a catalog sent to a peer is encoded in that format (`Node::encode_for_peer`);
+a peer from before the field is placed by its version. The rollback
+crash-looped every pod on "catalog format version 7 is not readable": a
+release that raises the format writes a file the previous one cannot open,
+which is inherent, so `CELASTRO_CATALOG_FORMAT` pins the written format for
+the first days on a new release and the README's Deployment section says
+so.
+
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
 in constant time), the call, and what is left of the statement's deadline,
@@ -1493,6 +1508,7 @@ guarantee:
 | a walk is the neighbourhood and nothing else, the same at every layout and across nodes, and a cut or a dangling edge is said, never hidden | `engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else` (1..k, the start excluded, the edge filter at every hop, `REVERSE`, `OR`/`NOT`, fused with text and a distance, every refusal), `engine::tests::a_hop_statement_is_bit_identical_across_shard_counts` (1, 3 and 6 shards of both collections, memtable and segments, a deleted node and a dangling edge), `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers` (the same through the wire, and a holder that stops answering is a deadline or a named absence), `engine::tests::a_cut_walk_says_which_cap_bound_it` (both caps, the lexicographically first kept, the line on the response, in the plan and in the console's JSON), `engine::tests::a_dangling_edge_is_skipped_and_counted` (a never-existed and a deleted target, per hop, and nothing walked through a deleted node), `engine::tests::a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so` (twenty seeds over `expand` and `present`: refused or bit-identical, a partial answer inside the unfaulted neighbourhood and short only with `missing`), `sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`, `catalog::tests::catalog_round_trips` (format 5: `nodes_of`, `undirected`, the adjacency kind, and a 4 read as a plain collection) |
 | random histories of creations and drops on three nodes, reconciled pairwise in random orders, converge on every node to what the instants say, indexes on dead incarnations included | `reconcile::random_histories_on_three_nodes_converge_to_the_last_word_on_each_name` |
 | every statement delivered twice with nothing written in between leaves what once leaves; a `DELETE ... WHERE` retried after a write takes the new row too, by contract | `retry::every_statement_delivered_twice_leaves_what_once_leaves`, `retry::a_delete_by_predicate_retried_after_a_write_takes_the_new_row_too` |
+| a write through one node is read through every other at once, counts through different nodes never go backwards, and a delete through one is gone through all | `wire::a_write_through_one_node_is_read_through_every_other_at_once` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |

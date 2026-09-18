@@ -1125,3 +1125,48 @@ fn an_older_process_answering_at_an_attached_address_is_named() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A write through one node is read through any other at once, and two
+/// reads through different nodes never go backwards: a read's snapshot is
+/// the maximum of the holders' clocks, fetched per statement, so it covers
+/// every commit any node has acknowledged.
+#[test]
+fn a_write_through_one_node_is_read_through_every_other_at_once() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("ryw-a");
+    let b = Node::start("ryw-b");
+    let c = Node::start("ryw-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    let nodes = [&a, &b, &c];
+    let count = |n: &Node| -> usize {
+        let r = n.query("SELECT count(*) AS c FROM items").unwrap();
+        r.rows[0].doc.path("c").and_then(|v| v.as_i64()).unwrap() as usize
+    };
+    let mut last = 0;
+    for i in 0..30usize {
+        nodes[i % 3].db.write().unwrap().insert("items", doc(i)).unwrap();
+        for (j, n) in nodes.iter().enumerate() {
+            let r =
+                n.query(&format!("SELECT id FROM items WHERE id = 'doc-{i:03}' LIMIT 1")).unwrap();
+            assert_eq!(r.rows.len(), 1, "row {i} written through {} read through {j}", i % 3);
+            let c = count(n);
+            assert!(c >= last && c == i + 1, "count through {j} after row {i}: {c}, last {last}");
+            last = c;
+        }
+    }
+    assert!(b.db.write().unwrap().delete_key("items", "t1\u{1}doc-004").unwrap());
+    for (j, n) in nodes.iter().enumerate() {
+        let r = n.query("SELECT id FROM items WHERE id = 'doc-004' LIMIT 1").unwrap();
+        assert_eq!(r.rows.len(), 0, "the delete through b is read through {j}");
+        assert_eq!(count(n), 29);
+    }
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

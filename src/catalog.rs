@@ -30,7 +30,37 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 8;
+pub const CATALOG_VERSION: u8 = 8;
+
+/// The format the catalog is written in, when an operator pinned one below
+/// `CATALOG_VERSION`: `CELASTRO_CATALOG_FORMAT`. A release that raises the
+/// format writes a file the previous release cannot open, so a rollback
+/// after the first write is a restore; pinned to the previous format for
+/// the first days on a new release, the file stays readable by the old one
+/// at the cost of what the new fields carry (tombstones and instants at 7
+/// and 8: a drop made while pinned does not reconcile after a restart).
+static FORMAT_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Pin the written format, `CATALOG_VERSION_OLDEST..=CATALOG_VERSION`, or
+/// refuse the value.
+pub fn pin_format(format: u8) -> Result<()> {
+    if !(CATALOG_VERSION_OLDEST..=CATALOG_VERSION).contains(&format) {
+        return Err(Error::Plan(format!(
+            "catalog format {format} cannot be written by this build (formats \
+             {CATALOG_VERSION_OLDEST} to {CATALOG_VERSION})"
+        )));
+    }
+    FORMAT_PIN.store(format, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The format written to disk: `CATALOG_VERSION`, or the pin.
+pub fn written_format() -> u8 {
+    match FORMAT_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => CATALOG_VERSION,
+        f => f,
+    }
+}
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
@@ -684,7 +714,7 @@ impl Catalog {
     /// intact. The manifest has done it this way from the start; the catalog
     /// now does too.
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_as(CATALOG_VERSION)
+        self.encode_as(written_format())
     }
 
     /// The catalog laid out as a given format version writes it. Only the
@@ -692,7 +722,7 @@ impl Catalog {
     /// the read path for it is tested against bytes shaped the way an older
     /// build shaped them, not against a current body with its version byte
     /// changed.
-    fn encode_as(&self, format: u8) -> Vec<u8> {
+    pub fn encode_as(&self, format: u8) -> Vec<u8> {
         let mut body = self.encode_body(format);
         let crc = crc32(&body);
         put_u32(&mut body, crc);

@@ -367,6 +367,14 @@ built from the tree at the time:
   volume: back empty in 20 s, `RESTORE FROM 'nightly'` on it brings its
   shard back. The rolling upgrade from the previous image stalled at the
   first pod until the attach stopped refusing a different crate version.
+- **Mixed versions** (0.45.0 and 0.46.0, 2026-09-18): one pod upgraded
+  by a partitioned rollout (`updateStrategy.rollingUpdate.partition`),
+  DDL from each side reached every pod, a move from the old node to the
+  new worked and the reverse was refused on the catalog format until the
+  sender learnt the peer's format from its hello. The rollback afterwards
+  crash-looped every pod on the same format message: pin
+  `CELASTRO_CATALOG_FORMAT` to the previous format while a rollback must
+  stay possible.
 - **Ingest under a memory limit** (celastro 0.33.0): the binary of the
   image, 300 statements of 1,000 documents (50,000 with text and 128-d
   vectors, 250,000 edges) in a cgroup with `MemoryMax`. With the old

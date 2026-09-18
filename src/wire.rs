@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::catalog::{Catalog, Collection, Tablet};
+use crate::catalog::{Catalog, Collection, Tablet, CATALOG_VERSION};
 use crate::codec::*;
 use crate::engine::Db;
 use crate::error::{Error, Result};
@@ -552,6 +552,9 @@ pub struct Node {
     /// it fail at once instead of each retrying for the whole window: a
     /// dead node costs a statement one window, not one per call it makes.
     dial_failed: Mutex<Option<Instant>>,
+    /// The newest catalog format the peer said it reads, from its hello;
+    /// zero until then.
+    peer_format: std::sync::atomic::AtomicU8,
 }
 
 impl std::fmt::Debug for Node {
@@ -577,6 +580,9 @@ pub struct Hello {
     /// from a node that predates the field. A later hello with a smaller
     /// epoch is an older process answering at the same address.
     pub epoch: u64,
+    /// The newest catalog format the node reads: what a catalog sent to it
+    /// is encoded as. A node from before the field is placed by its version.
+    pub catalog_format: u8,
 }
 
 impl Node {
@@ -596,6 +602,7 @@ impl Node {
             stream: Mutex::new(None),
             tls,
             dial_failed: Mutex::new(None),
+            peer_format: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -743,7 +750,28 @@ impl Node {
         };
         let now_micros = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
         let epoch = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
-        Ok(Hello { node, version, role, now_micros, epoch })
+        let catalog_format = if i < b.len() {
+            get_u8(&b, &mut i)?
+        } else {
+            // What each release before the field read; a move or a create
+            // sent in a newer format is refused by the peer as unreadable,
+            // which a mixed-version drill showed.
+            match version.split('.').nth(1).and_then(|m| m.parse::<u32>().ok()) {
+                Some(46) => 7,
+                Some(45) => 6,
+                _ => 5,
+            }
+        };
+        self.peer_format.store(catalog_format, Ordering::Relaxed);
+        Ok(Hello { node, version, role, now_micros, epoch, catalog_format })
+    }
+
+    /// A catalog as the peer reads it: the newest format it said it reads,
+    /// or this build's when it has not been asked yet.
+    fn encode_for_peer(&self, cat: &Catalog) -> Vec<u8> {
+        let theirs = self.peer_format.load(Ordering::Relaxed);
+        let format = if theirs == 0 { CATALOG_VERSION } else { theirs.min(CATALOG_VERSION) };
+        cat.encode_as(format)
     }
 
     /// The holder's clock and its write counter for a collection: what a
@@ -792,7 +820,7 @@ impl Node {
         let mut cat = Catalog::default();
         cat.collections.insert(coll.name.clone(), coll.clone());
         let mut body = Vec::new();
-        put_bytes(&mut body, &cat.encode());
+        put_bytes(&mut body, &self.encode_for_peer(&cat));
         put_tablets(&mut body, tablets);
         self.call(Call::CreateCollection, &coll.name, 0, &body).map(|_| ())
     }
@@ -847,7 +875,7 @@ impl Node {
         let mut cat = Catalog::default();
         cat.collections.insert(coll.name.clone(), coll.clone());
         let mut body = Vec::new();
-        put_bytes(&mut body, &cat.encode());
+        put_bytes(&mut body, &self.encode_for_peer(&cat));
         put_tablets(&mut body, tablets);
         put_str(&mut body, from);
         self.call(Call::PullShard, &coll.name, shard, &body).map(|_| ())
@@ -1315,6 +1343,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
             put_str(&mut out, db.role().name());
             put_u64(&mut out, db.clock_micros());
             put_u64(&mut out, db.epoch());
+            out.push(CATALOG_VERSION);
         }
         Call::Catalog => {
             put_bytes(&mut out, &db.catalog.encode());

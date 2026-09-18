@@ -148,6 +148,17 @@ other nodes; the sections that follow have each option's details.
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
 
+Upgrades roll one node at a time: two releases with one wire version
+talk, DDL and moves work both ways, and a newer node sends an older one
+its catalog in the newest format the older reads. What does not roll
+back is the data directory: a release that raised the catalog format
+(the changelog says when) writes a file the previous release refuses to
+open, so a pod rolled back after that crash-loops on it. To keep a
+rollback possible through the first days on a new release, start it with
+`CELASTRO_CATALOG_FORMAT=<previous>`, which pins the written format at
+the cost of what the newer fields carry, and lift the pin once the
+release is trusted.
+
 What is optional in every shape: TLS on the console and the wire
 (`CELASTRO_TLS_*`), encryption at rest (`CELASTRO_MASTER_KEY_FILE`), an
 S3-compatible store or a shared mount behind the `archived` tier and the

@@ -2124,6 +2124,11 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         o.role = celastro::engine::Role::parse(&v)
             .ok_or_else(|| format!("CELASTRO_ROLE: `{v}` is not data or coordinator"))?;
     }
+    if let Some(v) = var("CELASTRO_CATALOG_FORMAT") {
+        let f: u8 =
+            v.parse().map_err(|_| format!("CELASTRO_CATALOG_FORMAT: `{v}` is not a number"))?;
+        celastro::catalog::pin_format(f).map_err(|e| format!("CELASTRO_CATALOG_FORMAT: {e}"))?;
+    }
     if let Some(endpoint) = var("CELASTRO_ARCHIVE_ENDPOINT") {
         o.archive.endpoint = Some(endpoint);
         o.archive.bucket = var("CELASTRO_ARCHIVE_BUCKET").unwrap_or_default();
