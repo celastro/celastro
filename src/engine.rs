@@ -2038,6 +2038,31 @@ impl Db {
         } else {
             self.catalog.coordinators.remove(url);
         }
+        // A coordinator that attaches a node learns what that node knows:
+        // the collections, their maps and the policies made before this
+        // coordinator existed or while it was away, so a restart from an
+        // empty volume plans as soon as it has attached. A data node does
+        // not: a data node that lost its volume must not quietly grow empty
+        // shards for a map that names it. A peer from before this call
+        // answers nothing, and nothing is adopted.
+        if self.opts.role == Role::Coordinator {
+            if let Ok(theirs) = self.node_conn(url).and_then(|n| n.catalog()) {
+                for (name, coll) in theirs.collections {
+                    if self.catalog.get(&name).is_ok() {
+                        continue;
+                    }
+                    if let Some(tablets) = theirs.placement.get(&name) {
+                        self.adopt_collection(coll, tablets.clone())?;
+                    }
+                }
+                for (name, policy) in theirs.policies {
+                    self.catalog.policies.entry(name).or_insert(policy);
+                }
+                for (key, activity) in theirs.activity {
+                    self.catalog.activity.entry(key).or_insert(activity);
+                }
+            }
+        }
         self.persist_catalog()
     }
 

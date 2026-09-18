@@ -18,7 +18,10 @@ lifecycle run go to the holders only. Its role travels in the wire's
 version reads as before), and shows in `SHOW HEALTH`. A node from
 before roles is a data node. `DbOpts::role`, `engine::Role`. The chart's
 `coordinators.replicas` runs them as a second StatefulSet with the
-console Service over them alone. How many is measured in docs/design.md:
+console Service over them alone. A coordinator pulls the catalog of every
+node it attaches (a new wire call; a node from before it answers nothing),
+so one that arrives late or restarts from an empty volume plans as soon
+as it has attached. How many is measured in docs/design.md:
 one per four or five data nodes for hybrid traffic on small shards, more
 per coordinator as shards grow, none for point lookups.
 

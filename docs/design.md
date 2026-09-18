@@ -1232,7 +1232,12 @@ declared at `ATTACH`, kept in the catalog (format 6) -- and hears every
 definition (`fan_out_of` splits statements: a definition reaches holders
 and coordinators, a seal or a compaction reaches holders), so it plans
 over the data nodes' shards as they do, on cores with no seal or
-compaction of their own. Measured on kind (2026-09-18, the survey corpus
+compaction of their own; and at `ATTACH` it pulls the node's catalog
+(`Call::Catalog`) and adopts the collections, maps and policies it
+lacks, so a coordinator that arrives late or restarts empty plans at
+once -- a data node does not pull, since one that lost its volume must
+not quietly grow empty shards for a map that names it. Measured on kind
+(2026-09-18, the survey corpus
 of 50,000 documents spread over `N` data nodes, one coordinator taking
 every client request, CPU seconds per container from the node's
 `crictl stats` over 400 requests at concurrency 16): the coordinator's

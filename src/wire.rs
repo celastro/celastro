@@ -106,6 +106,9 @@ enum Call {
     ReadFile = 16,
     PullShard = 17,
     AbortMove = 18,
+    /// The node's catalog as it persists it: what a coordinator pulls at
+    /// `ATTACH` so it plans over collections made before it was there.
+    Catalog = 19,
 }
 
 impl Call {
@@ -129,6 +132,7 @@ impl Call {
             16 => Call::ReadFile,
             17 => Call::PullShard,
             18 => Call::AbortMove,
+            19 => Call::Catalog,
             _ => return None,
         })
     }
@@ -153,6 +157,7 @@ impl Call {
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
             Call::AbortMove => "abort_move",
+            Call::Catalog => "catalog",
         }
     }
 }
@@ -765,6 +770,14 @@ impl Node {
 
     /// Have the node adopt a collection: its definition and the whole
     /// placement map, building the shards the map puts on that node.
+    /// The peer's catalog. A peer from before this call answers "unknown
+    /// call", which the caller treats as nothing to adopt.
+    pub fn catalog(&self) -> Result<Catalog> {
+        let b = self.call(Call::Catalog, "", 0, &[])?;
+        let mut i = 0;
+        Catalog::decode(get_bytes(&b, &mut i).ok_or_else(truncated)?)
+    }
+
     pub fn create_collection(&self, coll: &Collection, tablets: &[Tablet]) -> Result<()> {
         let mut cat = Catalog::default();
         cat.collections.insert(coll.name.clone(), coll.clone());
@@ -1290,6 +1303,9 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
             put_opt_str(&mut out, db.node());
             put_str(&mut out, env!("CARGO_PKG_VERSION"));
             put_str(&mut out, db.role().name());
+        }
+        Call::Catalog => {
+            put_bytes(&mut out, &db.catalog.encode());
         }
         Call::Counters => {
             db.collection(&collection)?;

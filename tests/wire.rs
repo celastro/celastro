@@ -200,6 +200,20 @@ fn a_coordinator_holds_no_shards_and_answers_over_the_data_nodes() {
     let health = a.ack("SHOW HEALTH");
     assert!(health.contains(&format!("node {}: up, coordinator, ", c.url)), "{health}");
     assert!(health.starts_with(&format!("this node: {}, data, ", a.url)), "{health}");
+    // A coordinator that arrives later -- or restarts from an empty volume
+    // -- learns the collections at ATTACH and answers at once.
+    let d = Node::start_role("coord-d", 0, None, celastro::engine::Role::Coordinator);
+    assert!(d.exec("SHOW CATALOG items").is_err(), "knows nothing yet");
+    d.ack(&format!("ATTACH NODE '{}'", a.url));
+    let cat = d.ack("SHOW CATALOG items");
+    assert!(cat.contains("index items_body") && cat.contains("shard 2 on"), "{cat}");
+    assert!(d.local_shards("items").is_empty());
+    let want = shape(&one.query(QUERIES[0]).unwrap());
+    assert_eq!(shape(&d.query(QUERIES[0]).unwrap()), want, "the late coordinator answers");
+    let d_dir = d.dir.clone();
+    drop(d);
+    settle();
+    let _ = std::fs::remove_dir_all(&d_dir);
     for n in [a, b, c] {
         let d = n.dir.clone();
         drop(n);
