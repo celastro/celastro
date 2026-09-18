@@ -1509,6 +1509,9 @@ fn maintenance(db: &RwLock<Db>, stop: &AtomicBool) {
     }
 }
 
+/// How many peers the sweep dials at once.
+const SWEEP_DIALS: usize = 16;
+
 /// How often the sweep runs, or `None` when `CELASTRO_RECONCILE_SECS=0`
 /// turned it off.
 fn reconcile_interval() -> Option<Duration> {
@@ -1538,14 +1541,37 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
         }
         last = Instant::now();
         let peers = read(db).peers();
-        for (url, node) in peers {
+        // Dialled `SWEEP_DIALS` at a time: an unreachable peer costs its
+        // connect timeout, and a hundred of them one after another was a
+        // sweep of many minutes, during which a split that healed stayed
+        // unreconciled. Nothing here holds the database lock.
+        let mut answers = Vec::with_capacity(peers.len());
+        for batch in peers.chunks(SWEEP_DIALS) {
             if stop.load(AtomicOrdering::Acquire) {
                 return;
             }
-            let (hello, theirs) = {
-                let _deadline = crate::deadline::arm(Some(10_000));
-                (node.hello(), node.catalog())
-            };
+            let dialled: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|(_, node)| {
+                        scope.spawn(move || {
+                            let _deadline = crate::deadline::arm(Some(10_000));
+                            (node.hello(), node.catalog())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join()).collect()
+            });
+            for ((url, _), answer) in batch.iter().zip(dialled) {
+                if let Ok(a) = answer {
+                    answers.push((url.clone(), a));
+                }
+            }
+        }
+        for (url, (hello, theirs)) in answers {
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
             // An unreachable peer is `SHOW HEALTH`'s to report; the sweep
             // only has something to say when a catalog differs, a process
             // changed or a clock drifted.

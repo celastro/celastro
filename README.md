@@ -275,7 +275,11 @@ definitions made meanwhile. Those reconcile by themselves: a `CREATE` or
 the node adopts it when it reattaches or within the next sweep
 (`CELASTRO_RECONCILE_SECS`, 30 s) after the link returns, drops
 included. An `ALTER` or a move is still refused naming the node to run
-it on.
+it on. A client that times out may retry any statement: delivered twice
+with nothing written in between, every statement leaves what once
+leaves. The exception is a `DELETE ... WHERE` retried after a write it
+did not see, which takes the new rows too; delete by key when that
+matters.
 
 ## Kubernetes and containers
 

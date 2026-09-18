@@ -32,6 +32,15 @@ address -- a pod replaced while its predecessor still runs -- and `SHOW
 HEALTH` and the sweep's log say so. Detection, not fencing: a request
 frame carries no epoch yet.
 
+**The sweep dials sixteen peers at a time**, outside the lock, so a sweep
+over many unreachable peers takes one connect timeout and not one per
+peer.
+
+**A retry's contract is tested.** Every statement delivered twice with
+nothing written in between leaves what once leaves; the one shape a retry
+can change, a `DELETE ... WHERE` delivered again after a write it did not
+see, is named as the contract.
+
 ## 0.46.0 — 2026-09-18
 
 The catalog reconciles itself, hence a minor.
