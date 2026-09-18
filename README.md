@@ -144,7 +144,7 @@ other nodes; the sections that follow have each option's details.
 | option | how | data | clients | notes |
 |---|---|---|---|---|
 | **one process** | `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
-| **a container** | `docker run ... ghcr.io/celastro/celastro:0.45.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:0.46.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
 
@@ -264,6 +264,17 @@ nodes' shards exactly as they do, on cores with no seal or compaction of
 their own. `SHOW HEALTH` from any node names every node with its role and
 whether it answers, and every shard with whether its holder does.
 
+When nodes cannot reach each other -- a node down, a split between two
+subnets -- each side keeps serving the shards it holds and refuses, or
+answers partially with `WITH (partial_results)`, for the ones it cannot
+reach; no shard has two holders, so nothing diverges but the
+definitions made meanwhile. Those reconcile by themselves: a `CREATE` or
+`DROP` that could not reach a node succeeds with a note naming it, and
+the node adopts it when it reattaches or within the next sweep
+(`CELASTRO_RECONCILE_SECS`, 30 s) after the link returns, drops
+included. An `ALTER` or a move is still refused naming the node to run
+it on.
+
 ## Kubernetes and containers
 
 `chart/celastro` runs one pod or a cluster: a `StatefulSet` whose pods attach
@@ -282,8 +293,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.45.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.45.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.46.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.46.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

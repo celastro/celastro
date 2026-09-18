@@ -133,6 +133,7 @@ struct Counters {
     compactions: AtomicU64,
     compaction_millis: AtomicU64,
     connections: AtomicU64,
+    reconciled: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -144,6 +145,7 @@ static COUNTERS: Counters = Counters {
     compactions: AtomicU64::new(0),
     compaction_millis: AtomicU64::new(0),
     connections: AtomicU64::new(0),
+    reconciled: AtomicU64::new(0),
 };
 
 /// The metrics page: the process's counters, then what the database holds
@@ -216,6 +218,13 @@ fn metrics_text(db: &Db) -> String {
         "Connections the console served.",
         "",
         c.connections.load(Relaxed).to_string(),
+    );
+    line(
+        "celastro_catalog_reconciled_total",
+        "counter",
+        "Definitions the sweep adopted or dropped from a peer's catalog.",
+        "",
+        c.reconciled.load(Relaxed).to_string(),
     );
     line(
         "celastro_tls_resumed_handshakes_total",
@@ -497,6 +506,10 @@ impl Server {
             if server.auto_compact {
                 let stop = &stop;
                 scope.spawn(move || maintenance(db, stop));
+            }
+            if let Some(every) = reconcile_interval() {
+                let stop = &stop;
+                scope.spawn(move || reconciler(db, stop, every));
             }
             // A pool of `max_connections` workers, started once: a thread
             // per connection cost a clone and a fresh stack per request --
@@ -1492,6 +1505,65 @@ fn maintenance(db: &RwLock<Db>, stop: &AtomicBool) {
         }
         if !maintenance_step(db) {
             std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// How often the sweep runs, or `None` when `CELASTRO_RECONCILE_SECS=0`
+/// turned it off.
+fn reconcile_interval() -> Option<Duration> {
+    let secs = std::env::var("CELASTRO_RECONCILE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(crate::engine::RECONCILE_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The anti-entropy sweep: every `every`, pull the catalog of every peer
+/// this node knows and fold what it has into this node's. What heals two
+/// catalogs that changed apart while the nodes could not reach each other
+/// -- a split, a node down through a `CREATE INDEX` -- once they can.
+/// Its own thread, because a peer that is unreachable costs a connect
+/// timeout, and a sweep over many such peers must delay no compaction.
+/// Dialled outside the lock; the lock is taken to fold one catalog in.
+fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
+    let mut last = Instant::now();
+    loop {
+        if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        if last.elapsed() < every {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        last = Instant::now();
+        let peers = read(db).peers();
+        for (url, node) in peers {
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            let theirs = {
+                let _deadline = crate::deadline::arm(Some(10_000));
+                node.catalog()
+            };
+            // An unreachable peer is `SHOW HEALTH`'s to report; the sweep
+            // only has something to say when a catalog differs.
+            let Ok(theirs) = theirs else { continue };
+            match write(db).reconcile(&theirs) {
+                Ok(notes) => {
+                    for note in notes {
+                        COUNTERS.reconciled.fetch_add(1, AtomicOrdering::Relaxed);
+                        crate::log::info(
+                            "catalog_reconciled",
+                            &[("peer", url.clone()), ("change", note)],
+                        );
+                    }
+                }
+                Err(e) => crate::log::warn(
+                    "catalog_not_reconciled",
+                    &[("peer", url.clone()), ("error", e.to_string())],
+                ),
+            }
         }
     }
 }

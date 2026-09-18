@@ -30,7 +30,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 6;
+const CATALOG_VERSION: u8 = 7;
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
@@ -342,6 +342,12 @@ pub struct Collection {
     pub nodes_of: Option<String>,
     /// A walk over this collection's edges follows them in both directions.
     pub undirected: bool,
+    /// When the collection was created, microseconds since the epoch on
+    /// the creating node's clock; what a tombstone from another node is
+    /// compared against when the two catalogs are reconciled. Zero for a
+    /// collection from a catalog written before format 7, which every
+    /// tombstone outranks. Format 7.
+    pub created_micros: u64,
 }
 
 impl Collection {
@@ -357,6 +363,7 @@ impl Collection {
             prefix_expansion: None,
             nodes_of: None,
             undirected: false,
+            created_micros: 0,
         }
     }
 
@@ -567,9 +574,30 @@ pub struct Catalog {
     /// Data-plane readers observe catalog versions and never block on DDL
     /// (§10).
     pub version: u64,
+    /// What was dropped and when: a collection under its name, an index
+    /// under [`Catalog::tombstone`], each with the drop's microseconds.
+    /// What lets two catalogs that changed apart -- across a split, or
+    /// while a node was down -- be reconciled without resurrecting a
+    /// drop: a definition older than its tombstone is dropped on the node
+    /// that still has it, and one younger is the operator making it again.
+    /// Format 7.
+    pub dropped: BTreeMap<String, u64>,
+    /// When this data directory was made, microseconds. A definition
+    /// older than the directory that names this node as a holder is not
+    /// one this node missed while away; it is one whose data this
+    /// directory never had, and reconciliation refuses to grow an empty
+    /// shard for it. Zero for a directory from before format 7. Format 7.
+    pub born_micros: u64,
 }
 
 impl Catalog {
+    /// The tombstone key of an index: the collection's name, a slash, the
+    /// index's. A collection's tombstone is its name alone, and a name can
+    /// hold no slash, since it names a directory.
+    pub fn tombstone(collection: &str, index: &str) -> String {
+        format!("{collection}/{index}")
+    }
+
     pub fn get(&self, name: &str) -> Result<&Collection> {
         self.collections
             .get(name)
@@ -602,6 +630,12 @@ impl Catalog {
                     d.path, c.name
                 )));
             }
+        }
+        let mut c = c;
+        // A definition adopted from another node keeps the instant that
+        // node made it, so both compare it against the same tombstones.
+        if c.created_micros == 0 {
+            c.created_micros = crate::time::now_micros().max(0) as u64;
         }
         self.collections.insert(c.name.clone(), c);
         self.version += 1;
@@ -742,6 +776,9 @@ impl Catalog {
                 put_str(&mut out, c.nodes_of.as_deref().unwrap_or(""));
                 out.push(c.undirected as u8);
             }
+            if format >= 7 {
+                put_uvarint(&mut out, c.created_micros);
+            }
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
         crate::lifecycle::encode_activity(&self.activity, &mut out);
@@ -764,6 +801,14 @@ impl Catalog {
                 put_uvarint(&mut out, self.coordinators.len() as u64);
                 for n in &self.coordinators {
                     put_str(&mut out, n);
+                }
+            }
+            if format >= 7 {
+                put_uvarint(&mut out, self.born_micros);
+                put_uvarint(&mut out, self.dropped.len() as u64);
+                for (k, t) in &self.dropped {
+                    put_str(&mut out, k);
+                    put_uvarint(&mut out, *t);
                 }
             }
         }
@@ -863,6 +908,9 @@ impl Catalog {
                 c.undirected = *b.get(i).ok_or_else(bad)? == 1;
                 i += 1;
             }
+            if format >= 7 {
+                c.created_micros = get_uvarint(b, &mut i).ok_or_else(bad)?;
+            }
             collections.insert(name, c);
         }
         let policies = crate::lifecycle::decode_policies(b, &mut i)?;
@@ -896,7 +944,28 @@ impl Catalog {
                 }
             }
         }
-        Ok(Catalog { collections, policies, activity, nodes, placement, coordinators, version })
+        let mut dropped = BTreeMap::new();
+        let mut born_micros = 0;
+        if format >= 7 {
+            born_micros = get_uvarint(b, &mut i).ok_or_else(bad)?;
+            let nd = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+            for _ in 0..nd {
+                let k = get_str(b, &mut i).ok_or_else(bad)?;
+                let t = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                dropped.insert(k, t);
+            }
+        }
+        Ok(Catalog {
+            collections,
+            policies,
+            activity,
+            nodes,
+            placement,
+            coordinators,
+            version,
+            dropped,
+            born_micros,
+        })
     }
 }
 
@@ -984,9 +1053,16 @@ mod tests {
         c.observe_doc(&json::parse(r#"{"id":"a","tenant_id":"t1"}"#).unwrap());
         c.prefix_expansion = Some(2048);
         cat.create(c).unwrap();
+        cat.born_micros = 17;
+        cat.dropped.insert("old".into(), 40);
+        cat.dropped.insert(Catalog::tombstone("articles", "gone"), 41);
         let back = Catalog::decode(&cat.encode()).unwrap();
         let a = back.get("articles").unwrap();
         assert_eq!(a.partition_key.as_deref(), Some("tenant_id"));
+        assert!(a.created_micros > 0, "a creation is stamped and survives");
+        assert_eq!(back.born_micros, 17);
+        assert_eq!(back.dropped.get("old"), Some(&40));
+        assert_eq!(back.dropped.get("articles/gone"), Some(&41));
         assert_eq!(a.indexes[0].tier, crate::residency::Tier::Cached, "tier survives a reopen");
         assert_eq!(a.vector_dims("embedding"), Some(8));
         assert_eq!(a.doc_count, 1);
@@ -1090,7 +1166,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 6"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 7"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

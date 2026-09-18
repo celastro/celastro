@@ -140,6 +140,15 @@ pub enum Role {
     Coordinator,
 }
 
+/// How often the console's sweep pulls every peer's catalog and
+/// reconciles it with this node's, seconds; `CELASTRO_RECONCILE_SECS`
+/// changes it, `0` turns the sweep off. `ATTACH NODE` reconciles at once.
+pub const RECONCILE_SECS: u64 = 30;
+
+/// What a message says about a node a definition did not reach.
+const RECONCILE_NOTE: &str =
+    "the catalog reconciles at ATTACH and every 30 s, CELASTRO_RECONCILE_SECS";
+
 impl Role {
     pub fn name(self) -> &'static str {
         match self {
@@ -908,6 +917,11 @@ pub struct Db {
     /// catalog's list, which persists across a restart and so says nothing
     /// about whether a peer answers *now*; this is what readiness asks.
     attached: BTreeSet<String>,
+    /// Collections a peer's catalog names this node as a holder of and
+    /// `reconcile` refused to adopt, because they are older than this data
+    /// directory: the data is not here. Said once in the notes and on
+    /// every `SHOW HEALTH` until a restore or a drop settles it.
+    not_adopted: BTreeSet<String>,
     /// Shards of this node pinned for a move, by `(collection, index)`:
     /// the files the target pulls, as they were at the pin. Shared with the
     /// wire server, which answers a target's reads from it without this
@@ -965,6 +979,7 @@ impl Db {
             wire_token: crate::wire::token_from_env(),
             nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
+            not_adopted: BTreeSet::new(),
             moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             last_commit: 0,
         }
@@ -1002,6 +1017,12 @@ impl Db {
         // that catalog over the real one.
         if let Some(b) = crate::shard::read_content(&db.cipher, "CATALOG", &dir.join("CATALOG"))? {
             db.catalog = Catalog::decode(&b)?;
+        } else {
+            // A directory with no catalog is a new one, and when it was
+            // made is what `reconcile` compares a definition's age
+            // against: a collection older than this directory that names
+            // this node is data this directory never had.
+            db.catalog.born_micros = lifecycle::now_micros(&db.clock);
         }
         // A drop is complete once the collection's directory has been renamed
         // aside; the catalog catches up here if the process ended between
@@ -1459,6 +1480,7 @@ impl Db {
             }
         }
         self.forget_collection(name);
+        self.catalog.dropped.insert(name.to_string(), lifecycle::now_micros(&self.clock));
         self.persist_catalog()?;
         if let Some((parent, aside)) = aside {
             if aside.exists() {
@@ -1530,6 +1552,9 @@ impl Db {
         let component = Collection::index_component(&def);
         let coll = c.clone();
         self.catalog.activity.remove(&(collection.to_string(), index.to_string()));
+        self.catalog
+            .dropped
+            .insert(Catalog::tombstone(collection, index), lifecycle::now_micros(&self.clock));
         guard(&self.stats).remove(&cache_key(collection, &def.path));
         if let Some(shards) = self.shards.get_mut(collection) {
             for s in shards.iter_mut() {
@@ -1681,6 +1706,12 @@ impl Db {
                 ));
             }
         }
+        for name in &self.not_adopted {
+            out.push_str(&format!(
+                "collection `{name}`: NOT ADOPTED, a peer's map names this node as a holder \
+                 and the data is not in this directory; restore it or drop it\n"
+            ));
+        }
         out.push_str(&format!(
             "{} of {} node(s) answer; {unreachable} shard(s) unreachable",
             up.len(),
@@ -1742,7 +1773,7 @@ impl Db {
     pub fn create_collection(&mut self, coll: Collection, splits: &[String]) -> Result<()> {
         let _deadline = self.arm_default_deadline();
         let tablets = self.plan_tablets(splits, &[])?;
-        self.create_spread(coll, tablets)
+        self.create_spread(coll, tablets).map(|_| ())
     }
 
     /// Whether a placement entry means this node.
@@ -1883,7 +1914,10 @@ impl Db {
     /// same map and building the shards placed on it. A node that does not
     /// take it is reported by name; the statement is idempotent on a node
     /// that already holds the identical collection, so it can be re-run.
-    fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<()> {
+    /// Make the collection here and on every holder and coordinator. The
+    /// string is empty, or names the nodes it did not reach: they adopt the
+    /// collection when they reconnect, so that is a note and not a failure.
+    fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<String> {
         self.adopt_collection(coll.clone(), tablets.clone())?;
         let mut failures = Vec::new();
         // Every holder, and every coordinator: a coordinator holds none of
@@ -1895,15 +1929,168 @@ impl Db {
             }
         }
         if failures.is_empty() {
-            Ok(())
+            Ok(String::new())
         } else {
-            Err(Error::Plan(format!(
-                "collection `{}` was created here but not on {}; re-run the same CREATE \
-                 COLLECTION once those nodes are reachable",
-                coll.name,
-                failures.join("; ")
-            )))
+            Ok(format!(
+                "; not on {}: they adopt it when they reconnect ({})",
+                failures.join("; "),
+                RECONCILE_NOTE
+            ))
         }
+    }
+
+    /// Every peer this node knows of, with a connection to each: what the
+    /// console's sweep pulls a catalog from, dialled outside the lock.
+    pub fn peers(&self) -> Vec<(String, Arc<crate::wire::Node>)> {
+        let mut known: BTreeSet<String> = self.catalog.nodes.iter().cloned().collect();
+        known.extend(self.attached.iter().cloned());
+        for tablets in self.catalog.placement.values() {
+            known.extend(tablets.iter().map(|t| t.node.clone()));
+        }
+        known
+            .into_iter()
+            .filter(|n| !self.is_self(n))
+            .filter_map(|n| self.node_conn(&n).ok().map(|c| (n, c)))
+            .collect()
+    }
+
+    /// Fold what another node's catalog knows into this one: the
+    /// definitions made while the two could not reach each other -- across
+    /// a split, or while this node was down -- and the drops. Each note
+    /// returned names one change made, or one refused.
+    ///
+    /// The rule is per name and last writer wins: a collection or an index
+    /// the peer has and this node lacks is adopted unless this node holds a
+    /// tombstone for it younger than the definition; a tombstone the peer
+    /// holds drops the definition here if the definition is older. Policies
+    /// and the activity clocks are unioned. Nothing else is merged: a
+    /// placement that changed on one side stays as each side has it, and
+    /// an `ALTER` is applied by the statement's own fan-out or by an
+    /// operator. What this closes is the split's harm named in the design
+    /// notes: two catalogs that stay different after the link returns.
+    ///
+    /// A data node adopts a collection whose map names it as a holder only
+    /// if the collection is younger than the node's data directory. Older
+    /// means the directory never had those shards' data: a node restarted
+    /// from an empty volume, which needs a restore, not empty shards that
+    /// answer as if nothing were lost.
+    pub fn reconcile(&mut self, theirs: &Catalog) -> Result<Vec<String>> {
+        let mut notes = Vec::new();
+        // Their tombstones first, so a definition they dropped is not
+        // adopted back from a third node's catalog in the same sweep.
+        for (key, &t) in &theirs.dropped {
+            let mine = self.catalog.dropped.get(key).copied().unwrap_or(0);
+            if t > mine {
+                self.catalog.dropped.insert(key.clone(), t);
+            }
+            match key.split_once('/') {
+                None => {
+                    let created = self.catalog.get(key).map(|c| c.created_micros);
+                    if let Ok(created) = created {
+                        if created < t {
+                            match self.drop_collection(key) {
+                                Ok(()) => notes.push(format!("dropped collection `{key}`")),
+                                Err(e) => {
+                                    notes.push(format!("collection `{key}` not dropped: {e}"))
+                                }
+                            }
+                        }
+                    }
+                }
+                Some((coll, idx)) => {
+                    let has = self.catalog.get(coll).map(|c| c.index_by_name(idx).is_some());
+                    if has.unwrap_or(false) {
+                        let created = self
+                            .catalog
+                            .activity
+                            .get(&(coll.to_string(), idx.to_string()))
+                            .map(|a| a.created_micros)
+                            .unwrap_or(0);
+                        if created < t {
+                            match self.drop_index(coll, idx) {
+                                Ok(()) => notes.push(format!("dropped index `{idx}` on `{coll}`")),
+                                Err(e) => notes.push(format!("index `{idx}` not dropped: {e}")),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (name, coll) in &theirs.collections {
+            let Some(tablets) = theirs.placement.get(name) else { continue };
+            if self.catalog.get(name).is_err() {
+                if self.catalog.dropped.get(name).copied().unwrap_or(0) >= coll.created_micros {
+                    continue;
+                }
+                let names_me = tablets.iter().any(|t| self.is_self(&t.node));
+                if self.opts.role == Role::Data
+                    && names_me
+                    && coll.created_micros < self.catalog.born_micros
+                {
+                    if self.not_adopted.insert(name.clone()) {
+                        notes.push(format!(
+                            "collection `{name}` not adopted: its map names this node as a \
+                             holder and it is older than this data directory, so the data is \
+                             not here; restore it (RESTORE ... NODE) rather than starting from \
+                             empty shards"
+                        ));
+                    }
+                    continue;
+                }
+                match self.adopt_collection(coll.clone(), tablets.clone()) {
+                    Ok(()) => {
+                        self.not_adopted.remove(name);
+                        for (key, activity) in &theirs.activity {
+                            if key.0 == *name {
+                                self.catalog.activity.insert(key.clone(), *activity);
+                            }
+                        }
+                        notes.push(format!(
+                            "adopted collection `{name}` with {} index(es)",
+                            coll.indexes.len()
+                        ));
+                    }
+                    Err(e) => notes.push(format!("collection `{name}` not adopted: {e}")),
+                }
+                continue;
+            }
+            for idx in &coll.indexes {
+                if self.catalog.get(name)?.index_by_name(&idx.name).is_some() {
+                    continue;
+                }
+                let key = (name.clone(), idx.name.clone());
+                let created = theirs.activity.get(&key).map(|a| a.created_micros).unwrap_or(0);
+                let tomb = Catalog::tombstone(name, &idx.name);
+                if self.catalog.dropped.get(&tomb).copied().unwrap_or(0) >= created {
+                    continue;
+                }
+                match self.add_index(name, idx.clone()) {
+                    Ok(()) => {
+                        if let Some(a) = theirs.activity.get(&key) {
+                            self.catalog.activity.insert(key, *a);
+                        }
+                        notes.push(format!("adopted index `{}` on `{name}`", idx.name));
+                    }
+                    Err(e) => notes.push(format!("index `{}` not adopted: {e}", idx.name)),
+                }
+            }
+        }
+        for (name, policy) in &theirs.policies {
+            if self.catalog.get(&policy.collection).is_err() {
+                continue;
+            }
+            if !self.catalog.policies.contains_key(name) {
+                self.catalog.policies.insert(name.clone(), policy.clone());
+                notes.push(format!("adopted policy `{name}`"));
+            }
+        }
+        for (key, activity) in &theirs.activity {
+            self.catalog.activity.entry(key.clone()).or_insert(*activity);
+        }
+        if !notes.is_empty() {
+            self.persist_catalog()?;
+        }
+        Ok(notes)
     }
 
     /// Take a collection's definition and placement as another node planned
@@ -2038,29 +2225,21 @@ impl Db {
         } else {
             self.catalog.coordinators.remove(url);
         }
-        // A coordinator that attaches a node learns what that node knows:
-        // the collections, their maps and the policies made before this
-        // coordinator existed or while it was away, so a restart from an
-        // empty volume plans as soon as it has attached. A data node does
-        // not: a data node that lost its volume must not quietly grow empty
-        // shards for a map that names it. A peer from before this call
-        // answers nothing, and nothing is adopted.
-        if self.opts.role == Role::Coordinator {
-            if let Ok(theirs) = self.node_conn(url).and_then(|n| n.catalog()) {
-                for (name, coll) in theirs.collections {
-                    if self.catalog.get(&name).is_ok() {
-                        continue;
-                    }
-                    if let Some(tablets) = theirs.placement.get(&name) {
-                        self.adopt_collection(coll, tablets.clone())?;
-                    }
-                }
-                for (name, policy) in theirs.policies {
-                    self.catalog.policies.entry(name).or_insert(policy);
-                }
-                for (key, activity) in theirs.activity {
-                    self.catalog.activity.entry(key).or_insert(activity);
-                }
+        // A node that attaches another learns what it knows: the
+        // collections, indexes, drops and policies made before this node
+        // existed or while it was away, so a coordinator restarted from an
+        // empty volume plans as soon as it has attached and a data node
+        // that was down catches up on the definitions it missed. What a
+        // data node does not do is grow empty shards for a map that names
+        // it from before its directory existed; `reconcile` refuses that
+        // and says so. A peer from before this call answers nothing, and
+        // nothing is adopted.
+        if let Ok(theirs) = self.node_conn(url).and_then(|n| n.catalog()) {
+            for note in self.reconcile(&theirs)? {
+                crate::log::info(
+                    "catalog_reconciled",
+                    &[("peer", url.to_string()), ("change", note)],
+                );
             }
         }
         self.persist_catalog()
@@ -2109,12 +2288,17 @@ impl Db {
     /// Run `LOCAL <sql>` on every other holder of a collection, after it
     /// ran here. A holder that did not take it is named, with what to run
     /// there by hand.
+    /// Run `sql` as `LOCAL` on every one of `holders`: the nodes it reached
+    /// and, for the ones it did not, what went wrong. Whether a failure is
+    /// the statement's failure is the caller's to say: a definition the
+    /// reconciliation carries is applied here and noted, anything else is
+    /// refused naming the nodes and the statement to run on them.
     fn propagate(
         &mut self,
         holders: &[String],
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let local = format!("LOCAL {sql}");
         let mut done = Vec::new();
         let mut failures = Vec::new();
@@ -2124,14 +2308,18 @@ impl Db {
                 Err(e) => failures.push(format!("{url}: {e}")),
             }
         }
-        if failures.is_empty() {
-            return Ok(done);
-        }
-        Err(Error::Plan(format!(
-            "applied here{}, but not on {}. Run `{local}` on those nodes once they are reachable",
+        Ok((done, failures))
+    }
+
+    /// The refusal for a propagation that did not reach every node and
+    /// whose statement nothing reconciles.
+    fn not_propagated(done: &[String], failures: &[String], sql: &str) -> Error {
+        Error::Plan(format!(
+            "applied here{}, but not on {}. Run `LOCAL {sql}` on those nodes once they are \
+             reachable",
             if done.is_empty() { String::new() } else { format!(" and on {}", done.join(", ")) },
             failures.join("; ")
-        )))
+        ))
     }
 
     // ------------------------------------------------------------- moves
@@ -2277,7 +2465,10 @@ impl Db {
             }
         }
         let sql = format!("PLACE SHARD {shard} OF {collection} ON '{to}'");
-        let done = self.propagate(&order, &sql, &[])?;
+        let (done, failures) = self.propagate(&order, &sql, &[])?;
+        if !failures.is_empty() {
+            return Err(Db::not_propagated(&done, &failures, &sql));
+        }
         Ok(format!(
             "shard {shard} of `{collection}` moved from {} to {to}; {} file(s), map switched{}",
             if self.is_self(&from) { "this node" } else { from.as_str() },
@@ -3494,15 +3685,42 @@ impl Db {
         // reached it back would wait for that lock forever.
         let local = local || crate::wire::serving();
         let holders = if local { Vec::new() } else { self.fan_out_of(&stmt) };
+        let reconciled = Db::reconciles(&stmt);
         let out = self.run_one(stmt, sql, params, analyze)?;
         if holders.is_empty() {
             return Ok(out);
         }
-        let done = self.propagate(&holders, sql, params)?;
+        let (done, failures) = self.propagate(&holders, sql, params)?;
+        if !failures.is_empty() && !reconciled {
+            return Err(Db::not_propagated(&done, &failures, sql));
+        }
+        let note = if failures.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; not on {}: they adopt it when they reconnect ({RECONCILE_NOTE})",
+                failures.join("; ")
+            )
+        };
         Ok(match out {
-            Outcome::Ack(m) => Outcome::Ack(format!("{m}; and on {}", done.join(", "))),
+            Outcome::Ack(m) if done.is_empty() => Outcome::Ack(format!("{m}{note}")),
+            Outcome::Ack(m) => Outcome::Ack(format!("{m}; and on {}{note}", done.join(", "))),
             other => other,
         })
+    }
+
+    /// Whether a statement's effect is carried by `reconcile` to a node it
+    /// did not reach: the definitions and drops the catalog keeps a time
+    /// for. An `ALTER`, a placement or a policy's drop is not, and a node
+    /// it did not reach has to be told.
+    fn reconciles(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::CreateIndex(_)
+                | Statement::DropIndex { .. }
+                | Statement::DropCollection { .. }
+                | Statement::CreateLifecyclePolicy(_)
+        )
     }
 
     /// Convenience: run a SELECT and return its rows.
@@ -3562,9 +3780,9 @@ impl Db {
                 } else {
                     format!(" on {}", nodes.join(", "))
                 };
-                self.create_spread(coll, tablets)?;
+                let note = self.create_spread(coll, tablets)?;
                 Ok(Outcome::Ack(format!(
-                    "collection `{}` created with {n} shard(s){where_}",
+                    "collection `{}` created with {n} shard(s){where_}{note}",
                     c.name
                 )))
             }

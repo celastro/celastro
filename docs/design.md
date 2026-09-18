@@ -281,9 +281,31 @@ durability guarantee is kept by the disk the row lands on; a query fans out
 per shard through `ShardService`, local shards by direct call and the rest
 through `wire::Remote`, and the answer is fused where the statement arrived.
 DDL and the operational statements run here and are then re-run on every
-other holder with a `LOCAL` prefix, which is also the operator's tool for a
-node a statement did not reach: there is no two-phase commit, and the refusal
-names the nodes that did and did not take it.
+other holder with a `LOCAL` prefix: there is no two-phase commit. A node a
+definition did not reach -- down, or across a split -- catches up by
+reconciliation rather than by an operator: every drop leaves a tombstone in
+the catalog with its instant, every collection carries the instant it was
+made and every index has its activity clock, and `Db::reconcile` folds a
+peer's catalog into this node's by name, last writer wins. A definition the
+peer has and this node lacks is adopted unless a younger tombstone here says
+it was dropped; a tombstone the peer has drops the definition here if it is
+older. `ATTACH NODE` reconciles at once, so a restarted pod catches up as it
+attaches its peers, and the console's sweep pulls every known peer's catalog
+every `CELASTRO_RECONCILE_SECS` (30) in a thread of its own, so a split
+heals within a sweep of the link returning. The statement that could not
+reach a node therefore succeeds with a note naming it, for what the
+reconciliation carries -- `CREATE COLLECTION`, `CREATE INDEX`, `DROP INDEX`,
+`DROP COLLECTION`, a policy's creation. What it does not carry -- an `ALTER`,
+a placement after a move, a policy's drop -- is still refused naming the
+nodes and the `LOCAL` statement to run there. One refusal is deliberate: a
+data node adopts a collection whose map names it as a holder only if the
+collection is younger than the node's data directory. Older means the
+directory never had those shards' data -- a node restarted from an empty
+volume -- and growing empty shards for it would turn lost data into an
+answer; `SHOW HEALTH` names the collection as `NOT ADOPTED` until it is
+restored or dropped. Clocks matter to the rule only across a split, within
+their skew: a drop on one side and a re-creation on the other, closer in
+time than the two nodes' clocks differ, resolves as the clocks say.
 
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
@@ -1421,6 +1443,8 @@ guarantee:
 | a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
 | a fault on the coordinator-to-shard boundary can shorten an answer only by saying so, and a seeded run reproduces exactly | `sim::tests::a_fault_cannot_change_an_answer_without_saying_so` (twenty seeds of drops and restarts, every query shape: refused or bit-identical, never different), `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (`missing` is exactly the dropped shards, no second call to a shard given up on, real rows only, and the cache holds no partial sum afterwards), `sim::tests::a_shard_that_restarted_answers_exactly_what_it_did_before` (every call answered by a replacement opened from the directory), `sim::tests::the_order_shards_answer_in_does_not_change_the_answer` (and the plan lists shards by index), `sim::tests::a_seeded_run_reproduces_its_trace_and_its_answers` |
 | a walk is the neighbourhood and nothing else, the same at every layout and across nodes, and a cut or a dangling edge is said, never hidden | `engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else` (1..k, the start excluded, the edge filter at every hop, `REVERSE`, `OR`/`NOT`, fused with text and a distance, every refusal), `engine::tests::a_hop_statement_is_bit_identical_across_shard_counts` (1, 3 and 6 shards of both collections, memtable and segments, a deleted node and a dangling edge), `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers` (the same through the wire, and a holder that stops answering is a deadline or a named absence), `engine::tests::a_cut_walk_says_which_cap_bound_it` (both caps, the lexicographically first kept, the line on the response, in the plan and in the console's JSON), `engine::tests::a_dangling_edge_is_skipped_and_counted` (a never-existed and a deleted target, per hop, and nothing walked through a deleted node), `engine::tests::a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so` (twenty seeds over `expand` and `present`: refused or bit-identical, a partial answer inside the unfaulted neighbourhood and short only with `missing`), `sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`, `catalog::tests::catalog_round_trips` (format 5: `nodes_of`, `undirected`, the adjacency kind, and a 4 read as a plain collection) |
+| a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
+| a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
 | a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
 | a shard moves between nodes with no row lost or duplicated, every node agrees on the map, a pinned shard refuses writes naming the move, and an emptied node detaches | `wire::a_shard_moves_between_nodes_and_every_node_agrees` (source and target both elsewhere, target here, source here; answers on every node equal one process's after each; the refusal on a pinned shard and the write after the abort; `REBALANCE`; `DETACH` refused with the plan and accepted once empty; the map after a restart) |

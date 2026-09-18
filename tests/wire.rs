@@ -948,3 +948,122 @@ fn a_node_that_comes_back_within_the_dial_retry_is_reached() {
     assert!(t0.elapsed() < std::time::Duration::from_secs(4), "{:?}", t0.elapsed());
     let _b = back.join().unwrap();
 }
+
+/// What a node misses while it is down or across a split reaches it when
+/// it reconnects: the index made and the one dropped while it was away, a
+/// collection created without it, whose shard it then builds. The DDL that
+/// could not reach it answered with a note, not a refusal.
+#[test]
+fn a_node_away_through_ddl_catches_up_when_it_reattaches() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("recon-a");
+    let b = Node::start("recon-b");
+    let c = Node::start("recon-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    a.ack(INDEXES[0]);
+    let (c_url, c_dir) = (c.url.clone(), c.dir.clone());
+    let c_port: u16 = c_url.rsplit(':').next().unwrap().parse().unwrap();
+    drop(c);
+    settle();
+    // Made while c is away: an index, a drop, and a whole collection whose
+    // map names c.
+    let m = a.ack(INDEXES[1]);
+    assert!(m.contains(&format!("not on {c_url}")) && m.contains("adopt it"), "{m}");
+    let m = a.ack("DROP INDEX items_body ON items");
+    assert!(m.contains(&format!("not on {c_url}")), "{m}");
+    let m = a.ack("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m', 'x'])");
+    assert!(m.contains("created with 3 shard(s)") && m.contains(&format!("not on {c_url}")), "{m}");
+    // An ALTER is not carried by the reconciliation, so it is still refused
+    // naming the node to run it on.
+    let e = a.exec("ALTER INDEX items_emb ON items SET TIER 'cached'").unwrap_err().to_string();
+    assert!(e.contains("applied here") && e.contains(&format!("not on {c_url}")), "{e}");
+    // c comes back at the same address with the same directory, and
+    // attaches a as a restarted pod attaches its peers.
+    let c = Node::start_at("recon-c", c_port, Some(c_dir.clone()));
+    assert!(c.db.read().unwrap().collection("notes").is_err());
+    c.ack(&format!("ATTACH NODE '{}'", a.url));
+    {
+        let db = c.db.read().unwrap();
+        let items = db.collection("items").unwrap();
+        assert!(items.index_by_name("items_emb").is_some(), "the index made while away");
+        assert!(items.index_by_name("items_body").is_none(), "the index dropped while away");
+        db.collection("notes").unwrap();
+    }
+    assert_eq!(c.local_shards("notes"), vec![2], "c built the shard the map gives it");
+    // The collection works end to end: a write routed to c's shard lands.
+    a.ack(r#"INSERT INTO notes VALUES ('{"id":"zeta"}')"#);
+    assert_eq!(c.docs_here("notes"), 1);
+    // A second reconciliation changes nothing.
+    let notes = c.db.write().unwrap().reconcile(&a.db.read().unwrap().catalog.clone()).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    // The index is made again after its drop, on a alone: younger than the
+    // tombstone, so the tombstone does not keep it from c.
+    a.ack(&format!("LOCAL {}", INDEXES[0]));
+    let notes = c.db.write().unwrap().reconcile(&a.db.read().unwrap().catalog.clone()).unwrap();
+    assert_eq!(notes, vec!["adopted index `items_body` on `items`"]);
+    // And c's tombstone reaches a: c drops the index, a reconciles from c.
+    c.ack("LOCAL DROP INDEX items_emb ON items");
+    let notes = a.db.write().unwrap().reconcile(&c.db.read().unwrap().catalog.clone()).unwrap();
+    assert_eq!(notes, vec!["dropped index `items_emb` on `items`"]);
+    assert!(a.db.read().unwrap().collection("items").unwrap().index_by_name("items_emb").is_none());
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A data node that comes back with an empty directory is not a node that
+/// missed a definition: the map names it for data it does not have. The
+/// reconciliation refuses to grow an empty shard for it and says what to
+/// do instead; a coordinator, which holds nothing, adopts everything.
+#[test]
+fn a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("born-a");
+    let c = Node::start("born-c");
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    let c_url = c.url.clone();
+    let c_port: u16 = c_url.rsplit(':').next().unwrap().parse().unwrap();
+    let old_dir = c.dir.clone();
+    drop(c);
+    settle();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // The same address, a directory that never held the shard.
+    let c = Node::start_at("born-c2", c_port, None);
+    let notes = c.db.write().unwrap().reconcile(&a.db.read().unwrap().catalog.clone()).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("older than this data directory") && notes[0].contains("RESTORE"));
+    assert!(c.db.read().unwrap().collection("items").is_err());
+    let h = c.ack("SHOW HEALTH");
+    assert!(h.contains("collection `items`: NOT ADOPTED"), "{h}");
+    // A collection made after the directory was, while c is away again, is
+    // one it simply missed.
+    let new_dir = c.dir.clone();
+    drop(c);
+    settle();
+    let m = a.ack("CREATE COLLECTION later (id TEXT PRIMARY KEY) WITH (splits = ['m'])");
+    assert!(m.contains(&format!("not on {c_url}")), "{m}");
+    let c = Node::start_at("born-c2", c_port, Some(new_dir));
+    let notes = c.db.write().unwrap().reconcile(&a.db.read().unwrap().catalog.clone()).unwrap();
+    // The refusal is said once per process, so the restarted c says it again.
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(notes[1], "adopted collection `later` with 0 index(es)");
+    assert_eq!(c.local_shards("later").len(), 1);
+    let d = Node::start_role("born-d", 0, None, celastro::engine::Role::Coordinator);
+    d.ack(&format!("ATTACH NODE '{}'", a.url));
+    d.db.read().unwrap().collection("items").unwrap();
+    for n in [a, c, d] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&old_dir);
+}

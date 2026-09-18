@@ -6,6 +6,38 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.46.0 — 2026-09-18
+
+The catalog reconciles itself, hence a minor.
+
+**A definition made while a node could not be reached reaches it when it
+can.** A drill on a three-node cluster split for ninety seconds showed the
+harm a split does: no data diverged, but a `CREATE INDEX` on each side
+left the two catalogs different after the link returned, with nothing to
+reconcile them. Now every drop leaves a tombstone in the catalog with its
+instant, every collection carries the instant it was made, and a node
+folds a peer's catalog into its own by name, last writer wins:
+`ATTACH NODE` reconciles at once, so a restarted pod catches up as it
+attaches its peers, and the console pulls every known peer's catalog
+every `CELASTRO_RECONCILE_SECS` (30; `0` turns it off), so a split heals
+within a sweep. A `CREATE COLLECTION`, `CREATE INDEX`, `DROP INDEX`, `DROP
+COLLECTION` or policy that could not reach a node therefore succeeds with
+a note naming it, where it was refused before; an `ALTER`, a move's
+placement and a policy's drop are still refused naming the node and the
+`LOCAL` statement to run there. `celastro_catalog_reconciled_total`
+counts what the sweep changed, and each change is a `catalog_reconciled`
+log line.
+
+**A data node that comes back empty does not grow empty shards.** A
+collection older than the node's data directory whose map names the node
+is data the directory never had, not a definition it missed; the
+reconciliation refuses it, says so once, and `SHOW HEALTH` names it `NOT
+ADOPTED` until it is restored or dropped. A coordinator, holding nothing,
+adopts everything, as it did.
+
+The catalog is format 7 (creation instants, tombstones, the directory's
+birth); formats 2 through 6 are read as before.
+
 ## 0.45.0 — 2026-09-18
 
 Dedicated coordinators, hence a minor.
