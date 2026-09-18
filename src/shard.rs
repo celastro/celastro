@@ -1425,6 +1425,21 @@ impl Wal {
     /// Recorded for the probe because "the manifest is durable before the WAL
     /// is emptied" is an ordering claim, and the wrong order loses every
     /// document in the sealed memtable.
+    /// Rename the log aside as `wal.<seq>.log` and start a fresh one: what
+    /// a seal that runs off the lock does instead of truncating, so the
+    /// rows written meanwhile keep their log. The rotated file is the
+    /// frozen memtable's, deleted when its segments are installed, and
+    /// replayed with the live log if the process ends before then.
+    pub(crate) fn rotate(&mut self, seq: u64) -> Result<PathBuf> {
+        self.sync()?;
+        let rotated = self.path.with_file_name(format!("wal.{seq:06}.log"));
+        fs::rename(&self.path, &rotated)?;
+        sync_dir_of(&self.path)?;
+        self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        self.records = 0;
+        Ok(rotated)
+    }
+
     pub(crate) fn truncate(&mut self) -> Result<()> {
         // Two opens: the first empties the file, the second is the append-mode
         // handle the log goes on being written through. Assigning both to
@@ -1448,6 +1463,11 @@ pub(crate) enum Loc {
 #[derive(Default, Clone)]
 #[non_exhaustive]
 pub struct ShardOpts {
+    /// A seal that is due freezes the memtable and leaves the build to the
+    /// console's maintenance thread, which holds no lock for it
+    /// (`Shard::seal_freeze`, `seal_build`, `seal_install`); off, a due
+    /// seal builds inline under the caller's lock as `FLUSH` does.
+    pub background_seal: bool,
     pub thresholds: FlushThresholds,
     pub build: BuildOpts,
     pub budget: Option<Arc<MemtableBudget>>,
@@ -1475,6 +1495,31 @@ pub struct ShardOpts {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Sealed {
     pub segment_ids: Vec<u64>,
+}
+
+/// A memtable frozen for a seal, with everything its build needs and
+/// nothing the shard's lock protects: what `seal_build` turns into
+/// segments holding no lock, and `seal_install` commits under it.
+pub struct SealTicket {
+    frozen: Arc<Memtable>,
+    layers: Vec<Vec<PendingDoc>>,
+    first_id: u64,
+    coll: Collection,
+    build: BuildOpts,
+    retain_from: Timestamp,
+    tally: PathTally,
+    wals: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for SealTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SealTicket({} layer(s) from segment {})", self.layers.len(), self.first_id)
+    }
+}
+
+/// The segments a ticket's build produced, in memory, for `seal_install`.
+pub struct SealBuilt {
+    segments: Vec<Segment>,
 }
 
 impl Sealed {
@@ -1549,6 +1594,14 @@ pub struct Shard {
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
     pub(crate) flushes: u64,
+    /// Memtables frozen by `seal_freeze` whose segments are not built yet,
+    /// oldest first; each is also in `frozen`, where reads find it.
+    pub(crate) pending_seals: Vec<SealTicket>,
+    /// Rotated write-ahead logs whose rows are in the live memtable: the
+    /// ones replayed at open. Deleted by the seal that covers them.
+    unsealed_wals: Vec<PathBuf>,
+    /// The next rotation's number, past every rotated log in the directory.
+    wal_seq: u64,
     /// Seals that failed and were left for the next write to retry, and
     /// the last one's reason: a disk that is full or gone, seen here first.
     pub(crate) seal_failures: u64,
@@ -1607,6 +1660,9 @@ impl Shard {
             index: 0,
             memtable,
             frozen: Vec::new(),
+            pending_seals: Vec::new(),
+            unsealed_wals: Vec::new(),
+            wal_seq: 1,
             segments: Vec::new(),
             manifest_version: 0,
             next_segment_id: 1,
@@ -2364,11 +2420,163 @@ impl Shard {
     pub(crate) fn maybe_flush(&mut self) -> Result<bool> {
         let pinned = self.opts.gc_horizon > 0;
         if self.memtable.should_flush_pinned(&self.opts.thresholds, pinned) {
-            self.flush()?;
+            // With a sealer running, a due seal is a freeze here and a build
+            // there; two seals it has not caught up with are the bound, and
+            // past it the write path builds inline, which is backpressure.
+            if self.opts.background_seal && self.pending_seals.len() < 2 {
+                self.seal_freeze()?;
+            } else {
+                self.flush()?;
+            }
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    /// Freeze the memtable for a seal: the rows it holds, laid out as the
+    /// segments a build makes of them, the segment ids reserved, the
+    /// write-ahead log rotated aside, and the memtable itself moved to
+    /// `frozen` where reads and deletes still find it. Nothing here builds
+    /// an index; that is `seal_build`, holding no lock.
+    pub(crate) fn seal_freeze(&mut self) -> Result<bool> {
+        if self.memtable.is_empty() {
+            return Ok(false);
+        }
+        let retain_from = self.retain_from(self.clock.peek());
+        let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
+        let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
+        if self.opts.gc_horizon == 0 {
+            layers.truncate(1);
+        }
+        let first_id = self.next_segment_id;
+        self.next_segment_id += layers.len() as u64;
+        let mut wals = std::mem::take(&mut self.unsealed_wals);
+        if let Some(w) = self.wal.as_mut() {
+            let seq = self.wal_seq;
+            self.wal_seq += 1;
+            wals.push(w.rotate(seq)?);
+        }
+        let frozen = Arc::new(std::mem::replace(
+            &mut self.memtable,
+            Memtable::new(&self.coll, self.opts.budget.clone()),
+        ));
+        self.frozen.push(frozen.clone());
+        self.pending_seals.push(SealTicket {
+            frozen,
+            layers,
+            first_id,
+            coll: self.coll.clone(),
+            build: self.opts.build,
+            retain_from,
+            tally: std::mem::take(&mut self.unsealed),
+            wals,
+        });
+        Ok(true)
+    }
+
+    /// The oldest frozen memtable waiting for its build, if any.
+    pub(crate) fn seal_take(&mut self) -> Option<SealTicket> {
+        if self.pending_seals.is_empty() {
+            None
+        } else {
+            Some(self.pending_seals.remove(0))
+        }
+    }
+
+    /// Build a ticket's segments. No lock, no shard: the ticket has the
+    /// rows, the ids and the options, and this is the time the graph takes.
+    pub(crate) fn seal_build(t: &SealTicket) -> Result<SealBuilt> {
+        let mut segments = Vec::new();
+        for (id, layer) in (t.first_id..).zip(t.layers.iter().rev()) {
+            let mut b = SegmentBuilder::new(t.build);
+            for pd in layer {
+                b.add(pd.clone());
+            }
+            segments.push(b.build(id, 0, &t.coll)?);
+        }
+        Ok(SealBuilt { segments })
+    }
+
+    /// Commit a build: the segments to disk and the manifest, the deletes
+    /// the frozen memtable took before and during the build into their
+    /// logs, the frozen memtable let go, its rotated log removed.
+    pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
+        let deletes = Shard::deletes_of(&t.frozen);
+        let handles = self.handles_for(built.segments, &deletes)?;
+        let sealed = self.commit_handles(handles)?;
+        self.sealed.merge(&t.tally);
+        self.frozen.retain(|f| !Arc::ptr_eq(f, &t.frozen));
+        t.frozen.release_budget();
+        self.retain_floor = self.retain_floor.max(t.retain_from);
+        for p in &t.wals {
+            if p.exists() {
+                fs::remove_file(p)?;
+            }
+        }
+        if let Some(p) = t.wals.first() {
+            sync_dir_of(p)?;
+        }
+        Ok(sealed)
+    }
+
+    /// A build that failed: the ticket goes back to the front of the
+    /// queue, the rows stay readable in the frozen memtable and durable in
+    /// its rotated log, and the failure is counted.
+    pub(crate) fn seal_requeue(&mut self, t: SealTicket, err: &Error) {
+        self.seal_failures += 1;
+        self.last_seal_error = Some(err.to_string());
+        self.pending_seals.insert(0, t);
+    }
+
+    /// The deletes a memtable holds, as `(key, version, delete instant)`.
+    fn deletes_of(m: &Memtable) -> Vec<(String, Timestamp, Timestamp)> {
+        m.delete_entries()
+            .into_iter()
+            .filter_map(|(ord, dts)| {
+                m.docs.get(ord as usize).map(|d| (d.sort_key.clone(), d.commit_ts, dts))
+            })
+            .collect()
+    }
+
+    /// Persist built segments and give each its handle, with the deletes
+    /// that name its rows.
+    fn handles_for(
+        &self,
+        built: Vec<Segment>,
+        deletes: &[(String, Timestamp, Timestamp)],
+    ) -> Result<Vec<Arc<SegmentHandle>>> {
+        let mut handles: Vec<Arc<SegmentHandle>> = Vec::new();
+        for seg in built {
+            self.adopt_segment(&seg);
+            let path = self.persist_segment(&seg)?;
+            let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
+            for (key, version_ts, delete_ts) in deletes {
+                if let Some(ord) = handle.segment.ordinals.find(key) {
+                    if handle.segment.ordinals.commit_ts[ord as usize] == *version_ts {
+                        handle.mark_deleted(ord, *delete_ts);
+                    }
+                }
+            }
+            handles.push(handle);
+        }
+        Ok(handles)
+    }
+
+    /// Publish a manifest naming the shard's segments and these, and adopt
+    /// it: the one point at which a seal becomes reader-visible. Id order
+    /// is what `locate`'s newest-first scan reads as version order.
+    fn commit_handles(&mut self, handles: Vec<Arc<SegmentHandle>>) -> Result<Sealed> {
+        let sealed = Sealed { segment_ids: handles.iter().map(|h| h.id()).collect() };
+        let mut next = self.segments.clone();
+        next.extend(handles);
+        next.sort_by_key(|h| h.id());
+        let version = self.manifest_version + 1;
+        self.publish_segments(&next, version)?;
+        self.segments = next;
+        self.manifest_version = version;
+        self.flushes += 1;
+        Ok(sealed)
     }
 
     /// Seal the memtable into segments.
@@ -2399,8 +2607,24 @@ impl Shard {
     ///
     /// [`compaction::run`]: crate::compaction::run
     pub(crate) fn flush(&mut self) -> Result<Option<Sealed>> {
+        // Seals frozen for the background first, inline: `FLUSH` means
+        // everything sealed, and a shard with no sealer running has none.
+        let mut drained = Vec::new();
+        while let Some(t) = self.seal_take() {
+            match Shard::seal_build(&t) {
+                Ok(b) => drained.extend(self.seal_install(t, b)?.segment_ids),
+                Err(e) => {
+                    self.seal_requeue(t, &e);
+                    return Err(e);
+                }
+            }
+        }
         if self.memtable.is_empty() {
-            return Ok(None);
+            return Ok(if drained.is_empty() {
+                None
+            } else {
+                Some(Sealed { segment_ids: drained })
+            });
         }
         // Build first. A build that fails must leave the shard exactly as it
         // was — not with the memtable already swapped out and its contents
@@ -2465,45 +2689,13 @@ impl Shard {
         // key-only match would mark the surviving version deleted and lose the
         // document. Match the version by its commit timestamp; an entry whose
         // row was collected at the drain simply matches nothing.
-        let deletes: Vec<(String, Timestamp, Timestamp)> = self
-            .memtable
-            .delete_entries()
-            .into_iter()
-            .filter_map(|(ord, dts)| {
-                self.memtable.docs.get(ord as usize).map(|d| (d.sort_key.clone(), d.commit_ts, dts))
-            })
-            .collect();
-
+        let deletes = Shard::deletes_of(&self.memtable);
         // Every fallible step first, into a local list, exactly as
         // `install_compaction` does: a persist that fails on the second output
         // must not leave the first one live in `self.segments` while the
         // memtable still holds all of its rows, because then the same key is
         // reachable twice and a retry makes the duplicate permanent.
-        let mut handles: Vec<Arc<SegmentHandle>> = Vec::new();
-        for seg in built {
-            self.adopt_segment(&seg);
-            let path = self.persist_segment(&seg)?;
-            let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
-            for (key, version_ts, delete_ts) in &deletes {
-                if let Some(ord) = handle.segment.ordinals.find(key) {
-                    if handle.segment.ordinals.commit_ts[ord as usize] == *version_ts {
-                        handle.mark_deleted(ord, *delete_ts);
-                    }
-                }
-            }
-            handles.push(handle);
-        }
-
-        // The set this seal is proposing, in a local. Id order is what
-        // `locate`'s newest-first scan reads as version order, so it is stated
-        // here rather than left to the loop direction — `install_compaction`
-        // sorts for the same reason.
-        let sealed = Sealed { segment_ids: handles.iter().map(|h| h.id()).collect() };
-        let mut next = self.segments.clone();
-        next.extend(handles);
-        next.sort_by_key(|h| h.id());
-        let version = self.manifest_version + 1;
-
+        let handles = self.handles_for(built, &deletes)?;
         // The ids are committed here rather than below, and deliberately not
         // as part of the commit: the files under them are already on the disk,
         // so they have been spoken for whatever happens next. Handing one out
@@ -2515,30 +2707,16 @@ impl Shard {
         // out of 2^64. `Shard::open` refuses the same reuse across a reopen,
         // where the counter itself is what was lost.
         self.next_segment_id = next_id;
-
-        // The publication, and the last thing here that can fail. Until it
-        // returns `Ok` the shard is still the shard it was: the memtable holds
-        // every row, the old segment set is the one readers see, and it is the
-        // one the manifest on the disk names. A seal that installed first would
-        // answer queries out of a set no manifest records -- with the rows
-        // reachable a second time through the memtable that still holds them --
-        // and a reopen would produce neither state.
-        //
-        // It also comes before the log is emptied, and that `?` is load-bearing
-        // too. The WAL holds the only other copy of the rows this seal just
-        // wrote: truncating it first -- or despite a publication that failed --
-        // leaves the old MANIFEST, which does not name the new segments, beside
-        // a log that no longer holds the documents. Every document in the
-        // sealed memtable is gone, and nothing anywhere returns an error to say
-        // so.
-        self.publish_segments(&next, version)?;
-
-        // The commit. Nothing in it can fail: this is the one point at which
-        // the seal becomes reader-visible, and it is now a point at which the
-        // seal is already recorded.
-        self.segments = next;
-        self.manifest_version = version;
-        self.flushes += 1;
+        // The publication is the last thing that can fail, and it comes
+        // before the log is emptied: until it returns `Ok` the shard is the
+        // shard it was, the memtable holds every row, and the old segment
+        // set is the one readers see and the manifest on the disk names.
+        // Truncating the log first, or despite a publication that failed,
+        // would leave a manifest that does not name the new segments beside
+        // a log that no longer holds the documents.
+        let mut sealed = self.commit_handles(handles)?;
+        drained.extend(std::mem::take(&mut sealed.segment_ids));
+        sealed.segment_ids = drained;
         // The memtable's documents are on the disk under a published
         // manifest, so the next persist may count them: from here a reopen
         // finds them in segments and not in the WAL, and will not observe
@@ -2563,6 +2741,12 @@ impl Shard {
         // converges on rather than re-applying.
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
+        }
+        // The rotated logs replayed at open are covered by this seal too.
+        for p in std::mem::take(&mut self.unsealed_wals) {
+            if p.exists() {
+                fs::remove_file(&p)?;
+            }
         }
         Ok(Some(sealed))
     }
@@ -2816,7 +3000,35 @@ impl Shard {
             let live: Vec<u64> = m.segments.iter().map(|meta| meta.id).collect();
             reclaim_orphans(dir, &live);
         }
-        let records = Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?;
+        // Rotated logs first, oldest first, then the live one: a seal
+        // frozen but not installed when the process ended left its rows in
+        // a rotated log, and they come back into the memtable with the
+        // rest; the next seal covers them all and removes the files.
+        let mut rotated: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("wal.") && name.ends_with(".log") && name != "wal.log" {
+                    rotated.push(e.path());
+                }
+            }
+        }
+        rotated.sort();
+        for p in &rotated {
+            let seq = p.file_name().and_then(|f| f.to_str()).and_then(|f| {
+                f.trim_start_matches("wal.").trim_end_matches(".log").parse::<u64>().ok()
+            });
+            if let Some(seq) = seq {
+                s.wal_seq = s.wal_seq.max(seq + 1);
+            }
+        }
+        let mut records = Vec::new();
+        for p in &rotated {
+            records.extend(Wal::replay(p, &s.opts.cipher, &s.file_id("wal.log"))?);
+        }
+        records.extend(Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?);
+        s.unsealed_wals = rotated;
         for r in records {
             s.clock.observe(r.ts);
             match r.kind {
@@ -6217,5 +6429,107 @@ mod tests {
              reused its id: three documents nobody deleted are gone"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod background_seal_tests {
+    use super::*;
+    use crate::catalog::Collection;
+    use crate::value::Value;
+
+    fn coll() -> Collection {
+        Collection::new("t", "id", None)
+    }
+
+    fn doc(i: usize) -> Value {
+        crate::json::parse(&format!(r#"{{"id":"d{i:04}","n":{i},"body":"row {i}"}}"#)).unwrap()
+    }
+
+    fn dir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "celastro-bgseal-{label}-{}-{}",
+            std::process::id(),
+            crate::time::now_micros()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A due seal with a sealer running freezes rather than builds: the
+    /// rows stay readable and deletable in the frozen memtable, the log is
+    /// rotated aside, and the install commits the segment with the delete
+    /// made meanwhile and removes the rotated log.
+    #[test]
+    fn a_frozen_memtable_is_read_and_deleted_until_its_seal_is_installed() {
+        let d = dir("freeze");
+        let mut opts = ShardOpts::default();
+        opts.background_seal = true;
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts);
+        s.attach_dir(&d).unwrap();
+        for i in 0..20 {
+            s.insert(doc(i)).unwrap();
+        }
+        // Due now, and not before: the write path seals when it is.
+        s.opts.thresholds.max_bytes = 1;
+        assert!(s.maybe_flush().unwrap(), "due");
+        s.opts.thresholds = FlushThresholds::default();
+        assert!(s.memtable.is_empty() && s.frozen.len() == 1 && s.pending_seals.len() == 1);
+        assert!(s.segments.is_empty(), "nothing built under the lock");
+        assert!(d.join("wal.000001.log").exists(), "the log was rotated aside");
+        let now = s.clock.peek();
+        assert!(s.get("d0003", now).unwrap().is_some(), "read from the frozen memtable");
+        assert!(s.delete("d0003").unwrap().is_some(), "deleted in the frozen memtable");
+        s.insert(doc(100)).unwrap();
+        assert_eq!(s.num_docs(s.clock.peek()), 20, "19 frozen and 1 live");
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        let sealed = s.seal_install(t, built).unwrap();
+        assert_eq!(sealed.segment_ids.len(), 1);
+        assert!(s.frozen.is_empty() && s.pending_seals.is_empty());
+        assert!(!d.join("wal.000001.log").exists(), "the rotated log is gone");
+        let now = s.clock.peek();
+        assert!(s.get("d0003", now).unwrap().is_none(), "the delete made meanwhile holds");
+        assert!(s.get("d0004", now).unwrap().is_some());
+        assert!(s.get("d0100", now).unwrap().is_some(), "the live row is still live");
+        assert_eq!(s.num_docs(now), 20);
+        drop(s);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The process ends between the freeze and the install: the rotated
+    /// log and the live one both replay, every row comes back, and the
+    /// next seal covers them and removes the rotated file.
+    #[test]
+    fn a_seal_frozen_but_not_installed_replays_from_its_rotated_log() {
+        let d = dir("replay");
+        let clock = Arc::new(Hlc::new());
+        let mut opts = ShardOpts::default();
+        opts.background_seal = true;
+        {
+            let mut s = Shard::new(coll(), clock.clone(), opts.clone());
+            s.attach_dir(&d).unwrap();
+            for i in 0..10 {
+                s.insert(doc(i)).unwrap();
+            }
+            s.opts.thresholds.max_bytes = 1;
+            assert!(s.maybe_flush().unwrap());
+            s.opts.thresholds = FlushThresholds::default();
+            s.insert(doc(50)).unwrap();
+            s.delete("d0002").unwrap();
+            assert_eq!(s.pending_seals.len(), 1, "frozen, never installed");
+        }
+        let mut s = Shard::open(coll(), clock, opts, &d).unwrap();
+        let now = s.clock.peek();
+        assert_eq!(s.num_docs(now), 10, "9 of the first ten and the one after");
+        assert!(s.get("d0002", now).unwrap().is_none());
+        assert!(s.get("d0050", now).unwrap().is_some());
+        assert!(d.join("wal.000001.log").exists(), "kept until a seal covers it");
+        s.flush().unwrap();
+        assert!(!d.join("wal.000001.log").exists());
+        assert_eq!(s.num_docs(s.clock.peek()), 10);
+        drop(s);
+        let _ = fs::remove_dir_all(&d);
     }
 }

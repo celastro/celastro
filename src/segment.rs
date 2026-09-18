@@ -1077,6 +1077,7 @@ fn assemble(
 }
 
 /// One document on its way into a segment.
+#[derive(Clone)]
 pub struct PendingDoc {
     /// The composite `(partition_key, primary_key)` sort key. Segments are
     /// sorted on it, which is what makes a tenant a contiguous ordinal range

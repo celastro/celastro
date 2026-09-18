@@ -546,6 +546,9 @@ impl Server {
         let rx = Mutex::new(rx);
         std::thread::scope(|scope| {
             if server.auto_compact {
+                // The thread that builds seals off the lock exists, so a
+                // due seal may freeze for it.
+                write(db).set_background_seal(true);
                 let stop = &stop;
                 scope.spawn(move || maintenance(db, stop));
             }
@@ -1645,6 +1648,38 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
 /// One job, if any shard wants one: reserved, built, installed. Whether a
 /// job was found.
 fn maintenance_step(db: &RwLock<Db>) -> bool {
+    // A seal frozen by the write path first: the graph it builds is the
+    // pause a statement would otherwise wait out under the lock. The guard
+    // is bound and dropped on its own line: as a temporary in the `if let`
+    // it lived through the build and the install, which takes the lock
+    // again, and the first run of the check for this deadlocked the node.
+    let job = write(db).seal_reserve();
+    if let Some(job) = job {
+        let what = job.describe();
+        let started = Instant::now();
+        match Db::seal_build(&job) {
+            Ok(built) => match write(db).seal_install(job, built) {
+                Ok(_) => crate::log::info(
+                    "sealed",
+                    &[
+                        ("what", what),
+                        ("seconds", format!("{:.1}", started.elapsed().as_secs_f64())),
+                    ],
+                ),
+                Err(e) => crate::log::warn(
+                    "seal_not_installed",
+                    &[("what", what), ("error", e.to_string())],
+                ),
+            },
+            Err(e) => {
+                crate::log::warn("seal_failed", &[("what", what), ("error", e.to_string())]);
+                write(db).seal_requeue(job, &e);
+                // Not at once: a disk that is full is still full.
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        return true;
+    }
     let Some(ticket) = write(db).compaction_reserve() else { return false };
     let what = ticket.describe();
     let started = Instant::now();

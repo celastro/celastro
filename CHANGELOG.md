@@ -6,6 +6,33 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.49.0 — 2026-09-18
+
+The seal builds off the lock, hence a minor.
+
+**A seal no longer pauses the node.** A seal of a large vector memtable
+built its graph under the write lock -- 146 s for 50,000 vectors in the
+recovery drill -- and the node answered nothing meanwhile, which to its
+peers was a partition. With the console's maintenance thread running, a
+seal that is due now freezes the memtable under the lock (its rows laid
+out for the build, the segment ids reserved, the write-ahead log rotated
+aside, the memtable kept where reads and deletes find it), builds the
+segments on the maintenance thread holding nothing, and installs them
+under the lock again: compaction's shape, for the seal. Two frozen seals
+the thread has not caught up with are the bound; past it the write path
+builds inline, which is backpressure. `FLUSH` still seals everything
+inline, frozen memtables first. The resilience suite's new check writes
+20,000 vectors through the console and answers point lookups while the
+graph builds: 22 s of build, 106 lookups meanwhile, the slowest 67 ms.
+Its first run found a deadlock in the maintenance step itself, a lock
+guard living through the build as an `if let` temporary; fixed before
+the first tag with it.
+
+**The write-ahead log rotates.** A frozen memtable's log is renamed
+aside as `wal.<n>.log` and a fresh one takes the rows written meanwhile;
+the rotated file goes when its segments are installed, and a process
+that ends before then replays it with the live log at the next open.
+
 ## 0.48.0 — 2026-09-18
 
 The resilience drills' findings, hence a minor: a rotation that rolls,

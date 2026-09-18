@@ -232,6 +232,11 @@ pub struct DbOpts {
     /// load and more records unsynced at any one moment (the statement is
     /// not acknowledged until all of them are); 1000 by default.
     pub insert_batch: usize,
+    /// A seal that is due freezes the memtable and leaves the build to the
+    /// console's maintenance thread, holding no lock for it; off, it
+    /// builds inline under the write lock. The console turns it on when it
+    /// runs its maintenance thread ([`Db::set_background_seal`]).
+    pub background_seal: bool,
     /// Encryption at rest: the master key that wraps the database's data
     /// key (`CELASTRO_MASTER_KEY_FILE`, 32 bytes, or `CELASTRO_MASTER_KEY`
     /// as hex). With it, `<dir>/KEY` is made at the first open of an empty
@@ -276,6 +281,7 @@ impl Default for DbOpts {
             archive: crate::objstore::ArchiveOpts::default(),
             backup_dir: None,
             insert_batch: 1000,
+            background_seal: false,
             master_key: None,
             key_file: None,
             role: Role::Data,
@@ -1158,6 +1164,7 @@ impl Db {
 
     fn shard_opts(&self) -> ShardOpts {
         ShardOpts {
+            background_seal: self.opts.background_seal,
             thresholds: self.opts.thresholds,
             build: self.opts.build,
             budget: Some(self.budget.clone()),
@@ -3450,6 +3457,56 @@ impl Db {
 
     /// Install a built compaction on the shard it was reserved on. `false`
     /// when the shard moved on meanwhile and the build is dropped.
+    /// Whether a due seal freezes for the maintenance thread or builds
+    /// inline; set on every shard held and every one built from here on.
+    pub fn set_background_seal(&mut self, on: bool) {
+        self.opts.background_seal = on;
+        for shards in self.shards.values_mut() {
+            for s in shards.iter_mut() {
+                s.opts.background_seal = on;
+            }
+        }
+    }
+
+    /// The oldest frozen memtable of any shard waiting for its build,
+    /// under the lock; [`seal_build`](Self::seal_build) holding nothing;
+    /// [`seal_install`](Self::seal_install) under it again. Compaction's
+    /// triple, for the seal.
+    pub fn seal_reserve(&mut self) -> Option<SealJob> {
+        for (name, shards) in self.shards.iter_mut() {
+            for (i, s) in shards.iter_mut().enumerate() {
+                if let Some(ticket) = s.seal_take() {
+                    return Some(SealJob { collection: name.clone(), shard: i, ticket });
+                }
+            }
+        }
+        None
+    }
+
+    pub fn seal_build(job: &SealJob) -> Result<crate::shard::SealBuilt> {
+        Shard::seal_build(&job.ticket)
+    }
+
+    /// Commit a built seal. `false` when the shard is gone.
+    pub fn seal_install(&mut self, job: SealJob, built: crate::shard::SealBuilt) -> Result<bool> {
+        let Some(shards) = self.shards.get_mut(&job.collection) else { return Ok(false) };
+        let Some(shard) = shards.get_mut(job.shard) else { return Ok(false) };
+        shard.seal_install(job.ticket, built)?;
+        let name = job.collection.clone();
+        self.absorb_shard_catalogs(&name)?;
+        self.persist_catalog()?;
+        Ok(true)
+    }
+
+    /// A build that failed: the ticket goes back to its shard, retried by
+    /// the next reserve; the failure is counted on the shard.
+    pub fn seal_requeue(&mut self, job: SealJob, err: &Error) {
+        if let Some(shard) = self.shards.get_mut(&job.collection).and_then(|s| s.get_mut(job.shard))
+        {
+            shard.seal_requeue(job.ticket, err);
+        }
+    }
+
     pub fn compaction_install(
         &mut self,
         ticket: CompactionTicket,
@@ -5853,6 +5910,21 @@ fn sum_term_stats(
         }
     }
     Ok((sum, complete))
+}
+
+/// A seal frozen on one shard: what the console's maintenance thread
+/// carries between the lock it took to freeze and the lock it takes to
+/// install, with the build in between holding nothing.
+pub struct SealJob {
+    collection: String,
+    shard: usize,
+    ticket: crate::shard::SealTicket,
+}
+
+impl SealJob {
+    pub fn describe(&self) -> String {
+        format!("seal of shard {} of `{}`: {:?}", self.shard, self.collection, self.ticket)
+    }
 }
 
 /// A compaction reserved on one shard: what the console's maintenance

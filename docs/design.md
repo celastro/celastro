@@ -448,6 +448,33 @@ it with the dial retry and the attach loop. The `dns` scenario measured
 it: 11 s from the pod being ready to its name following it with the
 kubernetes plugin's default `ttl 30`, and 0.2 s with `ttl 5`.
 
+The seal was the last thing that built under the lock. A seal of a large
+vector memtable built its graph there -- 146 s for 50,000 vectors in the
+recovery drill -- and the node answered nothing meanwhile, which to its
+peers was a partition. It now has compaction's shape: `Shard::seal_freeze`
+under the lock moves the memtable into `frozen` (where `Loc::Frozen` has
+let reads and deletes find one since the tiering work), lays its rows out
+as the layers a build makes of them, reserves the segment ids and rotates
+the write-ahead log aside; `Shard::seal_build` builds the segments holding
+nothing; `Shard::seal_install` persists and publishes them, applies the
+deletes the frozen memtable took before and during the build, lets it go
+and removes its rotated log. The console's maintenance thread runs the
+triple ahead of compactions, and turns the freezing on
+(`DbOpts::background_seal`) when it starts; without it a due seal builds
+inline as before, and `FLUSH` seals everything inline, frozen memtables
+first. Two frozen seals the thread has not caught up with are the bound,
+past which the write path builds inline: backpressure, as with compaction
+debt. A build that fails is requeued with the rows still readable in the
+frozen memtable and durable in the rotated log, counted as a seal failure;
+a process that ends between freeze and install replays the rotated log
+with the live one at the next open. The check writes 20,000 vectors
+through the console and answers point lookups while the graph builds: 22 s
+of build, 106 lookups meanwhile, the slowest 67 ms. Its first run found the
+maintenance step deadlocked on itself -- the lock guard taken to reserve
+the seal was a temporary in an `if let`, alive through the build and the
+install that takes the lock again -- which is the kind of thing this suite
+is for.
+
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.
@@ -1607,6 +1634,9 @@ guarantee:
 | an expired certificate is refused by a peer naming the time; `SHOW HEALTH` says when the certificate and the CA expire and flags either inside two weeks | `tls::an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time` |
 | a node is attached only by the address it calls itself | `wire::a_node_is_attached_only_by_the_name_it_calls_itself` |
 | past the cap a wire connection is closed at once and counted; an idle one is closed after the idle time and the next call reconnects | `wire::idle_wire_connections_are_capped_and_closed` |
+| a due seal with a sealer running freezes rather than builds: the rows stay readable and deletable in the frozen memtable, the log is rotated aside, and the install commits the segment with the delete made meanwhile and removes the rotated log | `shard::background_seal_tests::a_frozen_memtable_is_read_and_deleted_until_its_seal_is_installed` |
+| a seal frozen but not installed when the process ends replays from its rotated log with the live one, and the next seal covers both | `shard::background_seal_tests::a_seal_frozen_but_not_installed_replays_from_its_rotated_log` |
+| a point lookup through the console answers while a 20,000-vector seal builds off the lock | `resilience::a_point_lookup_answers_while_a_large_vector_seal_builds` (`--ignored`) |
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |

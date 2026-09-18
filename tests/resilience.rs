@@ -341,3 +341,99 @@ fn a_cluster_backup_under_load_restores_to_one_consistent_cut() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// The pause that looked like a partition: a seal of a large vector
+/// memtable built its graph under the write lock, and a node answered
+/// nothing meanwhile. With the console's maintenance thread the seal
+/// freezes and builds off the lock, and a point lookup through the
+/// console answers while it does.
+#[test]
+#[ignore]
+fn a_point_lookup_answers_while_a_large_vector_seal_builds() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+    let d = dir("seal-console");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
+        .args(["--json", "--dir", d.to_str().unwrap(), "serve", "--port", "0"])
+        .env("CELASTRO_MEMTABLE_MAX_VECTORS", "20000")
+        .env("CELASTRO_MEMTABLE_MAX_BYTES", "1073741824")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn celastro");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
+    let addr = hello.get("addr").and_then(|v| v.as_str()).unwrap().to_string();
+    let token = hello.get("token").and_then(|v| v.as_str()).unwrap().to_string();
+    let post = |sql: &str| -> (String, Duration) {
+        let body =
+            celastro::json::to_string(&Value::obj(vec![("sql".into(), Value::Str(sql.into()))]));
+        let t0 = Instant::now();
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            s,
+            "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        (reply, t0.elapsed())
+    };
+    let (r, _) = post("CREATE COLLECTION v (id TEXT PRIMARY KEY)");
+    assert!(r.contains("\"ok\":true"), "{r}");
+    let (r, _) = post(
+        "CREATE INDEX v_emb ON v USING vector (embedding) WITH (dims = 32, metric = 'cosine')",
+    );
+    assert!(r.contains("\"ok\":true"), "{r}");
+    // 20,000 vectors in batches: the cap is reached on the last batch and
+    // the seal freezes there; the graph builds on the maintenance thread.
+    let mut seed = 7u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    };
+    let started = Instant::now();
+    for batch in 0..20 {
+        let mut rows = Vec::new();
+        for i in 0..1000 {
+            let n = batch * 1000 + i;
+            let emb: Vec<String> = (0..32).map(|_| format!("{:.4}", next())).collect();
+            rows.push(format!("('{{\"id\":\"v{n:05}\",\"embedding\":[{}]}}')", emb.join(",")));
+        }
+        let (r, _) = post(&format!("INSERT INTO v VALUES {}", rows.join(", ")));
+        assert!(r.contains("\"ok\":true"), "batch {batch}: {}", &r[r.len().saturating_sub(300)..]);
+    }
+    eprintln!("resilience: 20,000 vectors written in {:.1?}", started.elapsed());
+    // Lookups while the seal builds: each must answer within a second, and
+    // some must land before the segment exists.
+    let (mut before_seal, mut slowest) = (0usize, Duration::ZERO);
+    let t0 = Instant::now();
+    let mut sealed_at = None;
+    while t0.elapsed() < Duration::from_secs(240) {
+        let (r, took) = post("SELECT id FROM v WHERE id = 'v00042' LIMIT 1");
+        assert!(r.contains("v00042"), "{r}");
+        slowest = slowest.max(took);
+        assert!(took < Duration::from_secs(1), "a lookup took {took:?} during the seal");
+        let (seg, _) = post("SHOW SEGMENTS v");
+        // The summary lists one line per segment with its document count;
+        // the sealed one holds every vector.
+        if seg.contains("20000") {
+            sealed_at = Some(t0.elapsed());
+            break;
+        }
+        before_seal += 1;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!(
+        "resilience: {before_seal} lookups before the seal landed, slowest {slowest:?}, seal in {:?}",
+        sealed_at
+    );
+    assert!(before_seal > 0, "the seal landed before a single lookup could run");
+    assert!(sealed_at.is_some(), "the seal never landed");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&d);
+}
