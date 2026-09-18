@@ -261,8 +261,10 @@ A node started with `CELASTRO_ROLE=coordinator` holds no shards -- a
 placement, a rebalance and a move never land one on it -- and only
 coordinates: every definition reaches it, so it plans over the data
 nodes' shards exactly as they do, on cores with no seal or compaction of
-their own. `SHOW HEALTH` from any node names every node with its role and
-whether it answers, and every shard with whether its holder does.
+their own. `SHOW HEALTH` from any node names every node with its role,
+whether it answers, how far its clock is from this node's and whether an
+older process still answers at its address, and every shard with whether
+its holder does.
 
 When nodes cannot reach each other -- a node down, a split between two
 subnets -- each side keeps serving the shards it holds and refuses, or

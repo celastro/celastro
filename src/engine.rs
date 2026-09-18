@@ -145,6 +145,24 @@ pub enum Role {
 /// changes it, `0` turns the sweep off. `ATTACH NODE` reconciles at once.
 pub const RECONCILE_SECS: u64 = 30;
 
+/// A peer's clock this far from this node's is said in `SHOW HEALTH` and
+/// logged at `ATTACH`; this far and more is refused at `ATTACH`. Every
+/// timestamp, and every tombstone the reconciliation compares by, is a
+/// wall clock through the HLC, so two nodes whose clocks disagree by more
+/// than a statement takes disagree about which of two statements was last.
+pub const CLOCK_WARN_MICROS: i64 = 500_000;
+pub const CLOCK_REFUSE_MICROS: i64 = 5_000_000;
+
+/// What `SHOW HEALTH` and the sweep have seen of a peer's hello.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerSeen {
+    /// The largest epoch a hello from the address has carried: the newest
+    /// process seen there.
+    pub epoch: u64,
+    /// The peer's clock minus this node's at the last hello, microseconds.
+    pub skew_micros: i64,
+}
+
 /// What a message says about a node a definition did not reach.
 const RECONCILE_NOTE: &str =
     "the catalog reconciles at ATTACH and every 30 s, CELASTRO_RECONCILE_SECS";
@@ -922,6 +940,18 @@ pub struct Db {
     /// directory: the data is not here. Said once in the notes and on
     /// every `SHOW HEALTH` until a restore or a drop settles it.
     not_adopted: BTreeSet<String>,
+    /// When this process opened the database, microseconds: what `hello`
+    /// carries as the epoch, so a peer can tell a restart from the same
+    /// process, and an older process answering at the address from
+    /// either.
+    epoch: u64,
+    /// What every hello from every peer has shown, by address. A mutex
+    /// because `SHOW HEALTH` observes under the read lock.
+    peers_seen: Mutex<BTreeMap<String, PeerSeen>>,
+    /// Test and drill hooks: an epoch to claim instead of the real one,
+    /// and an offset on the clock `hello` reports.
+    pretend_epoch: Option<u64>,
+    pretend_clock_micros: i64,
     /// Shards of this node pinned for a move, by `(collection, index)`:
     /// the files the target pulls, as they were at the pin. Shared with the
     /// wire server, which answers a target's reads from it without this
@@ -980,6 +1010,10 @@ impl Db {
             nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
             not_adopted: BTreeSet::new(),
+            epoch: crate::time::now_micros().max(0) as u64,
+            peers_seen: Mutex::new(BTreeMap::new()),
+            pretend_epoch: None,
+            pretend_clock_micros: 0,
             moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             last_commit: 0,
         }
@@ -1682,11 +1716,29 @@ impl Db {
             match answer {
                 Ok(h) => {
                     up.insert(url.clone());
+                    let notes = self.observe_peer(url, &h);
+                    let clock = if h.now_micros > 0 {
+                        let skew = h.now_micros as i64 - self.clock_micros() as i64;
+                        format!(
+                            ", clock {:+.1} s{}",
+                            skew as f64 / 1e6,
+                            if skew.abs() > CLOCK_WARN_MICROS { " CLOCK OFF" } else { "" }
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let older = notes.iter().any(|n| n.starts_with("an older process"));
                     out.push_str(&format!(
-                        "node {url}: up, {}, celastro {}, {} ms\n",
+                        "node {url}: up, {}, celastro {}, {} ms{clock}{}{}\n",
                         h.role.name(),
                         h.version,
-                        started.elapsed().as_millis()
+                        started.elapsed().as_millis(),
+                        if older { ", AN OLDER PROCESS ANSWERS HERE TOO" } else { "" },
+                        if notes.iter().any(|n| n.contains(" restarted at ")) {
+                            ", restarted since last seen"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 Err(e) => out.push_str(&format!("node {url}: DOWN: {e}\n")),
@@ -1939,6 +1991,67 @@ impl Db {
         }
     }
 
+    /// This process's epoch: when it opened the database, or what
+    /// [`Db::pretend`] said.
+    pub fn epoch(&self) -> u64 {
+        self.pretend_epoch.unwrap_or(self.epoch)
+    }
+
+    /// This node's clock as `hello` reports it, microseconds.
+    pub fn clock_micros(&self) -> u64 {
+        (lifecycle::now_micros(&self.clock) as i64 + self.pretend_clock_micros).max(0) as u64
+    }
+
+    /// Claim another epoch, or a clock this far off, in every `hello` from
+    /// now on. For tests and drills of what peers do about a zombie and a
+    /// skewed clock; nothing else changes.
+    pub fn pretend(&mut self, epoch: Option<u64>, clock_offset_micros: i64) {
+        self.pretend_epoch = epoch;
+        self.pretend_clock_micros = clock_offset_micros;
+    }
+
+    /// What has been seen of a peer, if a hello from it was observed.
+    pub fn peer_seen(&self, url: &str) -> Option<PeerSeen> {
+        guard(&self.peers_seen).get(url).copied()
+    }
+
+    /// Take note of what a peer's hello says about it, against what earlier
+    /// ones said. The notes name what an operator should know: an older
+    /// process answering at the address (two processes, one address -- a
+    /// pod that was replaced while its predecessor still runs), a restart,
+    /// a clock further from this node's than `CLOCK_WARN_MICROS`.
+    pub fn observe_peer(&self, url: &str, hello: &crate::wire::Hello) -> Vec<String> {
+        let mut notes = Vec::new();
+        let mut seen = guard(&self.peers_seen);
+        let entry = seen.entry(url.to_string()).or_default();
+        if hello.epoch > 0 {
+            if entry.epoch > 0 && hello.epoch < entry.epoch {
+                notes.push(format!(
+                    "an older process answers at {url}: it started at {} while one started at {} \
+                     was seen there; two processes share the address",
+                    crate::time::format_micros(hello.epoch as i64),
+                    crate::time::format_micros(entry.epoch as i64)
+                ));
+            } else if entry.epoch > 0 && hello.epoch > entry.epoch {
+                notes.push(format!(
+                    "{url} restarted at {}",
+                    crate::time::format_micros(hello.epoch as i64)
+                ));
+            }
+            entry.epoch = entry.epoch.max(hello.epoch);
+        }
+        if hello.now_micros > 0 {
+            entry.skew_micros = hello.now_micros as i64 - self.clock_micros() as i64;
+            if entry.skew_micros.abs() > CLOCK_WARN_MICROS {
+                notes.push(format!(
+                    "the clock at {url} is {:+.1} s from this node's",
+                    entry.skew_micros as f64 / 1e6
+                ));
+            }
+        }
+        notes
+    }
+
     /// Every peer this node knows of, with a connection to each: what the
     /// console's sweep pulls a catalog from, dialled outside the lock.
     pub fn peers(&self) -> Vec<(String, Arc<crate::wire::Node>)> {
@@ -1980,9 +2093,7 @@ impl Db {
         // adopted back from a third node's catalog in the same sweep.
         for (key, &t) in &theirs.dropped {
             let mine = self.catalog.dropped.get(key).copied().unwrap_or(0);
-            if t > mine {
-                self.catalog.dropped.insert(key.clone(), t);
-            }
+            let t = t.max(mine);
             match key.split_once('/') {
                 None => {
                     let created = self.catalog.get(key).map(|c| c.created_micros);
@@ -1993,6 +2104,43 @@ impl Db {
                                 Err(e) => {
                                     notes.push(format!("collection `{key}` not dropped: {e}"))
                                 }
+                            }
+                        } else {
+                            // This incarnation outlives the drop; an index
+                            // made on one that did not, and merged here
+                            // before the drop was known, does not.
+                            let stale: Vec<String> = self
+                                .catalog
+                                .get(key)
+                                .map(|c| {
+                                    c.indexes
+                                        .iter()
+                                        .filter(|i| i.on_micros < t)
+                                        .map(|i| i.name.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for idx in stale {
+                                let own = self
+                                    .catalog
+                                    .dropped
+                                    .get(&Catalog::tombstone(key, &idx))
+                                    .copied();
+                                match self.drop_index(key, &idx) {
+                                    Ok(()) => notes.push(format!(
+                                        "dropped index `{idx}` on `{key}`: made on an \
+                                         incarnation since dropped"
+                                    )),
+                                    Err(e) => notes.push(format!("index `{idx}` not dropped: {e}")),
+                                }
+                                // Its own tombstone is not the collection's;
+                                // a re-creation on the live incarnation stands,
+                                // and a drop of its own from before still counts.
+                                let tomb = Catalog::tombstone(key, &idx);
+                                match own {
+                                    Some(t) => self.catalog.dropped.insert(tomb, t),
+                                    None => self.catalog.dropped.remove(&tomb),
+                                };
                             }
                         }
                     }
@@ -2015,6 +2163,10 @@ impl Db {
                     }
                 }
             }
+            // The drop above stamped a tombstone of its own, at now; the
+            // instant that counts is the peer's, or a re-creation between
+            // the two would be dropped by a drop that came before it.
+            self.catalog.dropped.insert(key.clone(), t);
         }
         for (name, coll) in &theirs.collections {
             let Some(tablets) = theirs.placement.get(name) else { continue };
@@ -2037,6 +2189,20 @@ impl Db {
                     }
                     continue;
                 }
+                // Without the indexes a tombstone here outranks: the peer
+                // may not have heard of the drop yet.
+                let mut coll = coll.clone();
+                let coll_tomb = self.catalog.dropped.get(name).copied().unwrap_or(0);
+                coll.indexes.retain(|idx| {
+                    let created = theirs
+                        .activity
+                        .get(&(name.clone(), idx.name.clone()))
+                        .map(|a| a.created_micros)
+                        .unwrap_or(0);
+                    let tomb = Catalog::tombstone(name, &idx.name);
+                    self.catalog.dropped.get(&tomb).copied().unwrap_or(0) < created
+                        && idx.on_micros > coll_tomb
+                });
                 match self.adopt_collection(coll.clone(), tablets.clone()) {
                     Ok(()) => {
                         self.not_adopted.remove(name);
@@ -2062,6 +2228,11 @@ impl Db {
                 let created = theirs.activity.get(&key).map(|a| a.created_micros).unwrap_or(0);
                 let tomb = Catalog::tombstone(name, &idx.name);
                 if self.catalog.dropped.get(&tomb).copied().unwrap_or(0) >= created {
+                    continue;
+                }
+                // Made on an incarnation this node knows was dropped: the
+                // peer has not heard of the drop yet, and will.
+                if idx.on_micros <= self.catalog.dropped.get(name).copied().unwrap_or(0) {
                     continue;
                 }
                 match self.add_index(name, idx.clone()) {
@@ -2216,6 +2387,22 @@ impl Db {
         // -- the first pod on the new version could attach nobody, was
         // never ready, and the rollout never moved.
         let _ = &hello.version;
+        if hello.now_micros > 0 {
+            let skew = hello.now_micros as i64 - self.clock_micros() as i64;
+            if skew.abs() > CLOCK_REFUSE_MICROS {
+                return Err(Error::Plan(format!(
+                    "the clock at {url} is {:+.1} s from this node's, more than {} s: every \
+                     timestamp and every tombstone compares by the clock, so the two would \
+                     disagree about which of two statements was last; fix the clocks (NTP) \
+                     before attaching",
+                    skew as f64 / 1e6,
+                    CLOCK_REFUSE_MICROS / 1_000_000
+                )));
+            }
+        }
+        for note in self.observe_peer(url, &hello) {
+            crate::log::warn("peer", &[("node", url.to_string()), ("note", note)]);
+        }
         self.attached.insert(url.to_string());
         if !self.catalog.nodes.iter().any(|n| n == url) {
             self.catalog.nodes.push(url.to_string());

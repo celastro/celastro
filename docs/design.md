@@ -307,6 +307,41 @@ restored or dropped. Clocks matter to the rule only across a split, within
 their skew: a drop on one side and a re-creation on the other, closer in
 time than the two nodes' clocks differ, resolves as the clocks say.
 
+The merge has to converge: whatever order the sweeps run in, every node must
+end with the same definitions, and they must be what the instants say. A
+property test (`tests/reconcile.rs`) runs random histories of creations and
+drops over three nodes, with reconciliations in the middle, then reconciles
+every ordered pair in random orders until a round changes nothing, and
+compares every node against a model built from the catalogs' own instants.
+Its second seed found the first hole: a drop applied by reconciliation
+stamped a tombstone at *now*, which then outranked every re-creation made
+between the drop and the sweep. Its seventh found the second, which is why
+an index records the incarnation of the collection it was made on
+(`IndexDef::on_micros`, format 8): a collection dropped and re-created on
+one side is two incarnations under one name, and an index made on the dead
+one could reach the live one through a node that had not yet heard of the
+drop, after which the drop no longer took it. The rule is now exact: a
+collection lives if its incarnation is younger than its tombstone; an index
+lives if it is younger than its own tombstone and was made on an incarnation
+that lives -- wherever it has been merged since. Four hundred seeds pass;
+`CELASTRO_RECONCILE_SEEDS` runs more.
+
+Two things the rule leans on are checked at the door. The clock: every
+timestamp and every tombstone is a wall clock through the HLC, so `hello`
+carries the node's clock, `ATTACH` refuses a peer more than five seconds
+from this node's (`CLOCK_REFUSE_MICROS`) naming both and NTP, and `SHOW
+HEALTH` shows every peer's offset and flags one past half a second
+(`CLOCK_WARN_MICROS`). The process: `hello` carries the epoch of the process
+behind the address, the instant it opened its database, and every node
+keeps the largest it has seen per peer. A larger one is a restart, said once;
+a smaller one after a larger is an older process still answering at the
+address -- a pod replaced while its predecessor runs on a partitioned node
+-- and `SHOW HEALTH` says so on every call that sees it, as does the sweep
+in the log. That is detection, not fencing: a write from the older process
+is still taken, because a request frame carries no epoch to refuse it by,
+and adding one is a wire version. `Db::pretend` lets a test, or a drill,
+claim an epoch or a clock offset.
+
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
 in constant time), the call, and what is left of the statement's deadline,
@@ -1443,6 +1478,9 @@ guarantee:
 | a dropped index is withdrawn everywhere the declaration reached | `engine::tests::dropping_an_index_withdraws_the_declaration_and_what_was_recorded_against_it` (the planner, the statistics, the clock, a reopen, and a re-declaration that finds the sealed regions), `sql::parser::tests::drop_collection_and_drop_index_parse_and_name_what_they_drop` |
 | a fault on the coordinator-to-shard boundary can shorten an answer only by saying so, and a seeded run reproduces exactly | `sim::tests::a_fault_cannot_change_an_answer_without_saying_so` (twenty seeds of drops and restarts, every query shape: refused or bit-identical, never different), `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (`missing` is exactly the dropped shards, no second call to a shard given up on, real rows only, and the cache holds no partial sum afterwards), `sim::tests::a_shard_that_restarted_answers_exactly_what_it_did_before` (every call answered by a replacement opened from the directory), `sim::tests::the_order_shards_answer_in_does_not_change_the_answer` (and the plan lists shards by index), `sim::tests::a_seeded_run_reproduces_its_trace_and_its_answers` |
 | a walk is the neighbourhood and nothing else, the same at every layout and across nodes, and a cut or a dangling edge is said, never hidden | `engine::tests::a_hop_filter_selects_the_neighbourhood_and_nothing_else` (1..k, the start excluded, the edge filter at every hop, `REVERSE`, `OR`/`NOT`, fused with text and a distance, every refusal), `engine::tests::a_hop_statement_is_bit_identical_across_shard_counts` (1, 3 and 6 shards of both collections, memtable and segments, a deleted node and a dangling edge), `a_walk_over_collections_spread_over_three_nodes_answers_what_one_process_answers` (the same through the wire, and a holder that stops answering is a deadline or a named absence), `engine::tests::a_cut_walk_says_which_cap_bound_it` (both caps, the lexicographically first kept, the line on the response, in the plan and in the console's JSON), `engine::tests::a_dangling_edge_is_skipped_and_counted` (a never-existed and a deleted target, per hop, and nothing walked through a deleted node), `engine::tests::a_walk_over_a_cold_adjacency_index_is_refused_naming_the_tier`, `sim::tests::a_faulted_walk_refuses_or_agrees_and_a_partial_one_says_so` (twenty seeds over `expand` and `present`: refused or bit-identical, a partial answer inside the unfaulted neighbourhood and short only with `missing`), `sql::parser::tests::a_walk_parses_as_a_filter_with_a_one_term_edge_filter`, `catalog::tests::catalog_round_trips` (format 5: `nodes_of`, `undirected`, the adjacency kind, and a 4 read as a plain collection) |
+| random histories of creations and drops on three nodes, reconciled pairwise in random orders, converge on every node to what the instants say, indexes on dead incarnations included | `reconcile::random_histories_on_three_nodes_converge_to_the_last_word_on_each_name` |
+| a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
+| a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |

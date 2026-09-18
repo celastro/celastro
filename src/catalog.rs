@@ -30,7 +30,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-const CATALOG_VERSION: u8 = 7;
+const CATALOG_VERSION: u8 = 8;
 /// The oldest format this build reads. Version 3 differs from 2 only by the
 /// per-collection prefix expansion cap, appended after each collection's path
 /// statistics, so a 2 is read as a 3 whose every collection is at the default
@@ -261,11 +261,25 @@ pub struct IndexDef {
     /// declared `cold` is not dragged into RAM by traffic. `ALTER INDEX ... SET
     /// TIER` moves both, because that is an operator restating the baseline.
     pub declared_tier: crate::residency::Tier,
+    /// The incarnation of the collection this index was made on: the
+    /// collection's `created_micros` at the time. A collection's tombstone
+    /// takes every index made on an incarnation older than it, wherever
+    /// the index has since been merged to, so two nodes reconciling in
+    /// either order end the same. Zero from a catalog before format 8,
+    /// which every tombstone outranks. Format 8.
+    pub on_micros: u64,
 }
 
 impl IndexDef {
     pub fn new(name: &str, path: &str, kind: IndexKind, tier: crate::residency::Tier) -> IndexDef {
-        IndexDef { name: name.to_string(), path: path.to_string(), kind, tier, declared_tier: tier }
+        IndexDef {
+            name: name.to_string(),
+            path: path.to_string(),
+            kind,
+            tier,
+            declared_tier: tier,
+            on_micros: 0,
+        }
     }
 }
 
@@ -647,6 +661,10 @@ impl Catalog {
         if c.indexes.iter().any(|i| i.name == idx.name) {
             return Err(Error::Schema(format!("index `{}` already exists", idx.name)));
         }
+        let mut idx = idx;
+        if idx.on_micros == 0 {
+            idx.on_micros = c.created_micros;
+        }
         c.indexes.push(idx);
         self.version += 1;
         Ok(())
@@ -753,6 +771,9 @@ impl Catalog {
                 }
                 out.push(i.tier.as_u8());
                 out.push(i.declared_tier.as_u8());
+                if format >= 8 {
+                    put_uvarint(&mut out, i.on_micros);
+                }
             }
             put_uvarint(&mut out, c.paths.len() as u64);
             for (p, s) in &c.paths {
@@ -879,7 +900,16 @@ impl Catalog {
                 i += 1;
                 let declared_tier = tier_byte(b.get(i))?;
                 i += 1;
-                c.indexes.push(IndexDef { name: iname, path: ipath, kind, tier, declared_tier });
+                let on_micros =
+                    if format >= 8 { get_uvarint(b, &mut i).ok_or_else(bad)? } else { 0 };
+                c.indexes.push(IndexDef {
+                    name: iname,
+                    path: ipath,
+                    kind,
+                    tier,
+                    declared_tier,
+                    on_micros,
+                });
             }
             let np = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
             for _ in 0..np {
@@ -1052,6 +1082,7 @@ mod tests {
         ));
         c.observe_doc(&json::parse(r#"{"id":"a","tenant_id":"t1"}"#).unwrap());
         c.prefix_expansion = Some(2048);
+        c.indexes[0].on_micros = 5;
         cat.create(c).unwrap();
         cat.born_micros = 17;
         cat.dropped.insert("old".into(), 40);
@@ -1061,6 +1092,7 @@ mod tests {
         assert_eq!(a.partition_key.as_deref(), Some("tenant_id"));
         assert!(a.created_micros > 0, "a creation is stamped and survives");
         assert_eq!(back.born_micros, 17);
+        assert_eq!(a.indexes[0].on_micros, 5, "an index knows its incarnation");
         assert_eq!(back.dropped.get("old"), Some(&40));
         assert_eq!(back.dropped.get("articles/gone"), Some(&41));
         assert_eq!(a.indexes[0].tier, crate::residency::Tier::Cached, "tier survives a reopen");
@@ -1166,7 +1198,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 7"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 8"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

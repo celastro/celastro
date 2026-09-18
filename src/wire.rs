@@ -569,6 +569,14 @@ pub struct Hello {
     /// What the node is for; a node from before roles says nothing and is
     /// a data node.
     pub role: crate::engine::Role,
+    /// The node's clock as it answered, microseconds; zero from a node
+    /// that predates the field. What `ATTACH` and `SHOW HEALTH` measure
+    /// skew by.
+    pub now_micros: u64,
+    /// When the process behind the address started, microseconds; zero
+    /// from a node that predates the field. A later hello with a smaller
+    /// epoch is an older process answering at the same address.
+    pub epoch: u64,
 }
 
 impl Node {
@@ -733,7 +741,9 @@ impl Node {
         } else {
             crate::engine::Role::Data
         };
-        Ok(Hello { node, version, role })
+        let now_micros = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
+        let epoch = if i < b.len() { get_u64(&b, &mut i).ok_or_else(truncated)? } else { 0 };
+        Ok(Hello { node, version, role, now_micros, epoch })
     }
 
     /// The holder's clock and its write counter for a collection: what a
@@ -1303,6 +1313,8 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
             put_opt_str(&mut out, db.node());
             put_str(&mut out, env!("CARGO_PKG_VERSION"));
             put_str(&mut out, db.role().name());
+            put_u64(&mut out, db.clock_micros());
+            put_u64(&mut out, db.epoch());
         }
         Call::Catalog => {
             put_bytes(&mut out, &db.catalog.encode());

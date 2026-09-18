@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The reconciliation converges, and a property test says so.** Random
+histories of creations and drops over three nodes, reconciled pairwise in
+random orders until nothing changes, end on every node with what the
+instants say. The test found two holes in 0.46.0's merge: a drop applied
+by reconciliation stamped a tombstone at *now*, so a re-creation made
+between the drop and the sweep was dropped too; and an index made on an
+incarnation of a collection that was dropped and re-created could reach
+the live incarnation through a node that had not yet heard of the drop,
+and then outlive it. An index now records the incarnation it was made on
+(catalog format 8; 2 through 7 are read as before), and a collection's
+tombstone takes every index made on an older one, wherever it has been
+merged to.
+
+**Clocks and processes are checked at the door.** `hello` carries the
+node's clock and the epoch of the process behind the address. `ATTACH
+NODE` refuses a peer whose clock is more than five seconds from this
+node's, naming both, since every timestamp and every tombstone compares
+by it; `SHOW HEALTH` shows each peer's offset and flags one past half a
+second. A hello with a newer epoch is a restart, said once; an older
+epoch after a newer one is a second process answering at the same
+address -- a pod replaced while its predecessor still runs -- and `SHOW
+HEALTH` and the sweep's log say so. Detection, not fencing: a request
+frame carries no epoch yet.
+
 ## 0.46.0 — 2026-09-18
 
 The catalog reconciles itself, hence a minor.

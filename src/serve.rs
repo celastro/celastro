@@ -1542,12 +1542,18 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
             if stop.load(AtomicOrdering::Acquire) {
                 return;
             }
-            let theirs = {
+            let (hello, theirs) = {
                 let _deadline = crate::deadline::arm(Some(10_000));
-                node.catalog()
+                (node.hello(), node.catalog())
             };
             // An unreachable peer is `SHOW HEALTH`'s to report; the sweep
-            // only has something to say when a catalog differs.
+            // only has something to say when a catalog differs, a process
+            // changed or a clock drifted.
+            if let Ok(h) = &hello {
+                for note in read(db).observe_peer(&url, h) {
+                    crate::log::warn("peer", &[("node", url.clone()), ("note", note)]);
+                }
+            }
             let Ok(theirs) = theirs else { continue };
             match write(db).reconcile(&theirs) {
                 Ok(notes) => {

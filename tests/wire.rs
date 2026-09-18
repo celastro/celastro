@@ -1067,3 +1067,61 @@ fn a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection() {
     }
     let _ = std::fs::remove_dir_all(&old_dir);
 }
+
+/// Every timestamp and every tombstone compares by the clock, so a peer
+/// whose clock is far off is refused at ATTACH, and one that is a little
+/// off is named by SHOW HEALTH.
+#[test]
+fn a_peer_whose_clock_is_off_is_refused_or_named() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("clock-a");
+    let b = Node::start("clock-b");
+    b.db.write().unwrap().pretend(None, 6_000_000);
+    let e = a.exec(&format!("ATTACH NODE '{}'", b.url)).unwrap_err().to_string();
+    assert!(e.contains("clock at") && e.contains("+6.0 s") && e.contains("NTP"), "{e}");
+    b.db.write().unwrap().pretend(None, -800_000);
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("clock -0.8 s CLOCK OFF"), "{h}");
+    assert_eq!(a.db.read().unwrap().peer_seen(&b.url).unwrap().skew_micros / 100_000, -8);
+    b.db.write().unwrap().pretend(None, 0);
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("clock +0.0 s") || h.contains("clock -0.0 s"), "{h}");
+    assert!(!h.contains("CLOCK OFF"), "{h}");
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A hello carries the epoch of the process behind the address. A newer
+/// one is a restart; an older one after a newer is a second process
+/// answering at the same address, and SHOW HEALTH says so.
+#[test]
+fn an_older_process_answering_at_an_attached_address_is_named() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("epoch-a");
+    let b = Node::start("epoch-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    let epoch = b.db.read().unwrap().epoch();
+    assert_eq!(a.db.read().unwrap().peer_seen(&b.url).unwrap().epoch, epoch);
+    b.db.write().unwrap().pretend(Some(epoch + 1_000_000), 0);
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("restarted since last seen"), "{h}");
+    let h = a.ack("SHOW HEALTH");
+    assert!(!h.contains("restarted"), "said once: {h}");
+    b.db.write().unwrap().pretend(Some(epoch), 0);
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("AN OLDER PROCESS ANSWERS HERE TOO"), "{h}");
+    assert_eq!(a.db.read().unwrap().peer_seen(&b.url).unwrap().epoch, epoch + 1_000_000);
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
