@@ -488,14 +488,41 @@ impl Server {
         let stop = AtomicBool::new(false);
         let active = AtomicUsize::new(0);
         let server = &self;
+        // Buffered to the connection cap: `active` never lets more than that
+        // many be accepted, so a send never blocks the accept loop, and a
+        // worker takes the next connection the moment it is free.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(self.max_connections);
+        let rx = Mutex::new(rx);
         std::thread::scope(|scope| {
             if server.auto_compact {
                 let stop = &stop;
                 scope.spawn(move || maintenance(db, stop));
             }
-            loop {
+            // A pool of `max_connections` workers, started once: a thread
+            // per connection cost a clone and a fresh stack per request --
+            // a fifth of a point lookup's CPU -- for connections the console
+            // closes after one request anyway. A connection waits in the
+            // channel until a worker is free, which is the same cap.
+            for _ in 0..server.max_connections {
+                let (rx, active, stop) = (&rx, &active, &stop);
+                scope.spawn(move || loop {
+                    let s = match rx.lock().unwrap_or_else(|p| p.into_inner()).recv() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    match server.serve_one(s, db) {
+                        Ok(Next::Serve) => {}
+                        Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
+                        Err(e) => {
+                            crate::log::warn("connection_dropped", &[("error", e.to_string())])
+                        }
+                    }
+                    active.fetch_sub(1, AtomicOrdering::AcqRel);
+                });
+            }
+            let outcome = loop {
                 if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
-                    return Ok(());
+                    break Ok(());
                 }
                 if active.load(AtomicOrdering::Acquire) >= server.max_connections {
                     std::thread::sleep(SATURATED_PAUSE);
@@ -506,20 +533,13 @@ impl Server {
                         failures = 0;
                         // The listener's flag is not inherited on every platform
                         // and must not be here: a connection is served blocking.
-                        s.set_nonblocking(false)?;
+                        if let Err(e) = s.set_nonblocking(false) {
+                            break Err(e.into());
+                        }
                         active.fetch_add(1, AtomicOrdering::AcqRel);
-                        let (active, stop) = (&active, &stop);
-                        scope.spawn(move || {
-                            match server.serve_one(s, db) {
-                                Ok(Next::Serve) => {}
-                                Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
-                                Err(e) => crate::log::warn(
-                                    "connection_dropped",
-                                    &[("error", e.to_string())],
-                                ),
-                            }
-                            active.fetch_sub(1, AtomicOrdering::AcqRel);
-                        });
+                        if tx.send(s).is_err() {
+                            break Ok(());
+                        }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         crate::signal::wait_readable(&server.listener, ACCEPT_WAIT);
@@ -545,7 +565,10 @@ impl Server {
                         }
                     }
                 }
-            }
+            };
+            // The workers end when the channel does.
+            drop(tx);
+            outcome
         })
     }
 

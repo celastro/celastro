@@ -8,6 +8,22 @@ repository.
 
 ## Unreleased
 
+**The console serves from a pool of workers.** A thread per connection
+cost a clone and a fresh stack for every request, since the console
+closes each connection after one; `max_connections` workers are started
+once and take connections from a queue bounded to the same cap. Measured
+on one node with the survey corpus: point lookups from 820-920 to
+970-1,000 requests a second at concurrency 16, with the server's CPU per
+lookup from 0.7 to 0.65 ms.
+
+**A query is prepared once against the SQ8 codes.** The graph search
+scored each candidate by decoding its code; now the query's parts of the
+distance are folded out once and a candidate costs one AVX2 pass over
+its bytes. The ranking is unchanged to float rounding (a test says so),
+and the gain is small -- hybrid queries from 7.7 to 7.4 ms of CPU each
+-- because the search is bound by the memory latency of fetching random
+candidates' codes, not by the arithmetic, the same finding as the build's.
+
 **`CELASTRO_ROLE=coordinator`.** A node that holds no shards and only
 coordinates: a placement, `REBALANCE` and `MOVE SHARD` never land a
 shard on it (they refuse by name), every definition -- a collection, an

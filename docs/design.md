@@ -940,6 +940,22 @@ list is only valid for the dictionary it came from. Over the bound the statement
 is refused rather than quietly trimmed — a silent aggregate cap would be the
 same failure one level up.
 
+**The search over codes is bound the same way.** A profile of hybrid
+queries showed 44% of the server's samples in the per-candidate SQ8
+distance, so the query's parts of it were folded out once
+(`Codes::prepare`, `PreparedQuery::distance`: for the dot product `Σ
+q·lo + Σ (q·s)·c`, for L2 `Σ a² - 2 Σ (a·s)·c + Σ s²·c²` with `a = q - lo`,
+one AVX2 pass over the code's bytes for the sums). It ranks identically
+to float rounding and costs 4% less CPU per hybrid query, not 40%: the
+samples were stalls on the random candidates' bytes, and a faster kernel
+does not fetch them sooner. The console's own fixed cost per request was
+not JSON either but a thread per connection -- a clone and a stack to
+zero for every request -- and a pool of `max_connections` workers took a
+point lookup from 0.7 to 0.65 ms of CPU and the node from 870 to 990
+lookups a second; a rendezvous channel between the accept loop and the
+workers was tried first and lost the hand-off race to the saturation
+pause on nearly every connection, so the channel is buffered to the cap.
+
 **The graph build is not bound by reading the vectors; building over
 the SQ8 codes was tried and does not pay.** After 0.35.0 the build's
 profile was distance evaluations on random vectors, and a software

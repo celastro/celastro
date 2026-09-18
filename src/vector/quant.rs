@@ -35,6 +35,37 @@ pub enum Quantizer {
     None,
 }
 
+/// What [`Codes::prepare`] makes of a query: the weights and the constant
+/// that turn each candidate's distance into one pass over its code.
+pub struct PreparedQuery {
+    metric: Metric,
+    w1: Vec<f32>,
+    w2: Vec<f32>,
+    constant: f32,
+}
+
+impl PreparedQuery {
+    /// The distance from the prepared query to code `i`, as
+    /// [`Codes::distance`] would answer it.
+    #[inline]
+    pub fn distance(&self, codes: &Codes, i: usize) -> f32 {
+        let base = i * codes.dims;
+        let code = &codes.data[base..base + codes.dims];
+        match self.metric {
+            Metric::L2 => {
+                let (s1, s2) = crate::vector::distance::code_sums(code, &self.w1, &self.w2);
+                (self.constant + s1 + s2).max(0.0)
+            }
+            Metric::Cosine => {
+                1.0 - (self.constant + crate::vector::distance::code_dot(code, &self.w1))
+            }
+            Metric::InnerProduct => {
+                -(self.constant + crate::vector::distance::code_dot(code, &self.w1))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Codes {
     pub quantizer: Quantizer,
@@ -80,6 +111,43 @@ impl Codes {
     /// which is what makes a segment self-contained: nothing outside it is
     /// needed to interpret its codes, and re-quantizing is a rolling rebuild
     /// through compaction rather than a migration (§12.3).
+    /// A query prepared against these codes, for SQ8: the per-query parts
+    /// of every distance folded out once, so that each candidate costs one
+    /// pass over its bytes with float weights (`distance::code_dot`,
+    /// `code_sums`) instead of a decode. For the dot product,
+    /// `Σ q·(lo + s·c) = Σ q·lo + Σ (q·s)·c`; for L2, with `a = q - lo`,
+    /// `Σ (a - s·c)² = Σ a² - 2 Σ (a·s)·c + Σ s²·c²`. `None` for the other
+    /// quantizers, which keep [`Codes::distance`].
+    pub fn prepare(&self, metric: Metric, query: &[f32]) -> Option<PreparedQuery> {
+        if self.quantizer != Quantizer::Sq8 || query.len() != self.dims {
+            return None;
+        }
+        let dims = self.dims;
+        Some(match metric {
+            Metric::L2 => {
+                let mut w1 = Vec::with_capacity(dims);
+                let mut w2 = Vec::with_capacity(dims);
+                let mut constant = 0.0f32;
+                for d in 0..dims {
+                    let a = query[d] - self.lo[d];
+                    constant += a * a;
+                    w1.push(-2.0 * a * self.step[d]);
+                    w2.push(self.step[d] * self.step[d]);
+                }
+                PreparedQuery { metric, w1, w2, constant }
+            }
+            _ => {
+                let mut w1 = Vec::with_capacity(dims);
+                let mut constant = 0.0f32;
+                for d in 0..dims {
+                    constant += query[d] * self.lo[d];
+                    w1.push(query[d] * self.step[d]);
+                }
+                PreparedQuery { metric, w1, w2: Vec::new(), constant }
+            }
+        })
+    }
+
     pub fn build(quantizer: Quantizer, dims: usize, vectors: &[f32]) -> Codes {
         let count = vectors.len().checked_div(dims).unwrap_or(0);
         let mut c = Codes::empty(quantizer, dims);
@@ -328,6 +396,37 @@ impl Codes {
 
 #[cfg(test)]
 mod tests {
+    /// A prepared query answers what the per-candidate decode answers, for
+    /// every metric, to float rounding: the kernel is the fast path of the
+    /// graph search and must not move a ranking.
+    #[test]
+    fn a_prepared_query_answers_what_the_decode_answers() {
+        let (n, dims) = (200usize, 128usize);
+        let mut rng = crate::codec::Rng::new(11);
+        let mut data: Vec<f32> = (0..n * dims).map(|_| rng.next_normal()).collect();
+        for v in data.chunks_exact_mut(dims) {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        let codes = Codes::build(Quantizer::Sq8, dims, &data);
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            for q in [7usize, 42, 199] {
+                let query = &data[q * dims..(q + 1) * dims];
+                let p = codes.prepare(metric, query).expect("sq8");
+                for i in 0..n {
+                    let want = codes.distance(metric, query, i);
+                    let got = p.distance(&codes, i);
+                    assert!(
+                        (want - got).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "{metric:?} q{q} i{i}: {want} vs {got}"
+                    );
+                }
+            }
+        }
+        assert!(Codes::build(Quantizer::OneBit, dims, &data)
+            .prepare(Metric::L2, &data[..dims])
+            .is_none());
+    }
 
     #[test]
     fn fuzz_code_decoding_never_panics() {

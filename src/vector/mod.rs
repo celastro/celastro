@@ -439,8 +439,14 @@ impl VectorStore {
             return self.brute_force(query, k, admit_after);
         };
         let use_codes = self.codes.quantizer != Quantizer::None;
+        // The query's parts of the distance folded out once: each candidate
+        // the traversal scores is then one pass over its bytes, which was
+        // 44% of a hybrid query's CPU when it decoded per candidate.
+        let prepared = if use_codes { self.codes.prepare(self.metric, query) } else { None };
         let d_to = |i: u32| {
-            if use_codes {
+            if let Some(p) = &prepared {
+                p.distance(&self.codes, i as usize)
+            } else if use_codes {
                 self.codes.distance(self.metric, query, i as usize)
             } else {
                 distance::distance(self.metric, query, self.vector(i as usize))

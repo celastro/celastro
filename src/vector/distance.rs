@@ -52,6 +52,74 @@ mod avx {
         _mm_cvtss_f32(s)
     }
 
+    /// `(Σ w1[d]·c[d], Σ w2[d]·c[d]²)` over a byte code: eight bytes
+    /// widened to floats per step, both sums in one pass. What a query
+    /// prepared against SQ8 codes needs per candidate.
+    ///
+    /// # Safety
+    /// The caller has checked `available()`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn code_sums(c: &[u8], w1: &[f32], w2: &[f32]) -> (f32, f32) {
+        let n = c.len().min(w1.len()).min(w2.len());
+        let (pc, p1, p2) = (c.as_ptr(), w1.as_ptr(), w2.as_ptr());
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let x = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                pc.add(i) as *const __m128i
+            )));
+            s1 = _mm256_fmadd_ps(x, _mm256_loadu_ps(p1.add(i)), s1);
+            s2 = _mm256_fmadd_ps(_mm256_mul_ps(x, x), _mm256_loadu_ps(p2.add(i)), s2);
+            i += 8;
+        }
+        let (mut a, mut b) = (hsum(s1), hsum(s2));
+        while i < n {
+            let x = c[i] as f32;
+            a += w1[i] * x;
+            b += w2[i] * x * x;
+            i += 1;
+        }
+        (a, b)
+    }
+
+    /// `Σ w[d]·c[d]` over a byte code.
+    ///
+    /// # Safety
+    /// The caller has checked `available()`.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn code_dot(c: &[u8], w: &[f32]) -> f32 {
+        let n = c.len().min(w.len());
+        let (pc, pw) = (c.as_ptr(), w.as_ptr());
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let x0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                pc.add(i) as *const __m128i
+            )));
+            let x1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                pc.add(i + 8) as *const __m128i
+            )));
+            s0 = _mm256_fmadd_ps(x0, _mm256_loadu_ps(pw.add(i)), s0);
+            s1 = _mm256_fmadd_ps(x1, _mm256_loadu_ps(pw.add(i + 8)), s1);
+            i += 16;
+        }
+        while i + 8 <= n {
+            let x0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                pc.add(i) as *const __m128i
+            )));
+            s0 = _mm256_fmadd_ps(x0, _mm256_loadu_ps(pw.add(i)), s0);
+            i += 8;
+        }
+        let mut s = hsum(_mm256_add_ps(s0, s1));
+        while i < n {
+            s += w[i] * c[i] as f32;
+            i += 1;
+        }
+        s
+    }
+
     /// # Safety
     /// The caller has checked `available()`.
     #[target_feature(enable = "avx2,fma")]
@@ -125,6 +193,44 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     dot_scalar(a, b)
+}
+
+/// `Σ w[d]·c[d]` over a byte code with float weights.
+#[inline]
+pub fn code_dot(c: &[u8], w: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::available() {
+            // SAFETY: `available` checked avx2 and fma on this CPU.
+            return unsafe { avx::code_dot(c, w) };
+        }
+    }
+    let n = c.len().min(w.len());
+    let mut s = 0.0f32;
+    for i in 0..n {
+        s += w[i] * c[i] as f32;
+    }
+    s
+}
+
+/// `(Σ w1[d]·c[d], Σ w2[d]·c[d]²)` over a byte code, in one pass.
+#[inline]
+pub fn code_sums(c: &[u8], w1: &[f32], w2: &[f32]) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::available() {
+            // SAFETY: `available` checked avx2 and fma on this CPU.
+            return unsafe { avx::code_sums(c, w1, w2) };
+        }
+    }
+    let n = c.len().min(w1.len()).min(w2.len());
+    let (mut a, mut b) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let x = c[i] as f32;
+        a += w1[i] * x;
+        b += w2[i] * x * x;
+    }
+    (a, b)
 }
 
 #[inline]
