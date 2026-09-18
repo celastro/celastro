@@ -1,6 +1,6 @@
 [package]
 name = "celastro"
-version = "0.44.0"
+version = "0.45.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Hybrid document database: SQL, BM25 and vector retrieval in a single query plan"

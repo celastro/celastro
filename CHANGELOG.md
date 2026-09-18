@@ -6,7 +6,9 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.45.0 — 2026-09-18
+
+Dedicated coordinators, hence a minor.
 
 **The console serves from a pool of workers.** A thread per connection
 cost a clone and a fresh stack for every request, since the console
