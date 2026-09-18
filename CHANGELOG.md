@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.44.0 — 2026-09-18
+
+Operations: what a node says about itself and what it does when the
+disk misbehaves; a minor.
 
 **`SHOW HEALTH`.** From any node: this node (version, collections, shards
 held, whether its directory is still there, seal failures), every
