@@ -96,6 +96,13 @@ pub struct Tls {
     chain_der: Vec<Vec<u8>>,
     key: crate::crypto::x509::KeyPair,
     anchors: Vec<crate::crypto::x509::Certificate>,
+    /// When the leaf stops being valid, seconds since the epoch: what
+    /// `SHOW HEALTH` and the metrics say, since at that instant every
+    /// peer refuses this node and every client does too.
+    not_after: i64,
+    /// The earliest end among the anchors: when this node stops accepting
+    /// everyone else.
+    anchors_not_after: i64,
 }
 
 impl fmt::Debug for Tls {
@@ -146,7 +153,18 @@ impl Tls {
         if anchors.is_empty() {
             return Err(read_err("CA", &ca, "no certificate in the file"));
         }
-        Ok(Some(Tls { chain_der, key: pair, anchors }))
+        let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
+        Ok(Some(Tls { chain_der, key: pair, anchors, not_after: leaf.not_after, anchors_not_after }))
+    }
+
+    /// When this node's certificate expires, seconds since the epoch.
+    pub fn expires_at(&self) -> i64 {
+        self.not_after
+    }
+
+    /// When the first of the trust anchors expires, seconds since the epoch.
+    pub fn anchors_expire_at(&self) -> i64 {
+        self.anchors_not_after
     }
 
     /// A connection this node accepted, encrypted; the handshake happens

@@ -384,6 +384,17 @@ each node. Per-shard read and write counters on the metrics page
 and shard) are what shows a hot shard, which range partitioning with fixed
 split keys can make.
 
+Three smaller doors from the same list. A certificate's end takes every
+peer at once, so `SHOW HEALTH` names when this node's certificate and its
+first trust anchor expire, flags either inside two weeks, and the metrics
+carry both instants; a peer's refusal of an expired one names the time. A
+node is attached only by the address it calls itself, so one process cannot
+be two holders under two names. And the wire caps the connections it serves
+(`CELASTRO_WIRE_MAX_CONNECTIONS`, a thread each) and closes one that carried
+no frame for `CELASTRO_WIRE_IDLE_SECS`, since a peer that opens a connection
+per statement and never closes one was otherwise a thread without end; the
+client side reconnects on its own for a connection the holder closed.
+
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
 in constant time), the call, and what is left of the statement's deadline,
@@ -1524,6 +1535,9 @@ guarantee:
 | every statement delivered twice with nothing written in between leaves what once leaves; a `DELETE ... WHERE` retried after a write takes the new row too, by contract | `retry::every_statement_delivered_twice_leaves_what_once_leaves`, `retry::a_delete_by_predicate_retried_after_a_write_takes_the_new_row_too` |
 | a write through one node is read through every other at once, counts through different nodes never go backwards, and a delete through one is gone through all | `wire::a_write_through_one_node_is_read_through_every_other_at_once` |
 | a backup `AS OF` an earlier instant holds what was visible then; an instant ahead of the clock is refused; `BACKUP CLUSTER` backs every node up at one instant, verifiable on each | `backup::a_backup_as_of_an_earlier_instant_holds_what_was_visible_then`, `wire::a_cluster_backup_is_one_instant_on_every_node` |
+| an expired certificate is refused by a peer naming the time; `SHOW HEALTH` says when the certificate and the CA expire and flags either inside two weeks | `tls::an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time` |
+| a node is attached only by the address it calls itself | `wire::a_node_is_attached_only_by_the_name_it_calls_itself` |
+| past the cap a wire connection is closed at once and counted; an idle one is closed after the idle time and the next call reconnects | `wire::idle_wire_connections_are_capped_and_closed` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |

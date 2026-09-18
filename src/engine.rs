@@ -153,6 +153,10 @@ pub const RECONCILE_SECS: u64 = 30;
 pub const CLOCK_WARN_MICROS: i64 = 500_000;
 pub const CLOCK_REFUSE_MICROS: i64 = 5_000_000;
 
+/// A certificate this close to its end is flagged by `SHOW HEALTH`: two
+/// weeks, the time a rotation takes to notice and do.
+pub const CERTIFICATE_WARN_SECS: i64 = 14 * 86_400;
+
 /// What `SHOW HEALTH` and the sweep have seen of a peer's hello.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerSeen {
@@ -1763,6 +1767,29 @@ impl Db {
                 String::new()
             }
         ));
+        if let Some(tls) = &self.opts.tls {
+            let now = crate::time::now_micros() / 1_000_000;
+            let describe = |what: &str, at: i64| -> String {
+                let left = at - now;
+                let flag = if left < 0 {
+                    " EXPIRED"
+                } else if left < CERTIFICATE_WARN_SECS {
+                    " EXPIRES SOON"
+                } else {
+                    ""
+                };
+                format!(
+                    "{what} expires {} ({} day(s)){flag}",
+                    crate::time::format_micros(at * 1_000_000),
+                    left / 86_400
+                )
+            };
+            out.push_str(&format!(
+                "tls: {}; {}\n",
+                describe("certificate", tls.expires_at()),
+                describe("CA", tls.anchors_expire_at())
+            ));
+        }
         let mut up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         up.insert(here.clone());
         // Every node this one knows of: the ones it attached, and every

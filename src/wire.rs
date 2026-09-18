@@ -1070,6 +1070,28 @@ impl ShardService for Remote {
 
 // ------------------------------------------------------------------ server
 
+/// Connections the wire refused because `CELASTRO_WIRE_MAX_CONNECTIONS`
+/// were open: `celastro_wire_connections_refused_total`.
+static REFUSED_CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn refused_connections() -> u64 {
+    REFUSED_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// How many connections the wire serves at once, and how long an idle one
+/// is kept. A peer that opens a connection per statement and never closes
+/// one, or many peers that each keep a pool, would otherwise be a thread
+/// per connection without end: past the cap a connection is accepted and
+/// closed at once, counted, and a connection that carried no frame for the
+/// idle time is closed -- a peer's next call reconnects, which the client
+/// side does on its own for a connection the holder closed while idle.
+const WIRE_MAX_CONNECTIONS: usize = 1024;
+const WIRE_IDLE_SECS: u64 = 300;
+
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
 /// Serve this node's shards to other nodes until `stop` is set or a
 /// shutdown signal arrives. One thread per connection; every call runs
 /// under the database's lock, as a console request does.
@@ -1083,6 +1105,10 @@ pub fn serve(
     listener.set_nonblocking(true)?;
     let token = Arc::new(token);
     let moves = db.read().unwrap_or_else(|p| p.into_inner()).moves();
+    let max_connections: usize = env_num("CELASTRO_WIRE_MAX_CONNECTIONS", WIRE_MAX_CONNECTIONS);
+    let idle: u64 = env_num("CELASTRO_WIRE_IDLE_SECS", WIRE_IDLE_SECS);
+    let idle = (idle > 0).then(|| Duration::from_secs(idle));
+    let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         if stop.load(Ordering::Relaxed) || crate::signal::shutdown_requested() {
             return Ok(());
@@ -1090,6 +1116,20 @@ pub fn serve(
         match listener.accept() {
             Ok((s, _)) => {
                 s.set_nonblocking(false)?;
+                if open.load(Ordering::Relaxed) >= max_connections {
+                    let n = REFUSED_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n % 1000 == 0 {
+                        crate::log::warn(
+                            "wire_connection_refused",
+                            &[
+                                ("open", max_connections.to_string()),
+                                ("refused_total", n.to_string()),
+                            ],
+                        );
+                    }
+                    drop(s);
+                    continue;
+                }
                 // The handshake happens on the connection's own thread, with
                 // its first read; a peer that never speaks costs that thread
                 // its idle poll and nothing else.
@@ -1104,7 +1144,12 @@ pub fn serve(
                 let token = token.clone();
                 let stop = stop.clone();
                 let moves = moves.clone();
-                std::thread::spawn(move || serve_connection(s, &db, &moves, &token, &stop));
+                let open = open.clone();
+                open.fetch_add(1, Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    serve_connection(s, &db, &moves, &token, &stop, idle);
+                    open.fetch_sub(1, Ordering::Relaxed);
+                });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 crate::signal::wait_readable(&listener, ACCEPT_WAIT);
@@ -1126,14 +1171,22 @@ fn serve_connection(
     moves: &Moves,
     token: &str,
     stop: &AtomicBool,
+    idle: Option<Duration>,
 ) {
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(IDLE_POLL));
+    let mut last_frame = Instant::now();
     loop {
         let frame = match read_frame(&mut s) {
-            Ok(f) => f,
+            Ok(f) => {
+                last_frame = Instant::now();
+                f
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if idle.is_some_and(|d| last_frame.elapsed() >= d) {
                     return;
                 }
                 continue;

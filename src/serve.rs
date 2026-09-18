@@ -234,6 +234,29 @@ fn metrics_text(db: &Db) -> String {
         crate::tls::resumed_handshakes().to_string(),
     );
     line(
+        "celastro_wire_connections_refused_total",
+        "counter",
+        "Wire connections refused at CELASTRO_WIRE_MAX_CONNECTIONS.",
+        "",
+        crate::wire::refused_connections().to_string(),
+    );
+    if let Some(tls) = db.tls() {
+        line(
+            "celastro_tls_certificate_expiry_seconds",
+            "gauge",
+            "When this node's certificate expires, seconds since the epoch.",
+            "",
+            tls.expires_at().to_string(),
+        );
+        line(
+            "celastro_tls_ca_expiry_seconds",
+            "gauge",
+            "When the first trust anchor expires, seconds since the epoch.",
+            "",
+            tls.anchors_expire_at().to_string(),
+        );
+    }
+    line(
         "celastro_collections",
         "gauge",
         "Collections in the catalog.",

@@ -1212,3 +1212,65 @@ fn a_cluster_backup_is_one_instant_on_every_node() {
     }
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// One process, two names, would be two holders in a placement that are
+/// one node: ATTACH takes a node only by the address it calls itself.
+#[test]
+fn a_node_is_attached_only_by_the_name_it_calls_itself() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("names-a");
+    let b = Node::start("names-b");
+    let by_other_name = b.url.replace("127.0.0.1", "localhost");
+    let e = a.exec(&format!("ATTACH NODE '{by_other_name}'")).unwrap_err().to_string();
+    assert!(e.contains("calls itself") && e.contains(&b.url), "{e}");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    assert_eq!(a.db.read().unwrap().catalog.nodes, vec![b.url.clone()]);
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A peer that opens connections and never closes them cannot take the
+/// wire with it: past the cap a connection is closed at once, and one that
+/// carries no frame for the idle time is closed, so the next call
+/// reconnects and is served.
+#[test]
+fn idle_wire_connections_are_capped_and_closed() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    std::env::set_var("CELASTRO_WIRE_MAX_CONNECTIONS", "2");
+    std::env::set_var("CELASTRO_WIRE_IDLE_SECS", "1");
+    let a = Node::start("idle-a");
+    // The wire reads its knobs as it starts, on its own thread.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::env::remove_var("CELASTRO_WIRE_MAX_CONNECTIONS");
+    std::env::remove_var("CELASTRO_WIRE_IDLE_SECS");
+    let addr = a.url.trim_start_matches("tcp://").to_string();
+    let idle1 = std::net::TcpStream::connect(&addr).unwrap();
+    let idle2 = std::net::TcpStream::connect(&addr).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let peer = celastro::wire::Node::new(&a.url, Some(TOKEN), None).unwrap();
+    let refused_before = celastro::wire::refused_connections();
+    let e = peer.hello().unwrap_err().to_string();
+    assert!(celastro::wire::refused_connections() > refused_before, "{e}");
+    // The idle time passes: the two are closed, and the next call is served.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let mut buf = [0u8; 1];
+    use std::io::Read;
+    let _ = idle1.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    assert_eq!(
+        idle1.take(1).read(&mut buf).unwrap_or(0),
+        0,
+        "the server closed the idle connection"
+    );
+    drop(idle2);
+    assert_eq!(peer.hello().unwrap().node.as_deref(), Some(a.url.as_str()));
+    let d = a.dir.clone();
+    drop(a);
+    settle();
+    let _ = std::fs::remove_dir_all(&d);
+}

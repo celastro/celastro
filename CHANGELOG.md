@@ -61,6 +61,18 @@ ahead of the node's clock than a cluster allows. The set restores with
 `celastro_shard_writes_total`, by collection and shard, on the metrics
 page: what shows a hot shard.
 
+**Certificate expiry is named ahead of time.** `SHOW HEALTH` says when
+this node's certificate and the first of its trust anchors expire and
+flags either inside two weeks; `celastro_tls_certificate_expiry_seconds`
+and `celastro_tls_ca_expiry_seconds` carry the instants for an alert.
+
+**The wire caps its connections and closes idle ones.**
+`CELASTRO_WIRE_MAX_CONNECTIONS` (1024) bounds the threads a peer that
+never closes a connection can take, past it a connection is closed at
+once and `celastro_wire_connections_refused_total` counts it;
+`CELASTRO_WIRE_IDLE_SECS` (300) closes a connection that carried no
+frame, and the peer's next call reconnects.
+
 **A retry's contract is tested.** Every statement delivered twice with
 nothing written in between leaves what once leaves; the one shape a retry
 can change, a `DELETE ... WHERE` delivered again after a write it did not

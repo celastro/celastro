@@ -141,6 +141,14 @@ format -- is fuzzed in the test suite with a seeded mutator
 (`src/fuzz.rs`), and a decoder that reserves memory for a count it read
 is bounded by the bytes that remain.
 
+A certificate has an end, and at it every peer refuses this node and
+every client does too, all at once. `SHOW HEALTH` says when this node's
+certificate and the first of its trust anchors expire and flags either
+inside two weeks; the metrics page carries both instants
+(`celastro_tls_certificate_expiry_seconds`, `celastro_tls_ca_expiry_seconds`)
+for an alert. Rotate by the chart's or your own issuer before then; a
+rotation's safe order across a cluster is not yet drilled.
+
 ## Encryption at rest, and what it is
 
 Off by default: without a master key every file is written in the clear,

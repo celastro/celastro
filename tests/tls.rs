@@ -177,3 +177,63 @@ fn certificates_are_all_three_or_none_and_a_bad_file_is_named() {
     std::env::remove_var(KEY_ENV);
     std::env::remove_var(CA_ENV);
 }
+
+/// Material made for a test with a given lifetime, under its own directory.
+fn material_for(tag: &str, days: i64) -> Arc<Tls> {
+    let dir = std::env::temp_dir().join(format!("celastro-tls-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let m = celastro::tls::make_material(
+        "localhost",
+        &["localhost".to_string()],
+        &["127.0.0.1".parse().unwrap()],
+        days,
+    )
+    .unwrap();
+    std::fs::write(dir.join("ca.crt"), m.ca_cert).unwrap();
+    std::fs::write(dir.join("localhost.crt"), m.cert).unwrap();
+    std::fs::write(dir.join("localhost.key"), m.key).unwrap();
+    std::env::set_var(CERT_ENV, dir.join("localhost.crt"));
+    std::env::set_var(KEY_ENV, dir.join("localhost.key"));
+    std::env::set_var(CA_ENV, dir.join("ca.crt"));
+    Arc::new(Tls::from_env().unwrap().unwrap())
+}
+
+/// At its certificate's end a node loses every peer at once: the peer's
+/// refusal names the time, and SHOW HEALTH and the metrics say when that
+/// is, and say so two weeks ahead.
+#[test]
+fn an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time() {
+    let _turn = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let expired = material_for("expired", -1);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("tcp://localhost:{port}");
+    let mut opts = DbOpts::default();
+    opts.node = Some(url.clone());
+    opts.tls = Some(expired.clone());
+    let db = Arc::new(RwLock::new(Db::with_opts(opts)));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (d, s, t) = (db.clone(), stop.clone(), expired.clone());
+        std::thread::spawn(move || {
+            celastro::wire::serve(listener, d, "wire-tls-token".to_string(), s, Some(t)).unwrap()
+        });
+    }
+    let peer = celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(expired.clone())).unwrap();
+    let e = peer.hello().unwrap_err().to_string();
+    assert!(e.contains("not valid at this time"), "{e}");
+    let h = db.read().unwrap().show_health();
+    assert!(h.contains("tls: certificate expires") && h.contains("EXPIRED"), "{h}");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let soon = material_for("soon", 3);
+    let mut opts = DbOpts::default();
+    opts.tls = Some(soon.clone());
+    let db = Db::with_opts(opts);
+    let h = db.show_health();
+    assert!(h.contains("(3 day(s)) EXPIRES SOON") || h.contains("(2 day(s)) EXPIRES SOON"), "{h}");
+    assert!(h.contains("CA expires"), "{h}");
+    let now = celastro::time::now_micros() / 1_000_000;
+    assert!((soon.expires_at() - now - 3 * 86_400).abs() < 120);
+    assert_eq!(soon.anchors_expire_at(), soon.expires_at(), "the test CA lives as long as its leaf");
+}
