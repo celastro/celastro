@@ -60,9 +60,19 @@ with no seal or compaction of their own. Every pod of both roles attaches
 every other; every definition reaches the coordinators; the console
 Service spreads clients over the coordinators alone. Each keeps only its
 catalog, on `coordinators.persistence.size` (1Gi). Zero, the default,
-keeps every data pod coordinating what reaches it. One coordinator per
-four to eight data pods is the starting point for search traffic; the
-binary's docs/design.md says how the ratio is measured.
+keeps every data pod coordinating what reaches it.
+
+How many: measured on kind (the binary's docs/design.md has the method),
+a coordinator spends about 2 ms of CPU per data node per hybrid request
+(0.5 ms for a text or a vector query), while a data node spends what its
+shard costs it -- 11 ms per hybrid request at 17,000 documents a shard,
+4.5 ms at 8,000. So the coordinators needed grow with the data pods
+times the fusion's per-node cost, divided by the shard's cost: one per
+four or five data pods for hybrid traffic on shards that small, one per
+seven for text, and more per coordinator as shards grow. Point lookups
+gain nothing from the role -- the coordinator's forwarding costs more
+than the lookup -- so a lookup-heavy service should let its data pods
+take clients (`coordinators.replicas: 0`).
 
 ### Encryption in transit
 

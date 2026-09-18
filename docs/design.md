@@ -1225,6 +1225,33 @@ where the missing directory can be seen. Tests inject the failures
 through the durability probe (`fail_next`, `fail_after`) at the append,
 the temporary file's fsync and by renaming the directory aside.
 
+**Dedicated coordinators, and how many.** A node started with
+`CELASTRO_ROLE=coordinator` holds no shards -- `plan_tablets`,
+`rebalance` and `move_shard` skip or refuse it by the role its `hello`
+declared at `ATTACH`, kept in the catalog (format 6) -- and hears every
+definition (`fan_out_of` splits statements: a definition reaches holders
+and coordinators, a seal or a compaction reaches holders), so it plans
+over the data nodes' shards as they do, on cores with no seal or
+compaction of their own. Measured on kind (2026-09-18, the survey corpus
+of 50,000 documents spread over `N` data nodes, one coordinator taking
+every client request, CPU seconds per container from the node's
+`crictl stats` over 400 requests at concurrency 16): the coordinator's
+CPU per request grows with `N` -- hybrid 6.2 ms at `N = 3`, 11.5 ms at
+`N = 6`, about 2 ms per data node fused; text and vector about 0.5 ms
+per data node; a point lookup 1.0-1.7 ms whatever `N`, which is the
+console's HTTP and JSON and the forward -- while a data node's falls as
+its shard shrinks (hybrid 10.8 ms at 17,000 documents a shard, 4.5 ms at
+8,000). So the coordinators a cluster needs are `N × c₁ / d`: the data
+nodes, times the fusion's per-node cost, over the shard's per-request
+cost. On shards this small that is one coordinator per four or five data
+nodes for hybrid traffic and one per seven for text; larger shards raise
+it in proportion, since `d` grows with the shard and `c₁` does not. For
+point lookups the coordinator costs more than the lookup, so the role
+buys nothing there. What would move the ratio: cheaper JSON on the
+console (the fixed 1 ms), and a merge that stops early once the top `k`
+cannot change. The numbers are relative -- every pod shared four cores
+-- and the ratio is what they are for.
+
 **Durability is unix-shaped, and every mover is inside it.** The guarantee
 rests on fsyncing the directory a rename landed in, which is a POSIX
 operation; off unix `sync_dir` is a no-op and the guarantee weakens to what
