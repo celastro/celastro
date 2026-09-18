@@ -219,7 +219,8 @@ fn an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time
             celastro::wire::serve(listener, d, "wire-tls-token".to_string(), s, Some(t)).unwrap()
         });
     }
-    let peer = celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(expired.clone())).unwrap();
+    let peer =
+        celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(expired.clone())).unwrap();
     let e = peer.hello().unwrap_err().to_string();
     assert!(e.contains("not valid at this time"), "{e}");
     let h = db.read().unwrap().show_health();
@@ -235,5 +236,9 @@ fn an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time
     assert!(h.contains("CA expires"), "{h}");
     let now = celastro::time::now_micros() / 1_000_000;
     assert!((soon.expires_at() - now - 3 * 86_400).abs() < 120);
-    assert_eq!(soon.anchors_expire_at(), soon.expires_at(), "the test CA lives as long as its leaf");
+    assert_eq!(
+        soon.anchors_expire_at(),
+        soon.expires_at(),
+        "the test CA lives as long as its leaf"
+    );
 }

@@ -154,7 +154,13 @@ impl Tls {
             return Err(read_err("CA", &ca, "no certificate in the file"));
         }
         let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
-        Ok(Some(Tls { chain_der, key: pair, anchors, not_after: leaf.not_after, anchors_not_after }))
+        Ok(Some(Tls {
+            chain_der,
+            key: pair,
+            anchors,
+            not_after: leaf.not_after,
+            anchors_not_after,
+        }))
     }
 
     /// When this node's certificate expires, seconds since the epoch.

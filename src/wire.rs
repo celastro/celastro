@@ -1177,6 +1177,13 @@ fn serve_connection(
     let _ = s.set_read_timeout(Some(IDLE_POLL));
     let mut last_frame = Instant::now();
     loop {
+        // Checked per frame, not only when a read times out: a connection
+        // that never pauses -- a peer writing as fast as it can -- kept a
+        // stopped node serving, and holding its directory, until the peer
+        // paused. The resilience suite's restart under load found it.
+        if stop.load(Ordering::Relaxed) || crate::signal::shutdown_requested() {
+            return;
+        }
         let frame = match read_frame(&mut s) {
             Ok(f) => {
                 last_frame = Instant::now();

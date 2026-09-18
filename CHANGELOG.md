@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.47.0 — 2026-09-18
+
+The reconciliation proven, mixed versions drilled, and a cluster-wide
+backup, hence a minor.
 
 **The reconciliation converges, and a property test says so.** Random
 histories of creations and drops over three nodes, reconciled pairwise in
@@ -72,6 +75,17 @@ never closes a connection can take, past it a connection is closed at
 once and `celastro_wire_connections_refused_total` counts it;
 `CELASTRO_WIRE_IDLE_SECS` (300) closes a connection that carried no
 frame, and the peer's next call reconnects.
+
+**The resilience suite.** `cargo test --release --test resilience --
+--ignored` runs the slow, cluster-shaped properties: the reconciliation
+over four nodes and four hundred random histories, no acknowledged write
+lost across a node restarting five times under load, a two-hundred-
+thousand-row write-ahead log replaying every row, and a cluster backup
+under load restoring to one consistent cut. Its first run found that a
+stopped node kept serving a connection that never paused -- the
+connection thread checked the stop flag only when a read timed out --
+and so held its directory against the restart; the flag is checked per
+frame now, which is also what makes a busy node stop on SIGTERM.
 
 **A retry's contract is tested.** Every statement delivered twice with
 nothing written in between leaves what once leaves; the one shape a retry

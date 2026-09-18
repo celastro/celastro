@@ -395,6 +395,23 @@ no frame for `CELASTRO_WIRE_IDLE_SECS`, since a peer that opens a connection
 per statement and never closes one was otherwise a thread without end; the
 client side reconnects on its own for a connection the holder closed.
 
+The resilience suite (`tests/resilience.rs`, `#[ignore]`, run with
+`--ignored`) holds the slow, cluster-shaped properties the drills and the
+pitfalls named, so they run when asked and the gates stay fast: the
+reconciliation over four nodes, forty statements and four hundred seeds
+(two minutes); a node restarted five times under a load of writes and
+reads through the others, every acknowledged write there when it is back
+and every failure meanwhile naming the node or a deadline -- measured at
+3,222 writes and reads with none refused, since a restart takes
+milliseconds and the dial retry absorbs it; a write-ahead log of two
+hundred thousand rows replaying (0.9 s, 4 µs a row); and a cluster backup
+taken under a writer that keeps every edge's endpoints ahead of the edge,
+restored node by node into fresh databases and checked to be one cut. Its
+first run found a bug the gate tests could not: a stopped node kept serving
+a connection that never paused, because the connection thread checked the
+stop flag only when a read timed out, and so held its directory against
+the restart; the flag is now checked per frame.
+
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
 in constant time), the call, and what is left of the statement's deadline,
@@ -1538,6 +1555,7 @@ guarantee:
 | an expired certificate is refused by a peer naming the time; `SHOW HEALTH` says when the certificate and the CA expire and flags either inside two weeks | `tls::an_expired_certificate_is_refused_by_a_peer_and_named_by_health_ahead_of_time` |
 | a node is attached only by the address it calls itself | `wire::a_node_is_attached_only_by_the_name_it_calls_itself` |
 | past the cap a wire connection is closed at once and counted; an idle one is closed after the idle time and the next call reconnects | `wire::idle_wire_connections_are_capped_and_closed` |
+| the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
