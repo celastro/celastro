@@ -108,6 +108,25 @@ holds them; that is the boundary.
 - Missing features listed under "What is deliberately not here" in the README.
   No replication means no replication vulnerabilities.
 
+## Rotating the wire token
+
+A rotation by one rolling update deadlocks: the first pod on the new token
+can attach nobody, is never ready, and the rollout never moves, which
+leaves that pod partitioned from the rest until someone intervenes. A
+drill showed exactly that. So a node accepts a second token,
+`CELASTRO_WIRE_TOKEN_ALSO`, and a rotation is three rollouts, each one
+leaving every pair of nodes with a token in common:
+
+1. every node accepts the new token too (`CELASTRO_WIRE_TOKEN_ALSO=new`);
+2. every node sends the new token and still accepts the old
+   (`CELASTRO_WIRE_TOKEN=new`, `CELASTRO_WIRE_TOKEN_ALSO=old`);
+3. the old one is dropped (`CELASTRO_WIRE_TOKEN_ALSO` unset).
+
+The chart's `wire.tokenAlso` is the second token; it is visible in the
+release's values while set, which is why the third step clears it. The
+console token is per node and per client and rotates on its own terms:
+clients take the new one when the Secret changes and the pods restart.
+
 ## The TLS, and what it is
 
 The TLS is written in this repository (`src/crypto`), because the crate

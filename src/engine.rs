@@ -2204,9 +2204,9 @@ impl Db {
     /// the peer has and this node lacks is adopted unless this node holds a
     /// tombstone for it younger than the definition; a tombstone the peer
     /// holds drops the definition here if the definition is older. Policies
-    /// and the activity clocks are unioned. Nothing else is merged: a
-    /// placement that changed on one side stays as each side has it, and
-    /// an `ALTER` is applied by the statement's own fan-out or by an
+    /// and the activity clocks are unioned. Placement is
+    /// [`Db::reconcile_from`]'s, by the holders' own word. An `ALTER` is
+    /// not merged: it is applied by the statement's own fan-out or by an
     /// operator. What this closes is the split's harm named in the design
     /// notes: two catalogs that stay different after the link returns.
     ///
@@ -2215,6 +2215,57 @@ impl Db {
     /// means the directory never had those shards' data: a node restarted
     /// from an empty volume, which needs a restore, not empty shards that
     /// answer as if nothing were lost.
+    /// [`Db::reconcile`], then the placement: a peer's word about the shards
+    /// it holds, or held, is final. For a collection both have, a shard
+    /// the peer's map puts on the peer and this node's map puts elsewhere
+    /// moves to the peer in this node's map; a shard this node's map puts
+    /// on the peer and the peer's map puts elsewhere moves there. What a
+    /// move made while the two could not reach each other left behind: the
+    /// far side's map naming the old holder, which then refused the
+    /// forwarded writes as not its own. A shard both this node and the
+    /// peer claim to hold is a conflict, kept as it is and named.
+    pub fn reconcile_from(&mut self, peer: &str, theirs: &Catalog) -> Result<Vec<String>> {
+        let mut notes = self.reconcile(theirs)?;
+        let mut changed = false;
+        for (name, their_tablets) in &theirs.placement {
+            let Some(mine) = self.catalog.placement.get(name) else { continue };
+            if mine.len() != their_tablets.len() {
+                continue;
+            }
+            let mut updated = mine.clone();
+            for (i, (m, t)) in mine.iter().zip(their_tablets).enumerate() {
+                let peer_claims = t.node == peer && m.node != peer;
+                let peer_gave_away = m.node == peer && t.node != peer;
+                if !(peer_claims || peer_gave_away) {
+                    continue;
+                }
+                let held_here = self.is_self(&m.node)
+                    && self.shards.get(name).is_some_and(|s| s.iter().any(|s| s.index == i));
+                if peer_claims && held_here {
+                    notes.push(format!(
+                        "shard {i} of `{name}`: held here and claimed by {peer}; kept here, \
+                         resolve by MOVE SHARD"
+                    ));
+                    continue;
+                }
+                updated[i] = t.clone();
+                changed = true;
+                notes.push(format!(
+                    "shard {i} of `{name}`: now on {} (was {})",
+                    t.node,
+                    if m.node.is_empty() { "this node" } else { m.node.as_str() }
+                ));
+            }
+            if changed {
+                self.catalog.placement.insert(name.clone(), updated);
+            }
+        }
+        if changed {
+            self.persist_catalog()?;
+        }
+        Ok(notes)
+    }
+
     pub fn reconcile(&mut self, theirs: &Catalog) -> Result<Vec<String>> {
         let mut notes = Vec::new();
         // Their tombstones first, so a definition they dropped is not
@@ -2573,7 +2624,7 @@ impl Db {
         // and says so. A peer from before this call answers nothing, and
         // nothing is adopted.
         if let Some(theirs) = theirs {
-            for note in self.reconcile(&theirs)? {
+            for note in self.reconcile_from(url, &theirs)? {
                 crate::log::info(
                     "catalog_reconciled",
                     &[("peer", url.to_string()), ("change", note)],
@@ -2804,14 +2855,22 @@ impl Db {
         }
         let sql = format!("PLACE SHARD {shard} OF {collection} ON '{to}'");
         let (done, failures) = self.propagate(&order, &sql, &[])?;
-        if !failures.is_empty() {
-            return Err(Db::not_propagated(&done, &failures, &sql));
-        }
+        // A holder a map switch did not reach learns it from the holders'
+        // own word when it reconnects (`reconcile_from`), so that is a
+        // note; the move itself is done.
         Ok(format!(
-            "shard {shard} of `{collection}` moved from {} to {to}; {} file(s), map switched{}",
+            "shard {shard} of `{collection}` moved from {} to {to}; {} file(s), map switched{}{}",
             if self.is_self(&from) { "this node" } else { from.as_str() },
             files.len(),
-            if done.is_empty() { String::new() } else { format!(" on {}", done.join(", ")) }
+            if done.is_empty() { String::new() } else { format!(" on {}", done.join(", ")) },
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; not on {}: they learn the map when they reconnect ({RECONCILE_NOTE})",
+                    failures.join("; ")
+                )
+            }
         ))
     }
 

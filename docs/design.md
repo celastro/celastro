@@ -295,9 +295,15 @@ every `CELASTRO_RECONCILE_SECS` (30) in a thread of its own, so a split
 heals within a sweep of the link returning. The statement that could not
 reach a node therefore succeeds with a note naming it, for what the
 reconciliation carries -- `CREATE COLLECTION`, `CREATE INDEX`, `DROP INDEX`,
-`DROP COLLECTION`, a policy's creation. What it does not carry -- an `ALTER`,
-a placement after a move, a policy's drop -- is still refused naming the
-nodes and the `LOCAL` statement to run there. One refusal is deliberate: a
+`DROP COLLECTION`, a policy's creation, and a placement after a move, which
+merges by a different rule since a map is a claim about files rather than a
+definition: a node's own word about the shards it holds, or held, is final,
+so for a collection both nodes have, a shard the peer's map puts on the peer
+moves to the peer in this node's map, one this node's map puts on the peer
+that the peer's map puts elsewhere moves there, and one both claim is kept
+and named for a `MOVE SHARD`. What it does not carry -- an `ALTER`, a
+policy's drop -- is still refused naming the nodes and the `LOCAL` statement
+to run there. One refusal is deliberate: a
 data node adopts a collection whose map names it as a holder only if the
 collection is younger than the node's data directory. Older means the
 directory never had those shards' data -- a node restarted from an empty
@@ -438,7 +444,25 @@ window at 29 s; with that wait the mixed-version scenario passes end to
 end, the move each way included. The window is the cluster's to shorten
 (a shorter TTL on the headless service's records) and a client's to
 absorb (a connect timeout under the DNS TTL and a retry); the pods absorb
-it with the dial retry and the attach loop.
+it with the dial retry and the attach loop. The `dns` scenario measured
+it: 11 s from the pod being ready to its name following it with the
+kubernetes plugin's default `ttl 30`, and 0.2 s with `ttl 5`.
+
+Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
+pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
+refused, none lost, the far shard named by `partial_results` meanwhile.
+Every pod killed at once, no grace, under load (`powerloss`): 1,749
+acknowledged, 145 refused, none lost after every node replayed its log. A
+link cut five seconds and healed five, three times, under load (`flap`):
+6,833 acknowledged, none refused, none lost -- a five-second cut sits
+inside the dial retry and the deadline. A move during a split
+(`movesplit`): the move across the split aborts naming the target, the
+move within a half completes with a note, and the far side's map corrects
+itself from the holders' word within a sweep of the heal, so its count and
+its writes to the moved shard answer. A pod back on an empty volume
+(`lostvolume`): nothing adopted, the shard named as missing. And the token
+rotation (`rotation`), whose first run found the deadlock above; with the
+grace token the three rollouts answer every count between them.
 
 What crosses the wire is length-prefixed frames of the crate's own codec,
 carrying the wire version, the shared token (`CELASTRO_WIRE_TOKEN`, compared
@@ -1586,6 +1610,7 @@ guarantee:
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
+| a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |

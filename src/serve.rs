@@ -1623,7 +1623,7 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
                 }
             }
             let Ok(theirs) = theirs else { continue };
-            match write(db).reconcile(&theirs) {
+            match write(db).reconcile_from(&url, &theirs) {
                 Ok(notes) => {
                     for note in notes {
                         COUNTERS.reconciled.fetch_add(1, AtomicOrdering::Relaxed);

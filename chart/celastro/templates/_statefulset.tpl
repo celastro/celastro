@@ -107,6 +107,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "celastro.wireSecretName" $r }}
                   key: CELASTRO_WIRE_TOKEN
+            {{- if $r.Values.wire.tokenAlso }}
+            - name: CELASTRO_WIRE_TOKEN_ALSO
+              value: {{ $r.Values.wire.tokenAlso | quote }}
+            {{- end }}
             {{- end }}
             {{- if $r.Values.archive.endpoint }}
             - name: CELASTRO_ARCHIVE_ENDPOINT

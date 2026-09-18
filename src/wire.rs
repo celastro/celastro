@@ -192,6 +192,18 @@ pub fn token_from_env() -> Option<String> {
     std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty())
 }
 
+/// A second token the wire accepts from a peer, `CELASTRO_WIRE_TOKEN_ALSO`:
+/// what makes a rotation roll. A rotation by rolling update alone
+/// deadlocks -- the first pod on the new token can attach nobody, is never
+/// ready, and the rollout never moves -- so it goes in three rollouts:
+/// every pod accepts the new token too, then every pod sends the new one
+/// and still accepts the old, then the old is dropped.
+pub const TOKEN_ALSO_ENV: &str = "CELASTRO_WIRE_TOKEN_ALSO";
+
+fn token_also_from_env() -> Option<String> {
+    std::env::var(TOKEN_ALSO_ENV).ok().filter(|t| !t.is_empty())
+}
+
 fn truncated() -> Error {
     Error::Storage("wire: truncated frame".into())
 }
@@ -784,7 +796,19 @@ impl Node {
     /// The holder's clock and its write counter for a collection: what a
     /// coordinator needs to pin a snapshot and to age its statistics cache.
     pub fn counters(&self, collection: &str) -> Result<(Timestamp, u64)> {
-        let b = self.call(Call::Counters, collection, 0, &[])?;
+        // The first call a statement makes to a holder, so the first to
+        // meet a node back on an empty volume, which has no collection: a
+        // missing shard to the statement, as `Remote::call` says.
+        let b = match self.call(Call::Counters, collection, 0, &[]) {
+            Err(Error::Plan(m)) if m.starts_with("no such collection") => {
+                return Err(Error::Deadline(format!(
+                    "{} holds no `{collection}`: a node back on an empty volume? (RESTORE ... \
+                     NODE on it); use WITH (partial_results) to opt in to incomplete answers",
+                    self.url
+                )))
+            }
+            other => other?,
+        };
         let mut i = 0;
         Ok((get_ts(&b, &mut i)?, get_u64(&b, &mut i).ok_or_else(truncated)?))
     }
@@ -922,7 +946,22 @@ impl Remote {
     }
 
     fn call(&self, call: Call, body: &[u8]) -> Result<Vec<u8>> {
-        self.node.call(call, &self.collection, self.index, body)
+        match self.node.call(call, &self.collection, self.index, body) {
+            // A holder that does not have the collection is a shard that is
+            // not there -- a node back on an empty volume, which adopts
+            // nothing older than its directory -- and to a statement that
+            // is the same as a holder that does not answer: refused naming
+            // the shard, or missing under `partial_results`.
+            Err(Error::Plan(m)) if m.starts_with("no such collection") => {
+                Err(Error::Deadline(format!(
+                    "shard {} of `{}` on {} holds no `{}`: a node back on an empty volume? \
+                     (RESTORE ... NODE on it); use WITH (partial_results) to opt in to \
+                     incomplete answers",
+                    self.index, self.collection, self.node.url, self.collection
+                )))
+            }
+            other => other,
+        }
     }
 }
 
@@ -1111,6 +1150,7 @@ pub fn serve(
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let token = Arc::new(token);
+    let also = Arc::new(token_also_from_env());
     let moves = db.read().unwrap_or_else(|p| p.into_inner()).moves();
     let max_connections: usize = env_num("CELASTRO_WIRE_MAX_CONNECTIONS", WIRE_MAX_CONNECTIONS);
     let idle: u64 = env_num("CELASTRO_WIRE_IDLE_SECS", WIRE_IDLE_SECS);
@@ -1149,12 +1189,13 @@ pub fn serve(
                 };
                 let db = db.clone();
                 let token = token.clone();
+                let also = also.clone();
                 let stop = stop.clone();
                 let moves = moves.clone();
                 let open = open.clone();
                 open.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    serve_connection(s, &db, &moves, &token, &stop, idle);
+                    serve_connection(s, &db, &moves, &token, also.as_deref(), &stop, idle);
                     open.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -1177,6 +1218,7 @@ fn serve_connection(
     db: &RwLock<Db>,
     moves: &Moves,
     token: &str,
+    also: Option<&str>,
     stop: &AtomicBool,
     idle: Option<Duration>,
 ) {
@@ -1208,7 +1250,7 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, token, &frame) {
+        match handle(db, moves, token, also, &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -1279,7 +1321,13 @@ impl Held<'_> {
     }
 }
 
-fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<Vec<u8>> {
+fn handle(
+    db: &RwLock<Db>,
+    moves: &Moves,
+    token: &str,
+    also: Option<&str>,
+    frame: &[u8],
+) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
     let _serving = Serving;
     let mut i = 0;
@@ -1291,7 +1339,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, token: &str, frame: &[u8]) -> Result<V
         )));
     }
     let given = get_string(frame, &mut i)?;
-    if !token_matches(token, &given) {
+    if !token_matches(token, &given) && !also.is_some_and(|a| token_matches(a, &given)) {
         return Err(Error::Plan(format!("wire token refused; both nodes read {TOKEN_ENV}")));
     }
     let call = Call::from_u8(get_u8(frame, &mut i)?)

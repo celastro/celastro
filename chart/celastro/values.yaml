@@ -32,6 +32,13 @@ wire:
   port: 2352
   token: ""
   existingSecret: ""
+  # A second token every pod accepts, for a rotation: a rotation by one
+  # rollout deadlocks, since the first pod on the new token can attach
+  # nobody and is never ready. Rotate in three: set tokenAlso to the new
+  # token (a rollout); put the new token in the Secret and the old one
+  # here (a rollout); clear this (a rollout). Visible in the release's
+  # values while set, which is why it is cleared.
+  tokenAlso: ""
 
 # Encryption in transit: the wire between pods and the console's traffic
 # from clients over TLS 1.3, each pod serving one certificate and verifying

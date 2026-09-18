@@ -1274,3 +1274,79 @@ fn idle_wire_connections_are_capped_and_closed() {
     settle();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A move made while a node could not be reached leaves that node's map
+/// naming the old holder. When it reconnects, the holders' own word about
+/// what they hold, or held, corrects its map, and its statements route
+/// to the shard where it is.
+#[test]
+fn a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("mv-a");
+    let b = Node::start("mv-b");
+    let c = Node::start("mv-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let (c_url, c_dir) = (c.url.clone(), c.dir.clone());
+    let c_port: u16 = c_url.rsplit(':').next().unwrap().parse().unwrap();
+    drop(c);
+    settle();
+    // The move completes between a and b; the map switch does not reach c.
+    let m = a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", b.url));
+    assert!(m.contains("map switched") && m.contains(&format!("not on {c_url}")), "{m}");
+    assert_eq!(a.local_shards("items"), vec![] as Vec<usize>);
+    assert_eq!(b.local_shards("items"), vec![0, 1]);
+    let c = Node::start_at("mv-c", c_port, Some(c_dir));
+    assert_eq!(c.db.read().unwrap().catalog.placement["items"][0].node, a.url, "stale");
+    // Attaching a, the old holder, is enough: a's word that it gave the
+    // shard away is final.
+    c.ack(&format!("ATTACH NODE '{}'", a.url));
+    assert_eq!(c.db.read().unwrap().catalog.placement["items"][0].node, b.url);
+    let r = c.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(30));
+    // And from the new holder's word alone, on a fresh stale map.
+    let mut stale = c.db.read().unwrap().catalog.clone();
+    stale.placement.get_mut("items").unwrap()[0].node = a.url.clone();
+    c.db.write().unwrap().catalog = stale;
+    let notes =
+        c.db.write()
+            .unwrap()
+            .reconcile_from(&b.url, &b.db.read().unwrap().catalog.clone())
+            .unwrap();
+    assert!(notes.iter().any(|n| n.starts_with("shard 0 of `items`: now on")), "{notes:?}");
+    assert_eq!(c.db.read().unwrap().catalog.placement["items"][0].node, b.url);
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A rotation of the wire token rolls only if a node accepts the new token
+/// before it sends it: `CELASTRO_WIRE_TOKEN_ALSO` is the second token the
+/// wire accepts, for the rollout in between.
+#[test]
+fn the_wire_accepts_a_second_token_for_a_rotation() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    std::env::set_var(celastro::wire::TOKEN_ALSO_ENV, "the-next-token");
+    let a = Node::start("also-a");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::env::remove_var(celastro::wire::TOKEN_ALSO_ENV);
+    let old = celastro::wire::Node::new(&a.url, Some(TOKEN), None).unwrap();
+    let new = celastro::wire::Node::new(&a.url, Some("the-next-token"), None).unwrap();
+    let wrong = celastro::wire::Node::new(&a.url, Some("neither"), None).unwrap();
+    assert!(old.hello().is_ok());
+    assert!(new.hello().is_ok());
+    assert!(wrong.hello().unwrap_err().to_string().contains("wire token refused"));
+    let d = a.dir.clone();
+    drop(a);
+    settle();
+    let _ = std::fs::remove_dir_all(&d);
+}

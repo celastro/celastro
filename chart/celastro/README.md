@@ -74,6 +74,23 @@ gain nothing from the role -- the coordinator's forwarding costs more
 than the lookup -- so a lookup-heavy service should let its data pods
 take clients (`coordinators.replicas: 0`).
 
+### Rotating the wire token
+
+One rollout deadlocks (the first pod on the new token attaches nobody and
+is never ready); three do not, each leaving every pair of pods a token in
+common:
+
+```
+helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=NEW
+kubectl create secret generic celastro-wire --from-literal=CELASTRO_WIRE_TOKEN=NEW --dry-run=client -o yaml | kubectl apply -f -
+helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=OLD   # pods restart on the new Secret
+helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=
+```
+
+`wire.existingSecret` names the Secret when it is yours; the middle step
+is then your update of it. The resilience drill `rotation` runs these
+three by `kubectl set env` and checks every count after each.
+
 ### Encryption in transit
 
 ```
@@ -188,8 +205,8 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.47.1 .
-kind load docker-image celastro:0.47.1        # for a kind cluster
+docker build -t celastro:0.48.0 .
+kind load docker-image celastro:0.48.0        # for a kind cluster
 helm install celastro chart/celastro --set image.repository=celastro
 ```
 

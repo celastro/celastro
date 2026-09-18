@@ -6,7 +6,38 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.48.0 — 2026-09-18
+
+The resilience drills' findings, hence a minor: a rotation that rolls,
+a map that heals after a move under a split, and an empty volume that
+is a missing shard.
+
+**A token rotation rolls.** A rotation by one rolling update deadlocked:
+the first pod on the new token could attach nobody, was never ready, and
+the rollout never moved, leaving it partitioned. `CELASTRO_WIRE_TOKEN_ALSO`
+is a second token the wire accepts, and a rotation is three rollouts
+(accept the new token too; send it and still accept the old; drop the
+old), each leaving every pair of nodes a token in common. The chart's
+`wire.tokenAlso` carries it; SECURITY.md has the steps.
+
+**A holder without the collection is a missing shard.** A node back on
+an empty volume adopts nothing older than its directory, and a statement
+that reached it for a shard was refused with "no such collection". It is
+now the same as a holder that does not answer: refused naming the shard
+and the empty volume, or missing under `partial_results`.
+
+**A move's map switch that missed a node is a note**, since the node
+learns the map from the holders' word when it reconnects.
+
+**A move made across a split reaches the far side's map.** A move
+within one half of a split completed there and left the other half's
+map naming the old holder, which then refused the forwarded writes as
+not its own; the reconciliation carried definitions and drops, not
+placement. It now carries a holder's own word: for a collection both
+nodes have, a shard the peer's map puts on the peer moves to the peer in
+this node's map, and a shard this node's map puts on the peer that the
+peer's map puts elsewhere moves there (`Db::reconcile_from`). A shard
+both claim to hold is kept and named for a `MOVE SHARD`.
 
 **Clock skew is measured as the hello is read.** A sweep computed a
 peer's skew after the call that followed the hello, and accused a peer
