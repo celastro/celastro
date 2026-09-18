@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Certificates carry key identifiers.** `celastro tls init` writes
+`subjectKeyIdentifier` and `authorityKeyIdentifier` (the leading 160
+bits of the SHA-256 of the key), so a client that keeps two CAs under
+one name for a rotation's middle step -- OpenSSL, so curl and Python --
+picks the one that signed the leaf; verified with `openssl verify`
+against a bundle of two same-named CAs in either order. A node tried
+every anchor already.
+
 ## 0.50.1 — 2026-09-18
 
 **A pooled connection to a superseded process is let go.** 0.50.0

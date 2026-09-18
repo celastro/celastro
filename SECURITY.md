@@ -130,13 +130,15 @@ clients take the new one when the Secret changes and the pods restart.
 A certificate rotation has the same shape, and the CA file may hold
 several certificates for it: every node trusts the new CA too (a rollout),
 every node presents a leaf from the new CA and still trusts the old (a
-rollout), the old CA is dropped (a rollout). Give the new CA a different
-name: a node tries every anchor, but a client whose library matches an
-issuer by subject name alone -- OpenSSL, so curl and Python -- takes the
-first CA of that name in its bundle and fails the signature against it.
-The certificates carry no key identifiers yet, which is what would settle
-that for every client. A drill runs the three steps under TLS on the wire
-and the console and checks every count between them.
+rollout), the old CA is dropped (a rollout). Certificates made by
+`celastro tls init` carry subject and authority key identifiers, so a
+client whose library matches an issuer by key identifier when there is
+one -- OpenSSL, so curl and Python -- picks the right CA of two under one
+name; material made before 0.51.0 carries none, and for it the new CA
+needs a different name, since such a client then takes the first of that
+name and fails the signature against it. A node tries every anchor either
+way. A drill runs the three steps under TLS on the wire and the console
+and checks every count between them.
 
 ## The TLS, and what it is
 

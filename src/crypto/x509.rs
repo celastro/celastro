@@ -15,6 +15,17 @@ const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+/// `subjectKeyIdentifier` and `authorityKeyIdentifier`: what lets a
+/// client that keeps two CAs under one name -- a rotation's middle step
+/// -- pick the one that signed a leaf. The identifier is the leading 160
+/// bits of the SHA-256 of the public key (RFC 7093, method 1).
+const OID_SKID: &[u8] = &[0x55, 0x1d, 0x0e];
+const OID_AKID: &[u8] = &[0x55, 0x1d, 0x23];
+
+/// A key's identifier, as the two extensions carry it.
+pub fn key_identifier(public: &[u8]) -> Vec<u8> {
+    super::sha2::sha256(public)[..20].to_vec()
+}
 const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 /// 1.2.840.113549.1.1.1, rsaEncryption; 1.2.840.113549.1.1.11, sha256WithRSAEncryption.
 const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
@@ -484,6 +495,14 @@ pub fn issue(
             der::sequence(&[&der::tlv(OID, OID_SERVER_AUTH)]),
         ));
     }
+    // The subject's key identifier, and the issuer's as the authority's:
+    // a CA signing itself carries the same in both.
+    extensions.push(ext(OID_SKID, false, der::tlv(OCTET_STRING, &key_identifier(&subject.public))));
+    extensions.push(ext(
+        OID_AKID,
+        false,
+        der::sequence(&[&der::tlv(0x80, &key_identifier(&issuer.public))]),
+    ));
     if !spec.dns_names.is_empty() || !spec.ip_addresses.is_empty() {
         let mut names: Vec<Vec<u8>> = Vec::new();
         for n in spec.dns_names {
@@ -608,6 +627,15 @@ mod tests {
         let ca = parse(&ca_der).unwrap();
         let leaf = parse(&leaf_der).unwrap();
         assert!(ca.is_ca && !leaf.is_ca);
+        // The leaf names its issuer's key, and the CA its own, so a client
+        // holding two CAs under one name picks the right one.
+        let ca_id = key_identifier(ca.ed25519_key().unwrap());
+        let skid = [&[0x06, 0x03][..], OID_SKID, &[0x04, 0x16, 0x04, 0x14][..], &ca_id].concat();
+        assert!(ca_der.windows(skid.len()).any(|w| w == skid), "the CA carries its key identifier");
+        let akid = [&[0x06, 0x03][..], OID_AKID, &[0x04, 0x18, 0x30, 0x16, 0x80, 0x14][..], &ca_id]
+            .concat();
+        assert!(leaf_der.windows(akid.len()).any(|w| w == akid), "the leaf names the CA's key");
+        assert!(ca_der.windows(akid.len()).any(|w| w == akid), "the CA names its own key");
         assert_eq!(leaf.dns_names, names);
         assert_eq!(leaf.ip_addresses, vec![vec![127, 0, 0, 1]]);
         assert!(ca.signed_by(&ca), "a CA signs itself");
