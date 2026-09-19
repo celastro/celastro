@@ -6,6 +6,14 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.52.1 — 2026-09-19
+
+**The README starts with Docker.** Most readers are not Rust developers:
+the first thing on the page is now `docker run` with a volume and a
+token, then the statements over `curl`, with the image as a client; the
+`cargo install` path follows under its own heading. Every line of the
+Docker block runs as written against the published image.
+
 ## 0.52.0 — 2026-09-19
 
 Wire version 5, hence a minor.

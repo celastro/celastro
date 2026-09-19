@@ -6,9 +6,42 @@ plan**, not orchestrated across services. Rust, **zero dependencies outside
 `std`**: the bitmaps and postings, the HNSW index, the SQL front end and the
 TLS are all in the tree.
 
+Run it with Docker, no toolchain needed; a volume keeps the data and the
+token is what every client presents:
+
 ```sh
-cargo install celastro        # the `celastro` command
+docker run -d --name celastro -p 8787:8787 -v celastro-data:/data \
+  -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef \
+  ghcr.io/celastro/celastro:0.52.1 --dir /data serve --bind 0.0.0.0
 ```
+
+```sh
+export CELASTRO_TOKEN=0123456789abcdef0123456789abcdef
+q() { curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" -H "Content-Type: application/json" \
+        http://127.0.0.1:8787/api/query -d "{\"sql\": $(printf %s "$1" | jq -Rs .)}"; echo; }
+q "CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT)"
+q "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')"
+q "CREATE INDEX notes_emb ON notes USING vector (embedding) WITH (dims = 4, metric = 'cosine')"
+q "INSERT INTO notes VALUES ('{\"id\":\"n1\",\"topic\":\"search\",\"body\":\"BM25 ranks documents by term frequency\",\"embedding\":[0.9,0.1,0.0,0.0]}'), ('{\"id\":\"n2\",\"topic\":\"storage\",\"body\":\"An LSM tree seals a memtable into segments\",\"embedding\":[0.0,0.0,0.9,0.1]}')"
+q "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), embedding <=> [0.8,0.2,0.0,0.0], method => 'rrf') LIMIT 3"
+```
+
+```
+{"ok":true,"kind":"ack","message":"2 document(s) written at ts 7330996124579622912"}
+{"ok":true,"kind":"rows","count":2,...,"rows":[{"key":"n1","score":0.0328,"distance":null,"doc":{"id":"n1","topic":"search"}},{"key":"n2",...}]}
+```
+
+The last query is text and vector in one plan, fused by reciprocal rank
+fusion; `WHERE` takes structured predicates, `text_match`, and a distance
+threshold. The same image is a client: `docker run --rm --network host
+-e CELASTRO_TOKEN ghcr.io/celastro/celastro:0.52.1 send
+http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body,
+'segments')"`, or `repl` for a prompt. The volume is written in the
+clear and the console is plain HTTP: encryption at rest and TLS are
+both off by default, and the [Encryption](#encryption) section is how
+to turn either on. [docs/container.md](docs/container.md) has the
+image's details, and the [Deployment](#deployment) table the other ways
+to run it.
 
 **Status.** Single-writer nodes; a collection's shards can be spread over
 nodes, moved between them, and any node coordinates a statement over all of
@@ -18,55 +51,28 @@ over all of it. No replication, consensus or cross-shard transactions — see
 [What is deliberately not here](docs/design.md#what-is-deliberately-not-here).
 Releases are in [CHANGELOG.md](CHANGELOG.md).
 
-## Quick start
+## Without Docker
 
-A server on a directory, and a client talking to it. Locally or in a
-cluster, that is the whole loop.
+`cargo install celastro` puts the `celastro` command on the path (Rust
+1.75 or later, no dependencies outside `std`). It is the server, the
+client and the tools in one binary:
 
 ```sh
 cat > quickstart.sql <<'EOF'
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT);
 CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
-CREATE INDEX notes_emb ON notes USING vector (embedding) WITH (dims = 4, metric = 'cosine');
-INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency","embedding":[0.9,0.1,0.0,0.0]}');
-INSERT INTO notes VALUES ('{"id":"n2","topic":"storage","body":"An LSM tree seals a memtable into segments","embedding":[0.0,0.0,0.9,0.1]}');
+INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency"}');
 EOF
-celastro --dir ./data run quickstart.sql
-celastro --dir ./data serve
+celastro --dir ./data run quickstart.sql     # statements from a file, no server
+celastro --dir ./data serve                  # the console on loopback; prints its URL with the token
+celastro send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'documents')"
 ```
 
-`./data` is written in the clear and the console is plain HTTP on
-loopback: encryption at rest and TLS are both off by default, and the
-[Encryption](#encryption) section is how to turn either on.
-
-```
-http://127.0.0.1:8787/?t=31beccfc...        # the console's URL; the token follows ?t=
-```
-
-From another terminal, with that token, one statement at a time or over
-HTTP as an application would:
-
-```sh
-export CELASTRO_TOKEN=31beccfc...
-celastro send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'segments')"
-curl -s -H "X-Celastro-Token: $CELASTRO_TOKEN" -H "Content-Type: application/json" \
-     http://127.0.0.1:8787/api/query -d @- <<'EOF'
-{"sql": "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), embedding <=> [0.8,0.2,0.0,0.0], method => 'rrf') LIMIT 3"}
-EOF
-```
-
-```
-{"ok":true,"kind":"rows","count":1,...,"rows":[{"key":"n2","score":null,"distance":null,"doc":{"id":"n2"}}]}
-{"ok":true,"kind":"rows","count":2,...,"rows":[{"key":"n1","score":0.0328,"distance":null,"doc":{"id":"n1","topic":"search"}},{"key":"n2",...}]}
-```
-
-The second query is text and vector in one plan, fused by reciprocal rank
-fusion; `WHERE` takes structured predicates, `text_match`, and a distance
-threshold. `celastro --dir ./data exec "<SQL>"` runs a statement without
-a server, `EXPLAIN ANALYZE` in front of a query prints the plan that ran,
-and `celastro demo` is a guided tour in memory. Every write is on the
-disk before it is acknowledged. Two limits worth knowing early: a prefix
-such as `text_match(body, 'comp*')` expands to at most 512 dictionary terms
+`celastro --dir ./data exec "<SQL>"` runs a statement without a server,
+`EXPLAIN ANALYZE` in front of a query prints the plan that ran, and
+`celastro demo` is a guided tour in memory. Every write is on the disk
+before it is acknowledged. Two limits worth knowing early: a prefix such
+as `text_match(body, 'comp*')` expands to at most 512 dictionary terms
 and says `TRUNCATED` when cut, and `DROP` is final.
 
 ## Counting and summing
@@ -148,7 +154,7 @@ other nodes; the sections that follow have each option's details.
 | option | how | data | clients | notes |
 |---|---|---|---|---|
 | **one process** | `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
-| **a container** | `docker run ... ghcr.io/celastro/celastro:0.52.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:0.52.1 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
 
@@ -320,8 +326,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.52.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.52.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.52.1 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.52.1 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
