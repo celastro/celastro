@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.52.0 — 2026-09-19
+
+Wire version 5, hence a minor.
+
+**Wire version 5, and the zombie fence's server half.** A frame carries
+its caller's address and epoch after the token, and a holder that has
+seen a newer process at that address refuses the call, naming both: the
+older process's own forwards are what this stops, as the client half of
+0.50.x stopped calls toward it. The bump is compatible: a node's hello
+says the newest version it accepts, a node sends 5 only to a peer that
+accepts it and 4 otherwise, and every node accepts 4, so a rolling
+upgrade across the bump talks in both directions throughout. A process's
+identity for the frames is its address and epoch, carried by every
+connection the engine makes.
+
 ## 0.51.0 — 2026-09-19
 
 The move's copy off every lock, hence a minor.

@@ -498,9 +498,15 @@ toward the old process is refused rather than taken. The drill's flipped
 assertion failed once more first: the write rode a pooled connection that
 a hello had just shown to be the older process, so a hello that shows one
 now drops the connection it came over, and a pooled connection to a
-process since superseded is dropped before the next call (0.50.1). What waits for the next wire version is the other
-half, a holder refusing a call from a stale caller, which needs the
-caller's epoch in the frame. Hello answers without the database lock when
+process since superseded is dropped before the next call (0.50.1). The
+other half needed the caller's epoch in the frame, which is wire version
+5: after the token, the caller's address and epoch, and a holder that has
+seen a newer process at that address refuses the call (`Db::observe_caller`,
+held in the peers' record without the database lock). The bump is
+compatible by design: a hello says the newest version a node accepts, a
+node sends 5 only to a peer that accepts it, and every node accepts 4, so
+the rolling upgrade that the five-node experiment showed stalling on a
+crate-version check does not stall on this. Hello answers without the database lock when
 a statement holds it, from the process's fixed identity: the pull of a
 move asks it of a source that holds its lock for the whole move, and the
 first run with the check found that out.
@@ -1695,6 +1701,7 @@ guarantee:
 | a due seal with a sealer running freezes rather than builds: the rows stay readable and deletable in the frozen memtable, the log is rotated aside, and the install commits the segment with the delete made meanwhile and removes the rotated log | `shard::background_seal_tests::a_frozen_memtable_is_read_and_deleted_until_its_seal_is_installed` |
 | a seal frozen but not installed when the process ends replays from its rotated log with the live one, and the next seal covers both | `shard::background_seal_tests::a_seal_frozen_but_not_installed_replays_from_its_rotated_log` |
 | a point lookup through the console answers while a 20,000-vector seal builds off the lock | `resilience::a_point_lookup_answers_while_a_large_vector_seal_builds` (`--ignored`) |
+| a holder that has seen a newer process at a caller's address refuses the caller's call, naming both; the caller's own writes are what it stops | `wire::a_call_from_an_older_process_is_refused_by_a_holder` |
 | a fresh connection to a process older than the newest seen at its address is refused before a statement goes down it, and a hello still names it | `wire::a_fresh_connection_to_an_older_process_is_refused` |
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a move issued to a busy source, writes flowing through it, holds no lock long: the move in about a hundred milliseconds, the slowest write waiting tens | `wire::a_move_from_a_busy_source_holds_no_lock_long` |

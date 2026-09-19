@@ -958,6 +958,9 @@ pub struct Db {
     /// What every hello from every peer has shown, by address. A mutex
     /// because `SHOW HEALTH` observes under the read lock.
     peers_seen: Mutex<BTreeMap<String, PeerSeen>>,
+    /// The epoch as claimed, in a cell the wire's frames read: the real
+    /// one, or what [`Db::pretend`] said.
+    epoch_cell: Arc<std::sync::atomic::AtomicU64>,
     /// Test and drill hooks: an epoch to claim instead of the real one,
     /// and an offset on the clock `hello` reports.
     pretend_epoch: Option<u64>,
@@ -1021,6 +1024,7 @@ impl Db {
             attached: BTreeSet::new(),
             not_adopted: BTreeSet::new(),
             epoch: crate::time::now_micros().max(0) as u64,
+            epoch_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peers_seen: Mutex::new(BTreeMap::new()),
             pretend_epoch: None,
             pretend_clock_micros: 0,
@@ -2007,13 +2011,19 @@ impl Db {
         if let Some(n) = guard(&self.nodes).get(url) {
             return Ok(n.clone());
         }
-        let n = Arc::new(crate::wire::Node::new(
-            url,
-            self.wire_token.as_deref(),
-            self.opts.tls.clone(),
-        )?);
+        let n = Arc::new(self.wire_node(url)?);
         guard(&self.nodes).insert(url.to_string(), n.clone());
         Ok(n)
+    }
+
+    /// A wire peer as this node speaks to it: the token, the TLS, and this
+    /// node's identity for the frames that carry one.
+    fn wire_node(&self, url: &str) -> Result<crate::wire::Node> {
+        let n = crate::wire::Node::new(url, self.wire_token.as_deref(), self.opts.tls.clone())?;
+        Ok(match &self.opts.node {
+            Some(me) => n.with_identity(me, self.epoch_cell()),
+            None => n,
+        })
     }
 
     /// Placement for a new collection: `splits` make `n+1` shards, shard `i`
@@ -2111,6 +2121,12 @@ impl Db {
         self.pretend_epoch.unwrap_or(self.epoch)
     }
 
+    /// The claimed epoch as a shared cell, for the wire's frames.
+    fn epoch_cell(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.epoch_cell.store(self.epoch(), std::sync::atomic::Ordering::Relaxed);
+        self.epoch_cell.clone()
+    }
+
     /// This node's wall clock as `hello` reports it, microseconds. The wall
     /// clock and not the HLC: the HLC runs ahead of the wall by whatever a
     /// peer's timestamps pushed it to, which is not skew, and a drill saw
@@ -2132,6 +2148,7 @@ impl Db {
     pub fn pretend(&mut self, epoch: Option<u64>, clock_offset_micros: i64) {
         self.pretend_epoch = epoch;
         self.pretend_clock_micros = clock_offset_micros;
+        self.epoch_cell.store(self.epoch(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// When a hello was read, on this node's clock as `hello` reports it:
@@ -2143,6 +2160,28 @@ impl Db {
         } else {
             self.clock_micros()
         }
+    }
+
+    /// A call's caller, from a version-5 frame: refused when a newer process
+    /// has been seen at its address, which is a zombie calling -- the pod
+    /// replaced while its predecessor still runs, forwarding its writes.
+    /// A newer epoch than seen raises the record, as a hello's would.
+    pub fn observe_caller(&self, node: &str, epoch: u64) -> Result<()> {
+        if epoch == 0 {
+            return Ok(());
+        }
+        let mut seen = guard(&self.peers_seen);
+        let entry = seen.entry(node.to_string()).or_default();
+        if entry.epoch > 0 && epoch < entry.epoch {
+            return Err(Error::Plan(format!(
+                "a call from an older process at {node}: it started at {} while one started at {} \
+                 was seen there; two processes share the address, and this one is refused",
+                crate::time::format_micros(epoch as i64),
+                crate::time::format_micros(entry.epoch as i64)
+            )));
+        }
+        entry.epoch = entry.epoch.max(epoch);
+        Ok(())
     }
 
     /// What has been seen of a peer, if a hello from it was observed.
@@ -2835,16 +2874,8 @@ impl Db {
         // one call at a time, and a pull that takes the copy's length on
         // it made a write forwarded to the same peer wait for it under this
         // node's lock, which the target's switch back here then waited on.
-        let target = Arc::new(crate::wire::Node::new(
-            to,
-            self.wire_token.as_deref(),
-            self.opts.tls.clone(),
-        )?);
-        let source = Arc::new(crate::wire::Node::new(
-            &from,
-            self.wire_token.as_deref(),
-            self.opts.tls.clone(),
-        )?);
+        let target = Arc::new(self.wire_node(to)?);
+        let source = Arc::new(self.wire_node(&from)?);
         Ok(MovePlan {
             collection: collection.to_string(),
             shard,

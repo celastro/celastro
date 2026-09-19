@@ -108,6 +108,17 @@ holds them; that is the boundary.
 - Missing features listed under "What is deliberately not here" in the README.
   No replication means no replication vulnerabilities.
 
+## Two processes at one address
+
+A pod replaced while its predecessor still runs, the old one reached
+through a stale name, is two processes at one address with one token
+between them. Every process carries an epoch, the instant it opened its
+database, in its hello and (from wire version 5) in every frame it
+sends. A node refuses a fresh connection whose hello shows an older
+epoch than the newest it has seen at the address, and a holder refuses a
+call whose frame carries one; `SHOW HEALTH` names the older process. The
+token does not tell the two apart; the epoch does.
+
 ## Rotating the wire token
 
 A rotation by one rolling update deadlocks: the first pod on the new token

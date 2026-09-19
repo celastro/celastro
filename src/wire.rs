@@ -67,6 +67,13 @@ use crate::value::Value;
 
 /// Refused on mismatch, in both directions.
 pub const WIRE_VERSION: u8 = 4;
+/// The newest frame this node accepts and sends: version 5 carries the
+/// caller's identity -- its address and epoch -- after the token, so a
+/// holder refuses a call from a process older than the newest it has seen
+/// at that address (the zombie fence's server half). A node sends 5 only
+/// to a peer whose hello said it accepts 5, and accepts 4 from anyone, so
+/// a rolling upgrade across the bump still talks in both directions.
+pub const WIRE_VERSION_MAX: u8 = 5;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 /// The port a node serves its shards on when none is given: `tcp://host`
@@ -578,6 +585,12 @@ pub struct Node {
     /// older than the newest seen since is dropped before the next call,
     /// which then dials afresh and is refused.
     conn_epoch: std::sync::atomic::AtomicU64,
+    /// The newest wire version the peer's hello said it accepts; zero
+    /// until a hello, which means 4.
+    peer_wire: std::sync::atomic::AtomicU8,
+    /// This node's address and epoch, sent in version-5 frames; the epoch
+    /// a cell shared with the engine, so a test's pretended one shows.
+    identity: Option<(String, Arc<std::sync::atomic::AtomicU64>)>,
 }
 
 impl std::fmt::Debug for Node {
@@ -606,6 +619,9 @@ pub struct Hello {
     /// The newest catalog format the node reads: what a catalog sent to it
     /// is encoded as. A node from before the field is placed by its version.
     pub catalog_format: u8,
+    /// The newest wire version the node accepts; a node from before the
+    /// field accepts 4.
+    pub wire_max: u8,
     /// This node's wall clock as the answer was read, microseconds: what
     /// `now_micros` is compared against. Taken here and not by whoever
     /// looks at the hello later, since a lock waited for or a call made in
@@ -634,7 +650,17 @@ impl Node {
             peer_format: std::sync::atomic::AtomicU8::new(0),
             max_epoch: std::sync::atomic::AtomicU64::new(0),
             conn_epoch: std::sync::atomic::AtomicU64::new(0),
+            peer_wire: std::sync::atomic::AtomicU8::new(0),
+            identity: None,
         })
+    }
+
+    /// Who this node is, for the frames it sends: its address and epoch,
+    /// carried from wire version 5 on so a holder can refuse a call from
+    /// a process older than the newest seen at the address.
+    pub fn with_identity(mut self, node: &str, epoch: Arc<std::sync::atomic::AtomicU64>) -> Node {
+        self.identity = Some((node.to_string(), epoch));
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -665,8 +691,16 @@ impl Node {
     /// holder, so a connection the holder closed while idle costs nothing.
     /// A request frame: the head every call carries, then the body.
     fn request(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Vec<u8> {
-        let mut req = vec![WIRE_VERSION];
+        // Version 5 to a peer that accepts it, when this node has an
+        // identity to carry; 4 otherwise, and to a peer not asked yet.
+        let five = self.identity.is_some() && self.peer_wire.load(Ordering::Relaxed) >= 5;
+        let mut req = vec![if five { WIRE_VERSION_MAX } else { WIRE_VERSION }];
         put_str(&mut req, &self.token);
+        if five {
+            let (node, epoch) = self.identity.as_ref().expect("checked");
+            put_str(&mut req, node);
+            put_u64(&mut req, epoch.load(Ordering::Relaxed));
+        }
         req.push(call as u8);
         put_str(&mut req, collection);
         put_uvarint(&mut req, shard as u64);
@@ -860,8 +894,19 @@ impl Node {
             }
         };
         self.peer_format.store(catalog_format, Ordering::Relaxed);
+        let wire_max = if i < b.len() { get_u8(b, &mut i)? } else { WIRE_VERSION };
+        self.peer_wire.store(wire_max, Ordering::Relaxed);
         let received_micros = crate::time::now_micros().max(0) as u64;
-        Ok(Hello { node, version, role, now_micros, epoch, catalog_format, received_micros })
+        Ok(Hello {
+            node,
+            version,
+            role,
+            now_micros,
+            epoch,
+            catalog_format,
+            wire_max,
+            received_micros,
+        })
     }
 
     /// A catalog as the peer reads it: the newest format it said it reads,
@@ -1428,16 +1473,29 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
     let _serving = Serving;
     let mut i = 0;
     let version = get_u8(frame, &mut i)?;
-    if version != WIRE_VERSION {
+    if !(WIRE_VERSION..=WIRE_VERSION_MAX).contains(&version) {
         return Err(Error::Storage(format!(
-            "wire version {version} is not this node's {WIRE_VERSION}; both nodes must run the \
-             same celastro"
+            "wire version {version} is not one this node speaks ({WIRE_VERSION} to \
+             {WIRE_VERSION_MAX}); both nodes must run a celastro that shares one"
         )));
     }
     let given = get_string(frame, &mut i)?;
     let (token, also) = (identity.token.as_str(), identity.also.as_deref());
     if !token_matches(token, &given) && !also.is_some_and(|a| token_matches(a, &given)) {
         return Err(Error::Plan(format!("wire token refused; both nodes read {TOKEN_ENV}")));
+    }
+    // The caller's identity, from version 5: refused when a newer process
+    // has been seen at its address -- the zombie fence's server half. Held
+    // in the peers' record without the database lock.
+    let caller = if version >= 5 {
+        Some((get_string(frame, &mut i)?, get_u64(frame, &mut i).ok_or_else(truncated)?))
+    } else {
+        None
+    };
+    if let Some((node, epoch)) = &caller {
+        if let Ok(g) = db.try_read() {
+            g.observe_caller(node, *epoch)?;
+        }
     }
     let call = Call::from_u8(get_u8(frame, &mut i)?)
         .ok_or_else(|| Error::Storage("wire: unknown call".into()))?;
@@ -1563,6 +1621,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
         put_u64(&mut out, clock);
         put_u64(&mut out, epoch);
         out.push(CATALOG_VERSION);
+        out.push(WIRE_VERSION_MAX);
         return Ok(out);
     }
     let read_call = matches!(

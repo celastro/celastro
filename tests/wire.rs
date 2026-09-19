@@ -1454,3 +1454,38 @@ fn a_move_from_a_busy_source_holds_no_lock_long() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// The fence's server half: a frame carries its caller's address and
+/// epoch, and a holder that has seen a newer process at that address
+/// refuses the call. The older process's own forwards are what this
+/// stops; the client half stops calls toward it.
+#[test]
+fn a_call_from_an_older_process_is_refused_by_a_holder() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fence2-a");
+    let b = Node::start("fence2-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    a.ack(CREATE);
+    a.db.write().unwrap().insert("items", doc(1)).unwrap();
+    let epoch = a.db.read().unwrap().epoch();
+    // A newer process at a's address calls b: its frames say so, and b
+    // raises what it has seen of a.
+    // Tenant t1's shard is b's: doc(1), doc(4), doc(7) go over the wire.
+    a.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
+    a.db.write().unwrap().insert("items", doc(4)).unwrap();
+    assert_eq!(b.db.read().unwrap().peer_seen(&a.url).unwrap().epoch, epoch + 5_000_000);
+    // The older process calls again: refused by b, naming both.
+    a.db.write().unwrap().pretend(Some(epoch), 0);
+    let e = a.db.write().unwrap().insert("items", doc(7)).unwrap_err().to_string();
+    assert!(e.contains("a call from an older process at") && e.contains(&a.url), "{e}");
+    // b's own writes go on.
+    b.db.write().unwrap().insert("items", doc(10)).unwrap();
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
