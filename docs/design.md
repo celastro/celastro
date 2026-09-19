@@ -517,9 +517,21 @@ deadline and a lookup on the source waited it out too: the coordinator
 holds its lock for the move, the target's pull needs the target's lock,
 and that lock was held by a write forwarded from the load through the
 target to a shard on the coordinator, which waited on the coordinator's
-lock -- a cycle that only the deadline breaks. Until the copy runs off the
-coordinator's lock, as a backup's copy does, issue a move to its source or
-its target, and expect the source's console to wait for the copy.
+lock -- a cycle that only the deadline breaks. So the copy now runs off the
+lock on both ends, as a backup's copy does: the checks and the pin under
+the coordinator's lock, then deferred work that has the target pull the
+pinned files holding nothing, adopt them under its lock, and switch the map
+on every node itself, the source last (`Db::move_begin`, `Db::move_run`,
+`Db::pull_files`, `Db::finish_move_here`). A rebalance pins its moves and
+copies them one after another the same way, applying only each move's
+entry to a target's map, since a plan's map is as of its pin. The drill's
+third-node move is the check, and a test with writes flowing through the
+source while it moves a shard away is the other: it found the last cycle,
+in the wire's pool. A pool connection is one call at a time, and the
+coordinator's pull, which takes the copy's length, held the connection to
+the target; a write forwarded to the target waited on that connection
+under the source's lock, and the target's switch back to the source waited
+on that lock. The move's long calls have connections of their own now.
 
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
@@ -1685,6 +1697,7 @@ guarantee:
 | a point lookup through the console answers while a 20,000-vector seal builds off the lock | `resilience::a_point_lookup_answers_while_a_large_vector_seal_builds` (`--ignored`) |
 | a fresh connection to a process older than the newest seen at its address is refused before a statement goes down it, and a hello still names it | `wire::a_fresh_connection_to_an_older_process_is_refused` |
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
+| a move issued to a busy source, writes flowing through it, holds no lock long: the move in about a hundred milliseconds, the slowest write waiting tens | `wire::a_move_from_a_busy_source_holds_no_lock_long` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |

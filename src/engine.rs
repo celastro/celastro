@@ -2776,9 +2776,25 @@ impl Db {
     /// last, so the source's copy goes only once everyone else can find the
     /// new one. A holder the map did not reach is named with the `LOCAL
     /// PLACE SHARD` that repairs it.
-    pub fn move_shard(&mut self, collection: &str, shard: usize, to: &str) -> Result<String> {
+    /// `MOVE SHARD`: under the caller's lock, the checks and the pin on the
+    /// source; the copy as deferred work holding nothing (the target pulls
+    /// the pinned files and, done, switches the map everywhere itself); so
+    /// neither the coordinator's lock nor the target's is held across the
+    /// copy. The first shape held both, and a write forwarded through the
+    /// target to a shard on the coordinator closed a cycle that only the
+    /// deadline broke.
+    pub fn move_shard(&mut self, collection: &str, shard: usize, to: &str) -> Result<Outcome> {
+        let plan = self.move_begin(collection, shard, to)?;
+        Ok(Outcome::Deferred(Deferred::new(move || Db::move_run(plan))))
+    }
+
+    /// The checks and the pin: what a move does under the lock.
+    fn move_begin(&mut self, collection: &str, shard: usize, to: &str) -> Result<MovePlan> {
         let _deadline = self.arm_default_deadline();
         crate::wire::parse_url(to)?;
+        let me = self.opts.node.clone().ok_or_else(|| {
+            Error::Plan("this node has no address; a move needs CELASTRO_NODE".into())
+        })?;
         let coll = self.catalog.get(collection)?.clone();
         let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
             Error::Plan(format!("collection `{collection}` has no placement map"))
@@ -2789,7 +2805,7 @@ impl Db {
                 tablets.len()
             )));
         };
-        let from = t.node.clone();
+        let from = if t.node.is_empty() { me.clone() } else { t.node.clone() };
         if !self.is_self(to) && !self.catalog.nodes.iter().any(|n| n == to) {
             return Err(Error::Plan(format!(
                 "node {to} is not attached; ATTACH NODE '{to}' first"
@@ -2808,121 +2824,89 @@ impl Db {
         }
         let mut new = tablets.clone();
         new[shard].node = to.to_string();
-
-        // 1. The source pins.
         let files = if self.is_self(&from) {
             self.begin_move(collection, shard, to)?
         } else {
             self.node_conn(&from)?.begin_move(collection, shard, to)?
         };
-        // 2. The target pulls and adopts.
-        let pulled = if self.is_self(to) {
-            let node = self.node_conn(&from)?;
-            self.pull_here(&coll, &new, shard, Some(&node), &files)
-        } else {
-            self.node_conn(to)?.pull_shard(&coll, &new, shard, &from)
-        };
-        if let Err(e) = pulled {
-            if self.is_self(&from) {
-                self.abort_move(collection, shard);
-            } else if let Ok(n) = self.node_conn(&from) {
-                let _ = n.abort_move(collection, shard);
+        // The target and the source as wire peers, this node included: the
+        // job holds no lock and reaches this node the way any other does.
+        // Connections of their own, not the pool's: a pool connection is
+        // one call at a time, and a pull that takes the copy's length on
+        // it made a write forwarded to the same peer wait for it under this
+        // node's lock, which the target's switch back here then waited on.
+        let target = Arc::new(crate::wire::Node::new(
+            to,
+            self.wire_token.as_deref(),
+            self.opts.tls.clone(),
+        )?);
+        let source = Arc::new(crate::wire::Node::new(
+            &from,
+            self.wire_token.as_deref(),
+            self.opts.tls.clone(),
+        )?);
+        Ok(MovePlan {
+            collection: collection.to_string(),
+            shard,
+            from,
+            to: to.to_string(),
+            coll,
+            new,
+            files,
+            source,
+            target,
+        })
+    }
+
+    /// The copy, holding nothing: the target pulls, adopts, and switches
+    /// the map on every node; a pull that fails releases the pin.
+    fn move_run(plan: MovePlan) -> Result<Outcome> {
+        // A copy takes what it takes.
+        let _no_deadline = crate::deadline::arm(None);
+        match plan.target.pull_shard(&plan.coll, &plan.new, plan.shard, &plan.from) {
+            Ok(switched) => Ok(Outcome::Ack(format!(
+                "shard {} of `{}` moved from {} to {}; {} file(s), {switched}",
+                plan.shard,
+                plan.collection,
+                plan.from,
+                plan.to,
+                plan.files.len()
+            ))),
+            Err(e) => {
+                let _ = plan.source.abort_move(&plan.collection, plan.shard);
+                Err(e)
             }
-            return Err(e);
         }
-        // 3. The map switches: here, then the target, then every other
-        // node that may coordinate a statement over the collection -- a
-        // holder, or any attached node, since one that dropped its last
-        // shard still carries the definition and routes by its map -- and
-        // the source last.
-        self.place_shard(collection, shard, to)?;
-        let mut order: Vec<String> = Vec::new();
-        if !self.is_self(to) {
-            order.push(to.to_string());
-        }
-        let others: Vec<String> = tablets
-            .iter()
-            .chain(new.iter())
-            .map(|t| t.node.clone())
-            .chain(self.catalog.nodes.iter().cloned())
-            .collect();
-        for n in others {
-            if !self.is_self(&n) && n != to && n != from && !order.contains(&n) {
-                order.push(n);
-            }
-        }
-        if !self.is_self(&from) {
-            order.push(from.clone());
-        }
-        // The coordinators plan by the map, so they hear where the shard went.
-        for c in &self.catalog.coordinators {
-            if !self.is_self(c) && !order.contains(c) {
-                order.push(c.clone());
-            }
-        }
-        let sql = format!("PLACE SHARD {shard} OF {collection} ON '{to}'");
-        let (done, failures) = self.propagate(&order, &sql, &[])?;
-        // A holder a map switch did not reach learns it from the holders'
-        // own word when it reconnects (`reconcile_from`), so that is a
-        // note; the move itself is done.
-        Ok(format!(
-            "shard {shard} of `{collection}` moved from {} to {to}; {} file(s), map switched{}{}",
-            if self.is_self(&from) { "this node" } else { from.as_str() },
-            files.len(),
-            if done.is_empty() { String::new() } else { format!(" on {}", done.join(", ")) },
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; not on {}: they learn the map when they reconnect ({RECONCILE_NOTE})",
-                    failures.join("; ")
-                )
-            }
-        ))
     }
 
     /// The target's half of a move, on this node: pull every file of the
     /// pinned shard from `source` (a node, or this process when the source
     /// is this node too) into a directory beside the shard's, then adopt it.
-    pub fn pull_here(
-        &mut self,
-        coll: &Collection,
-        tablets: &[Tablet],
+    /// The target's copy, holding no lock: every pinned file of the shard
+    /// from `source` into a directory beside the shard's, then synced.
+    /// Returns that directory, for [`Db::finish_move_here`].
+    pub fn pull_files(
+        dir: &Path,
+        collection: &str,
         shard: usize,
-        source: Option<&Arc<crate::wire::Node>>,
+        source: &Arc<crate::wire::Node>,
         files: &[(String, u64)],
-    ) -> Result<()> {
-        let dir = self
-            .dir
-            .clone()
-            .ok_or_else(|| Error::Plan("a move needs a persistent database (--dir)".into()))?;
-        let cdir = dir.join("collections").join(&coll.name);
+    ) -> Result<PathBuf> {
+        let cdir = dir.join("collections").join(collection);
         let incoming = cdir.join(format!("shard-{shard:04}.incoming"));
         let _ = fs::remove_dir_all(&incoming);
         fs::create_dir_all(incoming.join("segments"))?;
         fs::create_dir_all(incoming.join("deletes"))?;
         fs::create_dir_all(incoming.join("archive"))?;
-        let local = source.is_none().then(|| {
-            self.moves
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&(coll.name.clone(), shard))
-                .cloned()
-        });
         for (name, len) in files {
             let mut bytes = Vec::with_capacity(*len as usize);
             let mut off = 0u64;
             while off < *len {
                 let want = (*len - off).min(MOVE_CHUNK);
-                let chunk = match (source, &local) {
-                    (Some(n), _) => n.read_file(&coll.name, shard, name, off, want)?,
-                    (None, Some(Some(m))) => m.read(name, off, want)?,
-                    _ => return Err(Error::Plan("the move is not pinned here".into())),
-                };
+                let chunk = source.read_file(collection, shard, name, off, want)?;
                 if chunk.is_empty() {
                     return Err(Error::Storage(format!(
-                        "shard {shard} of `{}`: `{name}` ended at {off} of {len} bytes",
-                        coll.name
+                        "shard {shard} of `{collection}`: `{name}` ended at {off} of {len} bytes"
                     )));
                 }
                 off += chunk.len() as u64;
@@ -2931,7 +2915,82 @@ impl Db {
             crate::shard::atomic_write(&incoming.join(name), &bytes)?;
         }
         crate::shard::sync_dir(&incoming)?;
-        self.adopt_shard(coll, tablets, shard, &incoming)
+        Ok(incoming)
+    }
+
+    /// The target's end of a move under its lock: adopt the pulled shard
+    /// and switch the map here. Returns the switch to carry to every other
+    /// node -- the statement and the peers, the source last so its pin is
+    /// released once everyone else routes to the new holder -- for
+    /// [`Db::carry_switch`], which holds no lock: a switch carried under
+    /// this lock waited on the source's, held by a write forwarded into
+    /// this node, until the deadline.
+    pub fn finish_move_here(
+        &mut self,
+        coll: &Collection,
+        tablets: &[Tablet],
+        shard: usize,
+        incoming: &Path,
+        from: &str,
+    ) -> Result<Switch> {
+        let _deadline = self.arm_default_deadline();
+        let me = self.opts.node.clone().unwrap_or_default();
+        let old = self.catalog.placement.get(&coll.name).cloned().unwrap_or_default();
+        // Only this shard's entry from the plan: the plan's map is as of its
+        // pin, and a rebalance pins several moves before any copies, so a
+        // later move's map still names an earlier move's old holder.
+        let mut map = if old.len() == tablets.len() { old.clone() } else { tablets.to_vec() };
+        map[shard] = tablets[shard].clone();
+        self.adopt_shard(coll, &map, shard, incoming)?;
+        self.place_shard(&coll.name, shard, &me)?;
+        let mut order: Vec<String> = Vec::new();
+        let others: Vec<String> = old
+            .iter()
+            .chain(tablets.iter())
+            .map(|t| t.node.clone())
+            .chain(self.catalog.nodes.iter().cloned())
+            .chain(self.catalog.coordinators.iter().cloned())
+            .collect();
+        for n in others {
+            if !n.is_empty() && !self.is_self(&n) && n != from && !order.contains(&n) {
+                order.push(n);
+            }
+        }
+        if !self.is_self(from) {
+            order.push(from.to_string());
+        }
+        let sql = format!("PLACE SHARD {shard} OF {} ON '{me}'", coll.name);
+        let mut peers = Vec::new();
+        for n in order {
+            peers.push((n.clone(), self.node_conn(&n)?));
+        }
+        Ok(Switch { sql, peers })
+    }
+
+    /// Carry a map switch to the peers, holding nothing. What was switched
+    /// where, and where it was not.
+    pub fn carry_switch(switch: &Switch) -> String {
+        let local = format!("LOCAL {}", switch.sql);
+        let mut done = Vec::new();
+        let mut failures = Vec::new();
+        for (url, node) in &switch.peers {
+            match node.statement(&local, &[]) {
+                Ok(_) => done.push(url.clone()),
+                Err(e) => failures.push(format!("{url}: {e}")),
+            }
+        }
+        format!(
+            "map switched here{}{}",
+            if done.is_empty() { String::new() } else { format!(" and on {}", done.join(", ")) },
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; not on {}: they learn the map when they reconnect ({RECONCILE_NOTE})",
+                    failures.join("; ")
+                )
+            }
+        )
     }
 
     /// Take a pulled shard directory into this node: it becomes
@@ -3035,7 +3094,7 @@ impl Db {
     /// node and the attached ones, in attach order -- the placement a
     /// `CREATE COLLECTION` with no nodes named makes -- each a `MOVE
     /// SHARD`, stopping at the first that fails.
-    pub fn rebalance(&mut self, collection: &str) -> Result<Vec<String>> {
+    pub fn rebalance(&mut self, collection: &str) -> Result<Outcome> {
         let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
             Error::Plan(format!("collection `{collection}` has no placement map"))
         })?;
@@ -3047,15 +3106,29 @@ impl Db {
         if nodes.is_empty() {
             return Err(Error::Plan("no data node to rebalance over".into()));
         }
-        let mut done = Vec::new();
+        // Every move pinned under the lock, then copied one after another
+        // holding nothing: the pins overlap for the rebalance's length,
+        // which is writes to those shards refused meanwhile.
+        let mut plans = Vec::new();
         for (i, t) in tablets.iter().enumerate() {
             let target = &nodes[i % nodes.len()];
             if &t.node == target || (self.is_self(&t.node) && self.is_self(target)) {
                 continue;
             }
-            done.push(self.move_shard(collection, i, target)?);
+            plans.push(self.move_begin(collection, i, target)?);
         }
-        Ok(done)
+        if plans.is_empty() {
+            return Ok(Outcome::Ack(format!("`{collection}` is balanced; nothing moved")));
+        }
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let mut lines = Vec::new();
+            for plan in plans {
+                if let Outcome::Ack(m) = Db::move_run(plan)? {
+                    lines.push(m);
+                }
+            }
+            Ok(Outcome::Ack(lines.join("\n")))
+        })))
     }
 
     pub fn add_index(&mut self, collection: &str, idx: IndexDef) -> Result<()> {
@@ -4512,16 +4585,9 @@ impl Db {
                 Ok(Outcome::Ack(format!("node {url} detached")))
             }
             Statement::MoveShard { collection, shard, to } => {
-                Ok(Outcome::Ack(self.move_shard(&collection, shard, &to)?))
+                self.move_shard(&collection, shard, &to)
             }
-            Statement::Rebalance { collection } => {
-                let done = self.rebalance(&collection)?;
-                Ok(Outcome::Ack(if done.is_empty() {
-                    format!("`{collection}` is balanced; nothing moved")
-                } else {
-                    done.join("\n")
-                }))
-            }
+            Statement::Rebalance { collection } => self.rebalance(&collection),
             Statement::PlaceShard { collection, shard, node } => {
                 self.place_shard(&collection, shard, &node)?;
                 Ok(Outcome::Ack(format!("shard {shard} of `{collection}` placed on {node}")))
@@ -5925,6 +5991,26 @@ impl SealJob {
     pub fn describe(&self) -> String {
         format!("seal of shard {} of `{}`: {:?}", self.shard, self.collection, self.ticket)
     }
+}
+
+/// A map switch to carry to the peers, holding nothing: the statement and
+/// the peers in order, the source last.
+pub struct Switch {
+    sql: String,
+    peers: Vec<(String, Arc<crate::wire::Node>)>,
+}
+
+/// A move pinned under the lock: what the deferred copy carries.
+pub struct MovePlan {
+    collection: String,
+    shard: usize,
+    from: String,
+    to: String,
+    coll: Collection,
+    new: Vec<Tablet>,
+    files: Vec<(String, u64)>,
+    source: Arc<crate::wire::Node>,
+    target: Arc<crate::wire::Node>,
 }
 
 /// A compaction reserved on one shard: what the console's maintenance

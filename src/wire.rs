@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -980,14 +981,16 @@ impl Node {
         tablets: &[Tablet],
         shard: usize,
         from: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut cat = Catalog::default();
         cat.collections.insert(coll.name.clone(), coll.clone());
         let mut body = Vec::new();
         put_bytes(&mut body, &self.encode_for_peer(&cat));
         put_tablets(&mut body, tablets);
         put_str(&mut body, from);
-        self.call(Call::PullShard, &coll.name, shard, &body).map(|_| ())
+        let b = self.call(Call::PullShard, &coll.name, shard, &body)?;
+        // What the target switched; a target from before it says nothing.
+        Ok(get_string(&b, &mut 0).unwrap_or_default())
     }
 }
 
@@ -1513,8 +1516,23 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             };
             let source = Arc::new(Node::new(&from, Some(token), tls)?);
             let files = source.begin_move(&collection, shard, &me)?;
-            let mut db = db.write().unwrap_or_else(|p| p.into_inner());
-            db.pull_here(&coll, &tablets, shard, Some(&source), &files)?;
+            // The copy holds no lock: a write forwarded through this node
+            // meanwhile is served, and so is a pull's read from here.
+            let dir = db
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .dir()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| Error::Plan("a move needs a persistent database (--dir)".into()))?;
+            let incoming = Db::pull_files(&dir, &collection, shard, &source, &files)?;
+            let switch = db
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .finish_move_here(&coll, &tablets, shard, &incoming, &from)?;
+            // The switch is carried holding nothing, for the same reason the
+            // copy is.
+            let switched = Db::carry_switch(&switch);
+            put_str(&mut out, &switched);
             return Ok(out);
         }
         _ => {}

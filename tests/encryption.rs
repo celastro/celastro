@@ -356,12 +356,15 @@ fn a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves()
     let b = start("cluster-b", Some(key_file.clone()));
     assert_eq!(std::fs::read(a.dir.join("KEY")).unwrap(), wrapped);
     assert_eq!(std::fs::read(b.dir.join("KEY")).unwrap(), wrapped);
-    let exec =
-        |n: &Node, sql: &str| match n.db.write().unwrap().execute(sql).unwrap().finished().unwrap()
-        {
+    // The lock let go before the deferred work runs: a move's copy holds
+    // nothing, and a target's switch back here needs this lock.
+    let exec = |n: &Node, sql: &str| {
+        let out = n.db.write().unwrap().execute(sql).unwrap();
+        match out.finished().unwrap() {
             Outcome::Ack(m) => m,
             other => panic!("{sql}: {other:?}"),
-        };
+        }
+    };
     exec(&a, &format!("ATTACH NODE '{}'", b.url));
     exec(
         &a,

@@ -69,7 +69,9 @@ impl Node {
     }
 
     fn ack(&self, sql: &str) -> String {
-        match self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        // `exec` let go of the lock; a deferred copy runs here without it.
+        let out = self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match out.finished().unwrap_or_else(|e| panic!("{sql}: {e}")) {
             Outcome::Ack(m) => m,
             other => panic!("{sql}: {other:?}"),
         }

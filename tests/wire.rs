@@ -66,7 +66,9 @@ impl Node {
     }
 
     fn ack(&self, sql: &str) -> String {
-        match self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        // `exec` let go of the lock; a deferred copy runs here without it.
+        let out = self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match out.finished().unwrap_or_else(|e| panic!("{sql}: {e}")) {
             Outcome::Ack(m) => m,
             other => panic!("{sql}: {other:?}"),
         }
@@ -1388,6 +1390,64 @@ fn a_fresh_connection_to_an_older_process_is_refused() {
     std::thread::sleep(std::time::Duration::from_millis(1800));
     a.db.write().unwrap().insert("items", doc(2)).unwrap();
     for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A move issued to the source while writes flow through the source: the
+/// copy holds no lock on either end, so a reader on the source never
+/// waits long, and the move ends in seconds.
+#[test]
+fn a_move_from_a_busy_source_holds_no_lock_long() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("busy-a");
+    let b = Node::start("busy-b");
+    let c = Node::start("busy-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..3000usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let (db, writing) = (a.db.clone(), writing.clone());
+        std::thread::spawn(move || {
+            let (mut ok, mut refused, mut slowest) = (0usize, 0usize, std::time::Duration::ZERO);
+            let mut i = 5000usize;
+            while writing.load(Ordering::Relaxed) {
+                let t0 = std::time::Instant::now();
+                let r = db.write().unwrap().insert("items", doc(i));
+                slowest = slowest.max(t0.elapsed());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                match r {
+                    Ok(_) => ok += 1,
+                    Err(_) => refused += 1,
+                }
+                i += 1;
+            }
+            (ok, refused, slowest)
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let t0 = std::time::Instant::now();
+    let m = a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", c.url));
+    let took = t0.elapsed();
+    writing.store(false, Ordering::Relaxed);
+    let (ok, refused, slowest) = writer.join().unwrap();
+    eprintln!("move: {m}\nmove took {took:?}; writes {ok} ok, {refused} refused, slowest lock wait {slowest:?}");
+    assert!(m.contains("map switched here and on"), "{m}");
+    assert!(!m.contains("not on"), "{m}");
+    assert!(took < std::time::Duration::from_secs(10), "the move took {took:?}");
+    assert!(slowest < std::time::Duration::from_secs(2), "a write waited {slowest:?}");
+    assert_eq!(a.local_shards("items"), vec![] as Vec<usize>);
+    assert_eq!(c.local_shards("items"), vec![0, 2]);
+    for n in [a, b, c] {
         let d = n.dir.clone();
         drop(n);
         settle();

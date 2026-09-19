@@ -6,7 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.51.0 — 2026-09-19
+
+The move's copy off every lock, hence a minor.
+
+**A move's copy holds no lock, on either end.** `MOVE SHARD` did its
+whole copy under the coordinator's lock, and the target pulled under its
+own; a drill found the cycle that makes: a move issued to a third node
+took the whole deadline while a write forwarded through the target to
+the coordinator waited on the coordinator's lock, which waited on the
+target's. Now the checks and the pin happen under the lock and the copy
+is deferred work holding nothing: the target pulls the pinned files
+without its lock, adopts them under it, switches the map on every node
+itself (the source last, which releases the pin), and the answer is what
+it switched. `REBALANCE` pins its moves under the lock and copies them
+one after another the same way. Writes to a moving shard are refused
+while it is pinned, naming the move, and no longer wait behind a
+coordinator that is also the source. The move's long calls use
+connections of their own: a pool connection is one call at a time, and
+a pull that took the copy's length on it made a write forwarded to the
+same peer wait for it under the source's lock, which the target's switch
+back to the source then waited on -- the shape the busy-source test
+now pins.
 
 **Certificates carry key identifiers.** `celastro tls init` writes
 `subjectKeyIdentifier` and `authorityKeyIdentifier` (the leading 160
