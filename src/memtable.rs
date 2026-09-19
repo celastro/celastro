@@ -118,6 +118,12 @@ pub struct MemDoc {
 
 pub struct Memtable {
     pub docs: Vec<MemDoc>,
+    /// The shard's key range, once it has one: a document whose key is
+    /// outside it is invisible here -- what a split leaves behind in the
+    /// memtable of the shard that shrank, until it is sealed and compacted
+    /// away. Behind a lock because a frozen memtable is shared while its
+    /// segment is built and a split can land in that window.
+    pub range: RwLock<Option<(Option<String>, Option<String>)>>,
     /// sort key → every ordinal ever written for it, oldest first.
     ///
     /// A chain, not a single entry: the newest version is what the write path
@@ -159,6 +165,7 @@ impl Memtable {
         }
         Memtable {
             docs: Vec::new(),
+            range: RwLock::new(None),
             by_key: BTreeMap::new(),
             ordinals: Ordinals::default(),
             deletes: RwLock::new(DeleteLog::new()),
@@ -190,7 +197,20 @@ impl Memtable {
 
     /// The version of `sort_key` visible at `t`: committed at or before `t` and
     /// not deleted by then. Both conjuncts, always.
+    /// Whether `key` is inside the shard's range, when it has one.
+    pub fn in_range(&self, key: &str) -> bool {
+        match &*self.range.read().unwrap() {
+            None => true,
+            Some((lo, hi)) => {
+                lo.as_deref().map_or(true, |l| key >= l) && hi.as_deref().map_or(true, |h| key < h)
+            }
+        }
+    }
+
     pub fn find_at(&self, sort_key: &str, t: Timestamp) -> Option<u32> {
+        if !self.in_range(sort_key) {
+            return None;
+        }
         let d = self.deletes.read().unwrap();
         self.by_key.get(sort_key)?.iter().rev().copied().find(|&o| {
             self.ordinals.commit_ts.get(o as usize).map(|c| *c <= t).unwrap_or(false)

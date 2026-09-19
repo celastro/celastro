@@ -190,6 +190,23 @@ impl<'a> Parser<'a> {
         if self.eat_kw("REBALANCE") {
             return Ok(Statement::Rebalance { collection: self.ident()? });
         }
+        if self.eat_kw("SPLIT") {
+            self.expect_kw("SHARD")?;
+            let shard = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            self.expect_kw("AT")?;
+            let at = match self.literal()? {
+                Value::Str(s) => s,
+                other => {
+                    return Err(Error::Sql(format!(
+                        "a split key is a string, not {}",
+                        crate::json::to_string(&other)
+                    )))
+                }
+            };
+            return Ok(Statement::SplitShard { collection, shard, at });
+        }
         if self.eat_kw("BACKUP") {
             let cluster = self.eat_kw("CLUSTER");
             self.expect_kw("TO")?;

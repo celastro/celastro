@@ -124,6 +124,14 @@ pub enum Statement {
     Rebalance {
         collection: String,
     },
+    /// `SPLIT SHARD <i> OF <collection> AT '<key>'` -- shard `i` keeps the
+    /// keys below `key` and a new shard, the next index, takes the rest on
+    /// the same node.
+    SplitShard {
+        collection: String,
+        shard: usize,
+        at: String,
+    },
     /// `PLACE SHARD <i> OF <collection> ON 'tcp://host:port'` — this node's
     /// placement map records the shard on that node; a copy this node holds
     /// of a shard placed elsewhere is dropped. What a move sends every holder

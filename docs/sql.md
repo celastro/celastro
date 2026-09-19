@@ -413,25 +413,39 @@ address, and every shard with whether its holder does.
 `MOVE SHARD` carries a shard to another node without stopping the
 collection: the source pins it (writes to it are refused meanwhile,
 naming the move), the target pulls the files and switches the map on
-every node. `REBALANCE` is the moves that put shard `i` on the `i`-th
-node. `PLACE SHARD` writes a map entry without moving data, the repair
-for a node the switch did not reach; `LOCAL` prefixes any statement to
-the node it reaches, and nothing fans out.
+every node. `SPLIT SHARD i OF c AT 'key'` makes two shards of one:
+shard `i` keeps the keys below `key` and a new shard, the next index,
+takes the rest on the same node, no row moving -- the remedy for a hot
+shard, which a move can only relocate; `MOVE SHARD` then spreads it.
+The rows a split leaves outside a range stay on disk, invisible and
+counted as dead, until the next compaction. `REBALANCE` is the moves
+that put shard `i` on the `i`-th node. `PLACE SHARD` writes a map entry without moving data, the repair
+for a node the switch did not reach; `LOCAL` in front of a definition
+or a placement statement applies it to the node it reaches and carries
+it nowhere (a query always reads every shard, wherever it is).
 
 ```sql
 MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521';
 REBALANCE notes;
+SPLIT SHARD 1 OF notes AT 'p';
+MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23521';
 LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:23521';
-LOCAL SELECT count(*) FROM notes;
 DETACH NODE 'tcp://127.0.0.1:23523';
 ```
 
 ```
 shard 2 of `notes` moved from tcp://127.0.0.1:23523 to tcp://127.0.0.1:23521; 3 file(s), map switched here and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
 shard 2 of `notes` moved from tcp://127.0.0.1:23521 to tcp://127.0.0.1:23523; 3 file(s), map switched here and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23521
+shard 1 of `notes` split at 'p': shard 3 is [p, t) on this node, 3 file(s); map switched here and on tcp://127.0.0.1:23521, tcp://127.0.0.1:23523
+shard 3 of `notes` moved from tcp://127.0.0.1:23522 to tcp://127.0.0.1:23521; 3 file(s), map switched here and on tcp://127.0.0.1:23523, tcp://127.0.0.1:23522
 shard 0 of `notes` placed on tcp://127.0.0.1:23521
 node tcp://127.0.0.1:23523 holds 1 shard(s); move them first: MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'
 ```
+
+A split works on one node as well: `SPLIT SHARD 0 OF notes AT 'n3'`
+on the single-node `notes` above answers `shard 1 is [n3, ) on this
+node`, and `SHOW CATALOG notes` then shows `shard 0 on this node [, n3)`
+and `shard 1 on this node [n3, )`.
 
 A node that does not answer is a deadline at the coordinator, and
 `WITH (partial_results)` names its shards in `missing` (above). A

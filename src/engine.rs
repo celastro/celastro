@@ -516,9 +516,15 @@ impl MoveOut {
     }
 }
 
-enum MoveFile {
+pub(crate) enum MoveFile {
     Path(PathBuf),
     Bytes(Vec<u8>),
+}
+
+impl MoveOut {
+    pub(crate) fn files(&self) -> &[(String, MoveFile)] {
+        &self.files
+    }
 }
 
 /// How much of a file crosses the wire per call.
@@ -1238,7 +1244,7 @@ impl Db {
             }
             let (lo, hi) = read_range(&db.cipher, &sdir, i, name)?;
             let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
-            sh.key_range = Some((lo, hi));
+            sh.set_key_range(lo, hi);
             sh.index = i;
             shards.push(sh);
         }
@@ -2367,6 +2373,30 @@ impl Db {
         for (name, their_tablets) in &theirs.placement {
             let Some(mine) = self.catalog.placement.get(name) else { continue };
             if mine.len() != their_tablets.len() {
+                // A longer map whose added shards the peer holds is a split
+                // the peer made while the two could not reach each other:
+                // its word about its own shards, the ranges of the ones it
+                // already held included, is taken; a longer map that names
+                // others for the added shards is not, since it is not the
+                // holders' word.
+                if their_tablets.len() > mine.len()
+                    && their_tablets[mine.len()..].iter().all(|t| t.node == peer)
+                {
+                    let mut updated = mine.clone();
+                    for (i, t) in their_tablets.iter().enumerate() {
+                        if i >= updated.len() {
+                            updated.push(t.clone());
+                        } else if t.node == peer && updated[i].node == peer {
+                            updated[i] = t.clone();
+                        }
+                    }
+                    notes.push(format!(
+                        "`{name}`: {} shard(s) added by {peer}'s word (a split there)",
+                        their_tablets.len() - mine.len()
+                    ));
+                    self.catalog.placement.insert(name.clone(), updated);
+                    changed = true;
+                }
                 continue;
             }
             let mut updated = mine.clone();
@@ -3190,13 +3220,203 @@ impl Db {
         let def = self.catalog.get(&name)?.clone();
         let (lo, hi) = read_range(&self.cipher, &sdir, shard, &name)?;
         let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
-        sh.key_range = Some((lo, hi));
+        sh.set_key_range(lo, hi);
         sh.index = shard;
         let v = self.shards.entry(name.clone()).or_default();
         v.push(sh);
         v.sort_by_key(|s| s.index);
         self.absorb_shard_catalogs(&name)?;
         self.persist_catalog()
+    }
+
+    /// `SPLIT SHARD i OF c AT 'key'`: shard `i`, `[lo, hi)`, keeps `[lo,
+    /// key)` and a new shard, the next index, holds `[key, hi)` on the same
+    /// node; `MOVE SHARD` then spreads it. The holder makes the split: the
+    /// pinned files of shard `i` -- the same export a move takes -- become
+    /// the new shard's directory (linked when the directory is in the
+    /// clear, re-sealed under the new name when it is encrypted), each
+    /// shard's range is what makes it answer only its own keys, and the
+    /// rows outside a range stay on disk, invisible, until a compaction
+    /// drops them; so a split moves no row and takes what a hard link
+    /// takes. Issued elsewhere, the statement goes to the holder as
+    /// `LOCAL SPLIT SHARD`, and the holder carries the new map to every
+    /// peer the same way, which is what `LOCAL` means here: the holder's
+    /// word, the map alone.
+    pub fn split_shard(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        at: &str,
+        local: bool,
+    ) -> Result<Outcome> {
+        let _deadline = self.arm_default_deadline();
+        if at.is_empty() || at.contains('\n') {
+            return Err(Error::Schema(
+                "a split key must be non-empty and must not contain a line break".into(),
+            ));
+        }
+        let coll = self.catalog.get(collection)?.clone();
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let Some(t) = tablets.get(shard).cloned() else {
+            return Err(Error::Plan(format!(
+                "`{collection}` has {} shard(s); there is no shard {shard}",
+                tablets.len()
+            )));
+        };
+        let inside = t.lo.as_deref().map_or(true, |lo| at > lo)
+            && t.hi.as_deref().map_or(true, |hi| at < hi);
+        if !inside {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` holds [{}, {}); a split key must be strictly \
+                 inside that range",
+                t.lo.clone().unwrap_or_default(),
+                t.hi.clone().unwrap_or_default()
+            )));
+        }
+        let holder = t.node.clone();
+        let next = tablets.len();
+        let hi_text = t.hi.clone().unwrap_or_default();
+        let mut new = tablets.clone();
+        new[shard].hi = Some(at.to_string());
+        new.push(Tablet { node: holder.clone(), lo: Some(at.to_string()), hi: t.hi.clone() });
+        let quoted = at.replace('\'', "''");
+        if !self.is_self(&holder) {
+            if local {
+                self.catalog.placement.insert(collection.to_string(), new);
+                self.persist_catalog()?;
+                return Ok(Outcome::Ack(format!(
+                    "shard {shard} of `{collection}` split at '{at}' on {holder}: shard {next} is \
+                     [{at}, {hi_text}) there"
+                )));
+            }
+            let conn = self.node_conn(&holder)?;
+            let sql = format!("LOCAL SPLIT SHARD {shard} OF {collection} AT '{quoted}'");
+            let remaining = crate::deadline::remaining_ms();
+            return Ok(Outcome::Deferred(Deferred::new(move || {
+                let _deadline = crate::deadline::arm(remaining);
+                Ok(Outcome::Ack(conn.statement(&sql, &[])?))
+            })));
+        }
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| Error::Plan("a split needs a persistent database (--dir)".into()))?;
+        if self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == next)) {
+            return Err(Error::Plan(format!(
+                "shard {next} of `{collection}` is already on this node"
+            )));
+        }
+        self.absorb_shard_catalogs(collection)?;
+        let ts = self.clock.peek().max(self.last_commit);
+        let cdir = dir.join("collections").join(collection);
+        let incoming = cdir.join(format!("shard-{next:04}.incoming"));
+        let new_id = format!("shard-{next:04}");
+        let files = {
+            let s = self
+                .shards
+                .get(collection)
+                .and_then(|v| v.iter().find(|s| s.index == shard))
+                .ok_or_else(|| {
+                Error::Plan(format!("shard {shard} of `{collection}` is not on this node"))
+            })?;
+            let ex = export_shard(&coll, s, ts, self.opts.build)?;
+            let out = MoveOut::from_export(&holder, ex)?;
+            let _ = fs::remove_dir_all(&incoming);
+            fs::create_dir_all(incoming.join("segments"))?;
+            fs::create_dir_all(incoming.join("deletes"))?;
+            fs::create_dir_all(incoming.join("archive"))?;
+            let mut n = 0;
+            for (name, f) in out.files() {
+                if name == "RANGE" {
+                    continue;
+                }
+                let base = name.rsplit('/').next().unwrap_or(name);
+                let dest = incoming.join(name);
+                match (f, &self.cipher) {
+                    // Immutable bytes as they lie: one more name for them.
+                    (MoveFile::Path(p), None) => {
+                        if fs::hard_link(p, &dest).is_err() {
+                            fs::copy(p, &dest)?;
+                        }
+                    }
+                    (MoveFile::Path(p), Some(_)) => {
+                        let plain = crate::shard::read_content(&self.cipher, &s.file_id(base), p)?
+                            .ok_or_else(|| {
+                                Error::Storage(format!("{}: gone under the split", p.display()))
+                            })?;
+                        crate::shard::write_content(
+                            &self.cipher,
+                            &format!("{new_id}/{base}"),
+                            &dest,
+                            &plain,
+                        )?;
+                    }
+                    (MoveFile::Bytes(b), None) => crate::shard::atomic_write(&dest, b)?,
+                    (MoveFile::Bytes(b), Some(c)) => {
+                        let plain = c.open_file(&s.file_id(base), b)?;
+                        crate::shard::write_content(
+                            &self.cipher,
+                            &format!("{new_id}/{base}"),
+                            &dest,
+                            &plain,
+                        )?;
+                    }
+                }
+                n += 1;
+            }
+            n
+        };
+        crate::shard::write_content(
+            &self.cipher,
+            &format!("{new_id}/RANGE"),
+            &incoming.join("RANGE"),
+            format!("{at}\n{hi_text}").as_bytes(),
+        )?;
+        crate::shard::sync_dir(&incoming)?;
+        self.adopt_shard(&coll, &new, next, &incoming)?;
+        if let Some(sh) =
+            self.shards.get_mut(collection).and_then(|v| v.iter_mut().find(|s| s.index == shard))
+        {
+            sh.set_key_range(t.lo.clone(), Some(at.to_string()));
+        }
+        crate::shard::write_content(
+            &self.cipher,
+            &format!("shard-{shard:04}/RANGE"),
+            &cdir.join(format!("shard-{shard:04}")).join("RANGE"),
+            format!("{}\n{at}", t.lo.clone().unwrap_or_default()).as_bytes(),
+        )?;
+        let peers = self.every_peer(&new)?;
+        let switch =
+            Switch { sql: format!("SPLIT SHARD {shard} OF {collection} AT '{quoted}'"), peers };
+        let ack = format!(
+            "shard {shard} of `{collection}` split at '{at}': shard {next} is [{at}, {hi_text}) on \
+             this node, {files} file(s)"
+        );
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let switched = Db::carry_switch(&switch);
+            Ok(Outcome::Ack(format!("{ack}; {switched}")))
+        })))
+    }
+
+    /// Every node this one knows, other than itself, with a connection:
+    /// the holders, the nodes and coordinators the catalog names, and the
+    /// peers that attached.
+    fn every_peer(&self, tablets: &[Tablet]) -> Result<Vec<(String, Arc<crate::wire::Node>)>> {
+        let mut order: Vec<String> = Vec::new();
+        let known = tablets
+            .iter()
+            .map(|t| t.node.clone())
+            .chain(self.catalog.nodes.iter().cloned())
+            .chain(self.catalog.coordinators.iter().cloned())
+            .chain(self.attached.iter().cloned());
+        for n in known {
+            if !n.is_empty() && !self.is_self(&n) && !order.contains(&n) {
+                order.push(n);
+            }
+        }
+        order.into_iter().map(|n| Ok((n.clone(), self.node_conn(&n)?))).collect()
     }
 
     /// `PLACE SHARD i OF c ON 'node'`: this node's map records the shard
@@ -4503,6 +4723,11 @@ impl Db {
         let local = local || crate::wire::serving();
         let holders = if local { Vec::new() } else { self.fan_out_of(&stmt) };
         let reconciled = Db::reconciles(&stmt);
+        // A split is the holder's to make and everyone's to learn: `LOCAL`
+        // (or the wire) is how the holder's word arrives.
+        if let Statement::SplitShard { collection, shard, at } = &stmt {
+            return self.split_shard(collection, *shard, at, local);
+        }
         let out = self.run_one(stmt, sql, params, analyze)?;
         if holders.is_empty() {
             return Ok(out);
@@ -4885,7 +5110,15 @@ impl Db {
                 self.place_shard(&collection, shard, &node)?;
                 Ok(Outcome::Ack(format!("shard {shard} of `{collection}` placed on {node}")))
             }
-            Statement::Local(inner) => self.run_one(*inner, sql, params, analyze),
+            Statement::Local(inner) => match *inner {
+                Statement::SplitShard { collection, shard, at } => {
+                    self.split_shard(&collection, shard, &at, true)
+                }
+                other => self.run_one(other, sql, params, analyze),
+            },
+            Statement::SplitShard { collection, shard, at } => {
+                self.split_shard(&collection, shard, &at, false)
+            }
             Statement::DropIndex { collection, index } => {
                 self.drop_index(&collection, &index)?;
                 Ok(Outcome::Ack(format!("index `{index}` dropped from `{collection}`")))
@@ -6606,6 +6839,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Compact { .. } => "COMPACT",
         Statement::Backup { .. } => "BACKUP",
         Statement::Restore { .. } => "RESTORE",
+        Statement::SplitShard { .. } => "SPLIT SHARD",
         Statement::VerifyBackup { .. } => "VERIFY BACKUP",
         _ => "this statement",
     }

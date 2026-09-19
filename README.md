@@ -224,6 +224,7 @@ ATTACH NODE 'tcp://10.0.0.3';               -- port 2352 unless given
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
   PARTITION BY (tenant) WITH (splits = ['m', 't']);   -- three shards, one per node
 MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';
+SPLIT SHARD 2 OF notes AT 'w';              -- shard 3 takes [w, ...) on the same node; then move it
 REBALANCE notes;
 ```
 

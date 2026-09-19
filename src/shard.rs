@@ -127,6 +127,11 @@ pub struct SegmentHandle {
     /// it: a handle whose path still says `segments/` after the file moved to
     /// `archive/` unlinks nothing at sweep time and leaks the file.
     path: RwLock<Option<PathBuf>>,
+    /// The ordinals the shard's key range keeps, `[a, b)` of a segment
+    /// sorted by key, once the range shrank under a split; `None` keeps
+    /// every one. What a read of the shard that shrank never sees, and
+    /// what the next compaction drops.
+    mask: RwLock<Option<(u32, u32)>>,
 }
 
 impl SegmentHandle {
@@ -141,7 +146,19 @@ impl SegmentHandle {
             epoch: AtomicU64::new(0),
             vis: VisibilityCache::default(),
             path: RwLock::new(path),
+            mask: RwLock::new(None),
         })
+    }
+
+    /// Keep only the ordinals in `[a, b)`, or every one: the visibility
+    /// cache is invalidated with the epoch, as a delete invalidates it.
+    pub(crate) fn set_mask(&self, mask: Option<(u32, u32)>) {
+        *self.mask.write().unwrap() = mask;
+        self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    pub(crate) fn mask(&self) -> Option<(u32, u32)> {
+        *self.mask.read().unwrap()
     }
 
     pub fn path(&self) -> Option<PathBuf> {
@@ -162,8 +179,14 @@ impl SegmentHandle {
         self.vis.clear();
     }
 
+    /// Rows a rewrite would drop: deleted or superseded at `t`, and the
+    /// ones outside the shard's range since a split.
     pub fn dead_count(&self, t: Timestamp) -> usize {
-        self.deletes.read().unwrap().dead_count(t)
+        let masked = match self.mask() {
+            Some((a, b)) => self.segment.num_docs().saturating_sub((b - a) as usize),
+            None => 0,
+        };
+        self.deletes.read().unwrap().dead_count(t) + masked
     }
 
     pub fn dead_ratio(&self, t: Timestamp) -> f64 {
@@ -180,13 +203,18 @@ impl SegmentHandle {
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
         self.vis.get_or_build(t, epoch, || {
             let d = self.deletes.read().unwrap();
-            visibility(&self.segment.ordinals, &d, t)
+            let mut bm = visibility(&self.segment.ordinals, &d, t);
+            if let Some((a, b)) = self.mask() {
+                bm.and_inplace(&Bitmap::range(self.segment.num_docs(), a as usize, b as usize));
+            }
+            bm
         })
     }
 
     pub fn is_visible(&self, ord: u32, t: Timestamp) -> bool {
         self.segment.ordinals.commit_ts.get(ord as usize).map(|c| *c <= t).unwrap_or(false)
             && !self.deletes.read().unwrap().is_deleted_at(ord, t)
+            && self.mask().map_or(true, |(a, b)| ord >= a && ord < b)
     }
 
     /// `None` for a log with nothing in it. An empty log is never published:
@@ -265,7 +293,7 @@ impl<'a> Searchable<'a> {
             Searchable::Mem(m) => {
                 let mut bm = Bitmap::new(m.len());
                 for (i, ts) in m.ordinals.commit_ts.iter().enumerate() {
-                    if *ts <= t {
+                    if *ts <= t && m.in_range(&m.docs[i].sort_key) {
                         bm.set(i);
                     }
                 }
@@ -1689,8 +1717,53 @@ impl Shard {
     /// control
     /// plane's tablet map (§10) and changes on split and merge.
     pub(crate) fn with_key_range(mut self, lo: Option<String>, hi: Option<String>) -> Shard {
-        self.key_range = Some((lo, hi));
+        self.set_key_range(lo, hi);
         self
+    }
+
+    /// The shard's key range, applied to everything it holds: the memtable
+    /// and the frozen ones answer no key outside it, and every segment
+    /// keeps only the ordinals inside it. A range that shrank under a
+    /// split leaves the rows outside it on disk, invisible, until a
+    /// compaction drops them.
+    pub(crate) fn set_key_range(&mut self, lo: Option<String>, hi: Option<String>) {
+        self.key_range = Some((lo, hi));
+        *self.memtable.range.write().unwrap() = self.key_range.clone();
+        for f in &self.frozen {
+            *f.range.write().unwrap() = self.key_range.clone();
+        }
+        for h in &self.segments {
+            self.mask_handle(h);
+        }
+    }
+
+    /// The mask the shard's range gives a segment: the ordinal range of
+    /// its keys inside, or none when every key is.
+    fn mask_handle(&self, h: &SegmentHandle) {
+        let n = h.segment.num_docs();
+        let mask = match &self.key_range {
+            None => None,
+            Some((lo, hi)) => {
+                // `[lo, hi)`: the tablet's high bound is exclusive, where
+                // `Ordinals::range` takes an inclusive one.
+                let keys = &h.segment.ordinals.keys;
+                let a = lo.as_deref().map_or(0, |l| keys.partition_point(|k| k.as_str() < l));
+                let b = hi.as_deref().map_or(n, |x| keys.partition_point(|k| k.as_str() < x));
+                if a == 0 && b >= n {
+                    None
+                } else {
+                    Some((a as u32, b.min(n) as u32))
+                }
+            }
+        };
+        h.set_mask(mask);
+    }
+
+    /// A memtable for this shard: the definition, the budget, the range.
+    fn fresh_memtable(&self) -> Memtable {
+        let m = Memtable::new(&self.coll, self.opts.budget.clone());
+        *m.range.write().unwrap() = self.key_range.clone();
+        m
     }
 
     /// Does this shard own `key`?
@@ -1854,6 +1927,9 @@ impl Shard {
     }
 
     fn locate(&self, key: &str, t: Timestamp) -> Option<Loc> {
+        if !self.owns(key) {
+            return None;
+        }
         if let Some(ord) = self.memtable.find_at(key, t) {
             return Some(Loc::Mem(ord));
         }
@@ -2194,7 +2270,7 @@ impl Shard {
             self.adopt_segment(&h.segment);
         }
         if self.memtable.is_empty() {
-            self.memtable = Memtable::new(&self.coll, self.opts.budget.clone());
+            self.memtable = self.fresh_memtable();
         } else if let Err(e) = self.flush() {
             // Roll back only while the memtable is still unsealed: past that
             // point the new segment was built against the new definition, and
@@ -2457,10 +2533,8 @@ impl Shard {
             self.wal_seq += 1;
             wals.push(w.rotate(seq)?);
         }
-        let frozen = Arc::new(std::mem::replace(
-            &mut self.memtable,
-            Memtable::new(&self.coll, self.opts.budget.clone()),
-        ));
+        let fresh = self.fresh_memtable();
+        let frozen = Arc::new(std::mem::replace(&mut self.memtable, fresh));
         self.frozen.push(frozen.clone());
         self.pending_seals.push(SealTicket {
             frozen,
@@ -2551,6 +2625,7 @@ impl Shard {
             self.adopt_segment(&seg);
             let path = self.persist_segment(&seg)?;
             let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
+            self.mask_handle(&handle);
             for (key, version_ts, delete_ts) in deletes {
                 if let Some(ord) = handle.segment.ordinals.find(key) {
                     if handle.segment.ordinals.commit_ts[ord as usize] == *version_ts {
@@ -2723,10 +2798,8 @@ impl Shard {
         // them again.
         self.sealed.merge(&self.unsealed);
         self.unsealed = PathTally::default();
-        let old = std::mem::replace(
-            &mut self.memtable,
-            Memtable::new(&self.coll, self.opts.budget.clone()),
-        );
+        let fresh = self.fresh_memtable();
+        let old = std::mem::replace(&mut self.memtable, fresh);
         old.release_budget();
         // Only now has anything been forgotten: until the swap the memtable
         // still held every row. Claiming the floor earlier would claim a
@@ -3110,6 +3183,7 @@ impl Shard {
             self.adopt_segment(&seg);
             let path = self.persist_segment(&seg)?;
             let h = SegmentHandle::new(seg, DeleteLog::new(), path);
+            self.mask_handle(&h);
             for (key, version_ts, delete_ts) in carried_deletes {
                 if let Some(ord) = h.segment.ordinals.find(key) {
                     if h.segment.ordinals.commit_ts[ord as usize] == *version_ts {
@@ -3231,7 +3305,10 @@ pub(crate) fn collect_from_handles(
         for h in handles.iter().filter(|h| ids.contains(&h.id())) {
             let log = h.deletes.read().unwrap();
             let n = h.segment.num_docs();
-            for ord in 0..n as u32 {
+            // Outside the shard's range since a split: dropped here, which
+            // is how a split's rows leave the shard that shrank.
+            let (lo, hi) = h.mask().unwrap_or((0, n as u32));
+            for ord in lo..hi {
                 if log.is_deleted_at(ord, retain_from) {
                     continue; // dead before the horizon: this is the GC.
                 }

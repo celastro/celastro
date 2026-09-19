@@ -1730,3 +1730,67 @@ fn a_delete_by_predicate_reaching_a_holder_that_never_answers_holds_no_lock_and_
     }
     let _ = std::fs::remove_dir_all(&c_dir);
 }
+
+/// A split issued at a node that holds nothing goes to the holder, which
+/// splits and tells every peer: from then on every node's map has the new
+/// shard, a count from any node is whole, a write for a key past the split
+/// lands on the new shard, and the new shard moves like any other.
+#[test]
+fn a_shard_splits_on_its_holder_and_every_node_learns_the_new_map() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("split-a");
+    let b = Node::start("split-b");
+    let c = Node::start("split-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    for i in 0..60usize {
+        let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
+        let doc =
+            Value::obj(vec![("id".into(), Value::Str(key)), ("n".into(), Value::Int(i as i64))]);
+        a.db.write().unwrap().insert("items", doc).unwrap();
+    }
+    // Issued at a, which holds shard 0: the holder of shard 1 is b, and
+    // b's word comes back to a. (c, attached but holding nothing of
+    // `items`, never got the definition; it is the move's target below.)
+    let m = a.ack("SPLIT SHARD 1 OF items AT 't'");
+    assert!(m.contains("shard 2 is [t, )") && m.contains("map switched"), "{m}");
+    settle();
+    for n in [&a, &b] {
+        let cat = n.ack("SHOW CATALOG items");
+        assert!(cat.contains("shard 1 on") && cat.contains("[m, t)"), "{}: {cat}", n.url);
+        assert!(cat.contains("shard 2 on") && cat.contains("[t, )"), "{}: {cat}", n.url);
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(60), "{}", n.url);
+    }
+    // A key past the split, written through a, is on the new shard, and
+    // the key pins the plan to it.
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"z0001","n":1}')"#);
+    let plan = match a.exec("EXPLAIN SELECT id FROM items WHERE id = 'z0001' LIMIT 2").unwrap() {
+        Outcome::Explain(t) => t,
+        other => panic!("{other:?}"),
+    };
+    assert!(plan.contains("1 of 3 shard(s) scanned") && plan.contains("shard 2 ("), "{plan}");
+    let r = a.query("SELECT id FROM items WHERE id = 'z0001' LIMIT 2").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    // The new shard moves to the node that held nothing.
+    let m = a.ack(&format!("MOVE SHARD 2 OF items TO '{}'", c.url));
+    assert!(m.contains("moved from"), "{m}");
+    settle();
+    let health = a.ack("SHOW HEALTH");
+    assert!(health.contains(&format!("shard 2 of `items`: on {}", c.url)), "{health}");
+    for n in [&a, &b, &c] {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(61), "{}", n.url);
+    }
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

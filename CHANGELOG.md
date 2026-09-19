@@ -6,6 +6,26 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.56.0 — 2026-09-19
+
+A shard can be split, hence a minor.
+
+**`SPLIT SHARD i OF c AT 'key'`.** Shard `i`, holding `[lo, hi)`, keeps
+`[lo, key)` and a new shard -- the next index -- holds `[key, hi)` on the
+same node; `MOVE SHARD` then carries it wherever the load should go.
+The remedy for a hot shard that a move could only relocate. No row
+moves: the holder makes the new shard's directory from the pinned files
+of shard `i` -- the export a move takes, linked when the directory is
+in the clear and re-sealed under the new name when it is encrypted --
+and from then on each shard answers only the keys in its range, the
+memtable and every segment alike; the rows outside a range stay on disk,
+invisible, counted as dead, and the next compaction drops them. So a
+split takes what a hard link takes, under the lock. Issued at any node,
+the statement goes to the holder; the holder carries the new map to
+every peer, and a peer that was unreachable learns it from the holder's
+catalog at the next sweep. `SHOW CATALOG` shows the ranges; `SHOW
+SEGMENTS` counts the rows a split left behind as dead until they go.
+
 ## 0.55.1 — 2026-09-19
 
 Documentation: every command and every statement with a worked example.

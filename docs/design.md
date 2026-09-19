@@ -681,6 +681,35 @@ switch, so the statement is re-run). `REBALANCE c` is the moves that put
 shard `i` on the `i`-th node in attach order, and `DETACH NODE` of a node
 holding shards refuses with that plan.
 
+**A shard splits without a row moving.** `SPLIT SHARD i OF c AT 'key'`
+(0.56.0) is the remedy for a hot shard, which a move can only relocate:
+shard `i`, `[lo, hi)`, keeps `[lo, key)` and a new shard, the next
+index, holds `[key, hi)` on the same node, to be moved wherever the
+load should go. The holder makes it from the same pinned export a move
+takes -- the sealed segments, the delete logs as they stand, the
+memtable sealed into one more segment, a manifest -- written into the
+new shard's directory: linked when the directory is in the clear, since
+a segment is immutable and one more name costs nothing; read and
+re-sealed under the new name when it is encrypted, since every file is
+sealed under the shard's directory name. What makes it a split is the
+range: a shard answers only the keys inside its own, the memtable by
+key and every segment by an ordinal mask (`[a, b)` of its sorted keys,
+folded into the visibility bitmap and its cache's epoch), so the two
+shards hold the same bytes and each shows its half, once. The rows
+outside a range stay on disk, count as dead, and the next compaction
+drops them -- `collect_for_compaction` walks the mask -- which is what
+makes the split a link now and a rewrite later, under the lock only for
+the link. Issued at any node the statement goes to the holder as `LOCAL
+SPLIT SHARD`; the holder carries the same statement to every peer,
+where `LOCAL` means the holder's word, the map alone; and a peer that
+was unreachable takes a longer map from the holder's catalog at the
+next sweep when every added shard is the holder's. The placement map's
+length was fixed at `CREATE` until this; the tests pin that a split
+answers every key once, sealed and in memory, through point lookups,
+text and ranked queries and counts, that a compaction reclaims the
+halves, that a reopen and an encrypted directory keep the ranges, and
+that a cluster learns the map and moves the new shard.
+
 Not built, by decision: replication, so a node that is down is a shard that
 is down -- and only that shard (0.34.0): the counters call every statement
 opens with does not fail the statement when a holder is silent; the
@@ -1791,6 +1820,8 @@ guarantee:
 | the health probe answers at once, alive and busy, while the database lock is held, and the busy answer carries no attached count so readiness does not pass on it | `serve::tests::the_health_probe_answers_alive_and_busy_while_the_lock_is_held` |
 | a delete by predicate reaching a holder that never answers holds no lock while it waits, is refused with nothing deleted, and the rows on the holders that answer are still there | `wire::a_delete_by_predicate_reaching_a_holder_that_never_answers_holds_no_lock_and_deletes_nothing` |
 | shards moved at every step under a load and a scan that never stops: every scan answers each acknowledged key once or is refused naming the move, every move completes, and every node agrees after | `resilience::a_scan_under_moves_at_every_step_answers_each_key_once_or_is_refused` (`--ignored`) |
+| a shard split at its median answers every key once -- sealed and in memory, by point lookup, text match, ranked query and count -- routes writes by the new map, refuses a key outside the range, drops the halves at the next compaction, and keeps its ranges across a reopen; an encrypted shard's files are re-sealed under the new name | `split::a_split_shard_answers_every_key_once_and_a_compaction_drops_what_moved`, `split::a_split_of_an_encrypted_shard_reseals_every_file_under_its_new_name` |
+| a split issued at a node that does not hold the shard is made by the holder, every node's map gains the shard, a count from any node is whole, a key past the split pins the plan to the new shard, and the new shard moves like any other | `wire::a_shard_splits_on_its_holder_and_every_node_learns_the_new_map` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
