@@ -979,7 +979,15 @@ impl Node {
     /// A catalog as the peer reads it: the newest format it said it reads,
     /// or this build's when it has not been asked yet.
     fn encode_for_peer(&self, cat: &Catalog) -> Vec<u8> {
-        let theirs = self.peer_format.load(Ordering::Relaxed);
+        let mut theirs = self.peer_format.load(Ordering::Relaxed);
+        if theirs == 0 {
+            // Not asked yet: a hello says what the peer reads, and a catalog
+            // in this build's format sent blind refused a move to an older
+            // node that had not been spoken to before.
+            if self.hello().is_ok() {
+                theirs = self.peer_format.load(Ordering::Relaxed);
+            }
+        }
         let format = if theirs == 0 { CATALOG_VERSION } else { theirs.min(CATALOG_VERSION) };
         cat.encode_as(format)
     }
