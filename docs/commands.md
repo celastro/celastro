@@ -313,7 +313,10 @@ On real hosts, `--bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`
 the host's own address, and `CELASTRO_ATTACH=tcp://a,tcp://b,tcp://c`
 (the same list on every node; its own address is skipped) instead of
 `ATTACH NODE` by hand. `CELASTRO_ROLE=coordinator` makes a node that
-holds no shards and only coordinates. Every node's console answers every
+holds no shards and only coordinates. `CELASTRO_REPLICATION=async`
+acknowledges a write before its follower has it; `CELASTRO_AUTO_FAILOVER=on`
+lets the steward (`CELASTRO_STEWARD`, or the lowest address) promote a
+follower when a holder stops answering. Every node's console answers every
 statement over every node's shards, so a client needs one URL: any
 node's, or a load balancer's with `/api/health` as its check. The
 cluster statements -- placement, moves, `LOCAL`, `SHOW HEALTH`,

@@ -47,8 +47,10 @@ to run it.
 nodes, moved between them, and any node coordinates a statement over all of
 them. Immutable segments, MVCC snapshot reads, size-tiered compaction, tiered
 vector indexes, storage tiers with lifecycle policies, and `EXPLAIN ANALYZE`
-over all of it. No replication, consensus or cross-shard transactions — see
-[What is deliberately not here](docs/design.md#what-is-deliberately-not-here).
+over all of it. Every shard has a follower fed by its log, a write is
+acknowledged on two disks, and a follower is promoted by hand or by the
+steward when a holder stops answering. No consensus and no cross-shard
+transactions — see [What is deliberately not here](docs/design.md#what-is-deliberately-not-here).
 Releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Without Docker
@@ -226,11 +228,16 @@ CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
 MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';
 SPLIT SHARD 2 OF notes AT 'w';              -- shard 3 takes [w, ...) on the same node; then move it
 MERGE SHARDS 2 AND 3 OF notes;              -- the way back, once they are on one node
+PROMOTE SHARD 0 OF notes ON 'tcp://10.0.0.3:2352';  -- its follower becomes the holder
 REBALANCE notes;
 ```
 
 Shard `i` goes to the `i`-th attached node, wrapping (or the `i`-th of `WITH
-(nodes = [...])`). Every holder carries the same definition and placement,
+(nodes = [...])`), and the next node follows it: a copy fed by the
+holder's log, on which every write is confirmed before the client hears
+of it (`replicas = 2` by default; [docs/sql.md](docs/sql.md#two-or-more-nodes)
+has the rest, `CELASTRO_AUTO_FAILOVER` the steward that promotes on its
+own). Every holder carries the same definition and placement,
 so a statement issued at any of them reaches the right shards: writes are
 forwarded to the owner and acknowledged after it acknowledged, queries fan
 out and fuse where they arrived, DDL runs on every holder, and `LOCAL`
@@ -285,7 +292,7 @@ its holder does.
 When nodes cannot reach each other -- a node down, a split between two
 subnets -- each side keeps serving the shards it holds and refuses, or
 answers partially with `WITH (partial_results)`, for the ones it cannot
-reach; no shard has two holders, so nothing diverges but the
+reach; no shard has two holders at one term, so nothing diverges but the
 definitions made meanwhile. Those reconcile by themselves: a `CREATE` or
 `DROP` that could not reach a node succeeds with a note naming it, and
 the node adopts it when it reattaches or within the next sweep

@@ -73,7 +73,7 @@ pub const WIRE_VERSION: u8 = 4;
 /// at that address (the zombie fence's server half). A node sends 5 only
 /// to a peer whose hello said it accepts 5, and accepts 4 from anyone, so
 /// a rolling upgrade across the bump still talks in both directions.
-pub const WIRE_VERSION_MAX: u8 = 5;
+pub const WIRE_VERSION_MAX: u8 = 6;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 /// The port a node serves its shards on when none is given: `tcp://host`
@@ -126,6 +126,13 @@ enum Call {
     /// no read of it from here on, so a write landing on the target is
     /// missing from no answer.
     FenceMove = 20,
+    /// A batch of a held shard's log for a follower, with the shipper's
+    /// term; the follower answers where it stands.
+    Ship = 21,
+    /// Where a follower stands: whether its copy is whole, and the instant.
+    ShipStatus = 22,
+    /// The steward's lease renewal, its own address in the body.
+    Lease = 23,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -153,6 +160,9 @@ impl Call {
             17 => Call::PullShard,
             18 => Call::AbortMove,
             20 => Call::FenceMove,
+            21 => Call::Ship,
+            22 => Call::ShipStatus,
+            23 => Call::Lease,
             19 => Call::Catalog,
             _ => return None,
         })
@@ -179,6 +189,9 @@ impl Call {
             Call::PullShard => "pull_shard",
             Call::AbortMove => "abort_move",
             Call::FenceMove => "fence_move",
+            Call::Ship => "ship",
+            Call::ShipStatus => "ship_status",
+            Call::Lease => "lease",
             Call::Catalog => "catalog",
         }
     }
@@ -510,19 +523,43 @@ fn get_scan(b: &[u8], i: &mut usize) -> Result<ShardScan> {
     Ok(ShardScan { hits, explain, timed_out })
 }
 
-fn put_tablets(out: &mut Vec<u8>, tablets: &[Tablet]) {
+/// Tablets in a frame: the term and the followers ride along from wire
+/// version 6; a version 5 peer reads and writes the older shape.
+fn put_tablets(out: &mut Vec<u8>, tablets: &[Tablet], six: bool) {
     put_uvarint(out, tablets.len() as u64);
     for t in tablets {
         put_str(out, &t.node);
         put_opt_str(out, t.lo.as_deref());
         put_opt_str(out, t.hi.as_deref());
+        if six {
+            put_u64(out, t.term);
+            put_uvarint(out, t.followers.len() as u64);
+            for f in &t.followers {
+                put_str(out, f);
+            }
+        }
     }
 }
 
-fn get_tablets(b: &[u8], i: &mut usize) -> Result<Vec<Tablet>> {
+fn get_tablets(b: &[u8], i: &mut usize, six: bool) -> Result<Vec<Tablet>> {
     let n = get_count(b, i)?;
     (0..n)
-        .map(|_| Ok(Tablet { node: get_string(b, i)?, lo: get_opt(b, i)?, hi: get_opt(b, i)? }))
+        .map(|_| {
+            let mut t = Tablet {
+                node: get_string(b, i)?,
+                lo: get_opt(b, i)?,
+                hi: get_opt(b, i)?,
+                ..Default::default()
+            };
+            if six {
+                t.term = get_u64(b, i).ok_or_else(truncated)?;
+                let nf = get_count(b, i)?;
+                for _ in 0..nf {
+                    t.followers.push(get_string(b, i)?);
+                }
+            }
+            Ok(t)
+        })
         .collect()
 }
 
@@ -712,7 +749,7 @@ impl Node {
         // Version 5 to a peer that accepts it, when this node has an
         // identity to carry; 4 otherwise, and to a peer not asked yet.
         let five = self.identity.is_some() && self.peer_wire.load(Ordering::Relaxed) >= 5;
-        let mut req = vec![if five { WIRE_VERSION_MAX } else { WIRE_VERSION }];
+        let mut req = vec![self.frame_version()];
         put_str(&mut req, &self.token);
         if five {
             let (node, epoch) = self.identity.as_ref().expect("checked");
@@ -731,6 +768,18 @@ impl Node {
         }
         req.extend_from_slice(body);
         req
+    }
+
+    /// The frame version a call to this peer carries: 4 until the peer's
+    /// hello said more and this node has an identity to carry, then the
+    /// highest both speak.
+    fn frame_version(&self) -> u8 {
+        let peer = self.peer_wire.load(Ordering::Relaxed);
+        if self.identity.is_some() && peer >= 5 {
+            peer.min(WIRE_VERSION_MAX)
+        } else {
+            WIRE_VERSION
+        }
     }
 
     /// A fresh connection is asked who answers before a statement goes
@@ -994,7 +1043,7 @@ impl Node {
         cat.collections.insert(coll.name.clone(), coll.clone());
         let mut body = Vec::new();
         put_bytes(&mut body, &self.encode_for_peer(&cat));
-        put_tablets(&mut body, tablets);
+        put_tablets(&mut body, tablets, self.frame_version() >= 6);
         self.call(Call::CreateCollection, &coll.name, 0, &body).map(|_| ())
     }
 
@@ -1022,6 +1071,56 @@ impl Node {
     /// Tell the source its pinned shard is fenced: every file is here.
     pub fn fence_move(&self, collection: &str, shard: usize) -> Result<()> {
         self.call(Call::FenceMove, collection, shard, &[]).map(|_| ())
+    }
+
+    /// A batch of the log to a follower: whether it is caught up, and the
+    /// instant it stands at.
+    pub fn ship(
+        &self,
+        collection: &str,
+        shard: usize,
+        term: u64,
+        items: &[&crate::replication::ShipItem],
+    ) -> Result<(bool, Timestamp)> {
+        let mut body = Vec::new();
+        put_u64(&mut body, term);
+        put_uvarint(&mut body, items.len() as u64);
+        for it in items {
+            body.push(it.kind);
+            put_str(&mut body, &it.key);
+            put_u64(&mut body, it.ts);
+            match &it.doc {
+                Some(d) => {
+                    put_bool(&mut body, true);
+                    put_value(&mut body, d);
+                }
+                None => put_bool(&mut body, false),
+            }
+        }
+        let b = self.call(Call::Ship, collection, shard, &body)?;
+        let mut i = 0;
+        Ok((get_bool(&b, &mut i)?, get_ts(&b, &mut i)?))
+    }
+
+    /// Renew this node's lease on the peer, as the steward `me`.
+    pub fn lease(&self, me: &str) -> Result<()> {
+        let mut body = Vec::new();
+        put_str(&mut body, me);
+        self.call(Call::Lease, "", 0, &body).map(|_| ())
+    }
+
+    /// Where a follower stands.
+    pub fn ship_status(
+        &self,
+        collection: &str,
+        shard: usize,
+        term: u64,
+    ) -> Result<(bool, Timestamp)> {
+        let mut body = Vec::new();
+        put_u64(&mut body, term);
+        let b = self.call(Call::ShipStatus, collection, shard, &body)?;
+        let mut i = 0;
+        Ok((get_bool(&b, &mut i)?, get_ts(&b, &mut i)?))
     }
 
     /// `len` bytes of a pinned shard's file from `offset`.
@@ -1054,7 +1153,7 @@ impl Node {
         cat.collections.insert(coll.name.clone(), coll.clone());
         let mut body = Vec::new();
         put_bytes(&mut body, &self.encode_for_peer(&cat));
-        put_tablets(&mut body, tablets);
+        put_tablets(&mut body, tablets, self.frame_version() >= 6);
         put_str(&mut body, from);
         let b = self.call(Call::PullShard, &coll.name, shard, &body)?;
         // What the target switched; a target from before it says nothing.
@@ -1298,10 +1397,32 @@ pub fn serve(
     tls: Option<Arc<Tls>>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let (moves, identity) = {
+    // The catch-ups' driver: every half second, the next chunk of each
+    // follower that is catching up is cut under the lock and left for the
+    // shipper. The console's maintenance thread does the same where there
+    // is one; a node serving its shards always has this one.
+    {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::Builder::new()
+            .name("replication".into())
+            .spawn(move || {
+                let mut idle = true;
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(if idle { 500 } else { 20 }));
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    idle = db.write().unwrap_or_else(|p| p.into_inner()).replication_step() == 0;
+                }
+            })
+            .expect("a thread for the replication driver");
+    }
+    let (moves, followed, lease, identity) = {
         let g = db.read().unwrap_or_else(|p| p.into_inner());
         (
             g.moves(),
+            g.followed(),
+            g.lease(),
             Arc::new(Identity {
                 node: g.node().map(String::from),
                 role: g.role(),
@@ -1349,11 +1470,13 @@ pub fn serve(
                 let db = db.clone();
                 let stop = stop.clone();
                 let moves = moves.clone();
+                let followed = followed.clone();
+                let lease = lease.clone();
                 let identity = identity.clone();
                 let open = open.clone();
                 open.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    serve_connection(s, &db, &moves, &identity, &stop, idle);
+                    serve_connection(s, &db, &moves, &followed, &lease, &identity, &stop, idle);
                     open.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -1384,10 +1507,13 @@ struct Identity {
     also: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     mut s: Box<dyn Stream>,
     db: &RwLock<Db>,
     moves: &Moves,
+    followed: &crate::engine::Followed,
+    lease: &crate::engine::Lease,
     identity: &Identity,
     stop: &AtomicBool,
     idle: Option<Duration>,
@@ -1420,7 +1546,7 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, identity, &frame) {
+        match handle(db, moves, followed, lease, identity, &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -1491,7 +1617,14 @@ impl Held<'_> {
     }
 }
 
-fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> Result<Vec<u8>> {
+fn handle(
+    db: &RwLock<Db>,
+    moves: &Moves,
+    followed: &crate::engine::Followed,
+    lease: &crate::engine::Lease,
+    identity: &Identity,
+    frame: &[u8],
+) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
     let _serving = Serving;
     let mut i = 0;
@@ -1555,6 +1688,41 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             put_bytes(&mut out, &pinned.read(&name, offset, len)?);
             return Ok(out);
         }
+        // A holder's log into a copy this node follows, and where that copy
+        // stands: under the followed copies' lock and no other, so a write
+        // this node forwarded under its own lock cannot wait on itself.
+        Call::Ship => {
+            let mut j = 0;
+            let term = get_u64(body, &mut j).ok_or_else(truncated)?;
+            let n = get_count(body, &mut j)?;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                let kind = get_u8(body, &mut j)?;
+                let key = get_string(body, &mut j)?;
+                let ts = get_ts(body, &mut j)?;
+                let doc =
+                    if get_bool(body, &mut j)? { Some(get_value(body, &mut j)?) } else { None };
+                items.push(crate::replication::ShipItem { kind, key, ts, doc });
+            }
+            let (caught_up, at) =
+                crate::engine::apply_shipped(followed, &collection, shard, term, &items)?;
+            put_bool(&mut out, caught_up);
+            put_ts(&mut out, at);
+            return Ok(out);
+        }
+        Call::ShipStatus => {
+            let term = get_u64(body, &mut 0).ok_or_else(truncated)?;
+            let (caught_up, at) =
+                crate::engine::follower_status(followed, &collection, shard, term)?;
+            put_bool(&mut out, caught_up);
+            put_ts(&mut out, at);
+            return Ok(out);
+        }
+        Call::Lease => {
+            let from = get_string(body, &mut 0)?;
+            crate::engine::renew_lease(lease, &from)?;
+            return Ok(out);
+        }
         Call::FenceMove => {
             match moves.lock().unwrap_or_else(|p| p.into_inner()).get(&(collection.clone(), shard))
             {
@@ -1596,7 +1764,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
                 cat.collections.into_values().next().ok_or_else(|| {
                     Error::Storage("wire: no collection in the definition".into())
                 })?;
-            let tablets = get_tablets(body, &mut j)?;
+            let tablets = get_tablets(body, &mut j, version >= 6)?;
             let from = get_string(body, &mut j)?;
             let (me, tls) = {
                 let g = db.read().unwrap_or_else(|p| p.into_inner());
@@ -1685,7 +1853,13 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
         Held::Write(db.write().unwrap_or_else(|p| p.into_inner()))
     };
     match call {
-        Call::BeginMove | Call::ReadFile | Call::PullShard | Call::FenceMove => {
+        Call::BeginMove
+        | Call::ReadFile
+        | Call::PullShard
+        | Call::FenceMove
+        | Call::Ship
+        | Call::ShipStatus
+        | Call::Lease => {
             unreachable!("answered above")
         }
         Call::AbortMove => {
@@ -1702,12 +1876,31 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
         }
         Call::Insert => {
             let doc = get_value(body, &mut 0)?;
-            put_ts(&mut out, db.exclusive().insert_here(&collection, doc)?);
+            // Confirmed on the followers with the lock let go: the wait is
+            // the shipper's, and nothing under the lock waits for a peer.
+            let (ts, confirm) = {
+                let d = db.exclusive();
+                let ts = d.insert_here(&collection, doc)?;
+                (ts, d.confirmation())
+            };
+            drop(db);
+            confirm.wait()?;
+            put_ts(&mut out, ts);
+            return Ok(out);
         }
         Call::Delete => {
             let key = get_string(body, &mut 0)?;
-            put_bool(&mut out, db.exclusive().delete_key_here(&collection, &key)?);
+            let (gone, confirm) = {
+                let d = db.exclusive();
+                let gone = d.delete_key_here(&collection, &key)?;
+                (gone, d.confirmation())
+            };
+            drop(db);
+            confirm.wait()?;
+            put_bool(&mut out, gone);
+            return Ok(out);
         }
+
         Call::Statement => {
             let mut j = 0;
             let sql = get_string(body, &mut j)?;
@@ -1737,7 +1930,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
                 cat.collections.into_values().next().ok_or_else(|| {
                     Error::Storage("wire: no collection in the definition".into())
                 })?;
-            let tablets = get_tablets(body, &mut j)?;
+            let tablets = get_tablets(body, &mut j, version >= 6)?;
             db.exclusive().adopt_collection(coll, tablets)?;
         }
         Call::TermStats
@@ -1985,7 +2178,13 @@ mod tests {
         let mut tablets = Vec::new();
         put_tablets(
             &mut tablets,
-            &[Tablet { node: "tcp://a:2352".into(), lo: None, hi: Some("m".into()) }],
+            &[Tablet {
+                node: "tcp://a:2352".into(),
+                lo: None,
+                hi: Some("m".into()),
+                ..Default::default()
+            }],
+            false,
         );
         let mut values = Vec::new();
         put_values(&mut values, &[Value::Str("x".into()), Value::Timestamp(7), Value::Bool(true)]);
@@ -2000,7 +2199,7 @@ mod tests {
             let _ = get_candidates(b, &mut 0);
         });
         crate::fuzz::sweep(23, &[tablets, values, frontiers, pairs], 6000, |b| {
-            let _ = get_tablets(b, &mut 0);
+            let _ = get_tablets(b, &mut 0, false);
             let _ = get_values(b, &mut 0);
             let _ = get_frontiers(b, &mut 0);
             let _ = get_pairs(b, &mut 0);

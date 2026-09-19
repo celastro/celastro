@@ -2121,6 +2121,25 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     tuning_into(&mut o, &var)?;
     o.node = var("CELASTRO_NODE");
+    if let Some(v) = var("CELASTRO_REPLICATION") {
+        o.replication_sync = match v.trim().to_ascii_lowercase().as_str() {
+            "sync" => true,
+            "async" => false,
+            other => return Err(format!("CELASTRO_REPLICATION: `{other}` is not sync or async")),
+        };
+    }
+    o.steward = var("CELASTRO_STEWARD");
+    if let Some(v) = var("CELASTRO_AUTO_FAILOVER") {
+        o.auto_failover = match v.trim().to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" | "yes" => true,
+            "off" | "0" | "false" | "no" => false,
+            other => return Err(format!("CELASTRO_AUTO_FAILOVER: `{other}` is not on or off")),
+        };
+    }
+    if let Some(v) = var("CELASTRO_LEASE_SECS") {
+        o.lease_secs =
+            v.trim().parse().map_err(|_| format!("CELASTRO_LEASE_SECS: `{v}` is not a number"))?;
+    }
     if let Some(v) = var("CELASTRO_ROLE") {
         o.role = celastro::engine::Role::parse(&v)
             .ok_or_else(|| format!("CELASTRO_ROLE: `{v}` is not data or coordinator"))?;

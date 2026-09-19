@@ -210,6 +210,16 @@ impl<'a> Parser<'a> {
             };
             return Ok(Statement::SplitShard { collection, shard, at });
         }
+        if self.eat_kw("PROMOTE") {
+            self.expect_kw("SHARD")?;
+            let shard = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            self.expect_kw("ON")?;
+            let node = self.node_address()?;
+            let term = if self.eat_kw("TERM") { Some(self.usize_literal()? as u64) } else { None };
+            return Ok(Statement::PromoteShard { collection, shard, node, term });
+        }
         if self.eat_kw("MERGE") {
             self.expect_kw("SHARDS")?;
             let a = self.usize_literal()?;
@@ -300,10 +310,12 @@ impl<'a> Parser<'a> {
                 self.expect_kw("SET")?;
                 let mut prefix_expansion = None;
                 let mut nodes_of = None;
+                let mut replicas = None;
                 for (key, v) in self.option_list()? {
                     match key.as_str() {
                         "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
                         "nodes_of" => nodes_of = Some(name_option(&key, v)?),
+                        "replicas" => replicas = Some(replicas_option(&key, v)?),
                         "splits" => {
                             return Err(Error::Sql(
                                 "splits are fixed when the collection is created and cannot \
@@ -316,14 +328,19 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                if prefix_expansion.is_none() && nodes_of.is_none() {
+                if prefix_expansion.is_none() && nodes_of.is_none() && replicas.is_none() {
                     return Err(Error::Sql(
-                        "ALTER COLLECTION ... SET names no option; it takes prefix_expansion \
-                         and nodes_of"
+                        "ALTER COLLECTION ... SET names no option; it takes prefix_expansion, \
+                         nodes_of and replicas"
                             .into(),
                     ));
                 }
-                return Ok(Statement::AlterCollection { collection, prefix_expansion, nodes_of });
+                return Ok(Statement::AlterCollection {
+                    collection,
+                    prefix_expansion,
+                    replicas,
+                    nodes_of,
+                });
             }
             if !self.eat_kw("INDEX") {
                 return Err(Error::Sql("expected COLLECTION or INDEX after ALTER".into()));
@@ -497,6 +514,7 @@ impl<'a> Parser<'a> {
         let mut prefix_expansion = None;
         let mut nodes = Vec::new();
         let mut nodes_of = None;
+        let mut replicas = None;
         let mut undirected = false;
         if self.eat_kw("WITH") {
             for (key, v) in self.option_list()? {
@@ -515,6 +533,7 @@ impl<'a> Parser<'a> {
                             .collect()
                     }
                     "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
+                    "replicas" => replicas = Some(replicas_option(&key, v)?),
                     "nodes" => {
                         nodes = v
                             .as_array()
@@ -546,6 +565,7 @@ impl<'a> Parser<'a> {
             nodes,
             nodes_of,
             undirected,
+            replicas,
         }))
     }
 
@@ -1570,6 +1590,15 @@ fn count_option(key: &str, val: Option<Value>) -> Result<u64> {
     }
 }
 
+/// `replicas`, for `CREATE COLLECTION ... WITH` and `ALTER COLLECTION ...
+/// SET`: copies of every shard, one to eight.
+fn replicas_option(key: &str, v: Value) -> Result<usize> {
+    match v.as_i64() {
+        Some(n) if (1..=8).contains(&n) => Ok(n as usize),
+        _ => Err(Error::Sql(format!("`{key}` must be an integer from 1 to 8"))),
+    }
+}
+
 /// `prefix_expansion`, for `CREATE COLLECTION ... WITH` and `ALTER COLLECTION
 /// ... SET`: a count, as the other integer options are. Whether the engine can
 /// honour it is the engine's decision, because the bound is its cache and not
@@ -2004,7 +2033,7 @@ mod tests {
     #[test]
     fn a_collection_s_prefix_expansion_is_set_at_creation_or_altered_later() {
         match parse("ALTER COLLECTION notes SET (prefix_expansion = 2048)", &[]).unwrap() {
-            Statement::AlterCollection { collection, prefix_expansion, nodes_of } => {
+            Statement::AlterCollection { collection, prefix_expansion, nodes_of, .. } => {
                 assert_eq!(collection, "notes");
                 assert_eq!(prefix_expansion, Some(2048));
                 assert_eq!(nodes_of, None);

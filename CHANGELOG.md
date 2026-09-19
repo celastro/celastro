@@ -6,6 +6,53 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.0 — 2026-09-19
+
+Every shard has a follower, a write is acknowledged on two disks, and a
+follower can be promoted -- by hand, or by the steward when the holder
+stops answering. High availability, hence a minor; the catalog format
+is 9 and the wire speaks version 6 (older peers are spoken to at 5).
+
+**Followers.** A collection has `replicas = 2` by default: every shard
+has its holder and one follower, the next data node in the placement
+order (`WITH (replicas = n)` at `CREATE COLLECTION`, `ALTER COLLECTION
+... SET (replicas = n)` to re-plan; a cluster of one has no follower).
+A follower holds a real copy of the shard under
+`collections/<c>/followed/`, fed by the holder's log: every record the
+holder writes is shipped to its followers after the holder's own fsync,
+and in `CELASTRO_REPLICATION=sync` (the default) the client is
+acknowledged only once every live follower has it on disk; `async`
+acknowledges at once. A follower that is away does not hold the
+acknowledgement -- the write is on the holder's disk alone, and `SHOW
+HEALTH` says `DEGRADED` -- and is caught up from where it stood when it
+answers again, in chunks, or from nothing if it is new or too far
+behind. Definitions reach followers as they reach holders; a move keeps
+the copies (the old holder becomes a follower); a split or a merge
+resets the followers' copies, which catch up.
+
+**Promotion.** `PROMOTE SHARD i OF c ON 'follower'` makes the follower
+the holder at the next term and the old holder a follower. Every map
+entry carries a term; the higher term wins wherever two maps disagree,
+so the old holder, back or reconnected, demotes its copy and is caught
+up from the new holder, dropping what it took after the promotion --
+which was never acknowledged, since its follower had already left it.
+`SHOW CATALOG` shows the followers and the term; `SHOW HEALTH` shows
+every follower's state and lag and every copy this node follows.
+
+**The steward and automatic failover.** One node is the steward
+(`CELASTRO_STEWARD`, or the lowest attached address): it renews every
+node's lease on each reconcile sweep. With `CELASTRO_AUTO_FAILOVER=on`
+(off by default) the steward promotes the follower with the most
+recent copy once a holder has missed two sweeps, and a holder whose
+lease ran out (`CELASTRO_LEASE_SECS`, 60) refuses writes until it is
+renewed -- so a holder the steward cannot reach is not taking writes
+while its follower is promoted. With failover off, promotion is the
+operator's and no lease gates a write.
+
+The embedded API's `Db::insert` returns once the write is on this
+node's disk; `Db::confirmation()` is what to wait on, with the lock let
+go, for the followers.
+
 ## 0.57.0 — 2026-09-19
 
 A split picks its own key, and shards merge, hence a minor.

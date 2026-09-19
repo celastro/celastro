@@ -1237,6 +1237,23 @@ fn reclaim_orphans(dir: &Path, live: &[u64]) {
 
 pub(crate) const WAL_INSERT: u8 = 1;
 pub(crate) const WAL_DELETE: u8 = 2;
+/// A followed copy's mark: where the holder's log stood when this batch
+/// was applied. Never in a held shard's log.
+pub(crate) const WAL_SHIP_MARK: u8 = 3;
+
+/// A logged record as the shipper carries it.
+fn ship_item(r: &WalRecord) -> crate::replication::ShipItem {
+    crate::replication::ShipItem {
+        kind: if r.kind == WAL_DELETE {
+            crate::replication::SHIP_DELETE
+        } else {
+            crate::replication::SHIP_INSERT
+        },
+        key: r.key.clone(),
+        ts: r.ts,
+        doc: r.doc.clone(),
+    }
+}
 // Kind 3 was reserved for a seal marker and is never written; a record
 // carrying it is skipped by the replay like any other unknown kind.
 
@@ -1599,6 +1616,14 @@ pub struct Shard {
     pub(crate) memtable: Memtable,
     pub(crate) frozen: Vec<Arc<Memtable>>,
     pub segments: Vec<Arc<SegmentHandle>>,
+    /// The shipper of this shard's log to its followers, when it is held
+    /// here and has any.
+    pub(crate) shipper: Option<Arc<crate::replication::Shipper>>,
+    /// For a followed copy: the instant it stands at (the last mark the
+    /// holder shipped and this node logged) and whether it is whole up to
+    /// it.
+    pub(crate) ship_ts: Timestamp,
+    pub(crate) caught_up: bool,
     pub manifest_version: u64,
     pub(crate) next_segment_id: u64,
     pub(crate) opts: ShardOpts,
@@ -1707,6 +1732,9 @@ impl Shard {
             last_seal_error: None,
             compactions: 0,
             retain_floor: 0,
+            shipper: None,
+            ship_ts: 0,
+            caught_up: false,
             retiring: Vec::new(),
             published_manifest: RwLock::new(None),
             published_deletes: RwLock::new(BTreeMap::new()),
@@ -2064,6 +2092,9 @@ impl Shard {
                 let _ = w.rollback(mark);
                 return Err(e);
             }
+            if let Some(sh) = &self.shipper {
+                sh.push(ship_item(&record));
+            }
             // `append` ends at `write_all`, which reaches the page cache and
             // stops there, so without this the timestamp returned below names a
             // commit that a power loss still takes back. The record is framed
@@ -2162,6 +2193,16 @@ impl Shard {
                 let _ = w.rollback(mark);
                 return Err(e);
             }
+            if let Some(sh) = &self.shipper {
+                for (key, ts, doc, _) in &prepared {
+                    sh.push(crate::replication::ShipItem {
+                        kind: crate::replication::SHIP_INSERT,
+                        key: key.clone(),
+                        ts: *ts,
+                        doc: Some(doc.clone()),
+                    });
+                }
+            }
         }
         let mut out = Vec::with_capacity(prepared.len());
         for (key, ts, doc, prev) in prepared {
@@ -2236,6 +2277,9 @@ impl Shard {
             if let Err(e) = w.append(&record).and_then(|_| w.sync()) {
                 let _ = w.rollback(mark);
                 return Err(e);
+            }
+            if let Some(sh) = &self.shipper {
+                sh.push(ship_item(&record));
             }
         }
         self.mark_superseded(prev, ts);
@@ -3185,10 +3229,224 @@ impl Shard {
                         s.mark_superseded(loc, r.ts);
                     }
                 }
+                WAL_SHIP_MARK => {
+                    s.ship_ts = s.ship_ts.max(r.ts);
+                    s.caught_up = true;
+                }
                 _ => {}
             }
         }
         Ok(s)
+    }
+
+    /// A followed copy from nothing: its files gone, its memory empty, the
+    /// directory made again with the same range; what a catch-up from
+    /// nothing begins with.
+    pub(crate) fn reset_copy(&mut self) -> Result<()> {
+        let Some(dir) = self.dir.clone() else {
+            return Err(Error::Storage("a followed copy needs a directory".into()));
+        };
+        let range = self.key_range.clone();
+        let range_bytes = crate::shard::read_optional(&dir.join("RANGE"))?;
+        self.retire_all();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        if let Some(b) = range_bytes {
+            atomic_write(&dir.join("RANGE"), &b)?;
+        }
+        let fresh = Shard::new(self.coll.clone(), self.clock.clone(), self.opts.clone());
+        let index = self.index;
+        *self = fresh;
+        self.index = index;
+        if let Some((lo, hi)) = range {
+            self.set_key_range(lo, hi);
+        }
+        self.attach_dir(&dir)?;
+        Ok(())
+    }
+
+    /// A batch of the holder's log into this followed copy: each record
+    /// logged here and applied as a replay applies it, the batch's mark
+    /// logged last, one sync for all of it. Idempotent: a version this
+    /// copy already holds at that instant or later is skipped, as a replay
+    /// skips it. Returns where the copy stands.
+    pub(crate) fn apply_shipped(
+        &mut self,
+        items: &[crate::replication::ShipItem],
+    ) -> Result<(bool, Timestamp)> {
+        use crate::replication::{SHIP_CAUGHT_UP, SHIP_DELETE, SHIP_INSERT, SHIP_MARK};
+        let mut mark_ts = 0;
+        let mut caught_up_at = None;
+        let Some(w) = self.wal.as_mut() else {
+            return Err(Error::Storage("a followed copy needs a directory".into()));
+        };
+        let mark = w.mark()?;
+        let mut applied: Vec<WalRecord> = Vec::new();
+        let written: Result<()> = 'log: {
+            for it in items {
+                match it.kind {
+                    SHIP_INSERT | SHIP_DELETE => {
+                        let record = WalRecord {
+                            kind: if it.kind == SHIP_INSERT { WAL_INSERT } else { WAL_DELETE },
+                            key: it.key.clone(),
+                            ts: it.ts,
+                            doc: it.doc.clone(),
+                            supersedes: true,
+                            segment_id: 0,
+                        };
+                        if let Err(e) = w.append(&record) {
+                            break 'log Err(e);
+                        }
+                        applied.push(record);
+                        mark_ts = mark_ts.max(it.ts);
+                    }
+                    SHIP_MARK => mark_ts = mark_ts.max(it.ts),
+                    SHIP_CAUGHT_UP => {
+                        mark_ts = mark_ts.max(it.ts);
+                        caught_up_at = Some(it.ts);
+                    }
+                    _ => {}
+                }
+            }
+            if mark_ts > 0 && (caught_up_at.is_some() || self.caught_up) {
+                let m = WalRecord {
+                    kind: WAL_SHIP_MARK,
+                    key: String::new(),
+                    ts: mark_ts,
+                    doc: None,
+                    supersedes: false,
+                    segment_id: 0,
+                };
+                if let Err(e) = w.append(&m) {
+                    break 'log Err(e);
+                }
+            }
+            w.sync()
+        };
+        if let Err(e) = written {
+            let _ = w.rollback(mark);
+            return Err(e);
+        }
+        for r in applied {
+            self.clock.observe(r.ts);
+            match r.kind {
+                WAL_INSERT => {
+                    let prev = self.latest_version(&r.key);
+                    if prev.map(|(_, ts)| ts >= r.ts).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some((loc, _)) = prev {
+                        self.mark_superseded(loc, r.ts);
+                    }
+                    if let Some(d) = r.doc {
+                        self.coll.observe_doc(&d);
+                        self.unsealed.observe_doc(&d);
+                        self.memtable.insert(r.key, r.ts, d)?;
+                    }
+                }
+                WAL_DELETE => {
+                    if let Some(loc) = self.locate(&r.key, MAX_TS) {
+                        self.mark_superseded(loc, r.ts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(at) = caught_up_at {
+            self.caught_up = true;
+            self.ship_ts = self.ship_ts.max(at);
+        } else if self.caught_up {
+            self.ship_ts = self.ship_ts.max(mark_ts);
+        }
+        self.seal_if_due();
+        Ok((self.caught_up, self.ship_ts))
+    }
+
+    /// The rows written after `from` and by `upto`, as the copy at `upto`
+    /// shows them, in key order past `cursor`, at most `limit`: what a
+    /// follower catching up is shipped, a chunk at a time. Returns the
+    /// items and the cursor for the next chunk, or none when exhausted.
+    pub(crate) fn changes_since(
+        &self,
+        from: Timestamp,
+        cursor: Option<&str>,
+        upto: Timestamp,
+        limit: usize,
+    ) -> Result<(Vec<crate::replication::ShipItem>, Option<String>)> {
+        let snap = self.snapshot_at(upto);
+        let sources = self.sources(&snap);
+        let mut found: Vec<(String, Timestamp, usize, u32)> = Vec::new();
+        for (si, src) in sources.iter().enumerate() {
+            let vis = src.visibility(upto);
+            for ord in vis.iter() {
+                let Some(key) = src.key(ord) else { continue };
+                if cursor.is_some_and(|c| key <= c) {
+                    continue;
+                }
+                let ts = match src {
+                    Searchable::Mem(m) => m.ordinals.commit_ts[ord as usize],
+                    Searchable::Seg(h) => h.segment.ordinals.commit_ts[ord as usize],
+                };
+                if ts > from {
+                    found.push((key.to_string(), ts, si, ord));
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let more = found.len() > limit;
+        found.truncate(limit);
+        let mut items = Vec::with_capacity(found.len());
+        for (key, ts, si, ord) in &found {
+            let doc = match &sources[*si] {
+                Searchable::Mem(m) => m.docs[*ord as usize].doc.clone(),
+                Searchable::Seg(h) => h.segment.document(*ord)?,
+            };
+            items.push(crate::replication::ShipItem {
+                kind: crate::replication::SHIP_INSERT,
+                key: key.clone(),
+                ts: *ts,
+                doc: Some(doc),
+            });
+        }
+        let next = if more { found.last().map(|f| f.0.clone()) } else { None };
+        Ok((items, next))
+    }
+
+    /// The deletes after `from` this shard still remembers, for a follower
+    /// catching up from an instant it stood at.
+    pub(crate) fn deletes_since(&self, from: Timestamp) -> Vec<crate::replication::ShipItem> {
+        let mut out = Vec::new();
+        let mut push = |key: &str, ts: Timestamp| {
+            if ts > from && ts != MAX_TS {
+                out.push(crate::replication::ShipItem {
+                    kind: crate::replication::SHIP_DELETE,
+                    key: key.to_string(),
+                    ts,
+                    doc: None,
+                });
+            }
+        };
+        for (ord, ts) in self.memtable.delete_entries() {
+            if let Some(d) = self.memtable.docs.get(ord as usize) {
+                push(&d.sort_key, ts);
+            }
+        }
+        for f in &self.frozen {
+            for (ord, ts) in f.delete_entries() {
+                if let Some(d) = f.docs.get(ord as usize) {
+                    push(&d.sort_key, ts);
+                }
+            }
+        }
+        for h in &self.segments {
+            let log = h.deletes.read().unwrap();
+            for (ord, ts) in log.iter() {
+                if let Some(k) = h.segment.ordinals.key(ord) {
+                    push(k, ts);
+                }
+            }
+        }
+        out
     }
 
     /// Replace `inputs` with `outputs` atomically from a reader's point of

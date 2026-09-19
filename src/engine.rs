@@ -251,6 +251,20 @@ pub struct DbOpts {
     /// coordinator holds no shards, takes none from a placement, a
     /// rebalance or a move, and only coordinates (`CELASTRO_ROLE`).
     pub role: Role,
+    /// Whether a write is acknowledged only once every follower confirmed
+    /// it on disk (`sync`, the default) or at once (`async`):
+    /// `CELASTRO_REPLICATION`.
+    pub replication_sync: bool,
+    /// The node that renews every holder's lease and, with `auto_failover`,
+    /// promotes a follower of a holder that stopped answering:
+    /// `CELASTRO_STEWARD`, or the lowest attached address.
+    pub steward: Option<String>,
+    /// Whether the steward promotes on its own, and a holder whose lease
+    /// ran out refuses writes: `CELASTRO_AUTO_FAILOVER`. Off by default:
+    /// promotion is the operator's, and no lease gates a write.
+    pub auto_failover: bool,
+    /// How long a lease lasts, seconds: `CELASTRO_LEASE_SECS`.
+    pub lease_secs: u64,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -285,6 +299,10 @@ impl Default for DbOpts {
             master_key: None,
             key_file: None,
             role: Role::Data,
+            replication_sync: true,
+            steward: None,
+            auto_failover: false,
+            lease_secs: 60,
             node: None,
             tls: None,
         }
@@ -961,6 +979,22 @@ impl Outcome {
 pub struct Db {
     pub catalog: Catalog,
     shards: BTreeMap<String, Vec<Shard>>,
+    /// The shards this node follows -- a copy of each, fed by the holder's
+    /// log, under `follow-NNNN` beside the held ones -- with the term each
+    /// follows at. Behind a lock of their own, shared with the wire, so a
+    /// holder's batch is applied without this node's lock: a write
+    /// forwarded from here under this lock waits for that holder, which
+    /// waits for this node to confirm its own log, and this lock would
+    /// close the cycle. Not read by any statement; a promotion makes one
+    /// a held shard.
+    followed: Followed,
+    /// What the last write statement wrote here, shard by shard: what its
+    /// acknowledgement waits on the followers for.
+    recent_writes: Vec<(String, usize, Timestamp)>,
+    /// The lease the steward renews, shared with the wire so a renewal
+    /// takes no lock: when it was last renewed, and by which node it may
+    /// be.
+    lease: Lease,
     pub clock: Arc<Hlc>,
     pub opts: DbOpts,
     dir: Option<PathBuf>,
@@ -1087,6 +1121,9 @@ impl Db {
         Db {
             catalog: Catalog::default(),
             shards: BTreeMap::new(),
+            followed: Arc::new(Mutex::new(BTreeMap::new())),
+            recent_writes: Vec::new(),
+            lease: Arc::new(Mutex::new(LeaseState { at: None, steward: None })),
             clock: Arc::new(Hlc::new()),
             opts,
             dir: None,
@@ -1223,7 +1260,12 @@ impl Db {
                 while cdir.join(format!("shard-{i:04}")).exists() {
                     let (lo, hi) =
                         read_range(&db.cipher, &cdir.join(format!("shard-{i:04}")), i, name)?;
-                    t.push(Tablet { node: db.opts.node.clone().unwrap_or_default(), lo, hi });
+                    t.push(Tablet {
+                        node: db.opts.node.clone().unwrap_or_default(),
+                        lo,
+                        hi,
+                        ..Default::default()
+                    });
                     i += 1;
                 }
                 derived = true;
@@ -1232,8 +1274,24 @@ impl Db {
             }
         };
         let mut shards = Vec::new();
+        let mut followed = Vec::new();
         for (i, t) in tablets.iter().enumerate() {
-            if !db.is_self(&t.node) || t.is_merged() {
+            if t.is_merged() {
+                continue;
+            }
+            if t.followers.iter().any(|f| db.is_self(f)) && !db.is_self(&t.node) {
+                let fdir = cdir.join("followed").join(format!("shard-{i:04}"));
+                if fdir.exists() {
+                    let (lo, hi) = read_range(&db.cipher, &fdir, i, name)?;
+                    let mut sh =
+                        Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &fdir)?;
+                    sh.set_key_range(lo, hi);
+                    sh.index = i;
+                    followed.push(sh);
+                }
+                continue;
+            }
+            if !db.is_self(&t.node) {
                 continue;
             }
             let sdir = cdir.join(format!("shard-{i:04}"));
@@ -1250,6 +1308,13 @@ impl Db {
         }
         if !shards.is_empty() {
             db.shards.insert(name.to_string(), shards);
+        }
+        if !followed.is_empty() {
+            let mut g = db.followed.lock().unwrap_or_else(|p| p.into_inner());
+            for sh in followed {
+                let term = tablets.get(sh.index).map(|t| t.term).unwrap_or(0);
+                g.insert((name.to_string(), sh.index), FollowedShard { shard: sh, term });
+            }
         }
         Ok(derived)
     }
@@ -1773,6 +1838,12 @@ impl Db {
                 }
             }
         }
+        for f in followed_of(&self.followed, collection).iter_mut() {
+            f.shard.adopt_catalog(coll.clone())?;
+            for h in &f.shard.segments {
+                h.segment.unload_component(&component);
+            }
+        }
         self.apply_tiers(collection)?;
         self.persist_catalog()
     }
@@ -1973,6 +2044,54 @@ impl Db {
                  and the data is not in this directory; restore it or drop it\n"
             ));
         }
+        if let Some(s) = self.steward() {
+            let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+            out.push_str(&format!(
+                "steward: {}{}; automatic failover {}{}\n",
+                s,
+                if self.is_self(&s) { " (this node)" } else { "" },
+                if self.opts.auto_failover { "on" } else { "off" },
+                match (self.is_self(&s), g.at) {
+                    (true, _) => String::new(),
+                    (false, Some(at)) =>
+                        format!("; lease renewed {} s ago", at.elapsed().as_secs()),
+                    (false, None) => "; no lease yet".to_string(),
+                }
+            ));
+        }
+        for (name, shards) in &self.shards {
+            for s in shards {
+                if let Some(sh) = &s.shipper {
+                    for f in sh.report() {
+                        out.push_str(&format!(
+                            "shard {} of `{name}`: follower {} {}, confirmed to ts {}, {} behind{}{}\n",
+                            s.index,
+                            f.url,
+                            f.state,
+                            f.acked,
+                            f.backlog,
+                            f.last_error.map(|e| format!(" ({e})")).unwrap_or_default(),
+                            if f.state == "asking" {
+                                "; DEGRADED: writes to this shard are acknowledged on this node's disk alone"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        for ((name, i), f) in self.followed.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            out.push_str(&format!(
+                "follows shard {i} of `{name}` at term {}: {}\n",
+                f.term,
+                if f.shard.caught_up {
+                    format!("caught up to ts {}", f.shard.ship_ts)
+                } else {
+                    "copying".into()
+                }
+            ));
+        }
         out.push_str(&format!(
             "{} of {} node(s) answer; {unreachable} shard(s) unreachable",
             up.len(),
@@ -2031,9 +2150,12 @@ impl Db {
     /// Create a collection. `splits` are the boundary keys of the tablet map:
     /// `n` split points make `n+1` shards, range-partitioned on the composite
     /// `(partition_key, primary_key)`.
-    pub fn create_collection(&mut self, coll: Collection, splits: &[String]) -> Result<()> {
+    pub fn create_collection(&mut self, mut coll: Collection, splits: &[String]) -> Result<()> {
         let _deadline = self.arm_default_deadline();
-        let tablets = self.plan_tablets(splits, &[])?;
+        if coll.replicas == 0 {
+            coll.replicas = DEFAULT_REPLICAS as u8;
+        }
+        let tablets = self.plan_tablets(splits, &[], coll.replicas as usize)?;
         // A library caller waits for the spread; the statement defers it.
         let _ = self.create_spread(coll, tablets)?.carry();
         Ok(())
@@ -2075,12 +2197,131 @@ impl Db {
     /// collection, and every coordinator, which plans over it.
     fn ddl_targets(&self, collection: &str) -> Vec<String> {
         let mut v = self.holders(collection);
+        for f in self.followers_of(collection) {
+            if !v.contains(&f) {
+                v.push(f);
+            }
+        }
         for c in &self.catalog.coordinators {
             if !self.is_self(c) && !v.contains(c) {
                 v.push(c.clone());
             }
         }
         v
+    }
+
+    /// The other nodes following a shard of `collection`, each once.
+    fn followers_of(&self, collection: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .catalog
+            .placement
+            .get(collection)
+            .map(|t| {
+                t.iter()
+                    .filter(|x| !x.is_merged())
+                    .flat_map(|x| x.followers.iter().cloned())
+                    .filter(|n| !self.is_self(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The shards this node follows, as the map says: a followed shard
+    /// directory for every tablet that names this node and has none, and
+    /// none for a tablet that no longer does. A copy made here starts
+    /// empty; the holder's log fills it.
+    pub(crate) fn ensure_followed(&mut self, collection: &str) -> Result<()> {
+        let Some(tablets) = self.catalog.placement.get(collection).cloned() else {
+            return Ok(());
+        };
+        let coll = self.catalog.get(collection)?.clone();
+        let wanted: Vec<usize> = tablets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                !t.is_merged()
+                    && !self.is_self(&t.node)
+                    && t.followers.iter().any(|f| self.is_self(f))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let have: Vec<usize> = self
+            .followed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .filter(|(c, _)| c == collection)
+            .map(|(_, i)| *i)
+            .collect();
+        for i in have.iter().filter(|i| !wanted.contains(i)) {
+            self.drop_followed(collection, *i);
+        }
+        {
+            // The terms as the map says them now, for the copies kept.
+            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            for i in wanted.iter().filter(|i| have.contains(i)) {
+                if let Some(f) = g.get_mut(&(collection.to_string(), *i)) {
+                    f.term = tablets[*i].term;
+                }
+            }
+        }
+        for i in wanted.iter().filter(|i| !have.contains(i)) {
+            let t = &tablets[*i];
+            let mut sh = Shard::new(coll.clone(), self.clock.clone(), self.shard_opts())
+                .with_key_range(t.lo.clone(), t.hi.clone());
+            sh.index = *i;
+            if let Some(dir) = &self.dir {
+                let fdir = dir
+                    .join("collections")
+                    .join(collection)
+                    .join("followed")
+                    .join(format!("shard-{i:04}"));
+                if fdir.exists() {
+                    fs::remove_dir_all(&fdir)?;
+                }
+                fs::create_dir_all(&fdir)?;
+                crate::shard::write_content(
+                    &self.cipher,
+                    &format!("shard-{i:04}/RANGE"),
+                    &fdir.join("RANGE"),
+                    format!(
+                        "{}\n{}",
+                        t.lo.clone().unwrap_or_default(),
+                        t.hi.clone().unwrap_or_default()
+                    )
+                    .as_bytes(),
+                )?;
+                sh.attach_dir(&fdir)?;
+                crate::shard::sync_dir(&dir.join("collections").join(collection))?;
+            }
+            self.followed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert((collection.to_string(), *i), FollowedShard { shard: sh, term: t.term });
+        }
+        Ok(())
+    }
+
+    /// Let go of a followed copy: its directory removed.
+    fn drop_followed(&mut self, collection: &str, shard: usize) {
+        let gone = self
+            .followed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(collection.to_string(), shard))
+            .map(|f| f.shard);
+        if let Some(mut s) = gone {
+            s.retire_all();
+            if let Some(d) = s.dir().map(|d| d.to_path_buf()) {
+                let _ = fs::remove_dir_all(&d);
+                if let Some(p) = d.parent() {
+                    let _ = crate::shard::sync_dir(p);
+                }
+            }
+        }
     }
 
     fn is_self(&self, node: &str) -> bool {
@@ -2141,7 +2382,12 @@ impl Db {
     /// goes to the `i`-th of `nodes`, wrapping. No nodes named means this
     /// node and every attached one; a node with no address places every
     /// shard on itself.
-    fn plan_tablets(&self, splits: &[String], nodes: &[String]) -> Result<Vec<Tablet>> {
+    fn plan_tablets(
+        &self,
+        splits: &[String],
+        nodes: &[String],
+        replicas: usize,
+    ) -> Result<Vec<Tablet>> {
         for k in splits {
             if k.is_empty() || k.contains('\n') {
                 return Err(Error::Schema(format!(
@@ -2187,13 +2433,35 @@ impl Db {
                 None => vec![String::new()],
             }
         };
-        Ok((0..=splits.len())
+        let mut tablets: Vec<Tablet> = (0..=splits.len())
             .map(|i| Tablet {
                 node: nodes[i % nodes.len()].clone(),
                 lo: if i == 0 { None } else { Some(splits[i - 1].clone()) },
                 hi: splits.get(i).cloned(),
+                ..Default::default()
             })
-            .collect())
+            .collect();
+        for (i, t) in tablets.iter_mut().enumerate() {
+            t.followers = Self::followers_for(&nodes, i, replicas);
+        }
+        Ok(tablets)
+    }
+
+    /// The followers of shard `i` under `replicas` copies: the `replicas -
+    /// 1` nodes after its holder in the placement order, wrapping, each
+    /// once, the holder never; fewer when the nodes run out.
+    fn followers_for(nodes: &[String], i: usize, replicas: usize) -> Vec<String> {
+        let holder = &nodes[i % nodes.len()];
+        let mut out = Vec::new();
+        let mut k = i + 1;
+        while out.len() + 1 < replicas && k < i + nodes.len() {
+            let n = &nodes[k % nodes.len()];
+            if n != holder && !out.contains(n) && !n.is_empty() {
+                out.push(n.clone());
+            }
+            k += 1;
+        }
+        out
     }
 
     /// Create a collection under a placement: here, then on every other
@@ -2379,6 +2647,7 @@ impl Db {
     pub fn reconcile_from(&mut self, peer: &str, theirs: &Catalog) -> Result<Vec<String>> {
         let mut notes = self.reconcile(theirs)?;
         let mut changed = false;
+        let mut demote: Vec<(String, usize)> = Vec::new();
         for (name, their_tablets) in &theirs.placement {
             let Some(mine) = self.catalog.placement.get(name) else { continue };
             if mine.len() != their_tablets.len() {
@@ -2410,6 +2679,29 @@ impl Db {
             }
             let mut updated = mine.clone();
             for (i, (m, t)) in mine.iter().zip(their_tablets).enumerate() {
+                // A higher term is a promotion this node has not seen: the
+                // map at that term wins, whoever carries it, and a copy this
+                // node still holds at the old term follows from now on.
+                if t.term > m.term {
+                    let held_here = self.is_self(&m.node)
+                        && self.shards.get(name).is_some_and(|s| s.iter().any(|s| s.index == i));
+                    if held_here {
+                        demote.push((name.clone(), i));
+                    }
+                    updated[i] = t.clone();
+                    changed = true;
+                    notes.push(format!(
+                        "shard {i} of `{name}`: term {} on {} (was term {} on {})",
+                        t.term,
+                        t.node,
+                        m.term,
+                        if m.node.is_empty() { "this node" } else { m.node.as_str() }
+                    ));
+                    continue;
+                }
+                if t.term < m.term {
+                    continue;
+                }
                 let peer_claims = t.node == peer && m.node != peer;
                 let peer_gave_away = m.node == peer && t.node != peer;
                 // The peer's word about its own shards' ranges too: a split
@@ -2444,6 +2736,10 @@ impl Db {
             if changed {
                 self.catalog.placement.insert(name.clone(), updated);
             }
+        }
+        for (name, i) in demote {
+            self.demote_here(&name, i)?;
+            notes.push(format!("shard {i} of `{name}`: demoted here, following the new holder"));
         }
         if changed {
             self.persist_catalog()?;
@@ -2659,8 +2955,9 @@ impl Db {
         };
         self.catalog.placement.insert(name.clone(), tablets);
         if !shards.is_empty() {
-            self.shards.insert(name, shards);
+            self.shards.insert(name.clone(), shards);
         }
+        self.ensure_followed(&name)?;
         self.persist_catalog()?;
         Ok(())
     }
@@ -3480,7 +3777,13 @@ impl Db {
         let mut new = tablets.to_vec();
         let hi = new[shard].hi.take();
         new[shard].hi = Some(at.to_string());
-        new.push(Tablet { node: new[shard].node.clone(), lo: Some(at.to_string()), hi });
+        new.push(Tablet {
+            node: new[shard].node.clone(),
+            lo: Some(at.to_string()),
+            hi,
+            term: new[shard].term,
+            followers: new[shard].followers.clone(),
+        });
         new
     }
 
@@ -3546,9 +3849,15 @@ impl Db {
         }
         let holder = ta.node.clone();
         let mut new = tablets.clone();
-        new[a] = Tablet { node: holder.clone(), lo: lo.clone(), hi: hi.clone() };
+        new[a] = Tablet {
+            node: holder.clone(),
+            lo: lo.clone(),
+            hi: hi.clone(),
+            term: ta.term,
+            followers: ta.followers.clone(),
+        };
         let mark = Some(tb.lo.clone().unwrap_or_default());
-        new[b] = Tablet { node: holder.clone(), lo: mark.clone(), hi: mark };
+        new[b] = Tablet { node: holder.clone(), lo: mark.clone(), hi: mark, ..Default::default() };
         let (lo_text, hi_text) = (lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default());
         if !self.is_self(&holder) {
             if local {
@@ -3631,6 +3940,553 @@ impl Db {
         })))
     }
 
+    /// `ALTER COLLECTION c SET (replicas = n)`: the followers of every shard
+    /// re-planned to `n - 1` after its holder in the data nodes' order;
+    /// what was.
+    fn set_replicas(&mut self, collection: &str, n: usize) -> Result<usize> {
+        let coll = self.catalog.get(collection)?.clone();
+        let was = if coll.replicas == 0 { DEFAULT_REPLICAS } else { coll.replicas as usize };
+        let nodes = self.data_nodes();
+        let mut tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
+        for t in tablets.iter_mut() {
+            if t.is_merged() {
+                continue;
+            }
+            let holder_at = nodes
+                .iter()
+                .position(|x| x == &t.node || (self.is_self(x) && self.is_self(&t.node)));
+            t.followers = match holder_at {
+                Some(h) => Self::followers_for(&nodes, h, n),
+                None => Vec::new(),
+            };
+        }
+        self.catalog.placement.insert(collection.to_string(), tablets);
+        if let Some(c) = self.catalog.collections.get_mut(collection) {
+            c.replicas = n as u8;
+        }
+        self.ensure_followed(collection)?;
+        self.persist_catalog()?;
+        Ok(was)
+    }
+
+    /// What the last write statement's acknowledgement waits for: each
+    /// shard it wrote here, at the instant it wrote, on that shard's
+    /// followers. Empty when nothing here has followers. Takes the writes
+    /// noted so far.
+    pub fn confirmation(&mut self) -> Confirmation {
+        let budget = crate::deadline::remaining_ms();
+        let mut waits: Vec<(Arc<crate::replication::Shipper>, Timestamp)> = Vec::new();
+        for (c, idx, ts) in self.recent_writes.drain(..) {
+            if let Some(sh) = self
+                .shards
+                .get(&c)
+                .and_then(|v| v.iter().find(|s| s.index == idx))
+                .and_then(|s| s.shipper.clone())
+            {
+                match waits.iter().position(|(s, _)| Arc::ptr_eq(s, &sh)) {
+                    Some(p) => waits[p].1 = waits[p].1.max(ts),
+                    None => waits.push((sh, ts)),
+                }
+            }
+        }
+        Confirmation { waits, budget }
+    }
+
+    /// The instant of the last commit here.
+    pub fn last_commit_ts(&self) -> Timestamp {
+        self.last_commit
+    }
+
+    /// The shippers of every held shard, as the map says: one per held
+    /// shard with followers, replaced when its followers or term change,
+    /// stopped when it has none.
+    fn refresh_shippers(&mut self) {
+        let sync = self.opts.replication_sync;
+        let placement = self.catalog.placement.clone();
+        let mut fresh: Vec<(String, usize, Arc<crate::replication::Shipper>)> = Vec::new();
+        for (name, tablets) in &placement {
+            let Some(shards) = self.shards.get(name) else { continue };
+            for s in shards {
+                let Some(t) = tablets.get(s.index) else { continue };
+                let followers: Vec<String> =
+                    t.followers.iter().filter(|f| !self.is_self(f)).cloned().collect();
+                let same = s
+                    .shipper
+                    .as_ref()
+                    .is_some_and(|sh| sh.followers() == followers && sh.term == t.term)
+                    || (followers.is_empty() && s.shipper.is_none());
+                if same {
+                    continue;
+                }
+                if followers.is_empty() {
+                    fresh.push((
+                        name.clone(),
+                        s.index,
+                        Arc::new(crate::replication::Shipper::idle()),
+                    ));
+                    continue;
+                }
+                let mut conns = Vec::new();
+                for f in &followers {
+                    match self.wire_node(f) {
+                        Ok(n) => conns.push((f.clone(), Arc::new(n))),
+                        Err(e) => crate::log::warn(
+                            "follower_not_dialled",
+                            &[("node", f.clone()), ("error", e.to_string())],
+                        ),
+                    }
+                }
+                fresh.push((
+                    name.clone(),
+                    s.index,
+                    crate::replication::Shipper::new(name, s.index, t.term, conns, sync),
+                ));
+            }
+        }
+        for (name, idx, sh) in fresh {
+            if let Some(s) =
+                self.shards.get_mut(&name).and_then(|v| v.iter_mut().find(|s| s.index == idx))
+            {
+                if let Some(old) = s.shipper.take() {
+                    old.stop();
+                }
+                s.shipper = if sh.followers().is_empty() { None } else { Some(sh) };
+            }
+        }
+    }
+
+    /// The catch-ups due: for every follower a shipper is waiting to catch
+    /// up, the next chunk of what it lacks, cut from the held shard. What
+    /// the console's maintenance thread runs each second; how many chunks
+    /// were cut.
+    pub fn replication_step(&mut self) -> usize {
+        let now = self.clock.peek().max(self.last_commit);
+        let mut cut = 0;
+        let mut jobs: Vec<(
+            String,
+            usize,
+            Arc<crate::replication::Shipper>,
+            String,
+            crate::replication::FollowerState,
+        )> = Vec::new();
+        for (name, shards) in &self.shards {
+            for s in shards {
+                if let Some(sh) = &s.shipper {
+                    for (url, _) in sh.catchups_due() {
+                        if let Some(state) = sh.fix_upto(&url, now) {
+                            jobs.push((name.clone(), s.index, sh.clone(), url, state));
+                        }
+                    }
+                }
+            }
+        }
+        for (name, idx, sh, url, state) in jobs {
+            let crate::replication::FollowerState::CatchingUp { from, upto, cursor, reset, .. } =
+                state
+            else {
+                continue;
+            };
+            let Some(s) = self.shards.get(&name).and_then(|v| v.iter().find(|s| s.index == idx))
+            else {
+                continue;
+            };
+            let mut items = Vec::new();
+            // A follower that stood before this shard's floor may have
+            // missed deletes a compaction has since dropped: from nothing.
+            let reset = reset || from < s.retain_floor;
+            if cursor.is_none() {
+                if reset {
+                    items.push(crate::replication::ShipItem {
+                        kind: crate::replication::SHIP_RESET,
+                        key: String::new(),
+                        ts: 0,
+                        doc: None,
+                    });
+                } else {
+                    items.extend(s.deletes_since(from));
+                }
+            }
+            let from = if reset { 0 } else { from };
+            match s.changes_since(from, cursor.as_deref(), upto, CATCHUP_CHUNK) {
+                Ok((rows, next)) => {
+                    items.extend(rows);
+                    let done = next.is_none();
+                    if done {
+                        items.push(crate::replication::ShipItem {
+                            kind: crate::replication::SHIP_CAUGHT_UP,
+                            key: String::new(),
+                            ts: upto,
+                            doc: None,
+                        });
+                    }
+                    sh.push_catchup(&url, items, next, done);
+                    cut += 1;
+                }
+                Err(e) => crate::log::warn(
+                    "catchup_not_cut",
+                    &[
+                        ("collection", name.clone()),
+                        ("shard", idx.to_string()),
+                        ("error", e.to_string()),
+                    ],
+                ),
+            }
+        }
+        cut
+    }
+
+    /// The followed copies, shared with the wire.
+    pub fn followed(&self) -> Followed {
+        self.followed.clone()
+    }
+
+    /// `PROMOTE SHARD i OF c ON 'node'`: the follower named becomes the
+    /// holder at the next term, and the holder it replaces a follower. Made
+    /// on the node promoted -- the statement goes there from wherever it
+    /// was issued -- which then carries the map at the new term to every
+    /// peer: a peer takes the higher term, and the old holder, when it
+    /// hears (now, or from a catalog at the next sweep), demotes its copy
+    /// to a follower's and is caught up from the new holder, which drops
+    /// whatever it took that was never confirmed. Writes the old holder
+    /// takes meanwhile are never acknowledged, since its follower -- the
+    /// node promoted -- answers its log with the new term.
+    pub fn promote_shard(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        node: &str,
+        term: Option<u64>,
+        local: bool,
+    ) -> Result<Outcome> {
+        let _deadline = self.arm_default_deadline();
+        crate::wire::parse_url(node)?;
+        self.catalog.get(collection)?;
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let Some(t) = tablets.get(shard).cloned() else {
+            return Err(Error::Plan(format!(
+                "`{collection}` has {} shard(s); there is no shard {shard}",
+                tablets.len()
+            )));
+        };
+        if t.is_merged() {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` was merged away and owns no key"
+            )));
+        }
+        if !local {
+            if t.node == node || (self.is_self(&t.node) && self.is_self(node)) {
+                return Err(Error::Plan(format!(
+                    "shard {shard} of `{collection}` is already held by {node}"
+                )));
+            }
+            if !t.followed_by(node) {
+                return Err(Error::Plan(format!(
+                    "{node} does not follow shard {shard} of `{collection}` (its followers: {}); \
+                     only a follower can be promoted",
+                    if t.followers.is_empty() {
+                        "none".to_string()
+                    } else {
+                        t.followers.join(", ")
+                    }
+                )));
+            }
+        }
+        let new_term = match term {
+            Some(n) => n,
+            None => t.term + 1,
+        };
+        if local && new_term <= t.term {
+            return Ok(Outcome::Ack(format!(
+                "shard {shard} of `{collection}` is at term {} already",
+                t.term
+            )));
+        }
+        if !self.is_self(node) {
+            if local {
+                // The promoted node's word: the map, and this node's copy
+                // demoted if it held the shard.
+                let held =
+                    self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == shard));
+                let mut new = tablets.clone();
+                new[shard] = Self::promoted_tablet(&t, node, new_term);
+                self.catalog.placement.insert(collection.to_string(), new);
+                if held {
+                    self.demote_here(collection, shard)?;
+                }
+                self.persist_catalog()?;
+                return Ok(Outcome::Ack(format!(
+                    "shard {shard} of `{collection}` is held by {node} at term {new_term}{}",
+                    if held { "; this node's copy follows it" } else { "" }
+                )));
+            }
+            let conn = self.node_conn(node)?;
+            let sql =
+                format!("LOCAL PROMOTE SHARD {shard} OF {collection} ON '{node}' TERM {new_term}");
+            let remaining = crate::deadline::remaining_ms();
+            return Ok(Outcome::Deferred(Deferred::new(move || {
+                let _deadline = crate::deadline::arm(remaining);
+                Ok(Outcome::Ack(conn.statement(&sql, &[])?))
+            })));
+        }
+        // This node is promoted: its copy becomes the shard, then everyone
+        // hears.
+        self.promote_here(collection, shard, &t, new_term)?;
+        let new = self.catalog.placement.get(collection).cloned().unwrap_or_default();
+        let peers = self.every_peer(&new)?;
+        let switch = Switch {
+            sql: format!("PROMOTE SHARD {shard} OF {collection} ON '{node}' TERM {new_term}"),
+            peers,
+        };
+        let ack = format!(
+            "shard {shard} of `{collection}` promoted here at term {new_term} (was on {}); {} follow it",
+            t.node,
+            if new[shard].followers.is_empty() { "none".to_string() } else { new[shard].followers.join(", ") }
+        );
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let switched = Db::carry_switch(&switch);
+            Ok(Outcome::Ack(format!("{ack}; {switched}")))
+        })))
+    }
+
+    /// The map entry after a promotion: the node promoted holds, the old
+    /// holder follows, the term raised.
+    fn promoted_tablet(t: &Tablet, node: &str, term: u64) -> Tablet {
+        let mut followers: Vec<String> =
+            t.followers.iter().filter(|f| *f != node).cloned().collect();
+        if !t.node.is_empty() && t.node != node && !followers.contains(&t.node) {
+            followers.push(t.node.clone());
+        }
+        Tablet { node: node.to_string(), lo: t.lo.clone(), hi: t.hi.clone(), term, followers }
+    }
+
+    /// This node's followed copy becomes the shard: the directory moves
+    /// beside the held ones (the files keep their names, and so their
+    /// keys), the shard opens from it, the map says so.
+    fn promote_here(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        t: &Tablet,
+        term: u64,
+    ) -> Result<()> {
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| Error::Plan("a promotion needs a persistent database (--dir)".into()))?;
+        let copy = self
+            .followed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(collection.to_string(), shard));
+        let Some(mut copy) = copy else {
+            return Err(Error::Plan(format!(
+                "this node has no copy of shard {shard} of `{collection}` to promote"
+            )));
+        };
+        let (caught_up, at) = (copy.shard.caught_up, copy.shard.ship_ts);
+        copy.shard.retire_all();
+        drop(copy);
+        let cdir = dir.join("collections").join(collection);
+        let from = cdir.join("followed").join(format!("shard-{shard:04}"));
+        let to = cdir.join(format!("shard-{shard:04}"));
+        if to.exists() {
+            fs::remove_dir_all(&to)?;
+        }
+        fs::rename(&from, &to)?;
+        crate::shard::sync_dir(&cdir)?;
+        let def = self.catalog.get(collection)?.clone();
+        let (lo, hi) = read_range(&self.cipher, &to, shard, collection)?;
+        let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
+        sh.set_key_range(lo, hi);
+        sh.index = shard;
+        let v = self.shards.entry(collection.to_string()).or_default();
+        v.push(sh);
+        v.sort_by_key(|s| s.index);
+        let me = self.opts.node.clone().unwrap_or_default();
+        let mut new = self.catalog.placement.get(collection).cloned().unwrap_or_default();
+        new[shard] = Self::promoted_tablet(t, &me, term);
+        self.catalog.placement.insert(collection.to_string(), new);
+        self.absorb_shard_catalogs(collection)?;
+        crate::log::info(
+            "promoted",
+            &[
+                ("collection", collection.to_string()),
+                ("shard", shard.to_string()),
+                ("term", term.to_string()),
+                (
+                    "copy",
+                    if caught_up {
+                        format!("caught up to ts {at}")
+                    } else {
+                        "not caught up".into()
+                    },
+                ),
+            ],
+        );
+        self.persist_catalog()
+    }
+
+    /// This node's held shard becomes a followed copy: the directory moves
+    /// under `followed/`, the copy opens from it not caught up, so the new
+    /// holder starts it from nothing -- what this node took after the
+    /// promotion was never confirmed, and goes.
+    fn demote_here(&mut self, collection: &str, shard: usize) -> Result<()> {
+        let Some(dir) = self.dir.clone() else { return Ok(()) };
+        let mut gone = Vec::new();
+        if let Some(v) = self.shards.get_mut(collection) {
+            let mut keep = Vec::new();
+            for s in v.drain(..) {
+                if s.index == shard {
+                    gone.push(s);
+                } else {
+                    keep.push(s);
+                }
+            }
+            *v = keep;
+        }
+        if self.shards.get(collection).is_some_and(|v| v.is_empty()) {
+            self.shards.remove(collection);
+        }
+        self.abort_move(collection, shard);
+        for mut s in gone {
+            if let Some(sh) = s.shipper.take() {
+                sh.stop();
+            }
+            s.retire_all();
+        }
+        let cdir = dir.join("collections").join(collection);
+        let from = cdir.join(format!("shard-{shard:04}"));
+        let to = cdir.join("followed").join(format!("shard-{shard:04}"));
+        fs::create_dir_all(cdir.join("followed"))?;
+        if to.exists() {
+            fs::remove_dir_all(&to)?;
+        }
+        if from.exists() {
+            fs::rename(&from, &to)?;
+        }
+        crate::shard::sync_dir(&cdir)?;
+        let term = self
+            .catalog
+            .placement
+            .get(collection)
+            .and_then(|v| v.get(shard))
+            .map(|t| t.term)
+            .unwrap_or(0);
+        if to.exists() {
+            let def = self.catalog.get(collection)?.clone();
+            let (lo, hi) = read_range(&self.cipher, &to, shard, collection)?;
+            let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
+            sh.set_key_range(lo, hi);
+            sh.index = shard;
+            sh.caught_up = false;
+            sh.ship_ts = 0;
+            self.followed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert((collection.to_string(), shard), FollowedShard { shard: sh, term });
+        }
+        crate::log::info(
+            "demoted",
+            &[
+                ("collection", collection.to_string()),
+                ("shard", shard.to_string()),
+                ("term", term.to_string()),
+            ],
+        );
+        Ok(())
+    }
+
+    /// The steward: the node named, or the lowest address among the nodes
+    /// this one knows and itself. None for a node with no address.
+    pub fn steward(&self) -> Option<String> {
+        if let Some(s) = &self.opts.steward {
+            return Some(s.clone());
+        }
+        let me = self.opts.node.clone()?;
+        let mut all: Vec<String> = self.catalog.nodes.to_vec();
+        all.push(me);
+        all.into_iter().min()
+    }
+
+    pub fn auto_failover(&self) -> bool {
+        self.opts.auto_failover
+    }
+
+    /// The holder of a shard, as the map says.
+    pub fn holder_of(&self, collection: &str, shard: usize) -> Option<String> {
+        self.catalog.placement.get(collection).and_then(|v| v.get(shard)).map(|t| t.node.clone())
+    }
+
+    pub fn is_steward(&self) -> bool {
+        self.steward().is_some_and(|s| self.is_self(&s))
+    }
+
+    /// The lease, shared with the wire.
+    pub fn lease(&self) -> Lease {
+        self.lease.clone()
+    }
+
+    /// A write is refused under automatic failover once the steward's
+    /// lease on this node ran out: a holder the steward cannot reach may
+    /// be replaced, and must not take writes meanwhile.
+    fn lease_check(&self) -> Result<()> {
+        if !self.opts.auto_failover || self.is_steward() {
+            return Ok(());
+        }
+        let Some(steward) = self.steward() else { return Ok(()) };
+        let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = g
+            .at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(self.opts.lease_secs));
+        if fresh {
+            return Ok(());
+        }
+        Err(Error::Plan(format!(
+            "this node's lease from the steward {steward} {}; writes are refused until it is \
+             renewed (automatic failover is on; the steward may be promoting a follower)",
+            match g.at {
+                Some(at) => format!(
+                    "ran out {} s ago",
+                    at.elapsed().as_secs().saturating_sub(self.opts.lease_secs)
+                ),
+                None => "was never granted".to_string(),
+            }
+        )))
+    }
+
+    /// The steward's word about who it is, kept beside the lease so a
+    /// renewal is checked without the lock.
+    fn refresh_lease_steward(&mut self) {
+        let s = self.steward();
+        self.lease.lock().unwrap_or_else(|p| p.into_inner()).steward = s;
+    }
+
+    /// For the steward: the shards whose holder is not among `answered`,
+    /// with the followers that are -- what an automatic failover promotes
+    /// from.
+    pub fn failover_plan(&self, answered: &[String]) -> Vec<(String, usize, u64, Vec<String>)> {
+        let mut out = Vec::new();
+        for (name, tablets) in &self.catalog.placement {
+            for (i, t) in tablets.iter().enumerate() {
+                if t.is_merged() || self.is_self(&t.node) || answered.contains(&t.node) {
+                    continue;
+                }
+                let up: Vec<String> = t
+                    .followers
+                    .iter()
+                    .filter(|f| answered.contains(f) || self.is_self(f))
+                    .cloned()
+                    .collect();
+                if !up.is_empty() {
+                    out.push((name.clone(), i, t.term, up));
+                }
+            }
+        }
+        out
+    }
+
     /// Every node this one knows, other than itself, with a connection:
     /// the holders, the nodes and coordinators the catalog names, and the
     /// peers that attached.
@@ -3663,7 +4519,13 @@ impl Db {
         let Some(t) = tablets.get_mut(shard) else {
             return Err(Error::Plan(format!("`{collection}` has no shard {shard}")));
         };
-        t.node = node.to_string();
+        // The new holder was a follower, or was not; the old holder follows
+        // from here on, so a move keeps the copies where they are.
+        let prev = std::mem::replace(&mut t.node, node.to_string());
+        t.followers.retain(|f| f != node);
+        if !prev.is_empty() && prev != node && !t.followers.contains(&prev) {
+            t.followers.push(prev);
+        }
         let held = self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == shard));
         if self.is_self(node) {
             if !held {
@@ -3699,6 +4561,7 @@ impl Db {
                 }
             }
         }
+        self.ensure_followed(collection)?;
         self.persist_catalog()
     }
 
@@ -3761,6 +4624,9 @@ impl Db {
                 s.adopt_catalog(coll.clone())?;
             }
         }
+        for f in followed_of(&self.followed, collection).iter_mut() {
+            f.shard.adopt_catalog(coll.clone())?;
+        }
         // A new index changes where this collection's segments belong: the
         // resolved tier of a segment is the coldest tier over the indexes it
         // holds, so adding a cached or active index to a collection whose
@@ -3814,6 +4680,12 @@ impl Db {
     }
 
     fn persist_catalog(&mut self) -> Result<()> {
+        self.refresh_lease_steward();
+        let names: Vec<String> = self.catalog.placement.keys().cloned().collect();
+        for n in names {
+            self.ensure_followed(&n)?;
+        }
+        self.refresh_shippers();
         if let Some(dir) = &self.dir {
             let bytes = self.persisted_catalog().encode();
             let p = dir.join("CATALOG");
@@ -3927,6 +4799,15 @@ impl Db {
     /// statement order within a shard; the last timestamp is what the
     /// acknowledgement names.
     pub fn insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
+        self.insert_many_local(collection, docs)
+    }
+
+    /// The embedded write: durable here when it returns, the followers'
+    /// confirmation left in [`confirmation`](Self::confirmation) for the
+    /// caller to wait on with the lock let go -- a wait under the lock
+    /// would hold the very driver that feeds the followers. A statement
+    /// through `execute` waits for it as deferred work.
+    fn insert_many_local(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
         let _deadline = self.arm_default_deadline();
         let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
         let mut last = self.last_commit;
@@ -3954,17 +4835,25 @@ impl Db {
             }
         }
         let chunk = self.opts.insert_batch.max(1);
+        if !here.is_empty() {
+            self.lease_check()?;
+        }
         for (idx, mut batch) in here {
             self.wait_for_compaction(collection, idx);
             while !batch.is_empty() {
                 let tail = batch.split_off(batch.len().min(chunk));
-                let stamps = {
+                let (stamps, index) = {
                     let shards = self.shards.get_mut(collection).expect("checked above");
-                    shards[idx].insert_many(batch)?
+                    (shards[idx].insert_many(batch)?, shards[idx].index)
                 };
+                let mut chunk_last = 0;
                 for ts in stamps {
                     self.note_write(collection, ts);
                     last = last.max(ts);
+                    chunk_last = chunk_last.max(ts);
+                }
+                if chunk_last > 0 {
+                    self.recent_writes.push((collection.to_string(), index, chunk_last));
                 }
                 batch = tail;
             }
@@ -4051,6 +4940,7 @@ impl Db {
             )));
         }
         self.refuse_if_moving(collection, &key)?;
+        self.lease_check()?;
         let shards = self
             .shards
             .get_mut(collection)
@@ -4060,7 +4950,9 @@ impl Db {
             .position(|s| s.owns(&key))
             .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
         let ts = shards[idx].insert(doc)?;
+        let index = shards[idx].index;
         self.note_write(collection, ts);
+        self.recent_writes.push((collection.to_string(), index, ts));
         Ok(ts)
     }
 
@@ -4110,6 +5002,7 @@ impl Db {
             )));
         }
         self.refuse_if_moving(collection, key)?;
+        self.lease_check()?;
         let shards = self
             .shards
             .get_mut(collection)
@@ -4117,7 +5010,9 @@ impl Db {
         for s in shards.iter_mut() {
             if s.owns(key) {
                 if let Some(ts) = s.delete(key)? {
+                    let idx = s.index;
                     self.note_write(collection, ts);
+                    self.recent_writes.push((collection.to_string(), idx, ts));
                     return Ok(true);
                 }
             }
@@ -4818,7 +5713,8 @@ impl Db {
                 }
             }
         }
-        if away.is_empty() {
+        let confirm = self.confirmation();
+        if away.is_empty() && confirm.is_empty() {
             return Ok(Outcome::Ack(format!("{n} document(s) deleted")));
         }
         let collection = d.collection.clone();
@@ -4826,6 +5722,7 @@ impl Db {
         let dialer = self.dialer();
         Ok(Outcome::Deferred(Deferred::new(move || {
             let n = n + carry_deletes(&collection, away, remaining, &dialer)?;
+            confirm.wait()?;
             Ok(Outcome::Ack(format!("{n} document(s) deleted")))
         })))
     }
@@ -4963,6 +5860,9 @@ impl Db {
         if let Statement::MergeShards { collection, a, b } = &stmt {
             return self.merge_shards(collection, *a, *b, local);
         }
+        if let Statement::PromoteShard { collection, shard, node, term } = &stmt {
+            return self.promote_shard(collection, *shard, node, *term, local);
+        }
         let out = self.run_one(stmt, sql, params, analyze)?;
         if holders.is_empty() {
             return Ok(out);
@@ -5067,7 +5967,8 @@ impl Db {
                         not_null: col.not_null,
                     });
                 }
-                let tablets = self.plan_tablets(&c.splits, &c.nodes)?;
+                coll.replicas = c.replicas.unwrap_or(DEFAULT_REPLICAS) as u8;
+                let tablets = self.plan_tablets(&c.splits, &c.nodes, coll.replicas as usize)?;
                 let n = tablets.len();
                 let mut nodes: Vec<&str> = tablets.iter().map(|t| t.node.as_str()).collect();
                 nodes.sort();
@@ -5119,9 +6020,10 @@ impl Db {
                 let (here, away) = self.split_by_holder(&i.collection, i.docs)?;
                 let mut last = self.last_commit;
                 if !here.is_empty() {
-                    last = last.max(self.insert_many(&i.collection, here)?);
+                    last = last.max(self.insert_many_local(&i.collection, here)?);
                 }
-                if away.is_empty() {
+                let confirm = self.confirmation();
+                if away.is_empty() && confirm.is_empty() {
                     return Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")));
                 }
                 let collection = i.collection.clone();
@@ -5129,6 +6031,7 @@ impl Db {
                 let dialer = self.dialer();
                 Ok(Outcome::Deferred(Deferred::new(move || {
                     let last = carry_writes(&collection, away, last, remaining, &dialer)?;
+                    confirm.wait()?;
                     Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
                 })))
             }
@@ -5236,10 +6139,20 @@ impl Db {
                                 continue;
                             }
                             out.push_str(&format!(
-                                "  shard {i} on {} [{}, {})\n",
+                                "  shard {i} on {} [{}, {}){}{}\n",
                                 if self.is_self(&t.node) { "this node" } else { t.node.as_str() },
                                 t.lo.as_deref().unwrap_or(""),
-                                t.hi.as_deref().unwrap_or("")
+                                t.hi.as_deref().unwrap_or(""),
+                                if t.followers.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" followed by {}", t.followers.join(", "))
+                                },
+                                if t.term > 0 {
+                                    format!(" term {}", t.term)
+                                } else {
+                                    String::new()
+                                }
                             ));
                         }
                     }
@@ -5299,8 +6212,12 @@ impl Db {
                     tier.name()
                 )))
             }
-            Statement::AlterCollection { collection, prefix_expansion, nodes_of } => {
+            Statement::AlterCollection { collection, prefix_expansion, replicas, nodes_of } => {
                 let mut acks = Vec::new();
+                if let Some(n) = replicas {
+                    let placed = self.set_replicas(&collection, n)?;
+                    acks.push(format!("replicas {placed} -> {n}"));
+                }
                 if let Some(cap) = prefix_expansion {
                     let from = self.set_prefix_expansion(&collection, cap)?;
                     acks.push(format!(
@@ -5356,6 +6273,9 @@ impl Db {
                 Statement::MergeShards { collection, a, b } => {
                     self.merge_shards(&collection, a, b, true)
                 }
+                Statement::PromoteShard { collection, shard, node, term } => {
+                    self.promote_shard(&collection, shard, &node, term, true)
+                }
                 other => self.run_one(other, sql, params, analyze),
             },
             Statement::SplitShard { collection, shard, at } => {
@@ -5363,6 +6283,9 @@ impl Db {
             }
             Statement::MergeShards { collection, a, b } => {
                 self.merge_shards(&collection, a, b, false)
+            }
+            Statement::PromoteShard { collection, shard, node, term } => {
+                self.promote_shard(&collection, shard, &node, term, false)
             }
             Statement::DropIndex { collection, index } => {
                 self.drop_index(&collection, &index)?;
@@ -6672,8 +7595,20 @@ fn read_range(
     i: usize,
     name: &str,
 ) -> Result<(Option<String>, Option<String>)> {
+    read_range_at(cipher, sdir, &format!("shard-{i:04}"), name)
+}
+
+/// `RANGE` of the shard directory named `dirname` (`shard-NNNN` or
+/// `follow-NNNN`), sealed under that name.
+fn read_range_at(
+    cipher: &crate::cipher::Shared,
+    sdir: &Path,
+    dirname: &str,
+    name: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let i = dirname;
     let bytes =
-        crate::shard::read_content(cipher, &format!("shard-{i:04}/RANGE"), &sdir.join("RANGE"))
+        crate::shard::read_content(cipher, &format!("{dirname}/RANGE"), &sdir.join("RANGE"))
             .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?
             .ok_or_else(|| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE is missing")))?;
     let ranges = String::from_utf8_lossy(&bytes).to_string();
@@ -6779,6 +7714,148 @@ pub struct SealJob {
 impl SealJob {
     pub fn describe(&self) -> String {
         format!("seal of shard {} of `{}`: {:?}", self.shard, self.collection, self.ticket)
+    }
+}
+
+/// Copies of every shard unless a collection says otherwise: the holder
+/// and one follower.
+pub const DEFAULT_REPLICAS: usize = 2;
+
+/// Rows per catch-up chunk.
+const CATCHUP_CHUNK: usize = 2000;
+
+/// The steward's lease on this node: when it was last renewed and by
+/// whom it may be, shared with the wire.
+pub struct LeaseState {
+    pub at: Option<std::time::Instant>,
+    pub steward: Option<String>,
+}
+
+pub type Lease = Arc<Mutex<LeaseState>>;
+
+/// A renewal from `from`: taken when `from` is the steward this node
+/// expects.
+pub fn renew_lease(lease: &Lease, from: &str) -> Result<()> {
+    let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+    match &g.steward {
+        Some(s) if s == from => {
+            g.at = Some(std::time::Instant::now());
+            Ok(())
+        }
+        Some(s) => Err(Error::Plan(format!("{from} is not the steward this node expects ({s})"))),
+        None => Err(Error::Plan("this node has no steward".into())),
+    }
+}
+
+/// A copy this node follows, and the term it follows at.
+pub struct FollowedShard {
+    pub shard: Shard,
+    pub term: u64,
+}
+
+/// The followed copies by `(collection, shard)`, behind a lock of their
+/// own: the wire applies a holder's batch under this lock and no other.
+pub type Followed = Arc<Mutex<BTreeMap<(String, usize), FollowedShard>>>;
+
+/// The followed copies of one collection, for a definition that reaches
+/// them; a guard with the lock.
+fn followed_of<'a>(f: &'a Followed, collection: &str) -> FollowedOf<'a> {
+    let guard = f.lock().unwrap_or_else(|p| p.into_inner());
+    let keys: Vec<(String, usize)> =
+        guard.keys().filter(|(c, _)| c == collection).cloned().collect();
+    FollowedOf { guard, keys }
+}
+
+struct FollowedOf<'a> {
+    guard: MutexGuard<'a, BTreeMap<(String, usize), FollowedShard>>,
+    keys: Vec<(String, usize)>,
+}
+
+impl FollowedOf<'_> {
+    fn iter_mut(&mut self) -> Vec<&mut FollowedShard> {
+        let keys = self.keys.clone();
+        let mut out = Vec::new();
+        // Distinct keys, so the mutable borrows are disjoint.
+        let map: *mut BTreeMap<(String, usize), FollowedShard> = &mut *self.guard;
+        for k in keys {
+            // SAFETY: each key is looked up once and the keys are distinct,
+            // so no two references alias.
+            if let Some(f) = unsafe { (*map).get_mut(&k) } {
+                out.push(f);
+            }
+        }
+        out
+    }
+}
+
+/// A batch of a holder's log into a copy this node follows, at the
+/// holder's term, under the followed copies' lock alone; where the copy
+/// stands. The first item may say to start from nothing.
+pub fn apply_shipped(
+    followed: &Followed,
+    collection: &str,
+    shard: usize,
+    term: u64,
+    items: &[crate::replication::ShipItem],
+) -> Result<(bool, Timestamp)> {
+    let mut g = followed.lock().unwrap_or_else(|p| p.into_inner());
+    let f = g.get_mut(&(collection.to_string(), shard)).ok_or_else(|| {
+        Error::Plan(format!("this node does not follow shard {shard} of `{collection}`"))
+    })?;
+    if f.term != term {
+        return Err(Error::Plan(format!(
+            "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
+            f.term
+        )));
+    }
+    let rest = match items.first() {
+        Some(it) if it.kind == crate::replication::SHIP_RESET => {
+            f.shard.reset_copy()?;
+            &items[1..]
+        }
+        _ => items,
+    };
+    f.shard.apply_shipped(rest)
+}
+
+/// Where a copy this node follows stands.
+pub fn follower_status(
+    followed: &Followed,
+    collection: &str,
+    shard: usize,
+    term: u64,
+) -> Result<(bool, Timestamp)> {
+    let g = followed.lock().unwrap_or_else(|p| p.into_inner());
+    let f = g.get(&(collection.to_string(), shard)).ok_or_else(|| {
+        Error::Plan(format!("this node does not follow shard {shard} of `{collection}`"))
+    })?;
+    if f.term != term {
+        return Err(Error::Plan(format!(
+            "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
+            f.term
+        )));
+    }
+    Ok((f.shard.caught_up, f.shard.ship_ts))
+}
+
+/// What a write statement waits for before it is acknowledged: each shard
+/// it wrote, at the instant it wrote, confirmed by that shard's followers.
+pub struct Confirmation {
+    waits: Vec<(Arc<crate::replication::Shipper>, Timestamp)>,
+    budget: Option<u64>,
+}
+
+impl Confirmation {
+    pub fn is_empty(&self) -> bool {
+        self.waits.is_empty()
+    }
+
+    /// Wait for every confirmation, within the statement's budget.
+    pub fn wait(&self) -> Result<()> {
+        for (sh, ts) in &self.waits {
+            sh.wait(*ts, self.budget)?;
+        }
+        Ok(())
     }
 }
 
@@ -7090,6 +8167,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Restore { .. } => "RESTORE",
         Statement::SplitShard { .. } => "SPLIT SHARD",
         Statement::MergeShards { .. } => "MERGE SHARDS",
+        Statement::PromoteShard { .. } => "PROMOTE SHARD",
         Statement::VerifyBackup { .. } => "VERIFY BACKUP",
         _ => "this statement",
     }

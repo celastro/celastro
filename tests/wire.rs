@@ -1837,7 +1837,7 @@ fn shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median() {
         let r = n.query("SELECT count(*) AS n FROM items").unwrap();
         assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(40), "{}", n.url);
         let h = n.ack("SHOW HEALTH");
-        assert!(!h.contains("shard 1 of"), "{h}");
+        assert!(!h.contains("shard 1 of `items`: on"), "{h}");
     }
     // A split with no key, issued away from the holder: the holder's median.
     let m = b.ack("SPLIT SHARD 0 OF items");
@@ -1853,6 +1853,168 @@ fn shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median() {
     let r = b.query("SELECT count(*) AS n FROM items WHERE n >= 20").unwrap();
     assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(20));
     for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Every shard has a follower by default, and a write is acknowledged
+/// once the follower has it on disk: the health names the follower live
+/// and confirmed to the write's instant. A follower away degrades the
+/// acknowledgement to this node's disk alone -- the health says so -- and
+/// the follower is caught up when it returns, its copy whole again.
+#[test]
+fn a_write_is_confirmed_on_the_follower_and_a_follower_away_is_caught_up_on_return() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("rep-a");
+    let b = Node::start("rep-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    let m = a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'])");
+    assert!(m.contains("2 shard(s)"), "{m}");
+    let cat = a.ack("SHOW CATALOG items");
+    assert!(cat.contains(&format!("shard 0 on this node [, m) followed by {}", b.url)), "{cat}");
+    assert!(cat.contains(&format!("shard 1 on {} [m, ) followed by {}", b.url, a.url)), "{cat}");
+    for i in 0..40usize {
+        let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
+    }
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains(&format!("shard 0 of `items`: follower {} live", b.url)), "{h}");
+    assert!(h.contains("follows shard 1 of `items` at term 0: caught up"), "{h}");
+    assert!(b.dir.join("collections/items/followed/shard-0000").exists());
+    // The follower goes away: writes to shard 0 are acknowledged on a
+    // alone, and the health says it.
+    let (b_port, b_dir) =
+        (b.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), b.dir.clone());
+    drop(b);
+    settle();
+    let t0 = std::time::Instant::now();
+    for i in 40..60usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(25),
+        "degraded writes did not wait a deadline each"
+    );
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("DEGRADED"), "{h}");
+    // Back: caught up from where it stood, live again, and a write is
+    // confirmed on it once more.
+    let b = Node::start_at("rep-b", b_port, Some(b_dir));
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    let mut live = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let h = a.ack("SHOW HEALTH");
+        if h.contains(&format!("shard 0 of `items`: follower {} live", b.url))
+            && !h.contains("DEGRADED")
+        {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "{}", a.ack("SHOW HEALTH"));
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0099","n":99}')"#);
+    let h = b.ack("SHOW HEALTH");
+    assert!(h.contains("follows shard 0 of `items` at term 0: caught up"), "{h}");
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A holder lost: its follower is promoted and answers every acknowledged
+/// row at the next term; the old holder, back, hears the term at its
+/// attach, demotes its copy and follows the new holder, and a write
+/// through it lands on the new holder and is confirmed on the old one.
+#[test]
+fn a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("pro-a");
+    let b = Node::start("pro-b");
+    let c = Node::start("pro-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    for i in 0..40usize {
+        let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
+    }
+    let e = a.exec(&format!("PROMOTE SHARD 0 OF items ON '{}'", c.url)).unwrap_err().to_string();
+    assert!(e.contains("does not follow"), "{e}");
+    // a, the holder of shard 0, is lost.
+    let (a_port, a_dir) =
+        (a.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), a.dir.clone());
+    let a_url = a.url.clone();
+    drop(a);
+    settle();
+    b.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    let e = b
+        .exec(r#"INSERT INTO items VALUES ('{"id":"d0900","n":900}')"#)
+        .unwrap()
+        .finished_with(&b.db)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("did not answer") || e.contains("deadline"), "{e}");
+    b.db.write().unwrap().opts.statement_deadline_ms = Some(30_000);
+    // Promoted at b itself (c, attached but holding nothing of `items`,
+    // never got the definition).
+    let m = b.ack(&format!("PROMOTE SHARD 0 OF items ON '{}'", b.url));
+    assert!(m.contains("promoted here at term 1") && m.contains(&a_url), "{m}");
+    settle();
+    let cat = b.ack("SHOW CATALOG items");
+    assert!(
+        cat.contains(&format!("shard 0 on this node [, m) followed by {a_url} term 1")),
+        "{cat}"
+    );
+    let r = b.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(40));
+    assert_eq!(b.local_shards("items"), vec![0, 1]);
+    // Writes flow again, acknowledged on b alone while a is away.
+    b.ack(r#"INSERT INTO items VALUES ('{"id":"d0900","n":900}')"#);
+    let h = b.ack("SHOW HEALTH");
+    assert!(
+        h.contains(&format!("shard 0 of `items`: follower {}", a_url)) && h.contains("DEGRADED"),
+        "{h}"
+    );
+    // a returns with its old map, attaches, hears term 1, and follows.
+    let a = Node::start_at("pro-a", a_port, Some(a_dir));
+    assert_eq!(a.local_shards("items"), vec![0], "opened as it was left");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    assert_eq!(a.local_shards("items"), Vec::<usize>::new(), "demoted at the attach");
+    let cat = a.ack("SHOW CATALOG items");
+    assert!(
+        cat.contains(&format!("shard 0 on {} [, m) followed by {} term 1", b.url, a.url)),
+        "{cat}"
+    );
+    assert!(a.dir.join("collections/items/followed/shard-0000").exists());
+    let mut live = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let h = b.ack("SHOW HEALTH");
+        if h.contains(&format!("shard 0 of `items`: follower {} live", a.url)) {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "{}", b.ack("SHOW HEALTH"));
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0901","n":901}')"#);
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("follows shard 0 of `items` at term 1: caught up"), "{h}");
+    for n in [&a, &b] {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(42), "{}", n.url);
+    }
+    for n in [a, b, c] {
         let d = n.dir.clone();
         drop(n);
         settle();

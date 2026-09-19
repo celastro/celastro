@@ -30,7 +30,9 @@ collection `notes` created with 1 shard(s)
 `PARTITION BY (col)` prefixes every key with that column, so a predicate
 on it prunes shards; `splits = [...]` fixes the key ranges of the shards
 (two splits, three shards) and cannot be changed later; `nodes = [...]`
-names the nodes the shards go to (below); `nodes_of` says an edge
+names the nodes the shards go to (below); `replicas = n` is how many
+copies each shard has, the holder and `n - 1` followers (two by
+default; `ALTER COLLECTION ... SET (replicas = n)` re-plans them); `nodes_of` says an edge
 collection points into a node collection; `undirected = true` follows
 its edges both ways; `prefix_expansion` caps how many dictionary terms a
 `text_match` prefix expands to (512).
@@ -382,7 +384,9 @@ path that leaves it.
 `ATTACH NODE` makes a peer known (or `CELASTRO_ATTACH` at start);
 `DETACH NODE` forgets one, refusing while it holds shards. A collection
 created with more shards than one goes shard `i` to the `i`-th attached
-node, wrapping, or to `WITH (nodes = [...])`. Every holder carries the
+node, wrapping, or to `WITH (nodes = [...])`, and the next node follows
+it: a copy fed by the holder's log, on which every write is confirmed
+before the client hears of it. Every holder and follower carries the
 definition and the placement, so any node coordinates any statement.
 
 ```sql
@@ -397,18 +401,38 @@ SHOW HEALTH;
 node tcp://127.0.0.1:23522 attached
 collection `notes` created with 3 shard(s) on tcp://127.0.0.1:23521, tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
 index `notes_body` created on the active tier; and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
-this node: tcp://127.0.0.1:23521, data, celastro 0.55.0, 1 collection(s), 1 shard(s) held, directory present
-node tcp://127.0.0.1:23522: up, data, celastro 0.55.0, 0 ms, clock -0.0 s
-node tcp://127.0.0.1:23523: up, data, celastro 0.55.0, 0 ms, clock -0.0 s
+this node: tcp://127.0.0.1:23521, data, celastro 0.58.0, 1 collection(s), 1 shard(s) held, directory present
+node tcp://127.0.0.1:23522: up, data, celastro 0.58.0, 0 ms, clock -0.0 s
+node tcp://127.0.0.1:23523: up, data, celastro 0.58.0, 0 ms, clock -0.0 s
 shard 0 of `notes`: on tcp://127.0.0.1:23521, reachable
 shard 1 of `notes`: on tcp://127.0.0.1:23522, reachable
 shard 2 of `notes`: on tcp://127.0.0.1:23523, reachable
+steward: tcp://127.0.0.1:23521 (this node); automatic failover off
+shard 0 of `notes`: follower tcp://127.0.0.1:23522 live, confirmed to ts 7331216705097039872, 0 behind
+follows shard 2 of `notes` at term 0: caught up to ts 7331216705237512192
 3 of 3 node(s) answer; 0 shard(s) unreachable
 ```
 
 `SHOW HEALTH` names every node with its role, whether it answers, its
 clock against this one, whether an older process still answers at its
-address, and every shard with whether its holder does.
+address, every shard with whether its holder does, the steward, every
+follower of a shard held here with its state (`live`, `catching up`,
+`asking` -- and `DEGRADED` when a follower away leaves a write on this
+disk alone), and every copy this node follows.
+
+`PROMOTE SHARD i OF c ON 'follower'` makes a follower the holder at the
+next term -- what to run when a holder is lost, from any node; the
+follower answers every acknowledged row -- and the old holder, back,
+demotes its copy and follows. With `CELASTRO_AUTO_FAILOVER=on` the
+steward does it once a holder has missed two sweeps.
+
+```sql
+PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:23523';
+```
+
+```
+shard 1 of `notes` promoted here at term 1 (was on tcp://127.0.0.1:23522); tcp://127.0.0.1:23522 follow it; map switched here and on tcp://127.0.0.1:23521; not on tcp://127.0.0.1:23522: ...
+```
 
 `MOVE SHARD` carries a shard to another node without stopping the
 collection: the source pins it (writes to it are refused meanwhile,

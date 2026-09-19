@@ -182,12 +182,17 @@ run "merge the shards" 'shard 1 is \[m, t\).*shard 3 owns no key' "$CEL" send $A
 run "the count is whole after the split" '"count\(\*\)":3' "$CEL" send $C "SELECT count(*) FROM notes"
 run "place shard (repair, here a no-op)" 'placed' "$CEL" send $A "LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:23521'"
 run "a cluster backup at one instant" 'backed up|instant|AS OF' "$CEL" send $A "BACKUP CLUSTER TO '$W/cluster-backups'"
-run "detach refused while the node holds a shard" 'holds 1 shard' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
-run "move its shard away first" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'"
-run "detach node" 'detached' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
+run "every shard has a follower" 'followed by tcp://127.0.0.1:2352' "$CEL" send $A "SHOW CATALOG notes"
+run "a write is confirmed on the follower" 'follower tcp://127.0.0.1:2352[0-9]* live' "$CEL" send $A "SHOW HEALTH"
 kill "${NODE_PIDS[1]}"; sleep 0.5
 run "partial results when a node is gone" 'missing":\["shard 1"\]' "$CEL" send $A "SELECT count(*) FROM notes WITH (partial_results, deadline_ms = 3000)"
 run "without partial results, refused naming the node" 'did not answer|deadline' "$CEL" send $A "SELECT count(*) FROM notes WITH (deadline_ms = 2000)"
+run "promote its follower" 'promoted here at term 1' "$CEL" send $A "PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:23523'"
+run "the count is whole again" '"count\(\*\)":3' "$CEL" send $A "SELECT count(*) FROM notes"
+run "detach refused while the node holds a shard" 'holds [0-9]+ shard' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
+run "move its shards away first" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'"
+run "and the promoted one" 'moved from' "$CEL" send $A "MOVE SHARD 1 OF notes TO 'tcp://127.0.0.1:23521'"
+run "detach node" 'detached' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
 
 if command -v docker >/dev/null 2>&1 && docker image inspect ghcr.io/celastro/celastro:0.55.0 >/dev/null 2>&1; then
   echo "== the image"

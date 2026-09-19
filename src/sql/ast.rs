@@ -46,6 +46,9 @@ pub enum Statement {
     AlterCollection {
         collection: String,
         prefix_expansion: Option<usize>,
+        /// `SET (replicas = n)`: the followers re-planned to `n - 1` per
+        /// shard.
+        replicas: Option<usize>,
         /// `SET (nodes_of = 'papers')`: point an existing collection at the
         /// node collection its edges join, so that a collection loaded before
         /// it had an adjacency index can get one.
@@ -142,6 +145,15 @@ pub enum Statement {
         a: usize,
         b: usize,
     },
+    /// `PROMOTE SHARD <i> OF <collection> ON 'tcp://host:port' [TERM <n>]` --
+    /// the follower named becomes the holder at the next term (or the term
+    /// carried), the old holder a follower.
+    PromoteShard {
+        collection: String,
+        shard: usize,
+        node: String,
+        term: Option<u64>,
+    },
     /// `PLACE SHARD <i> OF <collection> ON 'tcp://host:port'` — this node's
     /// placement map records the shard on that node; a copy this node holds
     /// of a shard placed elsewhere is dropped. What a move sends every holder
@@ -207,6 +219,9 @@ pub struct CreateCollection {
     /// `WITH (undirected = true)`: a walk over this collection's edges
     /// follows them in both directions.
     pub undirected: bool,
+    /// `WITH (replicas = n)`: copies of every shard, the holder included;
+    /// `None` for the default, two.
+    pub replicas: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

@@ -1576,6 +1576,8 @@ fn reconcile_interval() -> Option<Duration> {
 /// Dialled outside the lock; the lock is taken to fold one catalog in.
 fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
     let mut last = Instant::now();
+    // Sweeps in a row a peer has not answered, for the steward's failover.
+    let mut missed: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     loop {
         if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
             return;
@@ -1613,6 +1615,15 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
                 }
             }
         }
+        // Answered means the hello came back: a dial that timed out is a
+        // peer that missed the sweep, which is what a failover counts.
+        let answered: Vec<String> =
+            answers.iter().filter(|(_, (h, _))| h.is_ok()).map(|(u, _)| u.clone()).collect();
+        for (url, _) in &peers {
+            let e = missed.entry(url.clone()).or_insert(0);
+            *e = if answered.contains(url) { 0 } else { e.saturating_add(1) };
+        }
+        steward_sweep(db, &peers, &answered, &missed);
         for (url, (hello, theirs)) in answers {
             if stop.load(AtomicOrdering::Acquire) {
                 return;
@@ -1647,7 +1658,126 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
 
 /// One job, if any shard wants one: reserved, built, installed. Whether a
 /// job was found.
+/// The steward's part of a sweep: a lease to every peer that answered,
+/// and, with automatic failover on, a promotion for every shard whose
+/// holder has missed two sweeps -- the follower that answered with the
+/// most recent copy is promoted, at the next term, and tells everyone.
+fn steward_sweep(
+    db: &RwLock<Db>,
+    peers: &[(String, Arc<crate::wire::Node>)],
+    answered: &[String],
+    missed: &std::collections::BTreeMap<String, u32>,
+) {
+    let (is_steward, me, auto, plan) = {
+        let g = read(db);
+        (
+            g.is_steward(),
+            g.node().map(String::from).unwrap_or_default(),
+            g.auto_failover(),
+            g.failover_plan(answered),
+        )
+    };
+    if !is_steward {
+        return;
+    }
+    for (url, node) in peers.iter().filter(|(u, _)| answered.contains(u)) {
+        let _deadline = crate::deadline::arm(Some(10_000));
+        if let Err(e) = node.lease(&me) {
+            crate::log::warn(
+                "lease_not_renewed",
+                &[("node", url.clone()), ("error", e.to_string())],
+            );
+        }
+    }
+    if !auto {
+        return;
+    }
+    for (collection, shard, term, followers) in plan {
+        let holder = read(db).holder_of(&collection, shard).unwrap_or_default();
+        if missed.get(&holder).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        // The follower with the most recent copy, among those that answer;
+        // this node's own copy, when it follows the shard, asked directly.
+        let mut best: Option<(String, u64)> = None;
+        for f in &followers {
+            let status = if f == &me {
+                let followed = read(db).followed();
+                crate::engine::follower_status(&followed, &collection, shard, term)
+            } else {
+                let Some((_, node)) = peers.iter().find(|(u, _)| u == f) else { continue };
+                let _deadline = crate::deadline::arm(Some(10_000));
+                node.ship_status(&collection, shard, term)
+            };
+            match status {
+                Ok((caught_up, at)) if caught_up => {
+                    if best.as_ref().map_or(true, |(_, b)| at > *b) {
+                        best = Some((f.clone(), at));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => crate::log::warn(
+                    "failover_candidate_not_asked",
+                    &[("node", f.clone()), ("error", e.to_string())],
+                ),
+            }
+        }
+        let Some((f, at)) = best else {
+            crate::log::warn(
+                "failover_no_candidate",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("holder", holder.clone()),
+                ],
+            );
+            continue;
+        };
+        let answer = if f == me {
+            // The steward's own copy: promoted here, the map carried with
+            // the lock let go.
+            let out = write(db).promote_shard(&collection, shard, &me, Some(term + 1), true);
+            out.and_then(|o| o.finished_with(db)).map(|o| match o {
+                Outcome::Ack(m) => m,
+                other => format!("{other:?}"),
+            })
+        } else {
+            let Some((_, node)) = peers.iter().find(|(u, _)| u == &f) else { continue };
+            let sql =
+                format!("LOCAL PROMOTE SHARD {shard} OF {collection} ON '{f}' TERM {}", term + 1);
+            let _deadline = crate::deadline::arm(Some(30_000));
+            node.statement(&sql, &[])
+        };
+        match answer {
+            Ok(m) => crate::log::warn(
+                "failover",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("holder", holder.clone()),
+                    ("promoted", f.clone()),
+                    ("copy_at", at.to_string()),
+                    ("answer", m),
+                ],
+            ),
+            Err(e) => crate::log::warn(
+                "failover_failed",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("error", e.to_string()),
+                ],
+            ),
+        }
+    }
+}
+
 fn maintenance_step(db: &RwLock<Db>) -> bool {
+    // Followers catching up: the next chunk of each, cut under the lock,
+    // shipped without it.
+    if write(db).replication_step() > 0 {
+        return true;
+    }
     // A seal frozen by the write path first: the graph it builds is the
     // pause a statement would otherwise wait out under the lock. The guard
     // is bound and dropped on its own line: as a temporary in the `if let`

@@ -30,7 +30,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-pub const CATALOG_VERSION: u8 = 8;
+pub const CATALOG_VERSION: u8 = 9;
 
 /// The format the catalog is written in, when an operator pinned one below
 /// `CATALOG_VERSION`: `CELASTRO_CATALOG_FORMAT`. A release that raises the
@@ -78,14 +78,25 @@ const CATALOG_VERSION_OLDEST: u8 = 2;
 /// key range it owns. The node is its advertised address, or empty for a
 /// shard on whichever node holds this catalog — what a single-node database
 /// has, and what a database created before it had an address keeps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tablet {
     pub node: String,
     pub lo: Option<String>,
     pub hi: Option<String>,
+    /// Raised by every promotion: the map entry with the higher term wins
+    /// when two nodes' maps disagree about a shard. Format 9.
+    pub term: u64,
+    /// The nodes that hold a copy of the shard and take its log: a
+    /// promotion makes one of them the holder. Format 9.
+    pub followers: Vec<String>,
 }
 
 impl Tablet {
+    /// Whether `node` follows this shard.
+    pub fn followed_by(&self, node: &str) -> bool {
+        self.followers.iter().any(|f| f == node)
+    }
+
     /// A shard merged into another: its entry stays, so nothing renumbers,
     /// with an empty range that owns no key and is skipped everywhere.
     pub fn is_merged(&self) -> bool {
@@ -392,6 +403,10 @@ pub struct Collection {
     pub nodes_of: Option<String>,
     /// A walk over this collection's edges follows them in both directions.
     pub undirected: bool,
+    /// Copies of every shard: the holder and `replicas - 1` followers. Zero
+    /// is the default, two, for a collection from an older catalog. Format
+    /// 9.
+    pub replicas: u8,
     /// When the collection was created, microseconds since the epoch on
     /// the creating node's clock; what a tombstone from another node is
     /// compared against when the two catalogs are reconciled. Zero for a
@@ -413,6 +428,7 @@ impl Collection {
             prefix_expansion: None,
             nodes_of: None,
             undirected: false,
+            replicas: 0,
             created_micros: 0,
         }
     }
@@ -836,6 +852,9 @@ impl Catalog {
             if format >= 7 {
                 put_uvarint(&mut out, c.created_micros);
             }
+            if format >= 9 {
+                out.push(c.replicas);
+            }
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
         crate::lifecycle::encode_activity(&self.activity, &mut out);
@@ -852,6 +871,13 @@ impl Catalog {
                     put_str(&mut out, &t.node);
                     put_opt_str(&mut out, t.lo.as_deref());
                     put_opt_str(&mut out, t.hi.as_deref());
+                    if format >= 9 {
+                        put_uvarint(&mut out, t.term);
+                        put_uvarint(&mut out, t.followers.len() as u64);
+                        for f in &t.followers {
+                            put_str(&mut out, f);
+                        }
+                    }
                 }
             }
             if format >= 6 {
@@ -977,6 +1003,10 @@ impl Catalog {
             if format >= 7 {
                 c.created_micros = get_uvarint(b, &mut i).ok_or_else(bad)?;
             }
+            if format >= 9 {
+                c.replicas = *b.get(i).ok_or_else(bad)?;
+                i += 1;
+            }
             collections.insert(name, c);
         }
         let policies = crate::lifecycle::decode_policies(b, &mut i)?;
@@ -995,11 +1025,20 @@ impl Catalog {
                 let nt = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
                 let mut tablets = Vec::with_capacity(nt);
                 for _ in 0..nt {
-                    tablets.push(Tablet {
+                    let mut t = Tablet {
                         node: get_str(b, &mut i).ok_or_else(bad)?,
                         lo: get_opt_str(b, &mut i).ok_or_else(bad)?,
                         hi: get_opt_str(b, &mut i).ok_or_else(bad)?,
-                    });
+                        ..Default::default()
+                    };
+                    if format >= 9 {
+                        t.term = get_uvarint(b, &mut i).ok_or_else(bad)?;
+                        let nf = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                        for _ in 0..nf {
+                            t.followers.push(get_str(b, &mut i).ok_or_else(bad)?);
+                        }
+                    }
+                    tablets.push(t);
                 }
                 placement.insert(name, tablets);
             }
@@ -1140,8 +1179,18 @@ mod tests {
         cat.placement.insert(
             "articles".into(),
             vec![
-                Tablet { node: String::new(), lo: None, hi: Some("m".into()) },
-                Tablet { node: "tcp://b:9000".into(), lo: Some("m".into()), hi: None },
+                Tablet {
+                    node: String::new(),
+                    lo: None,
+                    hi: Some("m".into()),
+                    ..Default::default()
+                },
+                Tablet {
+                    node: "tcp://b:9000".into(),
+                    lo: Some("m".into()),
+                    hi: None,
+                    ..Default::default()
+                },
             ],
         );
         let back = Catalog::decode(&cat.encode()).unwrap();
@@ -1234,7 +1283,7 @@ mod tests {
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 8"), "{e}");
+        assert!(e.contains("not readable") && e.contains("expected 2 to 9"), "{e}");
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

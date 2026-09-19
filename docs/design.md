@@ -736,8 +736,62 @@ well as holders since this: a shard the peer holds in both maps with a
 range that differs takes the peer's, so a split or a merge made across
 a partition arrives with the next sweep.
 
-Not built, by decision: replication, so a node that is down is a shard that
-is down -- and only that shard (0.34.0): the counters call every statement
+**A shard has a follower, and a follower becomes the holder.** Until
+0.58.0 there was no replication, by decision, so a node down was its
+shards down until it was back and a volume destroyed was its shards lost
+since the last backup. Now every shard has a holder and, by default,
+one follower: a real copy of the shard in the follower's data
+directory, fed by the holder's log. The holder's shipper -- a thread
+per held shard -- pushes every record the shard logged, after the
+shard's own fsync, to each follower over a connection of its own, in
+order, and the follower applies it as a replay applies a record and
+logs it, one sync per batch, ending each batch with a mark of where it
+stands; in `sync` mode the write's acknowledgement waits, with the
+lock let go, for every live follower to confirm the write's instant.
+A follower begins unknown, says where it stands, and is caught up from
+that instant -- the rows written since, in key order, in chunks the
+console's maintenance thread and the wire's driver cut under the lock
+and the shipper carries without it, the deletes since, and a mark that
+says the copy is whole -- or from nothing when it has no copy or stood
+before the shard's retention floor. A follower that is away holds no
+acknowledgement: the write goes to the holder's disk alone, `SHOW
+HEALTH` says `DEGRADED`, and the copy is caught up when it answers,
+which is what makes two copies usable rather than three. A live delete
+applied before an older row the catch-up carries would let the row come
+back, so live records are held back until the catch-up is whole.
+
+The map entry of a shard carries a term. `PROMOTE SHARD i OF c ON
+'follower'` is made on the follower: its copy's directory moves beside
+the held ones -- the files are sealed under `shard-NNNN/<name>`
+whether they sit under `followed/` or not, so nothing is re-sealed --
+the shard opens from it, the term is raised, the old holder becomes a
+follower, and the node promoted carries the map to every peer. The
+higher term wins wherever two maps disagree: the old holder, reached now
+or by the next sweep, demotes its copy and is caught up from nothing by
+the new holder, so what it took after the promotion goes -- and nothing
+it took was acknowledged, because its follower, the node promoted,
+answers its log with the new term and a write is not acknowledged
+without it. That is the fence, and it needs no consensus: a promotion
+can only be made where a caught-up copy is, and the old holder cannot
+acknowledge without that copy. The catch-up is shipped under the
+followed copies' lock and no other, since a write this node forwarded
+under its own lock waits for that holder, which waits for this node to
+confirm its log; the wire's ship calls take that lock alone.
+
+Automatic failover is the steward's: one node -- named, or the lowest
+attached address -- renews every node's lease on each reconcile sweep
+and, with `CELASTRO_AUTO_FAILOVER=on`, promotes the follower with the
+most recent copy once a holder has missed two sweeps. A holder whose
+lease ran out refuses writes until it is renewed, so a holder the
+steward cannot reach is not taking writes while its follower is
+promoted; a steward that is down is no failover and no worse than
+before. Off by default: promotion is the operator's. The steward by
+consensus, quorum acknowledgement over three copies, and copies placed
+across regions are the entries after this one.
+
+What replication does not change: one writer per shard at one term, no
+cross-shard transactions, and that a node down is its shards refused --
+for a lease length, then promoted -- as before (0.34.0): the counters call every statement
 opens with does not fail the statement when a holder is silent; the
 statement fails at the first shard call it makes to that node, which a
 predicate that pins the key to a live shard never makes. A text query is
@@ -1850,6 +1904,8 @@ guarantee:
 | a split issued at a node that does not hold the shard is made by the holder, every node's map gains the shard, a count from any node is whole, a key past the split pins the plan to the new shard, and the new shard moves like any other | `wire::a_shard_splits_on_its_holder_and_every_node_learns_the_new_map` |
 | a split with no key takes the median; a merge rebuilds the second shard's rows into the first, widens its range, leaves a marker that refuses a split and a merge, drops the rows an earlier split left behind so nothing answers twice after a compaction or a reopen, and the merged shard splits again at the next index | `split::a_median_split_and_a_merge_are_each_other_s_inverse` |
 | a merge across two nodes is refused naming the move; on the holder it reaches every map, the merged index is skipped by every read and by health, and a split with no key issued elsewhere takes the holder's median | `wire::shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median` |
+| every shard has a follower by default and a write is acknowledged once the follower confirmed it; a follower away degrades the acknowledgement to one disk and the health says so; back, it is caught up from where it stood and confirms again | `wire::a_write_is_confirmed_on_the_follower_and_a_follower_away_is_caught_up_on_return` |
+| a holder lost: its follower is promoted and answers every acknowledged row at the next term; writes flow through it; the old holder back hears the term at its attach, demotes its copy, follows, and is confirmed on again | `wire::a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |

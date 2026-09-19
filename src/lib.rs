@@ -91,6 +91,7 @@ pub mod memtable;
 pub mod mvcc;
 pub mod objstore;
 pub mod plan;
+pub mod replication;
 pub mod residency;
 pub mod segment;
 pub mod serve;
