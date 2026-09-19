@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.55.1 — 2026-09-19
+
+Documentation: every command and every statement with a worked example.
+
+**Two reference documents, run on every release.** `docs/commands.md`
+is the command line and the console's HTTP API -- one node, the tools,
+a served console, TLS, a cluster on loopback, the image -- and
+`docs/sql.md` every statement by what it is for, each with an example
+and what it answered. `scripts/examples.sh` runs all of them against a
+release build and fails on the first answer that changed, so the
+documents cannot drift; it is a gate. The README keeps the quick start
+and points at them; its image tags name this release.
+
 ## 0.55.0 — 2026-09-19
 
 The last statement that waited under the lock for a holder no longer

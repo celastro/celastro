@@ -12,7 +12,7 @@ token is what every client presents:
 ```sh
 docker run -d --name celastro -p 8787:8787 -v celastro-data:/data \
   -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef \
-  ghcr.io/celastro/celastro:0.53.0 --dir /data serve --bind 0.0.0.0
+  ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0
 ```
 
 ```sh
@@ -34,7 +34,7 @@ q "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), em
 The last query is text and vector in one plan, fused by reciprocal rank
 fusion; `WHERE` takes structured predicates, `text_match`, and a distance
 threshold. The same image is a client: `docker run --rm --network host
--e CELASTRO_TOKEN ghcr.io/celastro/celastro:0.53.0 send
+-e CELASTRO_TOKEN ghcr.io/celastro/celastro:0.55.0 send
 http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body,
 'segments')"`, or `repl` for a prompt. The volume is written in the
 clear and the console is plain HTTP: encryption at rest and TLS are
@@ -124,26 +124,13 @@ language, no unbounded paths, no analytics.
 
 ## The command line
 
-`celastro` is the tool. Without `--dir` the database is in memory.
-
-| command | what it does |
-|---|---|
-| `serve [--port N] [--bind ADDR] [--open]` | the console: on loopback, or on a network with `--bind` |
-| `exec <SQL>`, `run <FILE>`, `repl` | one statement, a script, an interactive session |
-| `demo` | the guided tour, in memory |
-| `catalog` | collections and their indexes |
-| `health [--port N] [--attached N]` | exit 0 if a console is serving — and has verified `N` peers; a container's probes |
-| `export <COLLECTION> <DIR>`, `import <DIR>` | copy a collection as of an instant, without stopping the source; adopt one |
-| `send <URL> <SQL>` | one statement to a running console, the answer as JSON — what a backup CronJob runs |
-| `key master <FILE>`, `key init <FILE>`, `key rekey <KEY> <MASTER>` | encryption at rest, off until a master key is given: make one, a wrapped data key for a cluster, rotate the master |
-| `tls init <DIR> <NAME>`, `tls secret <SECRET> <NAME>` | a CA and a certificate, as files or as a Kubernetes Secret |
-| `version` | |
-
-`--dir <DIR>` opens a persistent database; `--url <URL>` makes `exec`,
-`run`, `repl` and `catalog` clients of a console that is already serving,
-local or remote (below); `--json` makes every command's output
-machine-readable, failures included. Statements end with `;` or a
-blank line. Exit codes: 0, 1 a runtime or SQL error, 2 a usage error.
+`celastro` is the tool: the server (`serve`), the client (`exec`, `run`,
+`repl`, `send`, `--url`), and the tools (`export`/`import`, `key`, `tls`,
+`health`, `catalog`, `demo`). Without `--dir` the database is in memory;
+`--json` makes every output machine-readable. Every command with a
+worked example is in [docs/commands.md](docs/commands.md), and every
+statement in [docs/sql.md](docs/sql.md); both are run on each release by
+`scripts/examples.sh`.
 
 ## Deployment
 
@@ -154,7 +141,7 @@ other nodes; the sections that follow have each option's details.
 | option | how | data | clients | notes |
 |---|---|---|---|---|
 | **one process** | `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
-| **a container** | `docker run ... ghcr.io/celastro/celastro:0.53.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
 
@@ -326,8 +313,8 @@ Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
 `celastro` in an image `FROM scratch`, nothing running as root.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.53.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.53.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:0.55.0 demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.55.0 --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback
@@ -426,6 +413,9 @@ cargo clippy --all-targets -- -D warnings
 
 No dependencies outside `std`, Rust 1.75 or later, and a change must not
 rewrite `Cargo.lock`. Every test is named after the failure it prevents.
+`scripts/examples.sh` runs every example in the documents against a
+release build -- one node, a served console, the tools, three nodes on
+loopback, backups -- and fails on the first answer that changed.
 
 The resilience suite is the slow, cluster-shaped tests -- the
 reconciliation over four nodes and four hundred random histories, no
