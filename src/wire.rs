@@ -82,6 +82,14 @@ pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 pub const DEFAULT_WIRE_PORT: u16 = 2352;
 const MAX_FRAME: u32 = 256 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `d`, or what is left of the statement's deadline if that is less.
+fn within_deadline(d: Duration) -> Duration {
+    match crate::deadline::remaining_ms() {
+        Some(ms) => d.min(Duration::from_millis(ms.max(1))),
+        None => d,
+    }
+}
 /// How long a dial that fails outright -- a name that does not resolve, a
 /// port that refuses -- is retried with backoff before the node is given up
 /// on for this call, within what is left of the statement's deadline. Two
@@ -668,9 +676,13 @@ impl Node {
     }
 
     fn connect(&self) -> std::io::Result<Box<dyn Stream>> {
+        // Bounded by the statement's budget, the dial and the hello alike:
+        // a holder behind a partition drops the packets, and a fixed five
+        // seconds for each such holder is what spent a partial statement's
+        // budget before the shards that could answer were asked.
         let mut last = None;
         for a in self.addr.to_socket_addrs()? {
-            match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+            match TcpStream::connect_timeout(&a, within_deadline(CONNECT_TIMEOUT)) {
                 Ok(s) => {
                     s.set_nodelay(true)?;
                     // Verified by the name the URL gave, which is the name
@@ -723,7 +735,7 @@ impl Node {
     /// write the new one never sees.
     fn check_fresh(&self, s: &mut Box<dyn Stream>) -> Result<()> {
         let req = self.request(Call::Hello, "", 0, &[]);
-        s.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+        s.set_read_timeout(Some(within_deadline(CONNECT_TIMEOUT)))?;
         write_frame(s, &req)?;
         let resp = read_frame(s)?;
         let h = self.decode_hello(&decode_response(resp)?)?;

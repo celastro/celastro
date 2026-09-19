@@ -1574,3 +1574,66 @@ fn a_statement_waiting_on_a_holder_that_never_answers_holds_no_lock() {
     }
     let _ = std::fs::remove_dir_all(&c_dir);
 }
+
+/// A partial statement over two holders that never answer pays one
+/// deadline, not one per holder: the holders' clocks are asked at once,
+/// so the near shards are still asked within the budget and only the far
+/// ones are missing. Ten holders across a split, asked one after another,
+/// had spent the budget before the near ones were reached.
+#[test]
+fn a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("par-a");
+    let b = Node::start("par-b");
+    let c = Node::start("par-c");
+    let d = Node::start("par-d");
+    for n in [&b, &c, &d] {
+        a.ack(&format!("ATTACH NODE '{}'", n.url));
+    }
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['c', 'f', 'k'])");
+    for i in 0..40usize {
+        let key = format!("{}{i:04}", "adgm".chars().nth(i % 4).unwrap());
+        let doc = Value::obj(vec![("id".into(), Value::Str(key)), ("n".into(), Value::Int(i as i64))]);
+        a.db.write().unwrap().insert("items", doc).unwrap();
+    }
+    let mut holes = Vec::new();
+    let plug = Arc::new(AtomicBool::new(true));
+    for n in [c, d] {
+        let port: u16 = n.url.rsplit(':').next().unwrap().parse().unwrap();
+        let dir = n.dir.clone();
+        drop(n);
+        settle();
+        let hole = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        hole.set_nonblocking(true).unwrap();
+        let plug = plug.clone();
+        holes.push((dir, std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    kept.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })));
+    }
+    let t0 = std::time::Instant::now();
+    let r = a
+        .query("SELECT count(*) AS n FROM items WITH (partial_results, deadline_ms = 3000)")
+        .unwrap();
+    let took = t0.elapsed();
+    assert_eq!(r.missing.len(), 2, "{:?}", r.missing);
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(20), "a's and b's rows");
+    assert!(took < std::time::Duration::from_millis(3500), "two holders cost {took:?}");
+    plug.store(false, Ordering::Relaxed);
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    for (d, h) in holes {
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

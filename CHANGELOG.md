@@ -6,6 +6,33 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.54.0 — 2026-09-19
+
+A partial answer costs one bounded wait for every holder that cannot be
+reached, not the whole budget, and a busy node is alive, hence a minor.
+
+**A partial statement pays for the holders it cannot reach once, and
+together.** The same ten-node split drill, run again on 0.53.0, showed
+what was left: a statement with `partial_results` across the cut named
+the near shards missing along with the far ones. A statement's first
+step asks every holder for its clock and write counter, one holder
+after another, and a fresh connection to a holder behind a partition
+waited a fixed five seconds for its hello -- deadline or not -- so five
+far holders spent the budget before a near shard was asked. Now the
+dial and the hello are bounded by what is left of the deadline, every
+holder's counters are asked at once, and under `partial_results` that
+step gets half the budget: half to learn who is there, half to read
+from those who are. A statement over ten holders with five behind a
+cut answers the five it can reach and names the five it cannot.
+
+**A node whose lock is held is alive.** `/api/health` read the catalog
+under the database lock, so a statement holding the lock for its
+deadline made the liveness probe wait with it, and the pods under the
+split were restarted for being busy. The probe now tries the lock and,
+when it is held, answers `{"ok":true,"busy":true,"attached":0}` at once:
+alive to the liveness probe, not ready to the readiness probe, which
+asks for the attached count, and counts nothing.
+
 ## 0.53.0 — 2026-09-19
 
 No statement waits for a holder under the lock, hence a minor.

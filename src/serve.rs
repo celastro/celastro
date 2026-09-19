@@ -1754,7 +1754,16 @@ fn answer<W: Wire>(
     let served = match action {
         Err(r) => Served::keep(r.response()),
         Ok(Action::Reply(response)) => Served::keep(response),
-        Ok(Action::Health) => Served::keep(Response::json(health_json(&read(db)))),
+        // Liveness is "the process answers", not "the lock is free": a
+        // statement that holds the lock for its deadline is not a dead
+        // node, and a probe that read it as one restarted pods under a
+        // split. Readiness asks for the attached count, which a busy answer
+        // does not carry, so a busy node is alive and not ready.
+        Ok(Action::Health) => Served::keep(Response::json(match db.try_read() {
+            Ok(g) => health_json(&g),
+            Err(std::sync::TryLockError::Poisoned(p)) => health_json(&p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => health_busy_json(),
+        })),
         Ok(Action::Catalog) => Served::keep(Response::json(catalog_json(&read(db)))),
         Ok(Action::Metrics) => {
             Served::keep(Response::new(200, "OK", CT_METRICS, metrics_text(&read(db))))
@@ -1912,6 +1921,13 @@ fn error_json(message: &str) -> String {
 /// the licence it already reports, and it is not an interactive interface,
 /// so it carries no obligation for a modifier (AGPL §5(d)).
 pub const COPYRIGHT: &str = "Copyright (C) 2026 celastro";
+
+/// The health answer while the database lock is held: alive, busy, and
+/// nothing counted.
+fn health_busy_json() -> String {
+    let version = jstr(env!("CARGO_PKG_VERSION"));
+    format!(r#"{{"ok":true,"name":"celastro","version":{version},"busy":true,"attached":0}}"#)
+}
 
 fn health_json(db: &Db) -> String {
     let version = jstr(env!("CARGO_PKG_VERSION"));
@@ -2856,6 +2872,26 @@ mod tests {
         assert_eq!(parsed.get("name").and_then(|v| v.as_str()), Some("celastro"));
         let version = parsed.get("version").and_then(|v| v.as_str());
         assert_eq!(version, Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Health while the database lock is held answers at once and says
+    /// the process is alive: a statement holding the lock for its deadline
+    /// is not a dead node. The answer says busy and carries no attached
+    /// count, so a readiness probe waiting on peers does not pass on it.
+    #[test]
+    fn the_health_probe_answers_alive_and_busy_while_the_lock_is_held() {
+        let shared = RwLock::new(Db::in_memory());
+        let held = shared.write().unwrap();
+        let mut io = Cursor::new("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n".as_bytes());
+        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
+        drop(held);
+        let text = String::from_utf8(rendered(&served.response)).unwrap();
+        assert_eq!(status_line(&text), "HTTP/1.1 200 OK");
+        let parsed = json::parse(body_of(&text)).unwrap();
+        assert_eq!(parsed.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(parsed.get("busy"), Some(&Value::Bool(true)));
+        assert_eq!(parsed.get("attached").and_then(|v| v.as_i64()), Some(0));
+        assert!(parsed.get("collections").is_none(), "{text}");
     }
 
     /// Health needs no token, touches the database, and is still behind the

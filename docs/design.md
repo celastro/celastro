@@ -560,6 +560,24 @@ the keys are needed before anything can be deferred; `partial_results`
 cannot apply to a delete, so that one is refused at the deadline, as it
 should be.
 
+The drill run again on that release, the same cut, showed what was left.
+The pods converged 27 s after the heal and the loads were fourteen
+thousand writes a side, none lost, but a count with `partial_results`
+across the cut had named the near shards missing along with the far
+ones, and one pod was restarted once. Both had one shape: a fixed wait
+that a deadline did not bound. A statement's first step asks every
+holder for its clock and write counter, and a fresh connection to a
+holder behind the cut waited five seconds for its hello whatever the
+deadline said, one holder after another, so five far holders spent a
+budget before a near shard was asked. The dial and the hello are now
+bounded by what is left of the deadline, the holders are asked at once,
+and under `partial_results` the step gets half the budget: half to
+learn who is there, half to read from those who are. And `/api/health`
+read the catalog under the database lock, so a statement holding the
+lock for its deadline held the liveness probe with it; the probe now
+tries the lock and answers busy at once when it is held -- alive, and
+not ready, since a busy answer carries no attached count.
+
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.
@@ -1384,7 +1402,11 @@ started, because a statement it coordinates reaches the shards it does not
 hold through them. The peers are dialled outside the database lock, which a
 verification found the hard way: dialled under it, a peer not yet up held
 every probe behind a five-second connect timeout and the pod failed its own
-liveness check.
+liveness check. The lock itself is tried, not taken: a statement holding
+it for its deadline is not a dead node, and the probe answers busy at
+once when it is held -- `ok` for the liveness probe, no attached count
+for the readiness probe, so a busy node is alive and not routed to until
+it is free again.
 
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
@@ -1727,6 +1749,8 @@ guarantee:
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
 | a definition and a forwarded write whose fan-out reaches a holder that never answers hold no lock while they wait: a reader on the node is answered meanwhile, and the statement ends at the deadline naming the holder | `wire::a_statement_waiting_on_a_holder_that_never_answers_holds_no_lock` |
 | a move issued to a busy source, writes flowing through it, holds no lock long: the move in about a hundred milliseconds, the slowest write waiting tens | `wire::a_move_from_a_busy_source_holds_no_lock_long` |
+| a partial statement over four holders, two of which accept a connection and never answer, names those two shards missing, counts the other two, and pays one bounded wait for both rather than a fixed five seconds each | `wire::a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers` |
+| the health probe answers at once, alive and busy, while the database lock is held, and the busy answer carries no attached count so readiness does not pass on it | `serve::tests::the_health_probe_answers_alive_and_busy_while_the_lock_is_held` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |

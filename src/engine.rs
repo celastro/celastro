@@ -5390,9 +5390,18 @@ impl Db {
         // that never asks the lost node's shards answers (a key the
         // predicate pins to a live shard, a partition on a live shard).
         // Until 0.34.0 the counters call itself failed every statement.
+        // Every holder is asked at once, and under `partial_results` for
+        // half the budget: a holder behind a partition answers nothing
+        // until the deadline, and five of them one after another spent a
+        // partial statement's whole budget before the near shards were
+        // asked, which then counted as missing too. Half to learn who is
+        // there, half to read from those who are.
+        let mut conns = Vec::new();
         for url in self.holders(&sel.collection) {
-            let node = self.node_conn(&url)?;
-            match node.counters(&sel.collection) {
+            conns.push((url.clone(), self.node_conn(&url)?));
+        }
+        for (url, node, r) in fetch_counters(&conns, &sel.collection, partial) {
+            match r {
                 Ok((t, w)) => {
                     ts = ts.max(t);
                     writes += w;
@@ -5454,9 +5463,12 @@ impl Db {
             let tablets = self.catalog.placement.get(via).cloned().unwrap_or_default();
             let mut edge_unreachable: Vec<usize> = Vec::new();
             let mut remotes: BTreeMap<String, Arc<crate::wire::Node>> = BTreeMap::new();
+            let mut conns = Vec::new();
             for url in self.holders(via) {
-                let node = self.node_conn(&url)?;
-                match node.counters(via) {
+                conns.push((url.clone(), self.node_conn(&url)?));
+            }
+            for (url, node, r) in fetch_counters(&conns, via, partial) {
+                match r {
                     Ok((t, _)) => ts = ts.max(t),
                     Err(Error::Deadline(_)) if !partial => {}
                     Err(Error::Deadline(_)) => {
@@ -6086,6 +6098,40 @@ impl SealJob {
 
 /// What routes elsewhere, by holder: the connection and the items for it.
 type Away<T> = BTreeMap<String, (Arc<crate::wire::Node>, Vec<T>)>;
+
+/// Every holder's clock and write counter for a collection, asked at once
+/// in the holders' order, each thread armed with the caller's remaining
+/// budget -- half of it under `partial`, so that a holder that never
+/// answers leaves the other half for the shards that do.
+#[allow(clippy::type_complexity)]
+fn fetch_counters(
+    conns: &[(String, Arc<crate::wire::Node>)],
+    collection: &str,
+    partial: bool,
+) -> Vec<(String, Arc<crate::wire::Node>, Result<(Timestamp, u64)>)> {
+    let remaining = crate::deadline::remaining_ms().map(|ms| if partial { ms / 2 } else { ms });
+    if conns.len() < 2 {
+        let _deadline = crate::deadline::arm(remaining);
+        return conns
+            .iter()
+            .map(|(url, n)| (url.clone(), n.clone(), n.counters(collection)))
+            .collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = conns
+            .iter()
+            .map(|(url, n)| {
+                let (url, n) = (url.clone(), n.clone());
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    let r = n.counters(collection);
+                    (url, n, r)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a counters thread panicked")).collect()
+    })
+}
 
 /// A collection made here, to be carried to its holders and the
 /// coordinators as deferred work holding nothing.
