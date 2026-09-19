@@ -2215,9 +2215,9 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
         // the other connections are served while it copies.
         let mut guard = write(db);
         match guard.execute(sql) {
-            Ok(Outcome::Deferred(d)) => {
+            Ok(out @ Outcome::Deferred(_)) => {
                 drop(guard);
-                d.finish()
+                out.finished_with(db)
             }
             other => other,
         }
@@ -2882,7 +2882,8 @@ mod tests {
     fn the_health_probe_answers_alive_and_busy_while_the_lock_is_held() {
         let shared = RwLock::new(Db::in_memory());
         let held = shared.write().unwrap();
-        let mut io = Cursor::new("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n".as_bytes());
+        let mut io =
+            Cursor::new("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n".as_bytes());
         let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
         drop(held);
         let text = String::from_utf8(rendered(&served.response)).unwrap();

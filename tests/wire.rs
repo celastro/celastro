@@ -68,7 +68,7 @@ impl Node {
     fn ack(&self, sql: &str) -> String {
         // `exec` let go of the lock; a deferred copy runs here without it.
         let out = self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        match out.finished().unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        match out.finished_with(&self.db).unwrap_or_else(|e| panic!("{sql}: {e}")) {
             Outcome::Ack(m) => m,
             other => panic!("{sql}: {other:?}"),
         }
@@ -1500,10 +1500,10 @@ fn a_call_from_an_older_process_is_refused_by_a_holder() {
 /// applied here under the lock and carried as deferred work, so a reader
 /// on this node is answered meanwhile. Ten such holders under the lock
 /// was a console that answered nothing for the better part of a minute,
-/// and a liveness probe restarted it. A DELETE ... WHERE is not here: it
-/// selects its keys first, and a select that reaches the dead holder
-/// waits for it under the lock, since the keys are needed before
-/// anything can be deferred.
+/// and a liveness probe restarted it. A DELETE ... WHERE selects its keys
+/// first, so it asks the holders whether they answer with no lock held
+/// and is refused by the one that does not, nothing deleted; the test
+/// below.
 #[test]
 fn a_statement_waiting_on_a_holder_that_never_answers_holds_no_lock() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -1594,7 +1594,8 @@ fn a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers() {
     a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['c', 'f', 'k'])");
     for i in 0..40usize {
         let key = format!("{}{i:04}", "adgm".chars().nth(i % 4).unwrap());
-        let doc = Value::obj(vec![("id".into(), Value::Str(key)), ("n".into(), Value::Int(i as i64))]);
+        let doc =
+            Value::obj(vec![("id".into(), Value::Str(key)), ("n".into(), Value::Int(i as i64))]);
         a.db.write().unwrap().insert("items", doc).unwrap();
     }
     let mut holes = Vec::new();
@@ -1607,15 +1608,18 @@ fn a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers() {
         let hole = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         hole.set_nonblocking(true).unwrap();
         let plug = plug.clone();
-        holes.push((dir, std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            while plug.load(Ordering::Relaxed) {
-                if let Ok((s, _)) = hole.accept() {
-                    kept.push(s);
+        holes.push((
+            dir,
+            std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                while plug.load(Ordering::Relaxed) {
+                    if let Ok((s, _)) = hole.accept() {
+                        kept.push(s);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        })));
+            }),
+        ));
     }
     let t0 = std::time::Instant::now();
     let r = a
@@ -1636,4 +1640,93 @@ fn a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers() {
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// A delete by predicate that reaches a holder that never answers holds
+/// no lock while it waits, and deletes nothing: the keys come from every
+/// holder, so the holders are asked whether they answer with the lock let
+/// go, and the one that does not refuses the delete before a key is
+/// selected. The rows on the holders that answer are still there.
+#[test]
+fn a_delete_by_predicate_reaching_a_holder_that_never_answers_holds_no_lock_and_deletes_nothing() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("dhang-a");
+    let b = Node::start("dhang-b");
+    let c = Node::start("dhang-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        let doc = Value::obj(vec![
+            ("id".into(), Value::Str(format!("doc-{i:03}"))),
+            ("tenant".into(), Value::Str(format!("t{}", i % 3 + 1))),
+            ("n".into(), Value::Int(i as i64)),
+        ]);
+        a.db.write().unwrap().insert("items", doc).unwrap();
+    }
+    let before = a.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(before.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(30));
+    let c_port: u16 = c.url.rsplit(':').next().unwrap().parse().unwrap();
+    let c_dir = c.dir.clone();
+    drop(c);
+    settle();
+    let hole = std::net::TcpListener::bind(("127.0.0.1", c_port)).unwrap();
+    hole.set_nonblocking(true).unwrap();
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding = {
+        let plug = plug.clone();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    kept.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(kept);
+        })
+    };
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(2000);
+    let sql = "DELETE FROM items WHERE n < 100";
+    let t0 = std::time::Instant::now();
+    let out = a.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(500),
+        "held the lock {:?}",
+        t0.elapsed()
+    );
+    let db = a.db.clone();
+    let finishing = std::thread::spawn(move || out.finished_with(&db));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let t1 = std::time::Instant::now();
+    drop(a.db.read().unwrap());
+    let waited = t1.elapsed();
+    assert!(waited < std::time::Duration::from_millis(200), "a read waited {waited:?}");
+    let e = match finishing.join().unwrap() {
+        Err(e) => e.to_string(),
+        Ok(other) => panic!("{other:?}"),
+    };
+    assert!(e.contains("NOTHING was deleted"), "{e}");
+    assert!(t0.elapsed() > std::time::Duration::from_millis(1500), "never waited for c");
+    plug.store(false, Ordering::Relaxed);
+    holding.join().unwrap();
+    // The splits are 't1' and 't2': shard 0 is empty, shard 1 holds t1's
+    // ten rows, and c's shard 2 held t2's and t3's twenty.
+    let after = a
+        .query("SELECT count(*) AS n FROM items WITH (partial_results, deadline_ms = 2000)")
+        .unwrap();
+    assert_eq!(after.missing, vec!["shard 2".to_string()]);
+    assert_eq!(
+        after.rows[0].doc.path("n").and_then(|v| v.as_i64()),
+        Some(10),
+        "the rows still here"
+    );
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&c_dir);
 }

@@ -418,6 +418,35 @@ a connection that never paused, because the connection thread checked the
 stop flag only when a read timed out, and so held its directory against
 the restart; the flag is now checked per frame.
 
+The suite's fifth property is the map changing under a statement: shards
+moved at every step, round-robin over three nodes, under a write load and
+a scan that never stops, and every scan answering each key acknowledged
+before it exactly once or refused naming the move. Its first run found
+three things. A move whose source is another node asked that node for the
+pin under the coordinator's lock, and the source, serving the scan, was
+waiting on the coordinator's lock to answer it: a cycle only the deadline
+broke, thirty seconds each time, and a pin made late on the source that
+refused the shard's writes with nobody to abort it. A node that
+coordinates moves and holds no shard of the collection was told of no
+switch -- the target tells the holders old and new and the nodes the
+catalog names, and the coordinator was none of them -- so its map stayed
+stale and it sent the next move to the old holder. And a write carried to
+a holder after the map moved was refused by that holder as another's. So
+the pin on a source elsewhere is asked for as deferred work with the
+lock let go, within the statement's budget; a pin asked for past its
+deadline is not made; the switch is told to every peer that attached;
+and a carried write or delete follows the holder's refusal to the node
+it names, once. The run after: 24 moves of 24, 1,557 scans complete, none
+refused, 25 of 1,282 writes refused naming the move. The run after that,
+in the whole suite, found the fourth: a key acknowledged and missing
+from a scan. The scan, planned on the old map, read the shard on the
+source, whose copy the pin had frozen, after the target had taken the
+map and the write. So the target fences the source once it holds every
+file, before it takes the map: from then until the source learns the
+switch, a read of the shard there is refused naming the move, as a write
+has been since the pin -- the window in which the two copies could
+disagree answers nothing.
+
 The drills' side of the suite runs on kind, from the private tooling that
 drives the box, one scenario per script with its outcome asserted: the
 split, the mixed versions, a slow link. The mixed scenario's first run as
@@ -554,11 +583,17 @@ and four times. So a statement now waits for no holder under the lock: a
 definition is applied here and carried to the holders as deferred work,
 every holder at once; a forwarded write, a forwarded delete by key and a
 collection's spread are carried the same way; the wire finishes deferred
-work with its lock let go. The one that still waits is a `DELETE ...
+work with its lock let go. The one that still waited was a `DELETE ...
 WHERE` whose predicate reaches a holder that cannot be reached, since
-the keys are needed before anything can be deferred; `partial_results`
-cannot apply to a delete, so that one is refused at the deadline, as it
-should be.
+the keys are needed before anything can be deferred, and
+`partial_results` cannot apply to a delete. Since 0.55.0 it waits with
+the lock let go too: deferred work may go back under the lock
+(`Deferred::then_under_lock`, finished by `Outcome::finished_with`), so
+the delete asks every holder whether it answers with no lock held, is
+refused by the one that does not with nothing deleted, and selects its
+keys under the lock only once every holder has answered. A holder lost
+between the two steps is waited for under the lock, as before; the
+window is the one statement.
 
 The drill run again on that release, the same cut, showed what was left.
 The pods converged 27 s after the heal and the loads were fourteen
@@ -633,9 +668,12 @@ stops short leaves nothing a reopen mistakes for a shard), and the map
 switches by `LOCAL PLACE SHARD` on every holder -- target first, others,
 source last, so the source's copy is dropped only once everyone else can
 find the new one. The pin is shared with the wire server outside the
-engine's lock: a coordinator that is also the source holds its lock for the
-whole statement while the target reads from the pin, and a target pulls
-without its own lock, serving its other shards meanwhile. What is not here:
+engine's lock: a coordinator that is also the source pins under its lock
+and the target reads from the pin with that lock let go; a coordinator
+whose source is elsewhere asks for the pin as deferred work, holding
+nothing, since asked for under its lock the ask closed a cycle with a
+source that was serving a scan of the coordinator's shards; a target
+pulls without its own lock, serving its other shards meanwhile. What is not here:
 a write to a moving shard waits nowhere -- it is refused, and the client
 retries once the map has switched -- and a move is not resumable across a
 restart of the source (the pin is memory; the map is unchanged until the
@@ -1751,6 +1789,8 @@ guarantee:
 | a move issued to a busy source, writes flowing through it, holds no lock long: the move in about a hundred milliseconds, the slowest write waiting tens | `wire::a_move_from_a_busy_source_holds_no_lock_long` |
 | a partial statement over four holders, two of which accept a connection and never answer, names those two shards missing, counts the other two, and pays one bounded wait for both rather than a fixed five seconds each | `wire::a_partial_statement_pays_one_deadline_for_every_holder_that_never_answers` |
 | the health probe answers at once, alive and busy, while the database lock is held, and the busy answer carries no attached count so readiness does not pass on it | `serve::tests::the_health_probe_answers_alive_and_busy_while_the_lock_is_held` |
+| a delete by predicate reaching a holder that never answers holds no lock while it waits, is refused with nothing deleted, and the rows on the holders that answer are still there | `wire::a_delete_by_predicate_reaching_a_holder_that_never_answers_holds_no_lock_and_deletes_nothing` |
+| shards moved at every step under a load and a scan that never stops: every scan answers each acknowledged key once or is refused naming the move, every move completes, and every node agrees after | `resilience::a_scan_under_moves_at_every_step_answers_each_key_once_or_is_refused` (`--ignored`) |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |

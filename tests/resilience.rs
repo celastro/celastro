@@ -439,3 +439,190 @@ fn a_point_lookup_answers_while_a_large_vector_seal_builds() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// R2(17): the map changing under a statement. Shards move at every
+/// step -- one shard after another, round-robin over three nodes -- under
+/// a write load and a scan that never stops. The property: a scan answers
+/// every key acknowledged before it began exactly once, or is refused
+/// naming the move; never a short answer, never a key twice. And the
+/// moves themselves complete: every shard ends where its last move sent
+/// it, and every acknowledged key answers there.
+#[test]
+#[ignore]
+fn a_scan_under_moves_at_every_step_answers_each_key_once_or_is_refused() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("scan-a");
+    let b = Node::start("scan-b");
+    let c = Node::start("scan-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['k-2', 'k-4', 'k-6'])");
+    for i in 0..300usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let urls = [a.url.clone(), b.url.clone(), c.url.clone()];
+    let acked: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new((0..300).map(|i| format!("k-{i:06}")).collect()));
+    let moving = Arc::new(AtomicBool::new(true));
+    // The mover: every 400 ms, the next shard to the next node.
+    let mover = {
+        let (db, urls, moving) = (a.db.clone(), urls.clone(), moving.clone());
+        std::thread::spawn(move || {
+            let (mut done, mut refused) = (0usize, Vec::new());
+            for step in 0..24usize {
+                std::thread::sleep(Duration::from_millis(400));
+                let shard = step % 4;
+                let to = &urls[(step / 4 + shard + 1) % 3];
+                let sql = format!("MOVE SHARD {shard} OF items TO '{to}'");
+                let t0 = Instant::now();
+                let out = db.write().unwrap().execute(&sql);
+                let under_lock = t0.elapsed();
+                match out.and_then(|o| o.finished_with(&db)) {
+                    Ok(Outcome::Ack(m)) => {
+                        assert!(m.contains("moved") || m.contains("already on"), "{sql}: {m}");
+                        eprintln!(
+                            "resilience: step {step}: {sql} in {:.1?} ({under_lock:.1?} under the lock)",
+                            t0.elapsed()
+                        );
+                        done += 1;
+                    }
+                    Ok(other) => panic!("{sql}: {other:?}"),
+                    Err(e) => {
+                        eprintln!(
+                            "resilience: step {step}: {sql} refused after {:.1?}: {e}",
+                            t0.elapsed()
+                        );
+                        refused.push(format!("{sql}: {e}"));
+                    }
+                }
+            }
+            moving.store(false, Ordering::Relaxed);
+            (done, refused)
+        })
+    };
+    // The load: keys over every shard, through b as the console would run
+    // them -- an INSERT statement, its carry to the holder with b's lock
+    // let go -- each acknowledged one remembered; a write refused while
+    // its shard moves is not a failure.
+    let load = {
+        let (db, acked, moving) = (b.db.clone(), acked.clone(), moving.clone());
+        std::thread::spawn(move || {
+            let (mut n, mut refused, mut disagreed) = (300usize, 0usize, 0usize);
+            while moving.load(Ordering::Relaxed) {
+                let sql = format!(
+                    r#"INSERT INTO items VALUES ('{{"id":"k-{n:06}","n":{n},"body":"row {n}"}}')"#
+                );
+                let out = db.write().unwrap().execute(&sql);
+                match out.and_then(|o| o.finished_with(&db)) {
+                    Ok(_) => acked.lock().unwrap().push(format!("k-{n:06}")),
+                    Err(e) => {
+                        let e = e.to_string();
+                        // A key refused as another node's is the map moved
+                        // twice between the plan and the carry: once is
+                        // followed; twice is refused, and retried by a client.
+                        if e.contains("placement maps disagree") {
+                            disagreed += 1;
+                        } else {
+                            assert!(
+                                e.contains("moving")
+                                    || e.contains("did not answer")
+                                    || e.contains("deadline"),
+                                "a refusal that is not the move: {e}"
+                            );
+                        }
+                        refused += 1;
+                    }
+                }
+                n += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (n - 300, refused, disagreed)
+        })
+    };
+    // The scan: through c, under c's read lock as the console runs a
+    // read, every key, again and again.
+    let (mut scans, mut complete, mut refused_scans) = (0usize, 0usize, Vec::new());
+    while moving.load(Ordering::Relaxed) {
+        let before: Vec<String> = acked.lock().unwrap().clone();
+        let r =
+            c.db.read().unwrap().read("SELECT id FROM items LIMIT 100000").and_then(|o| o.rows());
+        scans += 1;
+        match r {
+            Ok(r) => {
+                let mut ids: Vec<String> = r
+                    .rows
+                    .iter()
+                    .map(|x| x.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string())
+                    .collect();
+                let n = ids.len();
+                ids.sort();
+                ids.dedup();
+                assert_eq!(ids.len(), n, "scan {scans} answered a key twice");
+                for k in &before {
+                    assert!(
+                        ids.binary_search(k).is_ok(),
+                        "scan {scans} lost {k}, acknowledged before it began"
+                    );
+                }
+                assert!(
+                    r.missing.is_empty(),
+                    "scan {scans} was short without asking: {:?}",
+                    r.missing
+                );
+                complete += 1;
+            }
+            Err(e) => {
+                let e = e.to_string();
+                assert!(
+                    e.contains("not on this node")
+                        || e.contains("moving")
+                        || e.contains("did not answer")
+                        || e.contains("deadline"),
+                    "scan {scans} refused for something that is not the move: {e}"
+                );
+                refused_scans.push(e);
+            }
+        }
+    }
+    let (moves, move_refusals) = mover.join().unwrap();
+    let (writes, write_refusals, disagreed) = load.join().unwrap();
+    eprintln!(
+        "resilience: {moves} moves done, {} refused; {writes} writes, {write_refusals} refused \
+         ({disagreed} as the map moved twice); {scans} scans, {complete} complete, {} refused naming \
+         the move",
+        move_refusals.len(),
+        refused_scans.len()
+    );
+    for r in &move_refusals {
+        eprintln!("resilience: move refused: {r}");
+    }
+    for r in &move_refusals {
+        assert!(
+            r.contains("already on")
+                || r.contains("not on this node")
+                || r.contains("already moving"),
+            "a move refused for something that is not the map moving under it: {r}"
+        );
+    }
+    assert!(moves >= 12, "the moves ran: {moves} of 24, refused: {move_refusals:?}");
+    assert!(complete >= 10, "scans completed between the moves: {complete} of {scans}");
+    // After the last move: every node agrees, every key answers everywhere.
+    std::thread::sleep(Duration::from_millis(500));
+    let acked = acked.lock().unwrap().clone();
+    for n in [&a, &b, &c] {
+        let r = n.query("SELECT count(*) AS c FROM items").unwrap();
+        let count = r.rows[0].doc.path("c").and_then(|v| v.as_i64()).unwrap() as usize;
+        assert_eq!(
+            count,
+            acked.len(),
+            "every acknowledged write, and nothing else, through {}",
+            n.url
+        );
+    }
+    for key in acked.iter().step_by(11) {
+        let r = c.query(&format!("SELECT id FROM items WHERE id = '{key}' LIMIT 1")).unwrap();
+        assert_eq!(r.rows.len(), 1, "{key} after the moves");
+    }
+    remove(vec![a, b, c]);
+}

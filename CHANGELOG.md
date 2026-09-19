@@ -6,6 +6,44 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.55.0 — 2026-09-19
+
+The last statement that waited under the lock for a holder no longer
+does, and deferred work may go back under the lock, hence a minor.
+
+**A delete by predicate waits for no holder under the lock.** Its keys
+come from every holder, so a holder that could not be reached was a
+select that waited for it under the lock -- the one statement 0.53.0
+left there. Now the delete asks every holder whether it answers with
+the lock let go, is refused by the one that does not (`DELETE refused
+and NOTHING was deleted: <node> ... did not answer`), and selects and
+deletes its keys under the lock only once every holder has answered.
+For that, deferred work may now go back under the lock:
+`Outcome::finished_with(&RwLock<Db>)` finishes it, and the console and
+the wire use it; `Outcome::finished()` still finishes work that needs
+no lock and refuses work that does, naming the other. A holder lost
+between the two steps is waited for under the lock, as before.
+
+**A move pins a source elsewhere with the lock let go, and every peer
+learns the switch.** The resilience suite's new property -- shards moved
+at every step under a load and a scan that never stops -- found a move
+asking another node for the pin under the coordinator's lock while that
+node waited on the same lock to answer a scan: thirty seconds each, and
+a pin made late that refused writes with nobody to abort it. The pin on
+a source elsewhere is now asked for as deferred work, within the
+statement's budget, and a pin asked for past its deadline is not made.
+A node that coordinates moves and holds no shard of the collection was
+told of no switch and sent the next move to the old holder: the switch
+now reaches every peer that attached. And a write or delete carried to
+a holder after the map moved under it follows the holder's refusal to
+the node it names, once. The suite's next run found a key acknowledged
+and missing from a scan: the scan, planned on the old map, read the
+source's copy after the target had taken the write. So the target
+fences the source once it holds every file (`fence_move`, a new wire
+call an older source may not know, in which case the old window stays):
+from then until the map switches, a read of the shard on the source is
+refused naming the move, as a write has been since the pin.
+
 ## 0.54.0 — 2026-09-19
 
 A partial answer costs one bounded wait for every holder that cannot be

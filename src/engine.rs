@@ -500,6 +500,20 @@ pub struct MoveOut {
     #[allow(dead_code)]
     sealed: Vec<Arc<SegmentHandle>>,
     files: Vec<(String, MoveFile)>,
+    /// Set by the target once it holds every file: from then on the source
+    /// answers no read of the shard either, since the next write lands on
+    /// the target and a read served here would not see it.
+    fenced: std::sync::atomic::AtomicBool,
+}
+
+impl MoveOut {
+    pub fn fence(&self) {
+        self.fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn fenced(&self) -> bool {
+        self.fenced.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 enum MoveFile {
@@ -533,7 +547,12 @@ impl MoveOut {
             files.push((format!("segments/{id:016x}.seg"), MoveFile::Bytes(bytes.clone())));
         }
         files.push(("MANIFEST".to_string(), MoveFile::Bytes(ex.manifest.clone())));
-        Ok(MoveOut { to: to.to_string(), sealed: ex.sealed, files })
+        Ok(MoveOut {
+            to: to.to_string(),
+            sealed: ex.sealed,
+            files,
+            fenced: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Every file and its length, in the order the target writes them:
@@ -827,17 +846,70 @@ pub enum Outcome {
 /// What a statement pinned under the lock and copies without it. Holds the
 /// segment handles it reads, so a compaction that retires one cannot unlink
 /// the file before the copy has it.
-pub struct Deferred(Box<dyn FnOnce() -> Result<Outcome> + Send>);
+pub struct Deferred(Box<dyn FnOnce() -> Result<Step> + Send>);
+
+/// What deferred work leaves behind: the outcome, or work that needs the
+/// database again.
+enum Step {
+    Done(Box<Outcome>),
+    Resume(Resume),
+}
+
+type ResumeFn = Box<dyn FnOnce(&mut Db) -> Result<Outcome> + Send>;
+
+/// Work that goes back under the database lock after work that ran without
+/// it: a `DELETE ... WHERE` asks its holders whether they answer with no lock
+/// held, and selects its keys under the lock only once they have.
+pub struct Resume(ResumeFn);
+
+impl Resume {
+    pub(crate) fn new(f: impl FnOnce(&mut Db) -> Result<Outcome> + Send + 'static) -> Resume {
+        Resume(Box::new(f))
+    }
+}
 
 impl Deferred {
     pub(crate) fn new(f: impl FnOnce() -> Result<Outcome> + Send + 'static) -> Deferred {
-        Deferred(Box::new(f))
+        Deferred(Box::new(move || f().map(|out| Step::Done(Box::new(out)))))
+    }
+
+    /// Work without the lock that then wants it back.
+    pub(crate) fn then_under_lock(f: impl FnOnce() -> Result<Resume> + Send + 'static) -> Deferred {
+        Deferred(Box::new(move || f().map(Step::Resume)))
     }
 
     /// Run the work. The caller holds no database lock here, and nothing
-    /// the work does needs one.
+    /// the work does needs one; work that does (a `DELETE ... WHERE` across
+    /// nodes) is refused here and finished by
+    /// [`finish_with`](Self::finish_with).
     pub fn finish(self) -> Result<Outcome> {
-        (self.0)()
+        match (self.0)()? {
+            Step::Done(out) => Ok(*out),
+            Step::Resume(_) => Err(Error::Plan(
+                "this statement's deferred work needs the database again; finish it with                  the lock at hand (`Outcome::finished_with`)"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Run the work, taking the database lock again for the steps that need
+    /// it and holding it for those alone.
+    pub fn finish_with(self, db: &std::sync::RwLock<Db>) -> Result<Outcome> {
+        let mut step = (self.0)()?;
+        loop {
+            step = match step {
+                Step::Done(out) => match *out {
+                    Outcome::Deferred(d) => (d.0)()?,
+                    out => return Ok(out),
+                },
+                Step::Resume(r) => {
+                    let mut guard = db.write().unwrap_or_else(|p| p.into_inner());
+                    let out = (r.0)(&mut guard)?;
+                    drop(guard);
+                    Step::Done(Box::new(out))
+                }
+            };
+        }
     }
 }
 
@@ -865,6 +937,16 @@ impl Outcome {
     pub fn finished(self) -> Result<Outcome> {
         match self {
             Outcome::Deferred(d) => d.finish(),
+            other => Ok(other),
+        }
+    }
+
+    /// The same, with the database at hand for deferred work that goes
+    /// back under its lock: what the console and the wire call, with the
+    /// lock they took for the statement let go.
+    pub fn finished_with(self, db: &std::sync::RwLock<Db>) -> Result<Outcome> {
+        match self {
+            Outcome::Deferred(d) => d.finish_with(db),
             other => Ok(other),
         }
     }
@@ -2018,6 +2100,18 @@ impl Db {
         Ok(n)
     }
 
+    /// What dials a holder with the lock let go, as `wire_node` does under
+    /// it: for a carry whose holder names another, the map having moved
+    /// under the statement.
+    fn dialer(&self) -> Dialer {
+        Dialer {
+            token: self.wire_token.clone(),
+            tls: self.opts.tls.clone(),
+            me: self.opts.node.clone(),
+            epoch: self.epoch_cell(),
+        }
+    }
+
     /// A wire peer as this node speaks to it: the token, the TLS, and this
     /// node's identity for the frames that carry one.
     fn wire_node(&self, url: &str) -> Result<crate::wire::Node> {
@@ -2757,6 +2851,15 @@ impl Db {
                 )));
             }
         }
+        // A pin asked for past its deadline is not made: the coordinator
+        // has given the move up by now, and a pin it never learns of would
+        // refuse the shard's writes until someone aborted it.
+        if crate::deadline::expired() {
+            return Err(Error::Deadline(format!(
+                "shard {shard} of `{collection}` was not pinned: the move's deadline had passed \
+                 when the pin was asked for"
+            )));
+        }
         let coll = self.catalog.get(collection)?.clone();
         self.absorb_shard_catalogs(collection)?;
         let ts = self.clock.peek().max(self.last_commit);
@@ -2772,6 +2875,28 @@ impl Db {
         let list = out.list()?;
         self.moves.lock().unwrap_or_else(|p| p.into_inner()).insert(key, out);
         Ok(list)
+    }
+
+    /// A shard of `collection` here whose move the target has fenced --
+    /// the target holds every file and is about to take the map -- and
+    /// where it went: a read of the collection here is refused meanwhile,
+    /// since a write landing on the target now would be missing from it.
+    /// The window is the switch's carry; before the fence a scan planned
+    /// on the old map read the source's copy after the target took a
+    /// write, and a key acknowledged was missing from the answer.
+    pub fn fenced_shard(&self, collection: &str) -> Option<(usize, String)> {
+        let moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
+        moves
+            .iter()
+            .find(|((c, _), m)| c == collection && m.fenced())
+            .map(|((_, i), m)| (*i, m.to.clone()))
+    }
+
+    fn refuse_if_fenced(&self, collection: &str) -> Result<()> {
+        match self.fenced_shard(collection) {
+            Some((i, to)) => Err(Error::Plan(fenced_message(collection, i, &to))),
+            None => Ok(()),
+        }
     }
 
     /// Let go of a pinned move: the shard takes writes again and its files
@@ -2837,11 +2962,13 @@ impl Db {
         }
         let mut new = tablets.clone();
         new[shard].node = to.to_string();
-        let files = if self.is_self(&from) {
-            self.begin_move(collection, shard, to)?
-        } else {
-            self.node_conn(&from)?.begin_move(collection, shard, to)?
-        };
+        // The pin: here, now, when this node is the source; on the source
+        // as deferred work otherwise. Asked for under this lock it closed a
+        // cycle -- the source waiting for this node's lock to answer a
+        // scan it was serving, this node waiting for the source's to pin
+        // -- that only the deadline broke.
+        let files =
+            if self.is_self(&from) { Some(self.begin_move(collection, shard, to)?) } else { None };
         // The target and the source as wire peers, this node included: the
         // job holds no lock and reaches this node the way any other does.
         // Connections of their own, not the pool's: a pool connection is
@@ -2860,12 +2987,28 @@ impl Db {
             files,
             source,
             target,
+            deadline_ms: crate::deadline::remaining_ms(),
         })
     }
 
     /// The copy, holding nothing: the target pulls, adopts, and switches
     /// the map on every node; a pull that fails releases the pin.
-    fn move_run(plan: MovePlan) -> Result<Outcome> {
+    fn move_run(mut plan: MovePlan) -> Result<Outcome> {
+        let files = match plan.files.take() {
+            Some(files) => files,
+            // The pin on a source elsewhere, within the statement's budget:
+            // a source that does not answer is a move that did not begin.
+            None => {
+                let _deadline = crate::deadline::arm(plan.deadline_ms);
+                match plan.source.begin_move(&plan.collection, plan.shard, &plan.to) {
+                    Ok(files) => files,
+                    Err(e) => {
+                        Db::move_abort(&plan);
+                        return Err(e);
+                    }
+                }
+            }
+        };
         // A copy takes what it takes.
         let _no_deadline = crate::deadline::arm(None);
         match plan.target.pull_shard(&plan.coll, &plan.new, plan.shard, &plan.from) {
@@ -2875,13 +3018,20 @@ impl Db {
                 plan.collection,
                 plan.from,
                 plan.to,
-                plan.files.len()
+                files.len()
             ))),
             Err(e) => {
-                let _ = plan.source.abort_move(&plan.collection, plan.shard);
+                Db::move_abort(&plan);
                 Err(e)
             }
         }
+    }
+
+    /// Let the source go of the pin, briefly: a source that does not answer
+    /// the abort is not waited for.
+    fn move_abort(plan: &MovePlan) {
+        let _deadline = crate::deadline::arm(Some(5_000));
+        let _ = plan.source.abort_move(&plan.collection, plan.shard);
     }
 
     /// The target's half of a move, on this node: pull every file of the
@@ -2949,12 +3099,18 @@ impl Db {
         self.adopt_shard(coll, &map, shard, incoming)?;
         self.place_shard(&coll.name, shard, &me)?;
         let mut order: Vec<String> = Vec::new();
+        // Every node this one knows: the holders old and new, the nodes
+        // and coordinators the catalog names, and the peers that attached
+        // -- a node that coordinates moves and holds no shard of the
+        // collection kept a stale map, and issued the next move to the old
+        // holder, until the peers that attached were counted.
         let others: Vec<String> = old
             .iter()
             .chain(tablets.iter())
             .map(|t| t.node.clone())
             .chain(self.catalog.nodes.iter().cloned())
             .chain(self.catalog.coordinators.iter().cloned())
+            .chain(self.attached.iter().cloned())
             .collect();
         for n in others {
             if !n.is_empty() && !self.is_self(&n) && n != from && !order.contains(&n) {
@@ -3285,6 +3441,12 @@ impl Db {
     // ------------------------------------------------------------- writes
 
     pub fn insert(&mut self, collection: &str, doc: Value) -> Result<Timestamp> {
+        // A document whose shard is elsewhere is forwarded HERE, under
+        // whatever lock the caller holds: this is the embedded API, one
+        // process and its own shards. In a cluster, an `INSERT` statement
+        // through `execute` is the way: its carry to the holder runs with
+        // the lock let go, so two nodes each forwarding to the other under
+        // their locks cannot wait for each other.
         let _deadline = self.arm_default_deadline();
         let coll = self.catalog.get(collection)?;
         let key = sort_key(coll, &doc)?;
@@ -4116,6 +4278,106 @@ impl Db {
         out
     }
 
+    /// A delete by predicate: the keys it selects, then each deleted here
+    /// or carried to its holder. Under the lock, as every statement.
+    fn delete_where(&mut self, d: DeleteStmt, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let (keys, cut): (Vec<String>, Vec<String>) = match &d.predicate {
+            None => {
+                return Err(Error::Plan(
+                    "DELETE without WHERE is refused; add a predicate or drop the \
+                     collection"
+                        .into(),
+                ))
+            }
+            Some(p) => {
+                let sel = exec::select_for_delete(&d.collection, p);
+                // The whole result, not just its rows. A DELETE runs
+                // the same `Select` every query does, so its predicate
+                // can be CUT the same way — and this is the one
+                // statement shape where a short answer does write
+                // work.
+                let r = self.run_select(&sel, sql, params, false)?;
+                (r.rows.iter().map(|x| x.key.clone()).collect(), r.truncated_prefixes.clone())
+            }
+        };
+        // REFUSED, and before a single `delete_key`. The choice is
+        // between executing and saying so, and refusing, and it is
+        // decided by what a cut predicate does in the shape that goes
+        // WRONG rather than by the shape that is merely short.
+        //
+        // A cut SELECT is recoverable: the caller widens the prefix and
+        // runs it again, and the rows are still there to be found. A
+        // cut DELETE is not, and in the negated shape it is not even
+        // short — it is LARGER than what was asked for. `DELETE ...
+        // WHERE text_match(body, 'zed -a*')` over 1000 documents each
+        // holding its own `a#####` term excludes every one of them, so
+        // the correct answer is zero rows; the cut exclusion set covers
+        // 512 of the terms, the other 488 documents are no longer
+        // excluded, and executing it destroyed 488 rows THE PREDICATE
+        // EXCLUDED. No acknowledgement fixes that, because by the time
+        // it is read the rows are gone.
+        //
+        // Nor are the two told apart here and only the dangerous one
+        // refused. The direction IS known — `required_prefixes` records
+        // the effective polarity, SQL's own `NOT` included, which is
+        // what lets the SELECT report name a consequence — but knowing
+        // it buys nothing for a statement that cannot be taken back.
+        // One statement may spell a prefix both ways and get one term
+        // list, a positive leaf that is merely SHORT still deletes a
+        // set nobody named, and the caller's remedy is the same either
+        // way. So the refusal is on the CUT, not on the sign.
+        //
+        // So: refuse, which is what this repository does everywhere the
+        // alternative is doing something irreversible quietly — the
+        // prefix-leaf budget above refuses rather than trimming, the
+        // server binds the loopback rather than guessing an interface.
+        // The cost is a wide-prefix DELETE that has to be spelled as
+        // several narrower ones, and that loop deletes exactly what
+        // each piece names, which is the property a re-run loop over a
+        // cut predicate never had.
+        if !cut.is_empty() {
+            let cap = self.catalog.get(&d.collection)?.prefix_cap();
+            return Err(Error::Plan(format!(
+                "DELETE refused and NOTHING was deleted: its predicate was CUT at \
+                 {cap} expanded terms (this collection's prefix_expansion), so the \
+                 documents it selects are not the documents it describes. A cut `a*` \
+                 names only part of what it matches; a cut `-a*` is a short EXCLUSION \
+                 set, so the statement would delete documents the predicate EXCLUDES \
+                 — and a delete cannot be taken back either way. Narrow the prefix \
+                 until it expands to at most {cap} terms and delete the pieces, raise \
+                 the collection's prefix_expansion if its vocabulary fits under the \
+                 ceiling, or delete by key; the same predicate as a SELECT shows what \
+                 was cut — {}",
+                cut.join("; ")
+            )));
+        }
+        let mut n = 0;
+        let mut away: Away<String> = BTreeMap::new();
+        for k in keys {
+            match self.owner_of(&d.collection, &k)? {
+                None => {
+                    if self.delete_key_here(&d.collection, &k)? {
+                        n += 1;
+                    }
+                }
+                Some(url) => {
+                    let conn = self.node_conn(&url)?;
+                    away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push(k);
+                }
+            }
+        }
+        if away.is_empty() {
+            return Ok(Outcome::Ack(format!("{n} document(s) deleted")));
+        }
+        let collection = d.collection.clone();
+        let remaining = crate::deadline::remaining_ms();
+        let dialer = self.dialer();
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let n = n + carry_deletes(&collection, away, remaining, &dialer)?;
+            Ok(Outcome::Ack(format!("{n} document(s) deleted")))
+        })))
+    }
+
     /// Whether `stmt` is answered by [`read`](Self::read): a `SELECT`, an
     /// `EXPLAIN` of one, or either behind `LOCAL`. Everything else changes
     /// something and takes `&mut self`.
@@ -4404,108 +4666,48 @@ impl Db {
                 }
                 let collection = i.collection.clone();
                 let remaining = crate::deadline::remaining_ms();
+                let dialer = self.dialer();
                 Ok(Outcome::Deferred(Deferred::new(move || {
-                    let last = carry_writes(&collection, away, last, remaining)?;
+                    let last = carry_writes(&collection, away, last, remaining, &dialer)?;
                     Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
                 })))
             }
             Statement::Delete(d) => {
-                let (keys, cut): (Vec<String>, Vec<String>) = match &d.predicate {
-                    None => {
-                        return Err(Error::Plan(
-                            "DELETE without WHERE is refused; add a predicate or drop the \
-                             collection"
-                                .into(),
-                        ))
-                    }
-                    Some(p) => {
-                        let sel = exec::select_for_delete(&d.collection, p);
-                        // The whole result, not just its rows. A DELETE runs
-                        // the same `Select` every query does, so its predicate
-                        // can be CUT the same way — and this is the one
-                        // statement shape where a short answer does write
-                        // work.
-                        let r = self.run_select(&sel, sql, params, false)?;
-                        (
-                            r.rows.iter().map(|x| x.key.clone()).collect(),
-                            r.truncated_prefixes.clone(),
-                        )
-                    }
-                };
-                // REFUSED, and before a single `delete_key`. The choice is
-                // between executing and saying so, and refusing, and it is
-                // decided by what a cut predicate does in the shape that goes
-                // WRONG rather than by the shape that is merely short.
-                //
-                // A cut SELECT is recoverable: the caller widens the prefix and
-                // runs it again, and the rows are still there to be found. A
-                // cut DELETE is not, and in the negated shape it is not even
-                // short — it is LARGER than what was asked for. `DELETE ...
-                // WHERE text_match(body, 'zed -a*')` over 1000 documents each
-                // holding its own `a#####` term excludes every one of them, so
-                // the correct answer is zero rows; the cut exclusion set covers
-                // 512 of the terms, the other 488 documents are no longer
-                // excluded, and executing it destroyed 488 rows THE PREDICATE
-                // EXCLUDED. No acknowledgement fixes that, because by the time
-                // it is read the rows are gone.
-                //
-                // Nor are the two told apart here and only the dangerous one
-                // refused. The direction IS known — `required_prefixes` records
-                // the effective polarity, SQL's own `NOT` included, which is
-                // what lets the SELECT report name a consequence — but knowing
-                // it buys nothing for a statement that cannot be taken back.
-                // One statement may spell a prefix both ways and get one term
-                // list, a positive leaf that is merely SHORT still deletes a
-                // set nobody named, and the caller's remedy is the same either
-                // way. So the refusal is on the CUT, not on the sign.
-                //
-                // So: refuse, which is what this repository does everywhere the
-                // alternative is doing something irreversible quietly — the
-                // prefix-leaf budget above refuses rather than trimming, the
-                // server binds the loopback rather than guessing an interface.
-                // The cost is a wide-prefix DELETE that has to be spelled as
-                // several narrower ones, and that loop deletes exactly what
-                // each piece names, which is the property a re-run loop over a
-                // cut predicate never had.
-                if !cut.is_empty() {
-                    let cap = self.catalog.get(&d.collection)?.prefix_cap();
-                    return Err(Error::Plan(format!(
-                        "DELETE refused and NOTHING was deleted: its predicate was CUT at \
-                         {cap} expanded terms (this collection's prefix_expansion), so the \
-                         documents it selects are not the documents it describes. A cut `a*` \
-                         names only part of what it matches; a cut `-a*` is a short EXCLUSION \
-                         set, so the statement would delete documents the predicate EXCLUDES \
-                         — and a delete cannot be taken back either way. Narrow the prefix \
-                         until it expands to at most {cap} terms and delete the pieces, raise \
-                         the collection's prefix_expansion if its vocabulary fits under the \
-                         ceiling, or delete by key; the same predicate as a SELECT shows what \
-                         was cut — {}",
-                        cut.join("; ")
-                    )));
+                // A delete by predicate selects its keys first, from every
+                // holder, so a holder that cannot be reached is a select
+                // that waits for it -- and the select is under the lock.
+                // So the holders are asked whether they answer with the
+                // lock let go, and the keys are selected under it only
+                // once they have; one that does not answer refuses the
+                // delete before anything is deleted. A holder lost between
+                // the two steps is waited for under the lock, as before.
+                let holders = self.holders(&d.collection);
+                if d.predicate.is_none() || holders.is_empty() || crate::wire::serving() {
+                    return self.delete_where(d, sql, params);
                 }
-                let mut n = 0;
-                let mut away: Away<String> = BTreeMap::new();
-                for k in keys {
-                    match self.owner_of(&d.collection, &k)? {
-                        None => {
-                            if self.delete_key_here(&d.collection, &k)? {
-                                n += 1;
-                            }
-                        }
-                        Some(url) => {
-                            let conn = self.node_conn(&url)?;
-                            away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push(k);
-                        }
-                    }
-                }
-                if away.is_empty() {
-                    return Ok(Outcome::Ack(format!("{n} document(s) deleted")));
+                let mut conns = Vec::new();
+                for url in holders {
+                    conns.push((url.clone(), self.node_conn(&url)?));
                 }
                 let collection = d.collection.clone();
                 let remaining = crate::deadline::remaining_ms();
-                Ok(Outcome::Deferred(Deferred::new(move || {
-                    let n = n + carry_deletes(&collection, away, remaining)?;
-                    Ok(Outcome::Ack(format!("{n} document(s) deleted")))
+                let sql = sql.to_string();
+                let params = params.to_vec();
+                Ok(Outcome::Deferred(Deferred::then_under_lock(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    for (url, _, r) in fetch_counters(&conns, &collection, false) {
+                        if let Err(Error::Deadline(e)) = r {
+                            return Err(Error::Deadline(format!(
+                                "DELETE refused and NOTHING was deleted: {url} holds shards of                                  `{collection}` and did not answer ({e}); a delete by predicate                                  selects its keys from every holder first"
+                            )));
+                        }
+                        r?;
+                    }
+                    let left = crate::deadline::remaining_ms();
+                    Ok(Resume::new(move |db: &mut Db| {
+                        let _deadline = crate::deadline::arm(left);
+                        db.delete_where(d, &sql, &params)
+                    }))
                 })))
             }
             Statement::Select(sel) => {
@@ -5377,6 +5579,7 @@ impl Db {
         // The snapshot and the epoch: this node's clock and write count,
         // raised by every other holder's, so that a write that landed on
         // another node is read and ages the statistics here.
+        self.refuse_if_fenced(&sel.collection)?;
         let tablets = self.catalog.placement.get(&sel.collection).cloned().unwrap_or_default();
         let mut ts = ts;
         let mut writes = self.writes_to(&sel.collection);
@@ -5460,6 +5663,7 @@ impl Db {
             let (edges, index) = self.check_walk(coll, path, *k, via, filters)?;
             self.note_touches(via, &[(index.path.clone(), IndexUse::Walk)]);
             // The edge collection's holders, for its instant and its shards.
+            self.refuse_if_fenced(via)?;
             let tablets = self.catalog.placement.get(via).cloned().unwrap_or_default();
             let mut edge_unreachable: Vec<usize> = Vec::new();
             let mut remotes: BTreeMap<String, Arc<crate::wire::Node>> = BTreeMap::new();
@@ -6219,6 +6423,7 @@ fn carry_writes(
     away: Away<Value>,
     last: Timestamp,
     remaining: Option<u64>,
+    dialer: &Dialer,
 ) -> Result<Timestamp> {
     let answers: Vec<Result<Timestamp>> = std::thread::scope(|scope| {
         let handles: Vec<_> = away
@@ -6228,8 +6433,16 @@ fn carry_writes(
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
                     let mut last = 0;
+                    let mut moved = Moved::default();
                     for doc in docs {
-                        last = last.max(n.insert(collection, doc)?);
+                        let ts = match n.insert(collection, doc) {
+                            Ok(ts) => ts,
+                            Err(e) => match moved_to(&e) {
+                                Some(url) => moved.dial(dialer, &url)?.insert(collection, doc)?,
+                                None => return Err(e),
+                            },
+                        };
+                        last = last.max(ts);
                     }
                     Ok(last)
                 })
@@ -6246,7 +6459,12 @@ fn carry_writes(
 
 /// Delete keys on their holders, holder by holder at once, holding
 /// nothing; how many were there.
-fn carry_deletes(collection: &str, away: Away<String>, remaining: Option<u64>) -> Result<usize> {
+fn carry_deletes(
+    collection: &str,
+    away: Away<String>,
+    remaining: Option<u64>,
+    dialer: &Dialer,
+) -> Result<usize> {
     let answers: Vec<Result<usize>> = std::thread::scope(|scope| {
         let handles: Vec<_> = away
             .values()
@@ -6255,8 +6473,16 @@ fn carry_deletes(collection: &str, away: Away<String>, remaining: Option<u64>) -
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
                     let mut n_deleted = 0;
+                    let mut moved = Moved::default();
                     for k in keys {
-                        if n.delete(collection, k)? {
+                        let gone = match n.delete(collection, k) {
+                            Ok(gone) => gone,
+                            Err(e) => match moved_to(&e) {
+                                Some(url) => moved.dial(dialer, &url)?.delete(collection, k)?,
+                                None => return Err(e),
+                            },
+                        };
+                        if gone {
                             n_deleted += 1;
                         }
                     }
@@ -6271,6 +6497,56 @@ fn carry_deletes(collection: &str, away: Away<String>, remaining: Option<u64>) -
         n += r?;
     }
     Ok(n)
+}
+
+/// What dials a holder outside the lock: the token, the TLS and this node's
+/// identity, as `Db::wire_node` uses them under it.
+pub(crate) struct Dialer {
+    token: Option<String>,
+    tls: Option<Arc<crate::tls::Tls>>,
+    me: Option<String>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Dialer {
+    fn dial(&self, url: &str) -> Result<crate::wire::Node> {
+        let n = crate::wire::Node::new(url, self.token.as_deref(), self.tls.clone())?;
+        Ok(match &self.me {
+            Some(me) => n.with_identity(me, self.epoch.clone()),
+            None => n,
+        })
+    }
+}
+
+/// The holders a carry was sent on to, one connection each: a holder
+/// that refuses a key as another's is the map having moved under the
+/// statement -- a shard switched to its new node between the plan and
+/// the carry -- and the refusal names where, so the key goes there once.
+#[derive(Default)]
+struct Moved(BTreeMap<String, crate::wire::Node>);
+
+impl Moved {
+    fn dial(&mut self, dialer: &Dialer, url: &str) -> Result<&crate::wire::Node> {
+        if !self.0.contains_key(url) {
+            self.0.insert(url.to_string(), dialer.dial(url)?);
+        }
+        Ok(&self.0[url])
+    }
+}
+
+/// What a read of a fenced shard is refused with, here and over the wire.
+pub fn fenced_message(collection: &str, shard: usize, to: &str) -> String {
+    format!(
+        "shard {shard} of `{collection}` is moving to {to} and its map is switching; a read of \
+         it here would miss the writes landing there -- retry"
+    )
+}
+
+/// The node a holder's refusal names as the key's, when it names one.
+fn moved_to(e: &Error) -> Option<String> {
+    let Error::Plan(m) = e else { return None };
+    let rest = m.split_once("belongs to the shard on ")?.1;
+    Some(rest.split(',').next()?.trim().to_string())
 }
 
 /// A map switch to carry to the peers, holding nothing: the statement and
@@ -6288,9 +6564,13 @@ pub struct MovePlan {
     to: String,
     coll: Collection,
     new: Vec<Tablet>,
-    files: Vec<(String, u64)>,
+    /// The pinned files, when this node is the source and pinned under the
+    /// lock; `None` for a source elsewhere, pinned by the deferred work.
+    files: Option<Vec<(String, u64)>>,
     source: Arc<crate::wire::Node>,
     target: Arc<crate::wire::Node>,
+    /// What was left of the statement's budget at the plan, for the pin.
+    deadline_ms: Option<u64>,
 }
 
 /// A compaction reserved on one shard: what the console's maintenance

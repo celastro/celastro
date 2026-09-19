@@ -431,8 +431,8 @@ The resilience suite is the slow, cluster-shaped tests -- the
 reconciliation over four nodes and four hundred random histories, no
 acknowledged write lost across a node restarting under load, a large
 write-ahead log replaying, a cluster backup under load restoring to one
-consistent cut -- ignored by default so the gates stay fast, and run when
-asked:
+consistent cut, shards moving at every step under a scan that never
+stops -- ignored by default so the gates stay fast, and run when asked:
 
 ```sh
 cargo test --release --test resilience -- --ignored --test-threads=1 --nocapture

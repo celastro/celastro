@@ -122,6 +122,10 @@ enum Call {
     ReadFile = 16,
     PullShard = 17,
     AbortMove = 18,
+    /// The target holds every file of a pinned shard: the source answers
+    /// no read of it from here on, so a write landing on the target is
+    /// missing from no answer.
+    FenceMove = 20,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -148,6 +152,7 @@ impl Call {
             16 => Call::ReadFile,
             17 => Call::PullShard,
             18 => Call::AbortMove,
+            20 => Call::FenceMove,
             19 => Call::Catalog,
             _ => return None,
         })
@@ -173,6 +178,7 @@ impl Call {
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
             Call::AbortMove => "abort_move",
+            Call::FenceMove => "fence_move",
             Call::Catalog => "catalog",
         }
     }
@@ -1013,6 +1019,11 @@ impl Node {
         self.call(Call::AbortMove, collection, shard, &[]).map(|_| ())
     }
 
+    /// Tell the source its pinned shard is fenced: every file is here.
+    pub fn fence_move(&self, collection: &str, shard: usize) -> Result<()> {
+        self.call(Call::FenceMove, collection, shard, &[]).map(|_| ())
+    }
+
     /// `len` bytes of a pinned shard's file from `offset`.
     pub fn read_file(
         &self,
@@ -1544,6 +1555,18 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             put_bytes(&mut out, &pinned.read(&name, offset, len)?);
             return Ok(out);
         }
+        Call::FenceMove => {
+            match moves.lock().unwrap_or_else(|p| p.into_inner()).get(&(collection.clone(), shard))
+            {
+                Some(m) => m.fence(),
+                None => {
+                    return Err(Error::Plan(format!(
+                        "shard {shard} of `{collection}` is not pinned for a move here"
+                    )))
+                }
+            }
+            return Ok(out);
+        }
         Call::BeginMove => {
             let to = get_string(body, &mut 0)?;
             let pinned = moves
@@ -1595,6 +1618,12 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
                 .map(Path::to_path_buf)
                 .ok_or_else(|| Error::Plan("a move needs a persistent database (--dir)".into()))?;
             let incoming = Db::pull_files(&dir, &collection, shard, &source, &files)?;
+            // Every file is here: the source stops answering reads of the
+            // shard before this node takes its writes, or a scan planned on
+            // the old map read the source's copy after a write landed here
+            // and missed it. A source too old to know the fence keeps the
+            // old window, and is not waited for.
+            let _ = source.fence_move(&collection, shard);
             let switch = db
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1649,13 +1678,16 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             | Call::Expand
             | Call::Present
     );
+    let shared = db;
     let mut db = if read_call {
         Held::Read(db.read().unwrap_or_else(|p| p.into_inner()))
     } else {
         Held::Write(db.write().unwrap_or_else(|p| p.into_inner()))
     };
     match call {
-        Call::BeginMove | Call::ReadFile | Call::PullShard => unreachable!("answered above"),
+        Call::BeginMove | Call::ReadFile | Call::PullShard | Call::FenceMove => {
+            unreachable!("answered above")
+        }
         Call::AbortMove => {
             db.exclusive().abort_move(&collection, shard);
         }
@@ -1690,7 +1722,7 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             // finishes with this node's lock let go.
             let outcome = db.exclusive().execute_with(&sql, &params)?;
             drop(db);
-            let text = match outcome.finished()? {
+            let text = match outcome.finished_with(shared)? {
                 crate::engine::Outcome::Ack(m) => m,
                 other => format!("{other:?}"),
             };
@@ -1720,6 +1752,17 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
             // inferred path classes are folded in before planning, as
             // `Db::run_select` does for its own shards.
             let coll = db.planning_collection(&collection)?;
+            if let Some(m) =
+                moves.lock().unwrap_or_else(|p| p.into_inner()).get(&(collection.clone(), shard))
+            {
+                if m.fenced() {
+                    return Err(Error::Plan(crate::engine::fenced_message(
+                        &collection,
+                        shard,
+                        &m.to,
+                    )));
+                }
+            }
             let shards = db.shards(&collection)?;
             let Some(sh) = shards.iter().find(|s| s.index == shard) else {
                 return Err(Error::Plan(format!(
