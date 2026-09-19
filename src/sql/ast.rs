@@ -130,7 +130,17 @@ pub enum Statement {
     SplitShard {
         collection: String,
         shard: usize,
-        at: String,
+        /// The split key; none for the median of the shard's keys, which
+        /// the holder picks.
+        at: Option<String>,
+    },
+    /// `MERGE SHARDS <a> AND <b> OF <collection>` -- adjacent, on one node:
+    /// shard `b`'s rows join shard `a`, whose range becomes the union, and
+    /// `b`'s entry stays as a merged marker owning no key.
+    MergeShards {
+        collection: String,
+        a: usize,
+        b: usize,
     },
     /// `PLACE SHARD <i> OF <collection> ON 'tcp://host:port'` — this node's
     /// placement map records the shard on that node; a copy this node holds

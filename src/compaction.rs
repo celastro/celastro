@@ -255,6 +255,39 @@ pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
     Ok(())
 }
 
+/// Rows from elsewhere into this shard as segments of its own, at level 0:
+/// a merge's rows from the shard that goes away, versions layered as a
+/// compaction layers them, the deletes carried, installed as a compaction
+/// installs with no input retired.
+pub fn absorb(
+    shard: &mut Shard,
+    docs: Vec<PendingDoc>,
+    carried: &[crate::shard::CarriedDelete],
+    opts: &CompactionOpts,
+) -> Result<()> {
+    let now = shard.clock.peek();
+    let retain_from = shard.retain_from(now);
+    let layers = crate::segment::layer_by_version(docs);
+    let chunk = opts.segment_cap.max(1);
+    let coll = shard.coll.clone();
+    let mut outputs: Vec<Segment> = Vec::new();
+    for layer in layers.into_iter().rev() {
+        let mut rest = layer;
+        while !rest.is_empty() {
+            let take = chunk.min(rest.len());
+            let piece: Vec<PendingDoc> = rest.drain(..take).collect();
+            let id = shard.next_segment_id;
+            shard.next_segment_id += 1;
+            let mut b = SegmentBuilder::new(shard.opts.build);
+            for pd in piece {
+                b.add(pd);
+            }
+            outputs.push(b.build(id, 0, &coll)?);
+        }
+    }
+    shard.install_compaction(&[], outputs, carried, retain_from)
+}
+
 /// A job planned and its inputs pinned, for a build that runs with no lock
 /// held: the handles keep the input files alive, the ids are reserved on
 /// the shard, and everything else is a copy. What the console's maintenance

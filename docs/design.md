@@ -710,6 +710,32 @@ text and ranked queries and counts, that a compaction reclaims the
 halves, that a reopen and an encrypted directory keep the ranges, and
 that a cluster learns the map and moves the new shard.
 
+A split names no key when the holder should pick one: the middle of the
+keys visible at the split, sealed and in memory, distinct, which is
+above the first and so strictly inside the range whenever there are two
+(0.57.0). And a merge is the way back. `MERGE SHARDS a AND b OF c`,
+adjacent and on one node, rebuilds shard `b`'s rows into shard `a`
+through the compaction machinery -- `b`'s memtable sealed, every live
+row of every segment collected as a compaction collects, versions
+layered, deletes carried, installed as outputs with no input retired --
+widens `a`'s range to the union and removes `b`'s directory. What a
+merge cannot do is renumber: shard indices are directory names, metrics
+labels and the operator's handle, so `b`'s entry stays in the map with
+an empty range, `[x, x)`, that owns no key; the reads, the counters,
+the health, the moves and the rebalance skip it, and `SHOW CATALOG`
+says so. One thing the mask made necessary: a range that widens over
+rows an earlier split left masked in `a`'s segments would show them
+again, twice with the rebuilt copies and again after a restart, so the
+merge first seals `a` and rewrites every masked segment, dropping those
+rows for good, and only then widens. A merge is therefore row work
+under the lock, proportional to `b` plus what `a` had left to drop,
+with `b`'s rows in memory meanwhile: the statement says to name the
+larger shard first, and the split's link is the cheap direction by
+design. The peer's-word rule of the reconciliation covers ranges as
+well as holders since this: a shard the peer holds in both maps with a
+range that differs takes the peer's, so a split or a merge made across
+a partition arrives with the next sweep.
+
 Not built, by decision: replication, so a node that is down is a shard that
 is down -- and only that shard (0.34.0): the counters call every statement
 opens with does not fail the statement when a holder is silent; the
@@ -1822,6 +1848,8 @@ guarantee:
 | shards moved at every step under a load and a scan that never stops: every scan answers each acknowledged key once or is refused naming the move, every move completes, and every node agrees after | `resilience::a_scan_under_moves_at_every_step_answers_each_key_once_or_is_refused` (`--ignored`) |
 | a shard split at its median answers every key once -- sealed and in memory, by point lookup, text match, ranked query and count -- routes writes by the new map, refuses a key outside the range, drops the halves at the next compaction, and keeps its ranges across a reopen; an encrypted shard's files are re-sealed under the new name | `split::a_split_shard_answers_every_key_once_and_a_compaction_drops_what_moved`, `split::a_split_of_an_encrypted_shard_reseals_every_file_under_its_new_name` |
 | a split issued at a node that does not hold the shard is made by the holder, every node's map gains the shard, a count from any node is whole, a key past the split pins the plan to the new shard, and the new shard moves like any other | `wire::a_shard_splits_on_its_holder_and_every_node_learns_the_new_map` |
+| a split with no key takes the median; a merge rebuilds the second shard's rows into the first, widens its range, leaves a marker that refuses a split and a merge, drops the rows an earlier split left behind so nothing answers twice after a compaction or a reopen, and the merged shard splits again at the next index | `split::a_median_split_and_a_merge_are_each_other_s_inverse` |
+| a merge across two nodes is refused naming the move; on the holder it reaches every map, the merged index is skipped by every read and by health, and a split with no key issued elsewhere takes the holder's median | `wire::shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |

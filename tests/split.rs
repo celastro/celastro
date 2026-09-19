@@ -147,3 +147,91 @@ fn a_split_of_an_encrypted_shard_reseals_every_file_under_its_new_name() {
     assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items WHERE n >= 50"), 70);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A split with no key takes the middle of the shard's keys, sealed and in
+/// memory alike; a merge rebuilds the second shard's rows into the first,
+/// widens its range, and leaves the second's entry as a marker that owns no
+/// key, refuses a move and a split, and is skipped by every read. Every key
+/// answers once throughout, across a reopen, and a compaction of the
+/// merged shard changes nothing it answers.
+#[test]
+fn a_median_split_and_a_merge_are_each_other_s_inverse() {
+    let d = dir("merge");
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    ack(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    ack(&mut db, "CREATE INDEX items_body ON items USING fulltext (body)");
+    for i in 0..300 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    ack(&mut db, "FLUSH items");
+    for i in 300..400 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    let m = ack(&mut db, "SPLIT SHARD 0 OF items");
+    assert!(m.contains("split at 'k0200'") && m.contains("shard 1 is [k0200, )"), "{m}");
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 400);
+    // The new shard splits again at its own middle: k0200..k0399 -> k0300.
+    let m = ack(&mut db, "SPLIT SHARD 1 OF items");
+    assert!(m.contains("split at 'k0300'") && m.contains("shard 2 is [k0300, )"), "{m}");
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 400);
+    // Not adjacent: 0 is [, k0200), 2 is [k0300, ).
+    let e = db.execute("MERGE SHARDS 0 AND 2 OF items").unwrap_err().to_string();
+    assert!(e.contains("not adjacent"), "{e}");
+    // Adjacent, named in either order: the first named survives.
+    for i in 400..420 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    ack(&mut db, "DELETE FROM items WHERE id = 'k0350'");
+    let m = ack(&mut db, "MERGE SHARDS 1 AND 2 OF items");
+    assert!(m.contains("shard 1 is [k0200, )") && m.contains("shard 2 owns no key"), "{m}");
+    assert!(m.contains("row(s) of shard 2 rebuilt"), "{m}");
+    let cat = ack(&mut db, "SHOW CATALOG items");
+    assert!(cat.contains("shard 1 on this node [k0200, )"), "{cat}");
+    assert!(cat.contains("shard 2 merged away"), "{cat}");
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 419);
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items WHERE n >= 200"), 219);
+    assert_eq!(
+        count(&mut db, "SELECT count(*) AS n FROM items WHERE text_match(body, 'row')"),
+        419
+    );
+    for key in ["k0199", "k0200", "k0299", "k0300", "k0419"] {
+        let r = db.query(&format!("SELECT id FROM items WHERE id = '{key}' LIMIT 5")).unwrap();
+        assert_eq!(r.rows.len(), 1, "{key} answers once");
+    }
+    let r = db.query("SELECT id FROM items WHERE id = 'k0350' LIMIT 5").unwrap();
+    assert!(r.rows.is_empty(), "the delete before the merge holds");
+    for (sql, why) in [
+        ("SPLIT SHARD 2 OF items", "merged away"),
+        ("MERGE SHARDS 1 AND 2 OF items", "merged away"),
+        ("MERGE SHARDS 1 AND 1 OF items", "two different"),
+    ] {
+        let e = db.execute(sql).unwrap_err().to_string();
+        assert!(e.contains(why), "{sql}: {e}");
+    }
+    // A write past the old boundary lands on the widened shard.
+    db.insert("items", doc(500)).unwrap();
+    let plan = ack(&mut db, "EXPLAIN SELECT id FROM items WHERE id = 'k0500' LIMIT 1");
+    assert!(plan.contains("shard 1 (") && !plan.contains("shard 2 ("), "{plan}");
+    ack(&mut db, "FLUSH items");
+    for _ in 0..4 {
+        if ack(&mut db, "COMPACT items").starts_with("0 compaction") {
+            break;
+        }
+    }
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 420);
+    drop(db);
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 420);
+    assert!(
+        !d.join("collections/items/shard-0002").exists(),
+        "the merged shard's directory is gone"
+    );
+    // The whole way back: one shard again, every key.
+    let m = ack(&mut db, "MERGE SHARDS 0 AND 1 OF items");
+    assert!(m.contains("shard 0 is [, )"), "{m}");
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 420);
+    let m = ack(&mut db, "SPLIT SHARD 0 OF items AT 'k0100'");
+    assert!(m.contains("shard 3 is [k0100, )"), "a split after a merge takes the next index: {m}");
+    assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 420);
+    let _ = std::fs::remove_dir_all(&d);
+}

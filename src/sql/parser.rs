@@ -195,17 +195,29 @@ impl<'a> Parser<'a> {
             let shard = self.usize_literal()?;
             self.expect_kw("OF")?;
             let collection = self.ident()?;
-            self.expect_kw("AT")?;
-            let at = match self.literal()? {
-                Value::Str(s) => s,
-                other => {
-                    return Err(Error::Sql(format!(
-                        "a split key is a string, not {}",
-                        crate::json::to_string(&other)
-                    )))
+            let at = if self.eat_kw("AT") {
+                match self.literal()? {
+                    Value::Str(s) => Some(s),
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "a split key is a string, not {}",
+                            crate::json::to_string(&other)
+                        )))
+                    }
                 }
+            } else {
+                None
             };
             return Ok(Statement::SplitShard { collection, shard, at });
+        }
+        if self.eat_kw("MERGE") {
+            self.expect_kw("SHARDS")?;
+            let a = self.usize_literal()?;
+            self.expect_kw("AND")?;
+            let b = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            return Ok(Statement::MergeShards { collection, a, b });
         }
         if self.eat_kw("BACKUP") {
             let cluster = self.eat_kw("CLUSTER");

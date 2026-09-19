@@ -1233,7 +1233,7 @@ impl Db {
         };
         let mut shards = Vec::new();
         for (i, t) in tablets.iter().enumerate() {
-            if !db.is_self(&t.node) {
+            if !db.is_self(&t.node) || t.is_merged() {
                 continue;
             }
             let sdir = cdir.join(format!("shard-{i:04}"));
@@ -1953,6 +1953,9 @@ impl Db {
         let mut unreachable = 0usize;
         for (name, tablets) in &self.catalog.placement {
             for (i, t) in tablets.iter().enumerate() {
+                if t.is_merged() {
+                    continue;
+                }
                 let holder = if t.node.is_empty() { here.clone() } else { t.node.clone() };
                 let ok = up.contains(&holder);
                 if !ok {
@@ -2090,7 +2093,13 @@ impl Db {
             .catalog
             .placement
             .get(collection)
-            .map(|t| t.iter().map(|x| x.node.clone()).filter(|n| !self.is_self(n)).collect())
+            .map(|t| {
+                t.iter()
+                    .filter(|x| !x.is_merged())
+                    .map(|x| x.node.clone())
+                    .filter(|n| !self.is_self(n))
+                    .collect()
+            })
             .unwrap_or_default();
         v.sort();
         v.dedup();
@@ -2403,6 +2412,15 @@ impl Db {
             for (i, (m, t)) in mine.iter().zip(their_tablets).enumerate() {
                 let peer_claims = t.node == peer && m.node != peer;
                 let peer_gave_away = m.node == peer && t.node != peer;
+                // The peer's word about its own shards' ranges too: a split
+                // or a merge it made while the two could not reach each
+                // other changed no holder, only where a key goes.
+                if t.node == peer && m.node == peer && (t.lo != m.lo || t.hi != m.hi) {
+                    updated[i] = t.clone();
+                    changed = true;
+                    notes.push(format!("shard {i} of `{name}`: its range by {peer}'s word"));
+                    continue;
+                }
                 if !(peer_claims || peer_gave_away) {
                     continue;
                 }
@@ -2823,7 +2841,7 @@ impl Db {
         let mut moves = Vec::new();
         for (name, tablets) in &self.catalog.placement {
             for (i, t) in tablets.iter().enumerate() {
-                if t.node == url {
+                if t.node == url && !t.is_merged() {
                     let target = &remaining[moves.len() % remaining.len()];
                     moves.push(format!("MOVE SHARD {i} OF {name} TO '{target}'"));
                 }
@@ -2973,6 +2991,11 @@ impl Db {
                 tablets.len()
             )));
         };
+        if t.is_merged() {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` was merged away and owns no key"
+            )));
+        }
         let from = if t.node.is_empty() { me.clone() } else { t.node.clone() };
         if !self.is_self(to) && !self.catalog.nodes.iter().any(|n| n == to) {
             return Err(Error::Plan(format!(
@@ -3246,11 +3269,11 @@ impl Db {
         &mut self,
         collection: &str,
         shard: usize,
-        at: &str,
+        at: Option<&str>,
         local: bool,
     ) -> Result<Outcome> {
         let _deadline = self.arm_default_deadline();
-        if at.is_empty() || at.contains('\n') {
+        if at.is_some_and(|k| k.is_empty() || k.contains('\n')) {
             return Err(Error::Schema(
                 "a split key must be non-empty and must not contain a line break".into(),
             ));
@@ -3265,25 +3288,33 @@ impl Db {
                 tablets.len()
             )));
         };
-        let inside = t.lo.as_deref().map_or(true, |lo| at > lo)
-            && t.hi.as_deref().map_or(true, |hi| at < hi);
-        if !inside {
+        if t.is_merged() {
             return Err(Error::Plan(format!(
-                "shard {shard} of `{collection}` holds [{}, {}); a split key must be strictly \
-                 inside that range",
-                t.lo.clone().unwrap_or_default(),
-                t.hi.clone().unwrap_or_default()
+                "shard {shard} of `{collection}` was merged away and owns no key"
             )));
         }
         let holder = t.node.clone();
         let next = tablets.len();
         let hi_text = t.hi.clone().unwrap_or_default();
-        let mut new = tablets.clone();
-        new[shard].hi = Some(at.to_string());
-        new.push(Tablet { node: holder.clone(), lo: Some(at.to_string()), hi: t.hi.clone() });
-        let quoted = at.replace('\'', "''");
         if !self.is_self(&holder) {
+            let Some(at) = at else {
+                if local {
+                    return Err(Error::Plan(format!(
+                        "shard {shard} of `{collection}` is on {holder}, which picks the key"
+                    )));
+                }
+                // The holder picks the median, and tells everyone.
+                let conn = self.node_conn(&holder)?;
+                let sql = format!("LOCAL SPLIT SHARD {shard} OF {collection}");
+                let remaining = crate::deadline::remaining_ms();
+                return Ok(Outcome::Deferred(Deferred::new(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    Ok(Outcome::Ack(conn.statement(&sql, &[])?))
+                })));
+            };
+            Self::inside_range(collection, shard, &t, at)?;
             if local {
+                let new = Self::split_map(&tablets, shard, at);
                 self.catalog.placement.insert(collection.to_string(), new);
                 self.persist_catalog()?;
                 return Ok(Outcome::Ack(format!(
@@ -3292,13 +3323,40 @@ impl Db {
                 )));
             }
             let conn = self.node_conn(&holder)?;
-            let sql = format!("LOCAL SPLIT SHARD {shard} OF {collection} AT '{quoted}'");
+            let sql = format!(
+                "LOCAL SPLIT SHARD {shard} OF {collection} AT '{}'",
+                at.replace('\'', "''")
+            );
             let remaining = crate::deadline::remaining_ms();
             return Ok(Outcome::Deferred(Deferred::new(move || {
                 let _deadline = crate::deadline::arm(remaining);
                 Ok(Outcome::Ack(conn.statement(&sql, &[])?))
             })));
         }
+        // Held here: the key given, or the middle of the shard's keys.
+        let at: String = match at {
+            Some(k) => k.to_string(),
+            None => {
+                let ts = self.clock.peek().max(self.last_commit);
+                self.shards
+                    .get(collection)
+                    .and_then(|v| v.iter().find(|s| s.index == shard))
+                    .ok_or_else(|| {
+                        Error::Plan(format!("shard {shard} of `{collection}` is not on this node"))
+                    })?
+                    .median_key(ts)
+                    .ok_or_else(|| {
+                        Error::Plan(format!(
+                            "shard {shard} of `{collection}` holds fewer than two keys; nothing \
+                             to split at"
+                        ))
+                    })?
+            }
+        };
+        let at = at.as_str();
+        Self::inside_range(collection, shard, &t, at)?;
+        let new = Self::split_map(&tablets, shard, at);
+        let quoted = at.replace('\'', "''");
         let dir = self
             .dir
             .clone()
@@ -3400,6 +3458,179 @@ impl Db {
         })))
     }
 
+    /// Whether `at` is strictly inside shard `shard`'s range.
+    fn inside_range(collection: &str, shard: usize, t: &Tablet, at: &str) -> Result<()> {
+        let inside = t.lo.as_deref().map_or(true, |lo| at > lo)
+            && t.hi.as_deref().map_or(true, |hi| at < hi);
+        if inside {
+            Ok(())
+        } else {
+            Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` holds [{}, {}); a split key must be strictly \
+                 inside that range",
+                t.lo.clone().unwrap_or_default(),
+                t.hi.clone().unwrap_or_default()
+            )))
+        }
+    }
+
+    /// The map after a split of `shard` at `at`: the shard's high bound
+    /// lowered, and the new shard appended on the same node.
+    fn split_map(tablets: &[Tablet], shard: usize, at: &str) -> Vec<Tablet> {
+        let mut new = tablets.to_vec();
+        let hi = new[shard].hi.take();
+        new[shard].hi = Some(at.to_string());
+        new.push(Tablet { node: new[shard].node.clone(), lo: Some(at.to_string()), hi });
+        new
+    }
+
+    /// `MERGE SHARDS a AND b OF c`: two adjacent shards on one node become
+    /// one. Shard `b`'s rows are rebuilt into shard `a` as segments of its
+    /// own (the memtable sealed first, then every live row of every
+    /// segment, versions layered and deletes carried as a compaction
+    /// carries them), shard `a`'s range becomes the union, and shard
+    /// `b`'s directory goes; its entry stays in the map as a merged marker
+    /// with an empty range, so no shard renumbers and nothing routes to
+    /// it. A merge is row work -- `b`'s rows through the segment builder,
+    /// under the lock, with those rows in memory meanwhile -- so name the
+    /// larger shard first. Two shards on different nodes are refused with
+    /// the move that brings them together.
+    pub fn merge_shards(
+        &mut self,
+        collection: &str,
+        a: usize,
+        b: usize,
+        local: bool,
+    ) -> Result<Outcome> {
+        let _deadline = self.arm_default_deadline();
+        if a == b {
+            return Err(Error::Plan("a merge takes two different shards".into()));
+        }
+        self.catalog.get(collection)?;
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        for i in [a, b] {
+            let Some(t) = tablets.get(i) else {
+                return Err(Error::Plan(format!(
+                    "`{collection}` has {} shard(s); there is no shard {i}",
+                    tablets.len()
+                )));
+            };
+            if t.is_merged() {
+                return Err(Error::Plan(format!(
+                    "shard {i} of `{collection}` was merged away and owns no key"
+                )));
+            }
+        }
+        let (ta, tb) = (tablets[a].clone(), tablets[b].clone());
+        let (lo, hi) = if ta.hi.is_some() && ta.hi == tb.lo {
+            (ta.lo.clone(), tb.hi.clone())
+        } else if tb.hi.is_some() && tb.hi == ta.lo {
+            (tb.lo.clone(), ta.hi.clone())
+        } else {
+            return Err(Error::Plan(format!(
+                "shards {a} and {b} of `{collection}` are not adjacent: [{}, {}) and [{}, {})",
+                ta.lo.clone().unwrap_or_default(),
+                ta.hi.clone().unwrap_or_default(),
+                tb.lo.clone().unwrap_or_default(),
+                tb.hi.clone().unwrap_or_default()
+            )));
+        };
+        if ta.node != tb.node {
+            return Err(Error::Plan(format!(
+                "shards {a} and {b} of `{collection}` are on different nodes ({} and {}); bring \
+                 them together first: MOVE SHARD {b} OF {collection} TO '{}'",
+                ta.node, tb.node, ta.node
+            )));
+        }
+        let holder = ta.node.clone();
+        let mut new = tablets.clone();
+        new[a] = Tablet { node: holder.clone(), lo: lo.clone(), hi: hi.clone() };
+        let mark = Some(tb.lo.clone().unwrap_or_default());
+        new[b] = Tablet { node: holder.clone(), lo: mark.clone(), hi: mark };
+        let (lo_text, hi_text) = (lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default());
+        if !self.is_self(&holder) {
+            if local {
+                self.catalog.placement.insert(collection.to_string(), new);
+                self.persist_catalog()?;
+                return Ok(Outcome::Ack(format!(
+                    "shards {a} and {b} of `{collection}` merged on {holder}: shard {a} is \
+                     [{lo_text}, {hi_text}) there, shard {b} owns no key"
+                )));
+            }
+            let conn = self.node_conn(&holder)?;
+            let sql = format!("LOCAL MERGE SHARDS {a} AND {b} OF {collection}");
+            let remaining = crate::deadline::remaining_ms();
+            return Ok(Outcome::Deferred(Deferred::new(move || {
+                let _deadline = crate::deadline::arm(remaining);
+                Ok(Outcome::Ack(conn.statement(&sql, &[])?))
+            })));
+        }
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| Error::Plan("a merge needs a persistent database (--dir)".into()))?;
+        for i in [a, b] {
+            if !self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == i)) {
+                return Err(Error::Plan(format!(
+                    "shard {i} of `{collection}` is not on this node"
+                )));
+            }
+        }
+        self.absorb_shard_catalogs(collection)?;
+        let now = self.clock.peek().max(self.last_commit);
+        let copts = self.opts.compaction;
+        let shards = self.shards.get_mut(collection).expect("checked above");
+        // Every row of `b`, sealed first so one path -- the segments' --
+        // carries every version and delete the way a compaction reads them.
+        let (docs, carried) = {
+            let g = shards.iter_mut().find(|s| s.index == b).expect("checked above");
+            g.flush()?;
+            let ids: Vec<u64> = g.segments.iter().map(|h| h.id()).collect();
+            let retain = g.retain_from(now);
+            crate::shard::collect_from_handles(&g.segments, &ids, retain)?
+        };
+        let rows = docs.len();
+        {
+            let k = shards.iter_mut().find(|s| s.index == a).expect("checked above");
+            // What a split left in `a` outside its range is dropped for
+            // good before the range widens over it again: sealed, then
+            // every masked segment rewritten, as a compaction would have.
+            k.flush()?;
+            let masked: Vec<u64> =
+                k.segments.iter().filter(|h| h.mask().is_some()).map(|h| h.id()).collect();
+            for id in masked {
+                let job =
+                    compaction::Job::Rewrite { input: id, reason: compaction::Reason::DeadRatio };
+                compaction::run(k, &job, &copts)?;
+            }
+            compaction::absorb(k, docs, &carried, &copts)?;
+            k.set_key_range(lo.clone(), hi.clone());
+        }
+        shards.retain(|s| s.index != b);
+        let cdir = dir.join("collections").join(collection);
+        crate::shard::write_content(
+            &self.cipher,
+            &format!("shard-{a:04}/RANGE"),
+            &cdir.join(format!("shard-{a:04}")).join("RANGE"),
+            format!("{lo_text}\n{hi_text}").as_bytes(),
+        )?;
+        let _ = fs::remove_dir_all(cdir.join(format!("shard-{b:04}")));
+        self.catalog.placement.insert(collection.to_string(), new.clone());
+        self.persist_catalog()?;
+        let peers = self.every_peer(&new)?;
+        let switch = Switch { sql: format!("MERGE SHARDS {a} AND {b} OF {collection}"), peers };
+        let ack = format!(
+            "shards {a} and {b} of `{collection}` merged: shard {a} is [{lo_text}, {hi_text}) on \
+             this node, {rows} row(s) of shard {b} rebuilt into it, shard {b} owns no key"
+        );
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let switched = Db::carry_switch(&switch);
+            Ok(Outcome::Ack(format!("{ack}; {switched}")))
+        })))
+    }
+
     /// Every node this one knows, other than itself, with a connection:
     /// the holders, the nodes and coordinators the catalog names, and the
     /// peers that attached.
@@ -3493,7 +3724,8 @@ impl Db {
         let mut plans = Vec::new();
         for (i, t) in tablets.iter().enumerate() {
             let target = &nodes[i % nodes.len()];
-            if &t.node == target || (self.is_self(&t.node) && self.is_self(target)) {
+            if t.is_merged() || &t.node == target || (self.is_self(&t.node) && self.is_self(target))
+            {
                 continue;
             }
             plans.push(self.move_begin(collection, i, target)?);
@@ -4726,7 +4958,10 @@ impl Db {
         // A split is the holder's to make and everyone's to learn: `LOCAL`
         // (or the wire) is how the holder's word arrives.
         if let Statement::SplitShard { collection, shard, at } = &stmt {
-            return self.split_shard(collection, *shard, at, local);
+            return self.split_shard(collection, *shard, at.as_deref(), local);
+        }
+        if let Statement::MergeShards { collection, a, b } = &stmt {
+            return self.merge_shards(collection, *a, *b, local);
         }
         let out = self.run_one(stmt, sql, params, analyze)?;
         if holders.is_empty() {
@@ -4996,6 +5231,10 @@ impl Db {
                     ));
                     if let Some(tablets) = self.catalog.placement.get(&n) {
                         for (i, t) in tablets.iter().enumerate() {
+                            if t.is_merged() {
+                                out.push_str(&format!("  shard {i} merged away (owns no key)\n"));
+                                continue;
+                            }
                             out.push_str(&format!(
                                 "  shard {i} on {} [{}, {})\n",
                                 if self.is_self(&t.node) { "this node" } else { t.node.as_str() },
@@ -5112,12 +5351,18 @@ impl Db {
             }
             Statement::Local(inner) => match *inner {
                 Statement::SplitShard { collection, shard, at } => {
-                    self.split_shard(&collection, shard, &at, true)
+                    self.split_shard(&collection, shard, at.as_deref(), true)
+                }
+                Statement::MergeShards { collection, a, b } => {
+                    self.merge_shards(&collection, a, b, true)
                 }
                 other => self.run_one(other, sql, params, analyze),
             },
             Statement::SplitShard { collection, shard, at } => {
-                self.split_shard(&collection, shard, &at, false)
+                self.split_shard(&collection, shard, at.as_deref(), false)
+            }
+            Statement::MergeShards { collection, a, b } => {
+                self.merge_shards(&collection, a, b, false)
             }
             Statement::DropIndex { collection, index } => {
                 self.drop_index(&collection, &index)?;
@@ -5844,7 +6089,11 @@ impl Db {
                 }
                 Err(Error::Deadline(_)) if partial => {
                     unreachable.extend(
-                        tablets.iter().enumerate().filter(|(_, t)| t.node == url).map(|(i, _)| i),
+                        tablets
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.node == url && !t.is_merged())
+                            .map(|(i, _)| i),
                     );
                 }
                 Err(Error::Deadline(_)) => {}
@@ -5910,7 +6159,7 @@ impl Db {
                     Err(Error::Deadline(_)) if !partial => {}
                     Err(Error::Deadline(_)) => {
                         for (i, t) in tablets.iter().enumerate() {
-                            if t.node == url {
+                            if t.node == url && !t.is_merged() {
                                 edge_unreachable.push(i);
                                 walk_missing.push(format!("{via} shard {i}"));
                             }
@@ -6462,7 +6711,7 @@ fn services_for<'a>(
         });
     }
     for (i, t) in tablets.iter().enumerate() {
-        if shards.iter().any(|s| s.index == i) {
+        if t.is_merged() || shards.iter().any(|s| s.index == i) {
             continue;
         }
         if let Some(node) = remotes.get(&t.node) {
@@ -6840,6 +7089,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Backup { .. } => "BACKUP",
         Statement::Restore { .. } => "RESTORE",
         Statement::SplitShard { .. } => "SPLIT SHARD",
+        Statement::MergeShards { .. } => "MERGE SHARDS",
         Statement::VerifyBackup { .. } => "VERIFY BACKUP",
         _ => "this statement",
     }

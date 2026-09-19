@@ -1794,3 +1794,68 @@ fn a_shard_splits_on_its_holder_and_every_node_learns_the_new_map() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A merge of two shards on different nodes is refused with the move that
+/// brings them together; made on their holder, it reaches every node's map,
+/// a count from any node is whole, the merged index is skipped by every
+/// read, and the holder picks the key when a split names none.
+#[test]
+fn shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("merge-a");
+    let b = Node::start("merge-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    for i in 0..40usize {
+        let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
+        let doc =
+            Value::obj(vec![("id".into(), Value::Str(key)), ("n".into(), Value::Int(i as i64))]);
+        a.db.write().unwrap().insert("items", doc).unwrap();
+    }
+    let e = a.exec("MERGE SHARDS 0 AND 1 OF items").unwrap_err().to_string();
+    assert!(e.contains("different nodes") && e.contains("MOVE SHARD 1 OF items TO"), "{e}");
+    a.ack(&format!("MOVE SHARD 1 OF items TO '{}'", a.url));
+    settle();
+    // Issued at b, which holds nothing now: a merges and tells b.
+    let m = b.ack("MERGE SHARDS 0 AND 1 OF items");
+    assert!(m.contains("shard 0 is [, )") && m.contains("20 row(s) of shard 1 rebuilt"), "{m}");
+    assert!(m.contains("map switched"), "{m}");
+    settle();
+    for n in [&a, &b] {
+        let cat = n.ack("SHOW CATALOG items");
+        assert!(
+            cat.contains("shard 0 on")
+                && cat.contains("[, )")
+                && cat.contains("shard 1 merged away"),
+            "{}: {cat}",
+            n.url
+        );
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(40), "{}", n.url);
+        let h = n.ack("SHOW HEALTH");
+        assert!(!h.contains("shard 1 of"), "{h}");
+    }
+    // A split with no key, issued away from the holder: the holder's median.
+    let m = b.ack("SPLIT SHARD 0 OF items");
+    assert!(m.contains("split at 'r0001'") && m.contains("shard 2 is [r0001, )"), "{m}");
+    settle();
+    for n in [&a, &b] {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(40), "{}", n.url);
+    }
+    let m = a.ack(&format!("MOVE SHARD 2 OF items TO '{}'", b.url));
+    assert!(m.contains("moved from"), "{m}");
+    settle();
+    let r = b.query("SELECT count(*) AS n FROM items WHERE n >= 20").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(20));
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

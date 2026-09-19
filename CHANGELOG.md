@@ -6,6 +6,31 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.57.0 — 2026-09-19
+
+A split picks its own key, and shards merge, hence a minor.
+
+**`SPLIT SHARD i OF c` with no key** takes the middle of the shard's
+keys, sealed and in memory alike: the holder picks it, so the
+statement issued anywhere splits at the median the holder sees, and
+the answer names the key. A shard with fewer than two keys is refused.
+
+**`MERGE SHARDS a AND b OF c`** makes one shard of two adjacent ones on
+one node: shard `b`'s rows are rebuilt into shard `a` as segments of
+its own (the memtable sealed first, every live row of every segment,
+versions layered and deletes carried as a compaction carries them),
+shard `a`'s range becomes the union, and shard `b`'s directory goes.
+Its entry stays in the map as a merged marker with an empty range that
+owns no key, so no shard renumbers and every read, move and rebalance
+skips it; `SHOW CATALOG` says `merged away`. Before the range widens,
+what an earlier split left in shard `a` outside its range is dropped
+for good, so nothing answers twice after a restart. A merge is row work
+under the lock, with shard `b`'s rows in memory meanwhile, so name the
+larger shard first. Two shards on different nodes are refused naming
+the move that brings them together; two that are not adjacent are
+refused. A peer that missed either statement learns the ranges from the
+holder's catalog at the next sweep.
+
 ## 0.56.0 — 2026-09-19
 
 A shard can be split, hence a minor.

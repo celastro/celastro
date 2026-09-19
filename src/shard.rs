@@ -1879,6 +1879,29 @@ impl Shard {
         self.sources(&snap).iter().map(|s| s.visibility(t).popcount()).sum()
     }
 
+    /// The middle key of the rows visible at `t`: what a split takes when
+    /// no key is given. `None` under two distinct keys, since a split
+    /// needs a key strictly inside the range, and the middle of two or
+    /// more distinct keys is above the first.
+    pub fn median_key(&self, t: Timestamp) -> Option<String> {
+        let snap = self.snapshot_at(t);
+        let mut keys: Vec<String> = Vec::new();
+        for src in self.sources(&snap) {
+            let vis = src.visibility(t);
+            for ord in vis.iter() {
+                if let Some(k) = src.key(ord) {
+                    keys.push(k.to_string());
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.len() < 2 {
+            return None;
+        }
+        Some(keys[keys.len() / 2].clone())
+    }
+
     /// Where a version lives.
     /// Whether a document with this sort key is visible at `t`: the locate
     /// without the decode, for a walk's liveness check, which asks it once

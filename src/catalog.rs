@@ -86,6 +86,12 @@ pub struct Tablet {
 }
 
 impl Tablet {
+    /// A shard merged into another: its entry stays, so nothing renumbers,
+    /// with an empty range that owns no key and is skipped everywhere.
+    pub fn is_merged(&self) -> bool {
+        self.lo.is_some() && self.lo == self.hi
+    }
+
     pub fn owns(&self, key: &str) -> bool {
         self.lo.as_ref().map(|l| key >= l.as_str()).unwrap_or(true)
             && self.hi.as_ref().map(|h| key < h.as_str()).unwrap_or(true)
