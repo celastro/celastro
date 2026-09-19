@@ -1943,7 +1943,9 @@ impl Db {
     pub fn create_collection(&mut self, coll: Collection, splits: &[String]) -> Result<()> {
         let _deadline = self.arm_default_deadline();
         let tablets = self.plan_tablets(splits, &[])?;
-        self.create_spread(coll, tablets).map(|_| ())
+        // A library caller waits for the spread; the statement defers it.
+        let _ = self.create_spread(coll, tablets)?.carry();
+        Ok(())
     }
 
     /// Whether a placement entry means this node.
@@ -2093,26 +2095,21 @@ impl Db {
     /// Make the collection here and on every holder and coordinator. The
     /// string is empty, or names the nodes it did not reach: they adopt the
     /// collection when they reconnect, so that is a note and not a failure.
-    fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<String> {
+    fn create_spread(&mut self, coll: Collection, tablets: Vec<Tablet>) -> Result<Spread> {
         self.adopt_collection(coll.clone(), tablets.clone())?;
         let mut failures = Vec::new();
         // Every holder, and every coordinator: a coordinator holds none of
-        // it but plans over it, so it needs the definition and the map.
+        // it but plans over it, so it needs the definition and the map. All
+        // at once, holding nothing, as a definition's fan-out does.
+        let remaining = crate::deadline::remaining_ms();
+        let mut conns = Vec::new();
         for url in self.ddl_targets(&coll.name) {
-            if let Err(e) = self.node_conn(&url).and_then(|n| n.create_collection(&coll, &tablets))
-            {
-                failures.push(format!("{url}: {e}"));
+            match self.node_conn(&url) {
+                Ok(n) => conns.push((url, n)),
+                Err(e) => failures.push(format!("{url}: {e}")),
             }
         }
-        if failures.is_empty() {
-            Ok(String::new())
-        } else {
-            Ok(format!(
-                "; not on {}: they adopt it when they reconnect ({})",
-                failures.join("; "),
-                RECONCILE_NOTE
-            ))
-        }
+        Ok(Spread { coll, tablets, conns, failures, remaining })
     }
 
     /// This process's epoch: when it opened the database, or what
@@ -2723,29 +2720,6 @@ impl Db {
     /// Run `LOCAL <sql>` on every other holder of a collection, after it
     /// ran here. A holder that did not take it is named, with what to run
     /// there by hand.
-    /// Run `sql` as `LOCAL` on every one of `holders`: the nodes it reached
-    /// and, for the ones it did not, what went wrong. Whether a failure is
-    /// the statement's failure is the caller's to say: a definition the
-    /// reconciliation carries is applied here and noted, anything else is
-    /// refused naming the nodes and the statement to run on them.
-    fn propagate(
-        &mut self,
-        holders: &[String],
-        sql: &str,
-        params: &[Value],
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let local = format!("LOCAL {sql}");
-        let mut done = Vec::new();
-        let mut failures = Vec::new();
-        for url in holders {
-            match self.node_conn(url).and_then(|n| n.statement(&local, params)) {
-                Ok(_) => done.push(url.clone()),
-                Err(e) => failures.push(format!("{url}: {e}")),
-            }
-        }
-        Ok((done, failures))
-    }
-
     /// The refusal for a propagation that did not reach every node and
     /// whose statement nothing reconciles.
     fn not_propagated(done: &[String], failures: &[String], sql: &str) -> Error {
@@ -3390,6 +3364,29 @@ impl Db {
     /// than compaction has caught up with, the writer waits, so a load
     /// cannot leave reads scanning dozens of unsorted segments. Counted for
     /// the metrics.
+    /// The documents of this node's shards, and the rest grouped by the
+    /// holder they route to with a connection to it.
+    fn split_by_holder(
+        &self,
+        collection: &str,
+        docs: Vec<Value>,
+    ) -> Result<(Vec<Value>, Away<Value>)> {
+        let mut here = Vec::new();
+        let mut away: Away<Value> = BTreeMap::new();
+        for doc in docs {
+            let coll = self.catalog.get(collection)?;
+            let key = sort_key(coll, &doc)?;
+            match self.owner_of(collection, &key)? {
+                Some(url) => {
+                    let conn = self.node_conn(&url)?;
+                    away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push(doc);
+                }
+                None => here.push(doc),
+            }
+        }
+        Ok((here, away))
+    }
+
     fn wait_for_compaction(&mut self, collection: &str, idx: usize) {
         let wait = match self.shards.get(collection).and_then(|s| s.get(idx)) {
             Some(shard) => crate::compaction::backpressure(shard, &self.opts.compaction),
@@ -4248,23 +4245,43 @@ impl Db {
         if holders.is_empty() {
             return Ok(out);
         }
-        let (done, failures) = self.propagate(&holders, sql, params)?;
-        if !failures.is_empty() && !reconciled {
-            return Err(Db::not_propagated(&done, &failures, sql));
+        // Applied here under the lock; carried to the holders as deferred
+        // work holding nothing, every holder at once. A holder that cannot
+        // be reached costs a dial's timeout, and ten of them in turn under
+        // the lock was a console that answered nothing for the better part
+        // of a minute -- which a liveness probe reads as a dead node.
+        let mut conns = Vec::with_capacity(holders.len());
+        let mut failures = Vec::new();
+        for url in &holders {
+            match self.node_conn(url) {
+                Ok(n) => conns.push((url.clone(), n)),
+                Err(e) => failures.push(format!("{url}: {e}")),
+            }
         }
-        let note = if failures.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; not on {}: they adopt it when they reconnect ({RECONCILE_NOTE})",
-                failures.join("; ")
-            )
-        };
-        Ok(match out {
-            Outcome::Ack(m) if done.is_empty() => Outcome::Ack(format!("{m}{note}")),
-            Outcome::Ack(m) => Outcome::Ack(format!("{m}; and on {}{note}", done.join(", "))),
-            other => other,
-        })
+        let local = format!("LOCAL {sql}");
+        let params = params.to_vec();
+        let sql = sql.to_string();
+        let remaining = crate::deadline::remaining_ms();
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let (done, more) = carry_statement(&conns, &local, &params, remaining);
+            failures.extend(more);
+            if !failures.is_empty() && !reconciled {
+                return Err(Db::not_propagated(&done, &failures, &sql));
+            }
+            let note = if failures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; not on {}: they adopt it when they reconnect ({RECONCILE_NOTE})",
+                    failures.join("; ")
+                )
+            };
+            Ok(match out {
+                Outcome::Ack(m) if done.is_empty() => Outcome::Ack(format!("{m}{note}")),
+                Outcome::Ack(m) => Outcome::Ack(format!("{m}; and on {}{note}", done.join(", "))),
+                other => other,
+            })
+        })))
     }
 
     /// Whether a statement's effect is carried by `reconcile` to a node it
@@ -4338,11 +4355,21 @@ impl Db {
                 } else {
                     format!(" on {}", nodes.join(", "))
                 };
-                let note = self.create_spread(coll, tablets)?;
-                Ok(Outcome::Ack(format!(
-                    "collection `{}` created with {n} shard(s){where_}{note}",
-                    c.name
-                )))
+                let spread = self.create_spread(coll, tablets)?;
+                let name = c.name.clone();
+                if spread.conns.is_empty() {
+                    // Nobody to carry it to: answered now.
+                    let note = spread.carry();
+                    return Ok(Outcome::Ack(format!(
+                        "collection `{name}` created with {n} shard(s){where_}{note}"
+                    )));
+                }
+                Ok(Outcome::Deferred(Deferred::new(move || {
+                    let note = spread.carry();
+                    Ok(Outcome::Ack(format!(
+                        "collection `{name}` created with {n} shard(s){where_}{note}"
+                    )))
+                })))
             }
             Statement::CreateIndex(c) => {
                 let kind = match c.spec {
@@ -4363,8 +4390,24 @@ impl Db {
             }
             Statement::Insert(i) => {
                 let n = i.docs.len();
-                self.insert_many(&i.collection, i.docs)?;
-                Ok(Outcome::Ack(format!("{n} document(s) written at ts {}", self.last_commit)))
+                // The documents of this node's shards written here under
+                // the lock; the rest carried to their holders as deferred
+                // work holding nothing, holder by holder at once. A holder
+                // that does not answer held the console for a deadline.
+                let (here, away) = self.split_by_holder(&i.collection, i.docs)?;
+                let mut last = self.last_commit;
+                if !here.is_empty() {
+                    last = last.max(self.insert_many(&i.collection, here)?);
+                }
+                if away.is_empty() {
+                    return Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")));
+                }
+                let collection = i.collection.clone();
+                let remaining = crate::deadline::remaining_ms();
+                Ok(Outcome::Deferred(Deferred::new(move || {
+                    let last = carry_writes(&collection, away, last, remaining)?;
+                    Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
+                })))
             }
             Statement::Delete(d) => {
                 let (keys, cut): (Vec<String>, Vec<String>) = match &d.predicate {
@@ -4441,12 +4484,29 @@ impl Db {
                     )));
                 }
                 let mut n = 0;
+                let mut away: Away<String> = BTreeMap::new();
                 for k in keys {
-                    if self.delete_key(&d.collection, &k)? {
-                        n += 1;
+                    match self.owner_of(&d.collection, &k)? {
+                        None => {
+                            if self.delete_key_here(&d.collection, &k)? {
+                                n += 1;
+                            }
+                        }
+                        Some(url) => {
+                            let conn = self.node_conn(&url)?;
+                            away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push(k);
+                        }
                     }
                 }
-                Ok(Outcome::Ack(format!("{n} document(s) deleted")))
+                if away.is_empty() {
+                    return Ok(Outcome::Ack(format!("{n} document(s) deleted")));
+                }
+                let collection = d.collection.clone();
+                let remaining = crate::deadline::remaining_ms();
+                Ok(Outcome::Deferred(Deferred::new(move || {
+                    let n = n + carry_deletes(&collection, away, remaining)?;
+                    Ok(Outcome::Ack(format!("{n} document(s) deleted")))
+                })))
             }
             Statement::Select(sel) => {
                 Ok(Outcome::Rows(self.run_select(&sel, sql, params, analyze)?))
@@ -6022,6 +6082,149 @@ impl SealJob {
     pub fn describe(&self) -> String {
         format!("seal of shard {} of `{}`: {:?}", self.shard, self.collection, self.ticket)
     }
+}
+
+/// What routes elsewhere, by holder: the connection and the items for it.
+type Away<T> = BTreeMap<String, (Arc<crate::wire::Node>, Vec<T>)>;
+
+/// A collection made here, to be carried to its holders and the
+/// coordinators as deferred work holding nothing.
+pub struct Spread {
+    coll: Collection,
+    tablets: Vec<Tablet>,
+    conns: Vec<(String, Arc<crate::wire::Node>)>,
+    failures: Vec<String>,
+    remaining: Option<u64>,
+}
+
+impl Spread {
+    /// Every target at once; the note naming the ones not reached.
+    fn carry(mut self) -> String {
+        let answers: Vec<(String, Result<()>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .conns
+                .iter()
+                .map(|(url, n)| {
+                    let (url, n, coll, tablets, remaining) =
+                        (url.clone(), n.clone(), &self.coll, &self.tablets, self.remaining);
+                    scope.spawn(move || {
+                        let _deadline = crate::deadline::arm(remaining);
+                        (url, n.create_collection(coll, tablets))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("a creation thread panicked")).collect()
+        });
+        for (url, r) in answers {
+            if let Err(e) = r {
+                self.failures.push(format!("{url}: {e}"));
+            }
+        }
+        if self.failures.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; not on {}: they adopt it when they reconnect ({})",
+                self.failures.join("; "),
+                RECONCILE_NOTE
+            )
+        }
+    }
+}
+
+/// Run a `LOCAL` statement on every peer at once, holding nothing: the
+/// peers that took it, and what went wrong on the ones that did not. The
+/// caller's deadline is armed in each thread, since it is thread-local.
+fn carry_statement(
+    conns: &[(String, Arc<crate::wire::Node>)],
+    local: &str,
+    params: &[Value],
+    remaining: Option<u64>,
+) -> (Vec<String>, Vec<String>) {
+    let answers: Vec<(String, Result<String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = conns
+            .iter()
+            .map(|(url, n)| {
+                let (url, n) = (url.clone(), n.clone());
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    (url, n.statement(local, params))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a carrier thread panicked")).collect()
+    });
+    let mut done = Vec::new();
+    let mut failures = Vec::new();
+    for (url, r) in answers {
+        match r {
+            Ok(_) => done.push(url),
+            Err(e) => failures.push(format!("{url}: {e}")),
+        }
+    }
+    (done, failures)
+}
+
+/// Write documents to their holders, holder by holder at once, holding
+/// nothing; the latest commit instant. A holder that refuses is the
+/// statement's failure, after every holder was tried, naming it.
+fn carry_writes(
+    collection: &str,
+    away: Away<Value>,
+    last: Timestamp,
+    remaining: Option<u64>,
+) -> Result<Timestamp> {
+    let answers: Vec<Result<Timestamp>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = away
+            .values()
+            .map(|(n, docs)| {
+                let n = n.clone();
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    let mut last = 0;
+                    for doc in docs {
+                        last = last.max(n.insert(collection, doc)?);
+                    }
+                    Ok(last)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a carrier thread panicked")).collect()
+    });
+    let mut latest = last;
+    for r in answers {
+        latest = latest.max(r?);
+    }
+    Ok(latest)
+}
+
+/// Delete keys on their holders, holder by holder at once, holding
+/// nothing; how many were there.
+fn carry_deletes(collection: &str, away: Away<String>, remaining: Option<u64>) -> Result<usize> {
+    let answers: Vec<Result<usize>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = away
+            .values()
+            .map(|(n, keys)| {
+                let n = n.clone();
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    let mut n_deleted = 0;
+                    for k in keys {
+                        if n.delete(collection, k)? {
+                            n_deleted += 1;
+                        }
+                    }
+                    Ok(n_deleted)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a carrier thread panicked")).collect()
+    });
+    let mut n = 0;
+    for r in answers {
+        n += r?;
+    }
+    Ok(n)
 }
 
 /// A map switch to carry to the peers, holding nothing: the statement and

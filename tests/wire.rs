@@ -980,7 +980,12 @@ fn a_node_away_through_ddl_catches_up_when_it_reattaches() {
     assert!(m.contains("created with 3 shard(s)") && m.contains(&format!("not on {c_url}")), "{m}");
     // An ALTER is not carried by the reconciliation, so it is still refused
     // naming the node to run it on.
-    let e = a.exec("ALTER INDEX items_emb ON items SET TIER 'cached'").unwrap_err().to_string();
+    let e = a
+        .exec("ALTER INDEX items_emb ON items SET TIER 'cached'")
+        .unwrap()
+        .finished()
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("applied here") && e.contains(&format!("not on {c_url}")), "{e}");
     // c comes back at the same address with the same directory, and
     // attaches a as a restarted pod attaches its peers.
@@ -1488,4 +1493,84 @@ fn a_call_from_an_older_process_is_refused_by_a_holder() {
         settle();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// A statement whose fan-out reaches a holder that never answers holds
+/// no lock while it waits: the definition and the forwarded write are
+/// applied here under the lock and carried as deferred work, so a reader
+/// on this node is answered meanwhile. Ten such holders under the lock
+/// was a console that answered nothing for the better part of a minute,
+/// and a liveness probe restarted it. A DELETE ... WHERE is not here: it
+/// selects its keys first, and a select that reaches the dead holder
+/// waits for it under the lock, since the keys are needed before
+/// anything can be deferred.
+#[test]
+fn a_statement_waiting_on_a_holder_that_never_answers_holds_no_lock() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("hang-a");
+    let b = Node::start("hang-b");
+    let c = Node::start("hang-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    // c goes away and a listener that accepts and never answers takes its
+    // port: every call to it waits out the deadline, here two seconds.
+    let c_port: u16 = c.url.rsplit(':').next().unwrap().parse().unwrap();
+    let c_dir = c.dir.clone();
+    drop(c);
+    settle();
+    let hole = std::net::TcpListener::bind(("127.0.0.1", c_port)).unwrap();
+    hole.set_nonblocking(true).unwrap();
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding = {
+        let plug = plug.clone();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    kept.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(kept);
+        })
+    };
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(2000);
+    let read_wait = |n: &Node| {
+        let t0 = std::time::Instant::now();
+        let _g = n.db.read().unwrap();
+        t0.elapsed()
+    };
+    for sql in [
+        "CREATE INDEX ix ON items USING secondary (n)",
+        r#"INSERT INTO items VALUES ('{"id":"doc-900","tenant":"t2","n":900}')"#,
+    ] {
+        let t0 = std::time::Instant::now();
+        let out = a.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "{sql} held the lock {:?}",
+            t0.elapsed()
+        );
+        let finishing = std::thread::spawn(move || out.finished());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let waited = read_wait(&a);
+        assert!(waited < std::time::Duration::from_millis(200), "{sql}: a read waited {waited:?}");
+        match finishing.join().unwrap() {
+            Ok(Outcome::Ack(m)) => assert!(m.contains("not on"), "{sql}: {m}"),
+            Ok(other) => panic!("{sql}: {other:?}"),
+            Err(e) => assert!(e.to_string().contains("did not answer"), "{sql}: {e}"),
+        }
+        assert!(t0.elapsed() > std::time::Duration::from_millis(1500), "{sql} never waited for c");
+    }
+    plug.store(false, Ordering::Relaxed);
+    holding.join().unwrap();
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&c_dir);
 }

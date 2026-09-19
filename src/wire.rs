@@ -1674,11 +1674,16 @@ fn handle(db: &RwLock<Db>, moves: &Moves, identity: &Identity, frame: &[u8]) -> 
                         .into(),
                 ));
             }
-            let text = match db.exclusive().execute_with(&sql, &params)?.finished()? {
+            // Deferred work -- a backup's copy, a forwarded write's carry --
+            // finishes with this node's lock let go.
+            let outcome = db.exclusive().execute_with(&sql, &params)?;
+            drop(db);
+            let text = match outcome.finished()? {
                 crate::engine::Outcome::Ack(m) => m,
                 other => format!("{other:?}"),
             };
             put_str(&mut out, &text);
+            return Ok(out);
         }
         Call::CreateCollection => {
             let mut j = 0;

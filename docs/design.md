@@ -539,6 +539,27 @@ the target; a write forwarded to the target waited on that connection
 under the source's lock, and the target's switch back to the source waited
 on that lock. The move's long calls have connections of their own now.
 
+The split at ten nodes, on a larger host: two subnets of five, the link
+cut for ten minutes, a write load on each side, a definition on each
+side and a collection created across the split, then the heal. Every
+pod converged 98 s after the heal, the far side adopting the near side's
+definitions and the collection made across the split within a sweep or
+two; nothing acknowledged was lost and every count agreed. What the
+scale showed that three pods could not: a definition's fan-out dialled
+the five unreachable holders one after another, 45 s in all, under the
+lock; and a write forwarded to a far shard waited out its deadline under
+the lock; either way the console answered nothing meanwhile, and the
+liveness probes restarted the two pods that were written through, three
+and four times. So a statement now waits for no holder under the lock: a
+definition is applied here and carried to the holders as deferred work,
+every holder at once; a forwarded write, a forwarded delete by key and a
+collection's spread are carried the same way; the wire finishes deferred
+work with its lock let go. The one that still waits is a `DELETE ...
+WHERE` whose predicate reaches a holder that cannot be reached, since
+the keys are needed before anything can be deferred; `partial_results`
+cannot apply to a delete, so that one is refused at the deadline, as it
+should be.
+
 Seven more scenarios ran on 2026-09-18, each with its outcome asserted. A
 pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.
@@ -1704,6 +1725,7 @@ guarantee:
 | a holder that has seen a newer process at a caller's address refuses the caller's call, naming both; the caller's own writes are what it stops | `wire::a_call_from_an_older_process_is_refused_by_a_holder` |
 | a fresh connection to a process older than the newest seen at its address is refused before a statement goes down it, and a hello still names it | `wire::a_fresh_connection_to_an_older_process_is_refused` |
 | the resilience suite, run when asked: the reconciliation over four nodes and four hundred seeds; no acknowledged write lost across five restarts under load, and no failure that is not the node or a deadline; a 200,000-row log replays every row; a cluster backup under load restores to one cut | `resilience::*` (`--ignored`) |
+| a definition and a forwarded write whose fan-out reaches a holder that never answers hold no lock while they wait: a reader on the node is answered meanwhile, and the statement ends at the deadline naming the holder | `wire::a_statement_waiting_on_a_holder_that_never_answers_holds_no_lock` |
 | a move issued to a busy source, writes flowing through it, holds no lock long: the move in about a hundred milliseconds, the slowest write waiting tens | `wire::a_move_from_a_busy_source_holds_no_lock_long` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |

@@ -6,6 +6,26 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.53.0 — 2026-09-19
+
+No statement waits for a holder under the lock, hence a minor.
+
+**A statement waits for no holder under the lock.** The split drill at
+ten nodes -- two subnets of five, the link cut for ten minutes -- found
+two things a statement did under the lock while a holder could not be
+reached: a definition's fan-out dialled the far holders one after
+another (45 s for five), and a write forwarded to a far shard waited out
+the deadline; either held the console, and the pods' liveness probes
+restarted them three and four times. Now a definition is applied here
+under the lock and carried to the holders as deferred work holding
+nothing, every holder at once; a forwarded write and a forwarded delete
+by key are carried the same way, holder by holder at once, after the
+documents of this node's shards are written; and a collection's spread
+to its holders is deferred too. What still waits under the lock is a
+`DELETE ... WHERE` whose predicate reaches a holder that cannot be
+reached, since the keys are needed before anything can be deferred. The
+wire finishes deferred work with its lock let go as well.
+
 ## 0.52.1 — 2026-09-19
 
 **The README starts with Docker.** Most readers are not Rust developers:
