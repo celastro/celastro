@@ -6,6 +6,28 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.62.0 — 2026-09-20
+
+**The steward by election.** `CELASTRO_STEWARDS=tcp://a:2352,tcp://b:2352,tcp://c:2352`
+names a group that elects the steward among themselves, with a term:
+a node that hears no steward for half a lease stands, a majority of
+the group makes it steward, its lease renewals are its heartbeats and
+carry the term, a node refuses a lease from a lower term than it has
+seen, and a steward that cannot reach a majority for half a lease
+stops renewing and steps down -- so the holders on its side run out of
+lease and refuse writes within a lease. A new steward promotes nothing
+for a lease and a quarter after its election, by when every lease the
+old one granted has run out; with that, two holders taking writes for
+one shard cannot happen through a steward cut off from the rest,
+assuming clocks that run at comparable rates. The term and the vote
+are kept in `STEWARD` in the data directory, so a restarted node
+grants no second vote in a term. `SHOW HEALTH` says `steward: … (elected,
+term N)`. The election is a pure state machine (`src/steward.rs`)
+driven by deterministic tests through partitions, split votes and
+restarts; the wire gains `vote`, and `lease` carries the term (a node
+from before answers a renewal as it did). Unset, the steward is
+`CELASTRO_STEWARD` or the lowest address, as before. HA1's step 3.
+
 ## 0.61.1 — 2026-09-20
 
 **The steward promotes nothing until the lost holder's lease has run

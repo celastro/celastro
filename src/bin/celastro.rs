@@ -2130,6 +2130,8 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         };
     }
     o.steward = var("CELASTRO_STEWARD");
+    o.stewards = var("CELASTRO_STEWARDS")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
     if let Some(v) = var("CELASTRO_AUTO_FAILOVER") {
         o.auto_failover = match v.trim().to_ascii_lowercase().as_str() {
             "on" | "1" | "true" | "yes" => true,

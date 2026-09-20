@@ -100,6 +100,7 @@ pub mod shard;
 pub mod signal;
 pub mod sim;
 pub mod sql;
+pub mod steward;
 pub mod text;
 pub mod time;
 pub mod tls;

@@ -155,6 +155,8 @@ enum Call {
     /// holder too old to know the call answers "unknown call", and the
     /// coordinator scans as before.
     Count = 24,
+    /// A vote asked for a candidate steward at a term (the election).
+    Vote = 25,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -178,6 +180,7 @@ impl Call {
             13 => Call::Expand,
             14 => Call::Present,
             24 => Call::Count,
+            25 => Call::Vote,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -208,6 +211,7 @@ impl Call {
             Call::Expand => "expand",
             Call::Present => "present",
             Call::Count => "count",
+            Call::Vote => "vote",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -1187,10 +1191,37 @@ impl Node {
     }
 
     /// Renew this node's lease on the peer, as the steward `me`.
-    pub fn lease(&self, me: &str) -> Result<()> {
+    /// A lease renewal (and, with an election, the steward's heartbeat)
+    /// at `term`: whether it was taken, and the peer's term. A peer from
+    /// before the election answers nothing, which reads as taken at zero.
+    pub fn lease(&self, me: &str, term: u64) -> Result<(bool, u64)> {
         let mut body = Vec::new();
         put_str(&mut body, me);
-        self.call(Call::Lease, "", 0, &body).map(|_| ())
+        put_u64(&mut body, term);
+        let b = self.call(Call::Lease, "", 0, &body)?;
+        let mut i = 0;
+        match get_bool(&b, &mut i) {
+            Ok(accepted) => Ok((accepted, get_u64(&b, &mut i).unwrap_or(0))),
+            Err(_) => Ok((true, 0)),
+        }
+    }
+
+    /// A vote asked of a peer for `candidate` at `term`: granted, and the
+    /// peer's term. A peer from before the election grants nothing.
+    pub fn vote(&self, me: &str, term: u64, candidate: &str) -> Result<(bool, u64)> {
+        let mut body = Vec::new();
+        put_u64(&mut body, term);
+        put_str(&mut body, candidate);
+        put_str(&mut body, me);
+        match self.call(Call::Vote, "", 0, &body) {
+            Ok(b) => {
+                let mut i = 0;
+                let granted = get_bool(&b, &mut i)?;
+                Ok((granted, get_u64(&b, &mut i).unwrap_or(0)))
+            }
+            Err(e) if e.to_string().contains("unknown call") => Ok((false, 0)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Where a follower stands.
@@ -1819,8 +1850,24 @@ fn handle(
             return Ok(out);
         }
         Call::Lease => {
-            let from = get_string(body, &mut 0)?;
-            crate::engine::renew_lease(lease, &from)?;
+            let mut j = 0;
+            let from = get_string(body, &mut j)?;
+            // The term rides behind the name since the election; a
+            // renewal from before it carries none.
+            let term = get_u64(body, &mut j).unwrap_or(0);
+            let mine = crate::engine::renew_lease(lease, &from, term)?;
+            put_bool(&mut out, true);
+            put_u64(&mut out, mine);
+            return Ok(out);
+        }
+        Call::Vote => {
+            let mut j = 0;
+            let term = get_u64(body, &mut j).ok_or_else(truncated)?;
+            let candidate = get_string(body, &mut j)?;
+            let from = get_string(body, &mut j)?;
+            let (granted, mine) = crate::engine::vote(lease, &from, term, &candidate);
+            put_bool(&mut out, granted);
+            put_u64(&mut out, mine);
             return Ok(out);
         }
         Call::FenceMove => {
@@ -1967,7 +2014,8 @@ fn handle(
         | Call::FenceMove
         | Call::Ship
         | Call::ShipStatus
-        | Call::Lease => {
+        | Call::Lease
+        | Call::Vote => {
             unreachable!("answered above")
         }
         Call::AbortMove => {

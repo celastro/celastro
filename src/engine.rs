@@ -259,6 +259,11 @@ pub struct DbOpts {
     /// promotes a follower of a holder that stopped answering:
     /// `CELASTRO_STEWARD`, or the lowest attached address.
     pub steward: Option<String>,
+    /// The group that elects the steward among themselves, addresses:
+    /// `CELASTRO_STEWARDS`. Set, `steward` is ignored and the steward is
+    /// whichever of the group holds the current term; a node not in the
+    /// group follows the elected one's leases.
+    pub stewards: Option<Vec<String>>,
     /// Whether the steward promotes on its own, and a holder whose lease
     /// ran out refuses writes: `CELASTRO_AUTO_FAILOVER`. Off by default:
     /// promotion is the operator's, and no lease gates a write.
@@ -301,6 +306,7 @@ impl Default for DbOpts {
             role: Role::Data,
             replication_sync: true,
             steward: None,
+            stewards: None,
             auto_failover: false,
             lease_secs: 60,
             node: None,
@@ -1123,7 +1129,13 @@ impl Db {
             shards: BTreeMap::new(),
             followed: Arc::new(Mutex::new(BTreeMap::new())),
             recent_writes: Vec::new(),
-            lease: Arc::new(Mutex::new(LeaseState { at: None, steward: None })),
+            lease: Arc::new(Mutex::new(LeaseState {
+                at: None,
+                steward: None,
+                term: 0,
+                election: None,
+                dir: None,
+            })),
             clock: Arc::new(Hlc::new()),
             opts,
             dir: None,
@@ -2044,12 +2056,19 @@ impl Db {
                  and the data is not in this directory; restore it or drop it\n"
             ));
         }
+        if self.opts.stewards.is_some() && self.steward().is_none() {
+            out.push_str("steward: none elected yet; automatic failover waits for one\n");
+        }
         if let Some(s) = self.steward() {
             let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
             out.push_str(&format!(
-                "steward: {}{}; automatic failover {}{}\n",
+                "steward: {}{}{}; automatic failover {}{}\n",
                 s,
                 if self.is_self(&s) { " (this node)" } else { "" },
+                match &g.election {
+                    Some(e) => format!(" (elected, term {})", e.term()),
+                    None => String::new(),
+                },
                 if self.opts.auto_failover { "on" } else { "off" },
                 match (self.is_self(&s), g.at) {
                     (true, _) => String::new(),
@@ -4547,6 +4566,10 @@ impl Db {
     /// The steward: the node named, or the lowest address among the nodes
     /// this one knows and itself. None for a node with no address.
     pub fn steward(&self) -> Option<String> {
+        if self.opts.stewards.is_some() {
+            // Elected: whoever this node last took a lease from, or itself.
+            return self.lease.lock().unwrap_or_else(|p| p.into_inner()).steward.clone();
+        }
         if let Some(s) = &self.opts.steward {
             return Some(s.clone());
         }
@@ -4570,7 +4593,23 @@ impl Db {
     }
 
     pub fn is_steward(&self) -> bool {
+        if self.opts.stewards.is_some() {
+            let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+            return g.election.as_ref().is_some_and(|e| e.role() == crate::steward::Role::Steward);
+        }
         self.steward().is_some_and(|s| self.is_self(&s))
+    }
+
+    /// The group that elects the steward, this node included, or none
+    /// when the steward is configured.
+    pub fn steward_group(&self) -> Option<Vec<String>> {
+        let mut g = self.opts.stewards.clone()?;
+        if let Some(me) = &self.opts.node {
+            if !g.contains(me) {
+                g.push(me.clone());
+            }
+        }
+        Some(g)
     }
 
     /// The lease, shared with the wire.
@@ -7886,22 +7925,126 @@ const CATCHUP_CHUNK: usize = 500;
 pub struct LeaseState {
     pub at: Option<std::time::Instant>,
     pub steward: Option<String>,
+    /// The steward's term this node last accepted a lease at; zero with
+    /// a configured steward.
+    pub term: u64,
+    /// The election, when the steward is elected (`stewards` set): the
+    /// wire feeds it votes and heartbeats, the elector thread its clock.
+    pub election: Option<crate::steward::Election>,
+    /// Where `STEWARD` (the persisted term and vote) lives.
+    pub dir: Option<PathBuf>,
 }
 
 pub type Lease = Arc<Mutex<LeaseState>>;
 
-/// A renewal from `from`: taken when `from` is the steward this node
-/// expects.
-pub fn renew_lease(lease: &Lease, from: &str) -> Result<()> {
+/// The file the election's term and vote are kept in.
+pub const STEWARD_FILE: &str = "STEWARD";
+
+/// The persisted term and vote, or zero and none.
+pub fn read_steward_file(dir: &Path) -> (u64, Option<String>) {
+    let Ok(s) = fs::read_to_string(dir.join(STEWARD_FILE)) else { return (0, None) };
+    let mut lines = s.lines();
+    let term = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+    let voted = lines.next().map(str::trim).filter(|v| !v.is_empty()).map(String::from);
+    (term, voted)
+}
+
+/// The election's actions that concern this node: the persisted term
+/// and vote written before anything else, a steward's rise or fall
+/// noted in the cell. The sends are returned for the caller to carry
+/// -- a reply, for the wire; a round, for the elector.
+pub fn apply_election_actions(
+    g: &mut LeaseState,
+    actions: Vec<crate::steward::Action>,
+) -> Vec<(String, crate::steward::Msg)> {
+    use crate::steward::Action;
+    let mut sends = Vec::new();
+    for a in actions {
+        match a {
+            Action::Persist { term, voted_for } => {
+                if let Some(d) = &g.dir {
+                    let body = format!("{term}\n{}\n", voted_for.as_deref().unwrap_or(""));
+                    if let Err(e) =
+                        crate::shard::atomic_write(&d.join(STEWARD_FILE), body.as_bytes())
+                    {
+                        crate::log::warn("steward_not_persisted", &[("error", e.to_string())]);
+                    }
+                }
+            }
+            Action::BecameSteward { term } => {
+                g.term = term;
+                g.at = Some(std::time::Instant::now());
+                if let Some(e) = &g.election {
+                    g.steward = e.steward().map(String::from);
+                }
+                crate::log::info("steward_elected", &[("term", term.to_string())]);
+            }
+            Action::SteppedDown { term } => {
+                crate::log::warn("steward_stepped_down", &[("term", term.to_string())]);
+            }
+            Action::Send { to, msg } => sends.push((to, msg)),
+        }
+    }
+    sends
+}
+
+/// A renewal from `from` at the steward's `term`: taken when `from` is
+/// the steward this node expects -- the configured one, or, with an
+/// election, one at a term no lower than this node has seen, which
+/// then is the steward. Answers this node's term, for a steward that
+/// is behind to step down by.
+pub fn renew_lease(lease: &Lease, from: &str, term: u64) -> Result<u64> {
     let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+    if g.election.is_some() {
+        let now = std::time::Instant::now();
+        let actions = g.election.as_mut().expect("checked").on_message(
+            now,
+            from,
+            crate::steward::Msg::Heartbeat { term },
+        );
+        let sends = apply_election_actions(&mut g, actions);
+        let accepted = sends
+            .iter()
+            .any(|(_, m)| matches!(m, crate::steward::Msg::HeartbeatAnswer { accepted: true, .. }));
+        let mine = g.election.as_ref().map_or(0, |e| e.term());
+        if accepted {
+            g.at = Some(now);
+            g.steward = Some(from.to_string());
+            g.term = mine;
+            return Ok(mine);
+        }
+        return Err(Error::Plan(format!(
+            "{from} renews at term {term}; this node has seen term {mine} and takes no lease \
+             from a lower one"
+        )));
+    }
     match &g.steward {
         Some(s) if s == from => {
             g.at = Some(std::time::Instant::now());
-            Ok(())
+            Ok(0)
         }
         Some(s) => Err(Error::Plan(format!("{from} is not the steward this node expects ({s})"))),
         None => Err(Error::Plan("this node has no steward".into())),
     }
+}
+
+/// A vote asked by `from` for `candidate` at `term`: granted or not, and
+/// this node's term.
+pub fn vote(lease: &Lease, from: &str, term: u64, candidate: &str) -> (bool, u64) {
+    let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(e) = g.election.as_mut() else { return (false, 0) };
+    let actions = e.on_message(
+        std::time::Instant::now(),
+        from,
+        crate::steward::Msg::Vote { term, candidate: candidate.to_string() },
+    );
+    let sends = apply_election_actions(&mut g, actions);
+    for (_, m) in sends {
+        if let crate::steward::Msg::VoteAnswer { term, granted } = m {
+            return (granted, term);
+        }
+    }
+    (false, g.election.as_ref().map_or(0, |e| e.term()))
 }
 
 /// A copy this node follows, and the term it follows at.

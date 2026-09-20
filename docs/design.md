@@ -1625,6 +1625,24 @@ away, writes on the holder alone, loses the holder, promotes the
 follower, brings the holder back and promotes it again: it answers
 the rows the other had and none of the ten nobody confirmed.
 
+**The steward by election (0.62.0).** `CELASTRO_STEWARDS` names a
+group; `steward::Election` is the machine, one per node, pure: time
+and messages in, actions out, driven in its tests through a cut
+steward, a split vote and a restart. The wire's `vote` call and the
+term on `lease` carry it; `serve::elector` is its clock, ticking every
+quarter second and, as steward, heartbeating every quarter lease with
+the lock let go; the lease cell (`LeaseState`) holds the machine, so
+the wire feeds it votes and heartbeats and `Db::steward` reads the
+elected one. What makes it safe without a replicated log: the map is
+already fenced by shard term, so the steward's term only orders
+stewards; a steward that cannot reach a majority for half a lease
+steps down, so its side's leases run out within a lease; and a new
+steward holds off promotions for a lease and a quarter after its
+election, longer than any lease the old one could have granted --
+with an election timeout of at least half a lease and clocks that run
+at comparable rates. A clock that runs twice as fast breaks the
+argument; the notes say so rather than pretend otherwise.
+
 **The steward waits out the lease before it promotes (0.61.1).** The
 lease is what stops a holder that is cut off rather than dead: it
 refuses writes once the lease runs out. The steward promoted a

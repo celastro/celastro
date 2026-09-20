@@ -562,6 +562,10 @@ impl Server {
                 let (stop, grants) = (&stop, &grants);
                 scope.spawn(move || lease_renewer(db, stop, grants));
             }
+            if read(db).steward_group().is_some() {
+                let (stop, grants) = (&stop, &grants);
+                scope.spawn(move || elector(db, stop, grants));
+            }
             // A pool of `max_connections` workers, started once: a thread
             // per connection cost a clone and a fresh stack per request --
             // a fifth of a point lookup's CPU -- for connections the console
@@ -1590,7 +1594,7 @@ fn reconcile_interval() -> Option<Duration> {
 /// missed sweeps, twenty seconds into a sixty-second lease: two writers
 /// for forty seconds, and what the old one took cut at its demotion.
 pub(crate) struct Grants {
-    since: Instant,
+    since: Mutex<Instant>,
     last: Mutex<std::collections::BTreeMap<String, Instant>>,
 }
 
@@ -1600,7 +1604,13 @@ impl Grants {
     }
 
     fn starting_at(since: Instant) -> Grants {
-        Grants { since, last: Mutex::new(std::collections::BTreeMap::new()) }
+        Grants { since: Mutex::new(since), last: Mutex::new(std::collections::BTreeMap::new()) }
+    }
+
+    /// This node is steward as of now (elected): the clock the hold-off
+    /// counts from starts again.
+    fn restart(&self) {
+        *self.since.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
     }
 
     /// A renewal reached `node` now.
@@ -1616,7 +1626,8 @@ impl Grants {
     /// `lease` since its last renewal to the holder.
     fn promotion_wait(&self, holder: &str, lease: Duration, now: Instant) -> Option<Duration> {
         let last = self.last.lock().unwrap_or_else(|p| p.into_inner()).get(holder).copied();
-        let mut left = lease.saturating_sub(now.saturating_duration_since(self.since));
+        let since = *self.since.lock().unwrap_or_else(|p| p.into_inner());
+        let mut left = lease.saturating_sub(now.saturating_duration_since(since));
         if let Some(at) = last {
             left = left.max(lease.saturating_sub(now.saturating_duration_since(at)));
         }
@@ -1725,7 +1736,114 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration, grants: &Gran
 /// with it -- a sweep under a load ran past the lease, and every holder
 /// refused writes for a lease the steward was late to renew -- so they
 /// no longer share its clock.
+/// The election's clock and its wire: the machine ticks here, its
+/// sends go out as vote and lease calls with the lock let go, and the
+/// answers come back to it. With an election the heartbeats are the
+/// lease renewals, so `lease_renewer` stands aside.
+fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
+    use crate::steward::{Election, Msg, Role};
+    let (me, group, secs, lease, dir) = {
+        let g = read(db);
+        (
+            g.node().map(String::from).unwrap_or_default(),
+            g.steward_group().unwrap_or_default(),
+            g.lease_secs(),
+            g.lease(),
+            g.data_dir().map(|d| d.to_path_buf()),
+        )
+    };
+    let lease_len = Duration::from_secs(secs.max(1));
+    let (term, voted) = dir.as_deref().map(crate::engine::read_steward_file).unwrap_or((0, None));
+    // The random slice of the timeout: the node's name hashed, so two
+    // nodes do not stand at once every time.
+    let slice = me.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)) % 1000;
+    let timeout = lease_len / 2 + Duration::from_millis(slice * (secs.max(1) * 250) / 1000);
+    {
+        let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+        g.dir = dir;
+        g.election =
+            Some(Election::new(&me, &group, term, voted, lease_len, timeout, Instant::now()));
+    }
+    let mut last_beat = Instant::now() - lease_len;
+    loop {
+        if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let sends = {
+            let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(e) = g.election.as_mut() else { return };
+            let steward = e.role() == Role::Steward;
+            if steward && last_beat.elapsed() < lease_len / 4 {
+                continue;
+            }
+            let actions = e.tick(Instant::now());
+            let became =
+                actions.iter().any(|a| matches!(a, crate::steward::Action::BecameSteward { .. }));
+            let sends = crate::engine::apply_election_actions(&mut g, actions);
+            if became {
+                grants.restart();
+            }
+            if steward || became {
+                last_beat = Instant::now();
+            }
+            sends
+        };
+        if sends.is_empty() {
+            continue;
+        }
+        let peers = read(db).peers();
+        let mut answers: Vec<(String, Msg)> = Vec::new();
+        for (to, msg) in sends {
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            let Some((_, node)) = peers.iter().find(|(u, _)| *u == to) else { continue };
+            let _deadline = crate::deadline::arm(Some(3_000));
+            match msg {
+                Msg::Vote { term, candidate } => {
+                    // A vote that does not come back is a vote not given.
+                    if let Ok((granted, t)) = node.vote(&me, term, &candidate) {
+                        answers.push((to, Msg::VoteAnswer { term: t, granted }));
+                    }
+                }
+                Msg::Heartbeat { term } => match node.lease(&me, term) {
+                    Ok((accepted, t)) => {
+                        if accepted {
+                            grants.note(&to);
+                        }
+                        answers.push((to, Msg::HeartbeatAnswer { term: t.max(term), accepted }));
+                    }
+                    Err(e) => crate::log::warn(
+                        "lease_not_renewed",
+                        &[("node", to.clone()), ("error", e.to_string())],
+                    ),
+                },
+                _ => {}
+            }
+        }
+        let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let mut follow_ups = Vec::new();
+        for (from, msg) in answers {
+            if let Some(e) = g.election.as_mut() {
+                follow_ups.extend(e.on_message(now, &from, msg));
+            }
+        }
+        let became =
+            follow_ups.iter().any(|a| matches!(a, crate::steward::Action::BecameSteward { .. }));
+        let _ = crate::engine::apply_election_actions(&mut g, follow_ups);
+        if became {
+            grants.restart();
+            last_beat = Instant::now() - lease_len;
+        }
+    }
+}
+
 fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
+    if read(db).steward_group().is_some() {
+        return;
+    }
     loop {
         let (is_steward, me, secs, peers) = {
             let g = read(db);
@@ -1742,8 +1860,8 @@ fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
                     return;
                 }
                 let _deadline = crate::deadline::arm(Some(5_000));
-                match node.lease(&me) {
-                    Ok(()) => grants.note(url),
+                match node.lease(&me, 0) {
+                    Ok(_) => grants.note(url),
                     Err(e) => crate::log::warn(
                         "lease_not_renewed",
                         &[("node", url.clone()), ("error", e.to_string())],
