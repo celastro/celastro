@@ -6,6 +6,15 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.62.3 — 2026-09-20
+
+**The pre-vote's ask leaves the timeout alone.** 0.62.2 counted a
+node's own ask as a steward heard, so every node was within a timeout
+of its own last ask and none was ever quiet enough to answer another
+yes: no steward was ever elected. The asks are paced by the timeout
+on a clock of their own, and only a steward's heartbeat or a vote
+given resets the quiet.
+
 ## 0.62.2 — 2026-09-20
 
 **A pre-vote before a vote.** A node that has heard no steward for

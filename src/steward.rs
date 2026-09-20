@@ -100,6 +100,12 @@ pub struct Election {
     votes: BTreeSet<String>,
     /// The pre-votes gathered for the next term, while asking.
     prevotes: BTreeSet<String>,
+    /// When this node last asked for pre-votes: the asks are paced by
+    /// the timeout, and they leave `heard` alone -- an ask of one's own
+    /// is not a steward heard, and counting it as one kept every node
+    /// within a timeout of its own last ask, so nobody was ever quiet
+    /// enough to answer anybody yes.
+    asked: Option<Instant>,
     /// The last heartbeat accepted from a steward, or vote granted to a
     /// candidate: what the election timeout counts from.
     heard: Instant,
@@ -140,6 +146,7 @@ impl Election {
             steward: None,
             votes: BTreeSet::new(),
             prevotes: BTreeSet::new(),
+            asked: None,
             heard: now,
             round: BTreeSet::new(),
             majority_at: now,
@@ -216,6 +223,7 @@ impl Election {
         self.steward = None;
         self.votes.clear();
         self.prevotes.clear();
+        self.asked = None;
         self.votes.insert(self.me.clone());
         self.heard = now;
         out.push(Action::Persist { term: self.term, voted_for: Some(self.me.clone()) });
@@ -259,7 +267,10 @@ impl Election {
                 }
                 // Ask first whether the group would vote: a node alone
                 // gets no answer and stays at its term.
-                self.heard = now;
+                if self.asked.is_some_and(|a| now.saturating_duration_since(a) < self.timeout) {
+                    return out;
+                }
+                self.asked = Some(now);
                 self.prevotes.clear();
                 self.prevotes.insert(self.me.clone());
                 if self.prevotes.len() >= self.majority() {
@@ -408,11 +419,22 @@ mod tests {
 
     impl Group {
         fn new(n: usize, lease: Duration) -> Group {
+            Group::with_timeouts(n, lease, false)
+        }
+
+        /// `staggered`: each node's timeout a second longer than the one
+        /// before, the way the random slice makes them in practice.
+        fn with_timeouts(n: usize, lease: Duration, staggered: bool) -> Group {
             let t0 = Instant::now();
             let names: Vec<String> = (0..n).map(|i| format!("n{i}")).collect();
             let nodes = names
                 .iter()
-                .map(|m| (m.clone(), Election::new(m, &names, 0, None, lease, lease / 2, t0)))
+                .enumerate()
+                .map(|(i, m)| {
+                    let extra =
+                        if staggered { Duration::from_secs(i as u64) } else { Duration::ZERO };
+                    (m.clone(), Election::new(m, &names, 0, None, lease, lease / 2 + extra, t0))
+                })
                 .collect();
             Group { nodes, cut: BTreeSet::new(), t0 }
         }
@@ -554,6 +576,36 @@ mod tests {
         assert_eq!(g.nodes["n0"].role(), Role::Follower);
         assert!(g.tick(34, "n0").is_empty(), "the healed node stood against a live steward");
         assert_eq!(g.nodes["n1"].term(), 1, "the steward's term moved");
+    }
+
+    /// Three nodes started together and ticked in turn every second
+    /// elect one steward within a few timeouts, and keep it. (0.62.2
+    /// never elected anybody this way: every node's own ask counted as
+    /// a steward heard.)
+    #[test]
+    fn a_group_started_together_elects_a_steward_within_a_few_timeouts() {
+        let mut g = Group::with_timeouts(3, Duration::from_secs(10), true);
+        let mut first = None;
+        for t in 1..=40u64 {
+            for n in ["n0", "n1", "n2"] {
+                let notable = g.tick(t, n);
+                if notable.iter().any(|a| matches!(a, Action::BecameSteward { .. })) {
+                    first.get_or_insert(t);
+                }
+            }
+            if t >= 20 {
+                assert_eq!(g.stewards().len(), 1, "at {t}: {:?}", g.stewards());
+            }
+        }
+        let first = first.expect("nobody was elected in forty seconds");
+        assert!(first <= 20, "the first steward came at {first} s");
+        let steward = g.stewards()[0].clone();
+        assert!(g.nodes.values().all(|e| e.term() == g.nodes[&steward].term()));
+        assert!(
+            g.nodes[&steward].term() <= 3,
+            "term {} for one election",
+            g.nodes[&steward].term()
+        );
     }
 
     /// The persisted term and vote come back on restart, and a restarted
