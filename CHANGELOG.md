@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.59.0 — 2026-09-20
+
+**The lock on a `Db` is the crate's own, and a wire read is never held
+back by a waiting writer.** The standard lock lets a writer that waits
+hold every new reader behind it -- fair on one machine, and across
+nodes the closing of a cycle: a statement holds its coordinator's
+shared lock while it waits on another node's shard, and that node's
+wire read waited behind a writer that waited for that node's own
+statements, waiting on the first. Under the five-node suite's mixed
+load every node had such a writer at any moment (a forwarded insert,
+a statement's own write), and reads and writes alike waited out the
+thirty-second deadline on idle CPUs. `celastro::lock::RwLock` has the
+standard API and one more entry, `read_served`, which yields to a
+writer that holds the lock and to none that waits; the wire's shard
+reads take it, so a wait across the network ends at local work and no
+cycle closes. Writers do not starve: the statements starting on a
+node still yield to a waiting writer. The replication step -- the
+next catch-up chunk of every follower -- is a read now and runs under
+the served lock too; under the exclusive one its try found a reader
+every time on a node under sustained reads, so followers never caught
+up and every write waited for their confirmation until the deadline.
+
+*Upgrading an embedded use:* wrap the database in
+`celastro::lock::RwLock` rather than `std::sync::RwLock` -- the
+console and the wire take that type. Everything else is unchanged.
+
 ## 0.58.5 — 2026-09-20
 
 **The catalog fetch and `SHOW HEALTH` take the shared lock.** The

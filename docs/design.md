@@ -907,10 +907,12 @@ them first:
   cache -- sits behind its own small lock, the statistics a read merges
   before planning are merged into a copy, and the index accesses it notes
   wait for a writer (`apply_touches`) rather than being applied under the
-  read. The console and the wire hold an `RwLock<Db>`: reads share it,
-  writes and DDL take it alone. (0.31.0; until then one mutex serialised
-  every statement, and a walk at 50 ms capped a node at 12 of them a second
-  whatever the core count.)
+  read. The console and the wire hold a `lock::RwLock<Db>`: reads share it,
+  writes and DDL take it alone, and a read that serves another node's
+  statement is never held back by a writer that waits (the served read,
+  0.59.0). (0.31.0; until then one mutex serialised every statement, and
+  a walk at 50 ms capped a node at 12 of them a second whatever the core
+  count.)
 - **A query reaches a shard through one boundary**, `plan::service::ShardService`:
   statistics, prefix expansion, candidates, an unranked scan, payload fetches,
   the two calls of a walk, and nothing else. A shard on this node answers by direct call, a shard on
@@ -1558,10 +1560,31 @@ closed as fast as the deadline broke them. The periodic work now
 `try_write`s and skips the tick when the lock is busy (a built seal or
 compaction insists after five seconds; a sweep's merge waits two and
 skips the peer until the next sweep), so no housekeeping writer holds a
-reader behind it. The statements' own writes remain, brief and free of
-the network since 0.53.0; the read that holds the lock across the
-fan-out is the next thing to take apart, and the suite's mixed load is
-where it shows.
+reader behind it. The statements' own writes remained, and the suite's
+mixed load was where they showed: the next paragraph.
+
+**A wire read is never held back by a waiting writer.** With the
+housekeeping writers gone, the mixed load -- eight workers, seventy
+per cent reads, single inserts forwarded to their holders -- still
+waited out the deadline on every statement, on idle CPUs: the writers
+that remained were the forwarded inserts and the statements' own
+writes, and any one of them waiting on a node closed the cycle above.
+The lock on a `Db` is now the crate's own (`src/lock.rs`), with the
+standard API and one more entry: `read_served` yields to a writer that
+holds the lock and to none that waits. The wire's shard reads take it,
+because the statement they serve is holding its coordinator's lock the
+whole time; every wait across the network then ends in a served read,
+which waits for local work only -- a holding writer, which since 0.53.0
+never waits on the network -- so no cycle can close. Writers do not
+starve: `read`, what a statement starting on the node takes, still
+yields to a waiting writer, and the served reads are the short ones.
+A two-node test runs the mixed load in-process and asserts no
+statement waits over two seconds; with the plain read on the wire it
+deadlocks both nodes until the deadline, every time. The replication
+step is a read now and runs under the served lock as well: under the
+exclusive lock its try found a reader every time on a node under
+sustained reads, so followers never caught up, and every write waited
+for their confirmation until the deadline.
 
 **A pooled connection is asked a hello after ten idle seconds.** The
 five-node suite, every node restarted, found the coordinators' pooled

@@ -3,10 +3,11 @@
 //! under the same master and under no other, and its copies -- exports,
 //! backups, moves -- carry the data key with them or refuse.
 
+use celastro::lock::RwLock;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::Value;

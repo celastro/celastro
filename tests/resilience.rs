@@ -14,10 +14,11 @@
 
 mod common;
 
+use celastro::lock::RwLock;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use celastro::engine::{Db, DbOpts, Outcome};

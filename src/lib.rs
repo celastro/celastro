@@ -86,6 +86,7 @@ pub(crate) mod fuzz;
 pub mod harness;
 pub mod json;
 pub mod lifecycle;
+pub mod lock;
 pub mod log;
 pub mod memtable;
 pub mod mvcc;

@@ -918,7 +918,7 @@ impl Deferred {
 
     /// Run the work, taking the database lock again for the steps that need
     /// it and holding it for those alone.
-    pub fn finish_with(self, db: &std::sync::RwLock<Db>) -> Result<Outcome> {
+    pub fn finish_with(self, db: &crate::lock::RwLock<Db>) -> Result<Outcome> {
         let mut step = (self.0)()?;
         loop {
             step = match step {
@@ -968,7 +968,7 @@ impl Outcome {
     /// The same, with the database at hand for deferred work that goes
     /// back under its lock: what the console and the wire call, with the
     /// lock they took for the statement let go.
-    pub fn finished_with(self, db: &std::sync::RwLock<Db>) -> Result<Outcome> {
+    pub fn finished_with(self, db: &crate::lock::RwLock<Db>) -> Result<Outcome> {
         match self {
             Outcome::Deferred(d) => d.finish_with(db),
             other => Ok(other),
@@ -4057,9 +4057,15 @@ impl Db {
 
     /// The catch-ups due: for every follower a shipper is waiting to catch
     /// up, the next chunk of what it lacks, cut from the held shard. What
-    /// the console's maintenance thread runs each second; how many chunks
-    /// were cut.
-    pub fn replication_step(&mut self) -> usize {
+    /// the console's maintenance thread and the wire's driver run; how
+    /// many chunks were cut. A read: it cuts from the shard's sealed files
+    /// and memtable and hands the chunk to the shipper, which keeps its
+    /// own state. Under the exclusive lock, as it first was, a node under
+    /// sustained reads never cut a chunk -- the try for the lock found a
+    /// reader every time -- so its followers never caught up, every write
+    /// waited for their confirmation until the deadline, and the
+    /// statements behind those writes with it.
+    pub fn replication_step(&self) -> usize {
         let now = self.clock.peek().max(self.last_commit);
         let mut cut = 0;
         let mut jobs: Vec<(

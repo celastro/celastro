@@ -2,10 +2,11 @@
 //! listener, sharing a collection whose shards are spread one per node.
 //! Every node coordinates; every node answers what one process answers.
 
+use celastro::lock::RwLock;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::plan::exec::QueryResult;
@@ -2015,6 +2016,94 @@ fn a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns() {
         assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(42), "{}", n.url);
     }
     for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A mixed load over two nodes -- statements that fan out to the other,
+/// writes forwarded to the other -- and no statement waits for anything
+/// but work. With a lock whose waiting writer holds every new reader
+/// behind it, the two nodes' statements waited for each other through
+/// their wire reads until the deadline broke the cycle: on the five-node
+/// suite every read and write of the mixed load took thirty seconds on
+/// idle CPUs. A served read yields to no waiting writer, so a wait across
+/// the wire ends at local work.
+#[test]
+fn a_mixed_load_over_two_nodes_closes_no_lock_cycle() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("cycle-a");
+    let b = Node::start("cycle-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    for sql in INDEXES {
+        a.ack(sql);
+    }
+    for i in 0..300usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    assert!(!a.local_shards("items").is_empty() && !b.local_shards("items").is_empty());
+    for n in [&a, &b] {
+        n.db.write().unwrap().opts.statement_deadline_ms = Some(5000);
+    }
+    let running = Arc::new(AtomicBool::new(true));
+    let mut workers = Vec::new();
+    for (which, node) in [("a", &a), ("b", &b)] {
+        for r in 0..3usize {
+            let (db, running) = (node.db.clone(), running.clone());
+            workers.push(std::thread::spawn(move || {
+                let (mut n, mut slowest, mut errors) = (0usize, std::time::Duration::ZERO, 0usize);
+                while running.load(Ordering::Relaxed) {
+                    let t0 = std::time::Instant::now();
+                    let out = db.read().unwrap().read(QUERIES[(n + r) % QUERIES.len()]);
+                    slowest = slowest.max(t0.elapsed());
+                    errors += out.is_err() as usize;
+                    n += 1;
+                }
+                (format!("{which} reads"), n, slowest, errors)
+            }));
+        }
+        for w in 0..2usize {
+            let (db, running) = (node.db.clone(), running.clone());
+            let which = which.to_string();
+            workers.push(std::thread::spawn(move || {
+                let (mut n, mut slowest, mut errors) = (0usize, std::time::Duration::ZERO, 0usize);
+                let mut i = 10_000 + (which.as_bytes()[0] as usize) * 1000 + w * 100_000;
+                while running.load(Ordering::Relaxed) {
+                    let t0 = std::time::Instant::now();
+                    let sql = format!("INSERT INTO items VALUES ('{}')", doc(i));
+                    // Two statements: a guard that is a temporary of the
+                    // expression lives through `finished_with`, and the
+                    // carry then runs under the lock it is meant to let go.
+                    let out = db.write().unwrap().execute(&sql);
+                    let out = out.and_then(|o| o.finished_with(&db));
+                    slowest = slowest.max(t0.elapsed());
+                    errors += out.is_err() as usize;
+                    n += 1;
+                    i += 1;
+                }
+                (format!("{which} writes"), n, slowest, errors)
+            }));
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    running.store(false, Ordering::Relaxed);
+    let mut worst = std::time::Duration::ZERO;
+    let mut errors = 0;
+    for w in workers {
+        let (what, n, slowest, errs) = w.join().unwrap();
+        eprintln!("{what}: {n} statements, slowest {slowest:?}, {errs} errors");
+        worst = worst.max(slowest);
+        errors += errs;
+        assert!(n > 0, "{what}: nothing ran");
+    }
+    assert_eq!(errors, 0, "statements failed under the mixed load");
+    assert!(worst < std::time::Duration::from_secs(2), "a statement waited {worst:?}");
+    for n in [a, b] {
         let d = n.dir.clone();
         drop(n);
         settle();

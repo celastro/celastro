@@ -28,10 +28,11 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 
 use crate::crypto::hex;
+use crate::lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::sql;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::IndexKind;
@@ -1814,15 +1815,12 @@ fn steward_sweep(
 }
 
 fn maintenance_step(db: &RwLock<Db>) -> bool {
-    // Followers catching up: the next chunk of each, cut under the lock,
-    // shipped without it.
-    match write_soon(db, Duration::from_millis(100)) {
-        Some(mut g) => {
-            if g.replication_step() > 0 {
-                return true;
-            }
-        }
-        None => return false,
+    // Followers catching up: the next chunk of each, cut under the served
+    // shared lock -- the one a waiting writer cannot hold back, since a
+    // step that waits is a follower that never catches up -- and shipped
+    // without it.
+    if db.read_served().unwrap_or_else(|p| p.into_inner()).replication_step() > 0 {
+        return true;
     }
     // A seal frozen by the write path first: the graph it builds is the
     // pause a statement would otherwise wait out under the lock. The guard

@@ -2,10 +2,11 @@
 //! certificates, a client with the CA is answered, a client without one is
 //! not, and the material is all three files or none.
 
+use celastro::lock::RwLock;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use celastro::engine::{Db, DbOpts};

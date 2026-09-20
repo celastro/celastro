@@ -39,12 +39,13 @@
 //! existed, and it is why the simulator's tests are the tests a transport has
 //! to pass.
 
+use crate::lock::RwLock;
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, Collection, Tablet, CATALOG_VERSION};
@@ -1488,20 +1489,12 @@ pub fn serve(
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    // Never queued behind readers: a writer waiting on the
-                    // lock holds every new reader behind it, and a reader
-                    // here is a statement of some coordinator's waiting on
-                    // this node -- while that coordinator's own readers wait
-                    // on this node's statements, which wait on it. Across
-                    // five nodes those waits closed cycles a deadline broke.
-                    // A busy lock is tried again in twenty milliseconds.
-                    idle = match db.try_write() {
-                        Ok(mut g) => g.replication_step() == 0,
-                        Err(std::sync::TryLockError::Poisoned(p)) => {
-                            p.into_inner().replication_step() == 0
-                        }
-                        Err(std::sync::TryLockError::WouldBlock) => false,
-                    };
+                    // A served read: never queued as a writer, which would
+                    // hold every new reader behind it, and never held back
+                    // by one, which under sustained reads kept the step from
+                    // ever running and the followers from ever catching up.
+                    idle =
+                        db.read_served().unwrap_or_else(|p| p.into_inner()).replication_step() == 0;
                 }
             })
             .expect("a thread for the replication driver");
@@ -1683,8 +1676,8 @@ impl Drop for Serving {
 /// The lock a call holds: shared for a read, exclusive for the rest. Both
 /// read as `&Db`; only the exclusive one hands out `&mut Db`.
 enum Held<'a> {
-    Read(std::sync::RwLockReadGuard<'a, Db>),
-    Write(std::sync::RwLockWriteGuard<'a, Db>),
+    Read(crate::lock::RwLockReadGuard<'a, Db>),
+    Write(crate::lock::RwLockWriteGuard<'a, Db>),
 }
 
 impl std::ops::Deref for Held<'_> {
@@ -1922,10 +1915,12 @@ fn handle(
         out.push(WIRE_VERSION_MAX);
         return Ok(out);
     }
-    // A read takes the shared lock; the catalog fetch of every sweep is
-    // one, and taken as a write it queued a writer on every node every
-    // few seconds -- which held every reader behind it, and across nodes
-    // closed the cycles the design notes describe.
+    // A read takes the shared lock, and the served kind: the statement
+    // it serves holds its coordinator's lock across this call, so a
+    // writer waiting here must not hold it back -- that writer waits for
+    // this node's statements, which may be waiting on that coordinator.
+    // The catalog fetch of every sweep is a read too; taken as a write it
+    // queued a writer on every node every few seconds.
     let read_call = matches!(
         call,
         Call::Hello
@@ -1942,7 +1937,7 @@ fn handle(
     );
     let shared = db;
     let mut db = if read_call {
-        Held::Read(db.read().unwrap_or_else(|p| p.into_inner()))
+        Held::Read(db.read_served().unwrap_or_else(|p| p.into_inner()))
     } else {
         Held::Write(db.write().unwrap_or_else(|p| p.into_inner()))
     };
