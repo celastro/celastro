@@ -4117,7 +4117,13 @@ impl Db {
     }
 
     fn replan_followers(&mut self, collection: &str, replicas: usize, regions: usize) {
-        let nodes = self.data_nodes();
+        // The ring in one order everywhere: `data_nodes` puts this node
+        // first, and the carried `LOCAL ALTER` re-plans on every node, so
+        // each node walked a different ring and named different followers
+        // -- the holder shipped to two nodes that said they did not follow
+        // the shard, for as long as the maps disagreed.
+        let mut nodes = self.data_nodes();
+        nodes.sort();
         let mut tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
         for t in tablets.iter_mut() {
             if t.is_merged() {
@@ -8845,6 +8851,56 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A re-plan of the followers names the same followers on every node:
+    /// two nodes with the same map and regions, each putting itself first
+    /// among the data nodes, agree -- which they did not while the ring
+    /// started at the node doing the planning.
+    #[test]
+    fn a_replan_names_the_same_followers_on_every_node() {
+        let nodes: Vec<String> = (0..5).map(|i| format!("tcp://10.0.0.{i}:2352")).collect();
+        let regions = ["sgp", "sgp", "sgp", "fra", "fra"];
+        let plan_on = |me: usize| {
+            let mut opts = DbOpts::default();
+            opts.node = Some(nodes[me].clone());
+            opts.region = Some(regions[me].into());
+            let mut db = Db::with_opts(opts);
+            for (i, n) in nodes.iter().enumerate() {
+                if i != me {
+                    db.catalog.nodes.push(n.clone());
+                    db.note_region(n, Some(regions[i]));
+                }
+            }
+            let mut coll = crate::catalog::Collection::new("items", "id", None);
+            coll.replicas = 3;
+            db.catalog.create(coll).unwrap();
+            db.catalog.placement.insert(
+                "items".into(),
+                (0..5).map(|i| Tablet { node: nodes[i].clone(), ..Default::default() }).collect(),
+            );
+            db.replan_followers("items", 3, 2);
+            db.catalog.placement["items"].iter().map(|t| t.followers.clone()).collect::<Vec<_>>()
+        };
+        let on_0 = plan_on(0);
+        for me in 1..5 {
+            assert_eq!(plan_on(me), on_0, "node {me} planned differently");
+        }
+        // And what it plans: a holder in sgp gets a fra follower and an
+        // sgp one; a holder in fra gets an sgp follower and the other fra.
+        for (i, followers) in on_0.iter().enumerate() {
+            let regs: Vec<&str> = followers
+                .iter()
+                .map(|f| regions[nodes.iter().position(|n| n == f).unwrap()])
+                .collect();
+            assert_eq!(followers.len(), 2, "shard {i}: {followers:?}");
+            assert!(regs.contains(&"sgp") && regs.contains(&"fra"), "shard {i}: {regs:?}");
+            assert_eq!(
+                regs[0],
+                if regions[i] == "sgp" { "fra" } else { "sgp" },
+                "shard {i}: {regs:?}"
+            );
+        }
+    }
 
     /// A followed copy's seals are the background sealer's as much as a
     /// held shard's: frozen by the ship, reserved, built and installed

@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.6 — 2026-09-20
+
+**A re-plan of the followers agrees on every node.** `ALTER COLLECTION
+... SET (replicas = n)` or `(regions = n)` is carried to every node and
+each re-plans; the ring of data nodes started at the node doing the
+planning, so each node named different followers, and a holder shipped
+to two nodes that said they did not follow the shard for as long as the
+maps disagreed. The ring is in address order everywhere now; a test
+plans on each of five nodes and gets one answer.
+
 ## 0.63.5 — 2026-09-20
 
 **A followed copy's seals go to the background sealer.** A copy
