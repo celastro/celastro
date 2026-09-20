@@ -311,11 +311,15 @@ impl<'a> Parser<'a> {
                 let mut prefix_expansion = None;
                 let mut nodes_of = None;
                 let mut replicas = None;
+                let mut regions = None;
+                let mut confirm = None;
                 for (key, v) in self.option_list()? {
                     match key.as_str() {
                         "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
                         "nodes_of" => nodes_of = Some(name_option(&key, v)?),
                         "replicas" => replicas = Some(replicas_option(&key, v)?),
+                        "regions" => regions = Some(regions_option(&key, v)?),
+                        "confirm" => confirm = Some(confirm_option(&key, v)?),
                         "splits" => {
                             return Err(Error::Sql(
                                 "splits are fixed when the collection is created and cannot \
@@ -328,15 +332,22 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                if prefix_expansion.is_none() && nodes_of.is_none() && replicas.is_none() {
+                if prefix_expansion.is_none()
+                    && nodes_of.is_none()
+                    && replicas.is_none()
+                    && regions.is_none()
+                    && confirm.is_none()
+                {
                     return Err(Error::Sql(
                         "ALTER COLLECTION ... SET names no option; it takes prefix_expansion, \
-                         nodes_of and replicas"
+                         nodes_of, replicas, regions and confirm"
                             .into(),
                     ));
                 }
                 return Ok(Statement::AlterCollection {
                     collection,
+                    regions,
+                    confirm,
                     prefix_expansion,
                     replicas,
                     nodes_of,
@@ -515,6 +526,8 @@ impl<'a> Parser<'a> {
         let mut nodes = Vec::new();
         let mut nodes_of = None;
         let mut replicas = None;
+        let mut regions = None;
+        let mut confirm = None;
         let mut undirected = false;
         if self.eat_kw("WITH") {
             for (key, v) in self.option_list()? {
@@ -534,6 +547,8 @@ impl<'a> Parser<'a> {
                     }
                     "prefix_expansion" => prefix_expansion = Some(cap_option(&key, v)?),
                     "replicas" => replicas = Some(replicas_option(&key, v)?),
+                    "regions" => regions = Some(regions_option(&key, v)?),
+                    "confirm" => confirm = Some(confirm_option(&key, v)?),
                     "nodes" => {
                         nodes = v
                             .as_array()
@@ -566,6 +581,8 @@ impl<'a> Parser<'a> {
             nodes_of,
             undirected,
             replicas,
+            regions,
+            confirm,
         }))
     }
 
@@ -1596,6 +1613,24 @@ fn replicas_option(key: &str, v: Value) -> Result<usize> {
     match v.as_i64() {
         Some(n) if (1..=8).contains(&n) => Ok(n as usize),
         _ => Err(Error::Sql(format!("`{key}` must be an integer from 1 to 8"))),
+    }
+}
+
+/// `regions`: how many regions a shard's copies span, 1 to 8.
+fn regions_option(key: &str, v: Value) -> Result<usize> {
+    match v.as_i64() {
+        Some(n) if (1..=8).contains(&n) => Ok(n as usize),
+        _ => Err(Error::Sql(format!("`{key}` must be an integer from 1 to 8"))),
+    }
+}
+
+/// `confirm`: what acknowledges a write, as the catalog numbers it.
+fn confirm_option(key: &str, v: Value) -> Result<u8> {
+    match v.as_str().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("all") => Ok(1),
+        Some("quorum") => Ok(2),
+        Some("none") => Ok(3),
+        _ => Err(Error::Sql(format!("`{key}` must be 'all', 'quorum' or 'none'"))),
     }
 }
 

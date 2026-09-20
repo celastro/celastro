@@ -6,6 +6,33 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.0 — 2026-09-20
+
+**Regions, and a quorum acknowledgement (HA2, steps 1 and 2).** A node
+carries `CELASTRO_REGION` (or picks one from `CELASTRO_REGIONS`, a list
+by the node's ordinal, for a StatefulSet); its hello says it, and
+`SHOW HEALTH` names each node's and each follower's region. A
+collection created `WITH (replicas = 3, regions = 2)` gets a shard's
+copies spread over that many regions -- the first followers one from
+each region the holder's is not, then the rest -- and `ALTER
+COLLECTION ... SET (regions = n)` re-plans them. `WITH (confirm =
+'quorum')` acknowledges a write once a majority of the copies, holder
+included, have it on disk: of three, the holder and one follower, so
+a follower away does not hold writes, and with no majority the write
+is refused rather than acknowledged on one disk alone -- with the
+copies over two regions, a region failing loses nothing acknowledged.
+`'all'` is HA1's rule (every live follower), `'none'` acknowledges on
+this disk, and unset is the node's `CELASTRO_REPLICATION`. Under
+quorum the steward promotes the most recent caught-up copy, the one
+that took part in the last acknowledgement; under `all` it prefers a
+copy in the holder's region. The health says `confirm = quorum, 2 of 3
+copies live` and `BELOW QUORUM` when writes are refused. Catalog
+format 10 (a peer at 9 reads the collections without the two fields).
+
+Found on the way: a follower down held the shipper's whole round for
+its backoff, up to five seconds, so the live follower's
+acknowledgements waited with it; the backoff is the follower's now.
+
 ## 0.62.4 — 2026-09-20
 
 **The elector carries what the answers make.** The votes come after

@@ -1625,6 +1625,26 @@ away, writes on the holder alone, loses the holder, promotes the
 follower, brings the holder back and promotes it again: it answers
 the rows the other had and none of the ten nobody confirmed.
 
+**Regions and the quorum acknowledgement (0.63.0, HA2 steps 1 and
+2).** A node's region travels in its hello and lives in the
+coordinator's memory (`Db::regions`), never in the catalog: a hello
+brings it back. Placement (`followers_over_regions`) takes the first
+followers one from each region the holder's is not, until the copies
+span what the collection asked, then the rest in ring order; `ALTER
+... SET (regions = n)` re-plans. The acknowledgement rule is the
+collection's (`Collection::confirm`, format 10) and the shipper's
+(`replication::Confirm`): `All` waits for every live follower, as HA1
+did; `Quorum` counts confirmations and needs a majority of the copies
+with the holder, and refuses the write when the budget runs out with
+fewer -- the error says the write is on this disk alone and may not
+survive a failover, which is the truth; `None` acknowledges at once.
+Under quorum the promotion takes the most recent caught-up copy, the
+one that took part in the last acknowledgement, wherever it is; under
+`All` every live copy has everything, so the holder's region is
+preferred. The shipper's backoff became the follower's on the way:
+one follower down slept the whole round, and under quorum the live
+follower is the acknowledgement.
+
 **The steward by election (0.62.0).** `CELASTRO_STEWARDS` names a
 group; `steward::Election` is the machine, one per node, pure: time
 and messages in, actions out, driven in its tests through a cut

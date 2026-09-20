@@ -264,6 +264,11 @@ pub struct DbOpts {
     /// whichever of the group holds the current term; a node not in the
     /// group follows the elected one's leases.
     pub stewards: Option<Vec<String>>,
+    /// Where this node runs: `CELASTRO_REGION` (or `CELASTRO_REGIONS`, a
+    /// list picked by the node's ordinal). Placement spreads a shard's
+    /// copies over regions when a collection asks, and a promotion
+    /// prefers a follower in the holder's region.
+    pub region: Option<String>,
     /// Whether the steward promotes on its own, and a holder whose lease
     /// ran out refuses writes: `CELASTRO_AUTO_FAILOVER`. Off by default:
     /// promotion is the operator's, and no lease gates a write.
@@ -307,6 +312,7 @@ impl Default for DbOpts {
             replication_sync: true,
             steward: None,
             stewards: None,
+            region: None,
             auto_failover: false,
             lease_secs: 60,
             node: None,
@@ -994,6 +1000,9 @@ pub struct Db {
     /// close the cycle. Not read by any statement; a promotion makes one
     /// a held shard.
     followed: Followed,
+    /// Each known node's region, as its hello said; this node's own
+    /// under its address. Not persisted: a hello brings it back.
+    regions: BTreeMap<String, String>,
     /// What the last write statement wrote here, shard by shard: what its
     /// acknowledgement waits on the followers for.
     recent_writes: Vec<(String, usize, Timestamp)>,
@@ -1136,6 +1145,7 @@ impl Db {
                 election: None,
                 dir: None,
             })),
+            regions: BTreeMap::new(),
             clock: Arc::new(Hlc::new()),
             opts,
             dir: None,
@@ -2018,9 +2028,10 @@ impl Db {
                     };
                     let older = notes.iter().any(|n| n.starts_with("an older process"));
                     out.push_str(&format!(
-                        "node {url}: up, {}, celastro {}, {} ms{clock}{}{}\n",
+                        "node {url}: up, {}, celastro {}{}, {} ms{clock}{}{}\n",
                         h.role.name(),
                         h.version,
+                        h.region.as_deref().map(|r| format!(", region {r}")).unwrap_or_default(),
                         started.elapsed().as_millis(),
                         if older { ", AN OLDER PROCESS ANSWERS HERE TOO" } else { "" },
                         if notes.iter().any(|n| n.contains(" restarted at ")) {
@@ -2081,17 +2092,38 @@ impl Db {
         for (name, shards) in &self.shards {
             for s in shards {
                 if let Some(sh) = &s.shipper {
-                    for f in sh.report() {
+                    let report = sh.report();
+                    let live = report.iter().filter(|f| f.state == "live").count();
+                    let quorum = sh.confirm == crate::replication::Confirm::Quorum;
+                    let copies = report.len() + 1;
+                    let majority = copies / 2 + 1;
+                    for f in &report {
                         out.push_str(&format!(
-                            "shard {} of `{name}`: follower {} {}, confirmed to ts {}, {} behind{}{}\n",
+                            "shard {} of `{name}`: follower {}{} {}, confirmed to ts {}, {} behind{}{}\n",
                             s.index,
                             f.url,
+                            self.region_of(&f.url)
+                                .map(|r| format!(" (region {r})"))
+                                .unwrap_or_default(),
                             f.state,
                             f.acked,
                             f.backlog,
-                            f.last_error.map(|e| format!(" ({e})")).unwrap_or_default(),
-                            if f.state == "asking" {
+                            f.last_error.clone().map(|e| format!(" ({e})")).unwrap_or_default(),
+                            if f.state == "asking" && !quorum {
                                 "; DEGRADED: writes to this shard are acknowledged on this node's disk alone"
+                            } else {
+                                ""
+                            }
+                        ));
+                    }
+                    if quorum {
+                        out.push_str(&format!(
+                            "shard {} of `{name}`: confirm = quorum, {} of {} copies live{}\n",
+                            s.index,
+                            live + 1,
+                            report.len() + 1,
+                            if live + 1 < majority {
+                                "; BELOW QUORUM: writes to this shard are refused until a copy is back"
                             } else {
                                 ""
                             }
@@ -2174,7 +2206,8 @@ impl Db {
         if coll.replicas == 0 {
             coll.replicas = DEFAULT_REPLICAS as u8;
         }
-        let tablets = self.plan_tablets(splits, &[], coll.replicas as usize)?;
+        let tablets =
+            self.plan_tablets(splits, &[], coll.replicas as usize, coll.regions as usize)?;
         // A library caller waits for the spread; the statement defers it.
         let _ = self.create_spread(coll, tablets)?.carry();
         Ok(())
@@ -2427,6 +2460,7 @@ impl Db {
         splits: &[String],
         nodes: &[String],
         replicas: usize,
+        regions: usize,
     ) -> Result<Vec<Tablet>> {
         for k in splits {
             if k.is_empty() || k.contains('\n') {
@@ -2482,9 +2516,52 @@ impl Db {
             })
             .collect();
         for (i, t) in tablets.iter_mut().enumerate() {
-            t.followers = Self::followers_for(&nodes, i, replicas);
+            t.followers = self.followers_over_regions(&nodes, i, replicas, regions);
         }
         Ok(tablets)
+    }
+
+    /// The followers for the holder at `i`, `replicas - 1` of them:
+    /// first one from each region the holder's is not, until the copies
+    /// span `regions` regions or no other region is left, then the rest
+    /// in ring order as `followers_for` takes them. With no regions
+    /// asked, or none carried by the nodes, this is `followers_for`.
+    fn followers_over_regions(
+        &self,
+        nodes: &[String],
+        i: usize,
+        replicas: usize,
+        regions: usize,
+    ) -> Vec<String> {
+        if regions <= 1 || nodes.len() <= 1 {
+            return Self::followers_for(nodes, i, replicas);
+        }
+        let holder = &nodes[i % nodes.len()];
+        let mut covered: Vec<Option<String>> = vec![self.region_of(holder)];
+        let mut out: Vec<String> = Vec::new();
+        let ring: Vec<&String> = (1..nodes.len())
+            .map(|k| &nodes[(i + k) % nodes.len()])
+            .filter(|n| *n != holder && !n.is_empty())
+            .collect();
+        for n in &ring {
+            if out.len() + 1 >= replicas || covered.len() >= regions {
+                break;
+            }
+            let r = self.region_of(n);
+            if r.is_some() && !covered.contains(&r) {
+                covered.push(r);
+                out.push((*n).clone());
+            }
+        }
+        for n in &ring {
+            if out.len() + 1 >= replicas {
+                break;
+            }
+            if !out.contains(n) {
+                out.push((*n).clone());
+            }
+        }
+        out
     }
 
     /// The followers of shard `i` under `replicas` copies: the `replicas -
@@ -3128,6 +3205,7 @@ impl Db {
             crate::log::warn("peer", &[("node", url.to_string()), ("note", note)]);
         }
         self.attached.insert(url.to_string());
+        self.note_region(url, hello.region.as_deref());
         if !self.catalog.nodes.iter().any(|n| n == url) {
             self.catalog.nodes.push(url.to_string());
         }
@@ -3996,6 +4074,42 @@ impl Db {
     fn set_replicas(&mut self, collection: &str, n: usize) -> Result<usize> {
         let coll = self.catalog.get(collection)?.clone();
         let was = if coll.replicas == 0 { DEFAULT_REPLICAS } else { coll.replicas as usize };
+        self.replan_followers(collection, n, coll.regions as usize);
+        if let Some(c) = self.catalog.collections.get_mut(collection) {
+            c.replicas = n as u8;
+        }
+        self.ensure_followed(collection)?;
+        self.persist_catalog()?;
+        Ok(was)
+    }
+
+    /// `ALTER COLLECTION ... SET (regions = n)`: the followers re-planned
+    /// over `n` regions, the replica count kept.
+    fn set_regions(&mut self, collection: &str, n: usize) -> Result<usize> {
+        let coll = self.catalog.get(collection)?.clone();
+        let was = coll.regions as usize;
+        let replicas = if coll.replicas == 0 { DEFAULT_REPLICAS } else { coll.replicas as usize };
+        self.replan_followers(collection, replicas, n);
+        if let Some(c) = self.catalog.collections.get_mut(collection) {
+            c.regions = n as u8;
+        }
+        self.ensure_followed(collection)?;
+        self.persist_catalog()?;
+        Ok(was)
+    }
+
+    /// `ALTER COLLECTION ... SET (confirm = '...')`: the acknowledgement
+    /// rule; the shippers take it at the persist.
+    fn set_confirm(&mut self, collection: &str, confirm: u8) -> Result<u8> {
+        let was = self.catalog.get(collection)?.confirm;
+        if let Some(c) = self.catalog.collections.get_mut(collection) {
+            c.confirm = confirm;
+        }
+        self.persist_catalog()?;
+        Ok(was)
+    }
+
+    fn replan_followers(&mut self, collection: &str, replicas: usize, regions: usize) {
         let nodes = self.data_nodes();
         let mut tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
         for t in tablets.iter_mut() {
@@ -4006,17 +4120,11 @@ impl Db {
                 .iter()
                 .position(|x| x == &t.node || (self.is_self(x) && self.is_self(&t.node)));
             t.followers = match holder_at {
-                Some(h) => Self::followers_for(&nodes, h, n),
+                Some(h) => self.followers_over_regions(&nodes, h, replicas, regions),
                 None => Vec::new(),
             };
         }
         self.catalog.placement.insert(collection.to_string(), tablets);
-        if let Some(c) = self.catalog.collections.get_mut(collection) {
-            c.replicas = n as u8;
-        }
-        self.ensure_followed(collection)?;
-        self.persist_catalog()?;
-        Ok(was)
     }
 
     /// What the last write statement's acknowledgement waits for: each
@@ -4051,7 +4159,6 @@ impl Db {
     /// shard with followers, replaced when its followers or term change,
     /// stopped when it has none.
     fn refresh_shippers(&mut self) {
-        let sync = self.opts.replication_sync;
         let placement = self.catalog.placement.clone();
         let mut fresh: Vec<(String, usize, Arc<crate::replication::Shipper>)> = Vec::new();
         for (name, tablets) in &placement {
@@ -4060,11 +4167,10 @@ impl Db {
                 let Some(t) = tablets.get(s.index) else { continue };
                 let followers: Vec<String> =
                     t.followers.iter().filter(|f| !self.is_self(f)).cloned().collect();
-                let same = s
-                    .shipper
-                    .as_ref()
-                    .is_some_and(|sh| sh.followers() == followers && sh.term == t.term)
-                    || (followers.is_empty() && s.shipper.is_none());
+                let confirm = self.confirm_of(name);
+                let same = s.shipper.as_ref().is_some_and(|sh| {
+                    sh.followers() == followers && sh.term == t.term && sh.confirm == confirm
+                }) || (followers.is_empty() && s.shipper.is_none());
                 if same {
                     continue;
                 }
@@ -4094,7 +4200,7 @@ impl Db {
                         s.index,
                         t.term,
                         conns,
-                        sync,
+                        confirm,
                         s.dir().map(|d| d.to_path_buf()),
                     ),
                 ));
@@ -4561,6 +4667,50 @@ impl Db {
             ],
         );
         Ok(())
+    }
+
+    /// A node's region as its hello said it.
+    pub fn note_region(&mut self, url: &str, region: Option<&str>) {
+        match region {
+            Some(r) if !r.is_empty() => {
+                self.regions.insert(url.to_string(), r.to_string());
+            }
+            _ => {
+                self.regions.remove(url);
+            }
+        }
+    }
+
+    /// This node's region, from its options.
+    pub fn own_region(&self) -> Option<String> {
+        self.opts.region.clone()
+    }
+
+    /// The region of a node: this one's from its options, a peer's from
+    /// its hello; none for a node that names none.
+    pub fn region_of(&self, url: &str) -> Option<String> {
+        if self.is_self(url) {
+            return self.opts.region.clone();
+        }
+        self.regions.get(url).cloned()
+    }
+
+    /// The acknowledgement rule of a collection, as the catalog numbers
+    /// it, the node's default standing in for zero.
+    pub fn confirm_of(&self, collection: &str) -> crate::replication::Confirm {
+        use crate::replication::Confirm;
+        match self.catalog.collections.get(collection).map(|c| c.confirm).unwrap_or(0) {
+            1 => Confirm::All,
+            2 => Confirm::Quorum,
+            3 => Confirm::None,
+            _ => {
+                if self.opts.replication_sync {
+                    Confirm::All
+                } else {
+                    Confirm::None
+                }
+            }
+        }
     }
 
     /// The steward: the node named, or the lowest address among the nodes
@@ -6160,7 +6310,14 @@ impl Db {
                     });
                 }
                 coll.replicas = c.replicas.unwrap_or(DEFAULT_REPLICAS) as u8;
-                let tablets = self.plan_tablets(&c.splits, &c.nodes, coll.replicas as usize)?;
+                coll.regions = c.regions.unwrap_or(0) as u8;
+                coll.confirm = c.confirm.unwrap_or(0);
+                let tablets = self.plan_tablets(
+                    &c.splits,
+                    &c.nodes,
+                    coll.replicas as usize,
+                    coll.regions as usize,
+                )?;
                 let n = tablets.len();
                 let mut nodes: Vec<&str> = tablets.iter().map(|t| t.node.as_str()).collect();
                 nodes.sort();
@@ -6405,11 +6562,30 @@ impl Db {
                     tier.name()
                 )))
             }
-            Statement::AlterCollection { collection, prefix_expansion, replicas, nodes_of } => {
+            Statement::AlterCollection {
+                collection,
+                prefix_expansion,
+                replicas,
+                regions,
+                confirm,
+                nodes_of,
+            } => {
                 let mut acks = Vec::new();
                 if let Some(n) = replicas {
                     let placed = self.set_replicas(&collection, n)?;
                     acks.push(format!("replicas {placed} -> {n}"));
+                }
+                if let Some(n) = regions {
+                    let was = self.set_regions(&collection, n)?;
+                    acks.push(format!("regions {was} -> {n}"));
+                }
+                if let Some(c) = confirm {
+                    let was = self.set_confirm(&collection, c)?;
+                    acks.push(format!(
+                        "confirm {} -> {}",
+                        crate::replication::confirm_name(was),
+                        crate::replication::confirm_name(c)
+                    ));
                 }
                 if let Some(cap) = prefix_expansion {
                     let from = self.set_prefix_expansion(&collection, cap)?;

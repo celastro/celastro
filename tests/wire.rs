@@ -47,11 +47,23 @@ impl Node {
         reuse: Option<PathBuf>,
         role: celastro::engine::Role,
     ) -> Node {
+        Node::start_in(tag, port, reuse, role, None)
+    }
+
+    /// A node in a region.
+    fn start_in(
+        tag: &str,
+        port: u16,
+        reuse: Option<PathBuf>,
+        role: celastro::engine::Role,
+        region: Option<&str>,
+    ) -> Node {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let url = format!("tcp://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let dir = reuse.unwrap_or_else(|| dir(tag));
         let mut opts = DbOpts::default();
         opts.role = role;
+        opts.region = region.map(String::from);
         opts.node = Some(url.clone());
         let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -2339,4 +2351,105 @@ fn a_plain_count_is_the_shards_counts_and_answers_what_a_scan_answers() {
         settle();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// Copies over regions and a quorum acknowledgement: with `regions = 2`
+/// a shard's copies span both regions whatever the ring order says; the
+/// health names each node's region; under `confirm = quorum` a write is
+/// acknowledged with one of two followers away and refused with both
+/// away, and never on one disk alone.
+#[test]
+fn copies_span_regions_and_a_quorum_acknowledges_with_one_follower_away() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let role = celastro::engine::Role::Data;
+    // Ring order a, b, c with regions eu, eu, us: without the rule b's
+    // shard would be followed by c and a -- fine -- but a's by b and c,
+    // which is fine too; with `regions = 2` a's first follower must be c.
+    let a = Node::start_in("reg-a", 0, None, role, Some("eu"));
+    let b = Node::start_in("reg-b", 0, None, role, Some("eu"));
+    let c = Node::start_in("reg-c", 0, None, role, Some("us"));
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    let m = a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], replicas = 3, \
+         regions = 2, confirm = 'quorum', nodes = ['{a}', '{b}', '{c}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .replace("{c}", &c.url)
+            .as_str(),
+    );
+    assert!(m.contains("2 shard(s)"), "{m}");
+    let cat = a.ack("SHOW CATALOG items");
+    // Shard 0 on a (eu): its followers are c (us) first, then b.
+    assert!(
+        cat.contains(&format!("shard 0 on this node [, m) followed by {}, {}", c.url, b.url)),
+        "{cat}"
+    );
+    let h = a.ack("SHOW HEALTH");
+    assert!(
+        h.contains(&format!("node {}: up, data, celastro", b.url)) && h.contains(", region eu,"),
+        "{h}"
+    );
+    assert!(h.contains(", region us,"), "{h}");
+    assert!(h.contains(&format!("follower {} (region us)", c.url)), "{h}");
+    assert!(
+        h.contains("shard 0 of `items`: confirm = quorum, 3 of 3 copies live") || {
+            // The followers may still be catching up a moment after the create.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            a.ack("SHOW HEALTH").contains("confirm = quorum, 3 of 3 copies live")
+        },
+        "{}",
+        a.ack("SHOW HEALTH")
+    );
+    for i in 0..10usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    // One follower away: the holder and the other are a majority.
+    let (c_port, c_dir) =
+        (c.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), c.dir.clone());
+    drop(c);
+    settle();
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    let t0 = std::time::Instant::now();
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0100","n":100}')"#);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "a quorum write waited for the away follower"
+    );
+    let h = a.ack("SHOW HEALTH");
+    assert!(
+        h.contains("confirm = quorum, 2 of 3 copies live") && !h.contains("BELOW QUORUM"),
+        "{h}"
+    );
+    // Both away: no majority, so the write is refused -- not acknowledged
+    // on one disk.
+    let b_dir = b.dir.clone();
+    drop(b);
+    settle();
+    let out = a.exec(r#"INSERT INTO items VALUES ('{"id":"d0101","n":101}')"#).unwrap();
+    let e = out.finished_with(&a.db).unwrap_err().to_string();
+    assert!(e.contains("majority of its 3 copies"), "{e}");
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("BELOW QUORUM"), "{h}");
+    // c back: the quorum is back with it, and it catches up d0100.
+    let c = Node::start_in("reg-c", c_port, Some(c_dir), role, Some("us"));
+    c.ack(&format!("ATTACH NODE '{}'", a.url));
+    let mut ok = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if a.ack("SHOW HEALTH").contains(&format!("follower {} (region us) live", c.url)) {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "{}", a.ack("SHOW HEALTH"));
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0102","n":102}')"#);
+    for n in [a, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&b_dir);
 }

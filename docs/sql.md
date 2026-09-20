@@ -32,7 +32,13 @@ on it prunes shards; `splits = [...]` fixes the key ranges of the shards
 (two splits, three shards) and cannot be changed later; `nodes = [...]`
 names the nodes the shards go to (below); `replicas = n` is how many
 copies each shard has, the holder and `n - 1` followers (two by
-default; `ALTER COLLECTION ... SET (replicas = n)` re-plans them); `nodes_of` says an edge
+default; `ALTER COLLECTION ... SET (replicas = n)` re-plans them);
+`regions = n` spreads those copies over at least `n` regions when the
+nodes carry one (`CELASTRO_REGION`); `confirm = 'all' | 'quorum' |
+'none'` is what acknowledges a write -- every live follower, a majority
+of the copies (a follower away holds nothing, and with no majority the
+write is refused, never acknowledged on one disk), or this disk alone;
+unset is the node's `CELASTRO_REPLICATION`; `nodes_of` says an edge
 collection points into a node collection; `undirected = true` follows
 its edges both ways; `prefix_expansion` caps how many dictionary terms a
 `text_match` prefix expands to (512).

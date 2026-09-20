@@ -2132,6 +2132,21 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     o.steward = var("CELASTRO_STEWARD");
     o.stewards = var("CELASTRO_STEWARDS")
         .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    o.region = var("CELASTRO_REGION").filter(|r| !r.trim().is_empty());
+    if o.region.is_none() {
+        // A list picked by the node's ordinal (`celastro-2.celastro` is the
+        // third): what a StatefulSet's identical environment can carry.
+        if let (Some(list), Some(node)) = (var("CELASTRO_REGIONS"), &o.node) {
+            let host = node.trim_start_matches("tcp://").split([':', '.']).next().unwrap_or("");
+            let ordinal = host.rsplit('-').next().and_then(|n| n.parse::<usize>().ok());
+            let regions: Vec<&str> = list.split(',').map(str::trim).collect();
+            if let Some(r) = ordinal.and_then(|i| regions.get(i)) {
+                if !r.is_empty() {
+                    o.region = Some(r.to_string());
+                }
+            }
+        }
+    }
     if let Some(v) = var("CELASTRO_AUTO_FAILOVER") {
         o.auto_failover = match v.trim().to_ascii_lowercase().as_str() {
             "on" | "1" | "true" | "yes" => true,

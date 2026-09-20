@@ -30,7 +30,7 @@ const CATALOG_MAGIC: &[u8; 4] = b"CLSC";
 /// with a different ladder would be read with every tier shifted by one.
 /// Refusing to open it is the point — silently promoting an on-disk index to a
 /// RAM-resident one on upgrade is exactly the failure a version field prevents.
-pub const CATALOG_VERSION: u8 = 9;
+pub const CATALOG_VERSION: u8 = 10;
 
 /// The format the catalog is written in, when an operator pinned one below
 /// `CATALOG_VERSION`: `CELASTRO_CATALOG_FORMAT`. A release that raises the
@@ -407,6 +407,13 @@ pub struct Collection {
     /// is the default, two, for a collection from an older catalog. Format
     /// 9.
     pub replicas: u8,
+    /// `WITH (regions = n)`: the copies of every shard span at least this
+    /// many regions when the nodes carry one. Zero: no such rule.
+    pub regions: u8,
+    /// `WITH (confirm = ...)`: what acknowledges a write -- 0 the node's
+    /// default (`CELASTRO_REPLICATION`), 1 every live follower, 2 a
+    /// majority of the copies (holder included), 3 nobody.
+    pub confirm: u8,
     /// When the collection was created, microseconds since the epoch on
     /// the creating node's clock; what a tombstone from another node is
     /// compared against when the two catalogs are reconciled. Zero for a
@@ -429,6 +436,8 @@ impl Collection {
             nodes_of: None,
             undirected: false,
             replicas: 0,
+            regions: 0,
+            confirm: 0,
             created_micros: 0,
         }
     }
@@ -855,6 +864,10 @@ impl Catalog {
             if format >= 9 {
                 out.push(c.replicas);
             }
+            if format >= 10 {
+                out.push(c.regions);
+                out.push(c.confirm);
+            }
         }
         crate::lifecycle::encode_policies(&self.policies, &mut out);
         crate::lifecycle::encode_activity(&self.activity, &mut out);
@@ -1005,6 +1018,12 @@ impl Catalog {
             }
             if format >= 9 {
                 c.replicas = *b.get(i).ok_or_else(bad)?;
+                i += 1;
+            }
+            if format >= 10 {
+                c.regions = *b.get(i).ok_or_else(bad)?;
+                i += 1;
+                c.confirm = *b.get(i).ok_or_else(bad)?;
                 i += 1;
             }
             collections.insert(name, c);
@@ -1280,10 +1299,27 @@ mod tests {
             "the current layout carries the setting"
         );
 
+        // The format's own fields: regions and the acknowledgement rule.
+        let mut spread = cat.clone();
+        if let Some(c) = spread.collections.get_mut("articles") {
+            c.replicas = 3;
+            c.regions = 2;
+            c.confirm = 2;
+        }
+        let back = Catalog::decode(&spread.encode()).unwrap();
+        let a = back.get("articles").unwrap();
+        assert_eq!((a.replicas, a.regions, a.confirm), (3, 2, 2));
+        let old = spread.encode_as(9);
+        let a = Catalog::decode(&old).unwrap();
+        let a = a.get("articles").unwrap();
+        assert_eq!((a.replicas, a.regions, a.confirm), (3, 0, 0), "format 9 carries no regions");
         let mut future = cat.encode();
         future[4] = CATALOG_VERSION + 1;
         let e = Catalog::decode(&future).unwrap_err().to_string();
-        assert!(e.contains("not readable") && e.contains("expected 2 to 9"), "{e}");
+        assert!(
+            e.contains("not readable") && e.contains(&format!("expected 2 to {CATALOG_VERSION}")),
+            "{e}"
+        );
         let mut ancient = cat.encode();
         ancient[4] = 1;
         let e = Catalog::decode(&ancient).unwrap_err().to_string();

@@ -49,6 +49,10 @@ pub enum Statement {
         /// `SET (replicas = n)`: the followers re-planned to `n - 1` per
         /// shard.
         replicas: Option<usize>,
+        /// `SET (regions = n)`: the followers re-planned over n regions.
+        regions: Option<usize>,
+        /// `SET (confirm = '...')`: the acknowledgement rule.
+        confirm: Option<u8>,
         /// `SET (nodes_of = 'papers')`: point an existing collection at the
         /// node collection its edges join, so that a collection loaded before
         /// it had an adjacency index can get one.
@@ -222,6 +226,11 @@ pub struct CreateCollection {
     /// `WITH (replicas = n)`: copies of every shard, the holder included;
     /// `None` for the default, two.
     pub replicas: Option<usize>,
+    /// `WITH (regions = n)`: the copies span at least n regions.
+    pub regions: Option<usize>,
+    /// `WITH (confirm = 'all' | 'quorum' | 'none')`: what acknowledges a
+    /// write, as `Collection::confirm` numbers it.
+    pub confirm: Option<u8>,
 }
 
 #[derive(Debug, Clone)]

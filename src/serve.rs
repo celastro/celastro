@@ -1956,6 +1956,19 @@ fn steward_sweep(
         }
         // The follower with the most recent copy, among those that answer;
         // this node's own copy, when it follows the shard, asked directly.
+        // Under `confirm = all` every live copy has every acknowledged
+        // write, so one in the holder's region is preferred (the clients
+        // that wrote through the holder are there); under quorum only the
+        // most recent copy is known to have taken part in the last
+        // acknowledgement, and it is the one, wherever it is.
+        let (holder_region, quorum) = {
+            let g = read(db);
+            (g.region_of(&holder), g.confirm_of(&collection) == crate::replication::Confirm::Quorum)
+        };
+        let rank = |f: &str, at: u64| -> (bool, u64) {
+            let same = !quorum && holder_region.is_some() && read(db).region_of(f) == holder_region;
+            (same, at)
+        };
         let mut best: Option<(String, u64)> = None;
         for f in &followers {
             let status = if f == &me {
@@ -1968,7 +1981,7 @@ fn steward_sweep(
             };
             match status {
                 Ok((caught_up, at)) if caught_up => {
-                    if best.as_ref().map_or(true, |(_, b)| at > *b) {
+                    if best.as_ref().map_or(true, |(b, bat)| rank(f, at) > rank(b, *bat)) {
                         best = Some((f.clone(), at));
                     }
                 }

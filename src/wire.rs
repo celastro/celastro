@@ -696,6 +696,9 @@ pub struct Hello {
     /// that predates the field. What `ATTACH` and `SHOW HEALTH` measure
     /// skew by.
     pub now_micros: u64,
+    /// The region the node runs in (`CELASTRO_REGION`); none from a node
+    /// that names none or predates the field.
+    pub region: Option<String>,
     /// When the process behind the address started, microseconds; zero
     /// from a node that predates the field. A later hello with a smaller
     /// epoch is an older process answering at the same address.
@@ -1043,6 +1046,7 @@ impl Node {
         self.peer_format.store(catalog_format, Ordering::Relaxed);
         let wire_max = if i < b.len() { get_u8(b, &mut i)? } else { WIRE_VERSION };
         self.peer_wire.store(wire_max, Ordering::Relaxed);
+        let region = if i < b.len() { get_string(b, &mut i)? } else { String::new() };
         let received_micros = crate::time::now_micros().max(0) as u64;
         Ok(Hello {
             node,
@@ -1052,6 +1056,7 @@ impl Node {
             epoch,
             catalog_format,
             wire_max,
+            region: if region.is_empty() { None } else { Some(region) },
             received_micros,
         })
     }
@@ -1559,6 +1564,7 @@ pub fn serve(
                 node: g.node().map(String::from),
                 role: g.role(),
                 epoch: g.epoch(),
+                region: g.own_region(),
                 token,
                 also: token_also_from_env(),
             }),
@@ -1634,6 +1640,7 @@ struct Identity {
     node: Option<String>,
     role: crate::engine::Role,
     epoch: u64,
+    region: Option<String>,
     /// The wire token, and the second one a rotation accepts.
     token: String,
     also: Option<String>,
@@ -1981,6 +1988,8 @@ fn handle(
         put_u64(&mut out, epoch);
         out.push(CATALOG_VERSION);
         out.push(WIRE_VERSION_MAX);
+        // The region, trailing: a peer from before it reads none.
+        put_str(&mut out, identity.region.as_deref().unwrap_or(""));
         return Ok(out);
     }
     // A read takes the shared lock, and the served kind: the statement

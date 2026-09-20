@@ -76,6 +76,11 @@ pub struct Follower {
     /// The catch-up chunk in flight, sent before anything in the backlog.
     pub catchup: VecDeque<Arc<ShipItem>>,
     pub last_error: Option<String>,
+    /// Not before this, after a failure: the backoff is the follower's,
+    /// not the shipper's -- one follower down held the live one's
+    /// acknowledgements for up to five seconds a round.
+    pub retry_at: Option<Instant>,
+    pub backoff: Duration,
     /// Marks sent for a catch-up chunk are in the backlog too; when the
     /// caught-up mark is confirmed the follower is live.
     pub caught_up_mark: Option<Timestamp>,
@@ -86,11 +91,35 @@ pub const BACKLOG_CAP: usize = 100_000;
 /// Items per frame.
 pub const BATCH: usize = 500;
 
+/// What acknowledges a write to a shard, per collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// Every live follower has it on disk (a follower away, or catching
+    /// up, does not hold the acknowledgement: the health says DEGRADED).
+    All,
+    /// A majority of the copies, holder included, have it on disk -- or
+    /// the write is refused: nothing acknowledged is on one disk alone,
+    /// and a region holding a minority of the copies can fail with it.
+    Quorum,
+    /// Nobody: acknowledged when it is on this node's disk.
+    None,
+}
+
+/// The rule's name for the catalog's number.
+pub fn confirm_name(n: u8) -> &'static str {
+    match n {
+        1 => "all",
+        2 => "quorum",
+        3 => "none",
+        _ => "default",
+    }
+}
+
 pub struct Shipper {
     pub collection: String,
     pub shard: usize,
     pub term: u64,
-    pub sync: bool,
+    pub confirm: Confirm,
     inner: Mutex<Vec<Follower>>,
     cv: Condvar,
     stop: AtomicBool,
@@ -131,7 +160,7 @@ impl Shipper {
         shard: usize,
         term: u64,
         followers: Vec<(String, Arc<crate::wire::Node>)>,
-        sync: bool,
+        confirm: Confirm,
         dir: Option<std::path::PathBuf>,
     ) -> Arc<Shipper> {
         let inner = followers
@@ -144,6 +173,8 @@ impl Shipper {
                 backlog: VecDeque::new(),
                 catchup: VecDeque::new(),
                 last_error: None,
+                retry_at: None,
+                backoff: Duration::from_millis(200),
                 caught_up_mark: None,
             })
             .collect();
@@ -151,7 +182,7 @@ impl Shipper {
             collection: collection.to_string(),
             shard,
             term,
-            sync,
+            confirm,
             inner: Mutex::new(inner),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -173,7 +204,7 @@ impl Shipper {
             collection: String::new(),
             shard: 0,
             term: 0,
-            sync: true,
+            confirm: Confirm::All,
             inner: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             stop: AtomicBool::new(true),
@@ -267,20 +298,32 @@ impl Shipper {
 
     /// Wait until every follower confirmed `ts`, or the budget runs out.
     pub fn wait(&self, ts: Timestamp, budget: Option<u64>) -> Result<()> {
-        if !self.sync {
+        if self.confirm == Confirm::None {
             return Ok(());
         }
         let deadline = budget.map(|ms| Instant::now() + Duration::from_millis(ms));
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Under quorum: this many followers, with the holder, are a
+        // majority of the copies.
+        let copies = g.len() + 1;
+        let needed = copies / 2;
         loop {
-            // A follower that is away (not yet asked, or asked and silent)
-            // or still catching up does not hold the acknowledgement: the
-            // write is on this disk alone until the follower is live, which
-            // `SHOW HEALTH` says, and it reaches the follower behind its
-            // catch-up. Only a live follower has to confirm. (A catching-up
-            // one held it, and a node back from a minute away held every
-            // write to the shards it follows for the minutes its copy took.)
-            if g.iter().all(|f| f.state != FollowerState::Live || f.acked >= ts) {
+            let confirmed = match self.confirm {
+                // A follower that is away (not yet asked, or asked and
+                // silent) or still catching up does not hold the
+                // acknowledgement: the write is on this disk alone until the
+                // follower is live, which `SHOW HEALTH` says, and it reaches
+                // the follower behind its catch-up. Only a live follower has
+                // to confirm. (A catching-up one held it, and a node back
+                // from a minute away held every write to the shards it
+                // follows for the minutes its copy took.)
+                Confirm::All => g.iter().all(|f| f.state != FollowerState::Live || f.acked >= ts),
+                // A majority of the copies, whoever they are: a follower away
+                // is a follower that has not confirmed.
+                Confirm::Quorum => g.iter().filter(|f| f.acked >= ts).count() >= needed,
+                Confirm::None => true,
+            };
+            if confirmed {
                 return Ok(());
             }
             let wait_for = match deadline {
@@ -296,12 +339,21 @@ impl Shipper {
                             })
                             .collect();
                         return Err(Error::Deadline(format!(
-                            "shard {} of `{}` written here at ts {ts}, NOT confirmed on {} within \
-                             the deadline: the write is on this node's disk and will reach the \
-                             follower when it answers; retry to be sure",
+                            "shard {} of `{}` written here at ts {ts}, NOT confirmed {}{} within \
+                             the deadline: the write is on this node's disk{}; retry to be sure",
                             self.shard,
                             self.collection,
-                            behind.join(", ")
+                            if self.confirm == Confirm::Quorum {
+                                format!("by a majority of its {} copies; not on ", g.len() + 1)
+                            } else {
+                                "on ".to_string()
+                            },
+                            behind.join(", "),
+                            if self.confirm == Confirm::Quorum {
+                                " alone and may not survive a failover"
+                            } else {
+                                " and will reach the follower when it answers"
+                            }
                         )));
                     }
                 },
@@ -335,7 +387,6 @@ impl Shipper {
     }
 
     fn run(self: Arc<Self>) {
-        let mut backoff = Duration::from_millis(200);
         loop {
             if self.stop.load(Ordering::Acquire) {
                 return;
@@ -345,9 +396,11 @@ impl Shipper {
                 Ask(String, Arc<crate::wire::Node>),
                 Send(String, Arc<crate::wire::Node>, Vec<Arc<ShipItem>>),
             }
+            let now = Instant::now();
             let work: Vec<Work> = {
                 let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 g.iter()
+                    .filter(|f| f.retry_at.map_or(true, |t| now >= t))
                     .filter_map(|f| match &f.state {
                         FollowerState::Unknown => Some(Work::Ask(f.url.clone(), f.node.clone())),
                         FollowerState::CatchingUp { .. } if !f.catchup.is_empty() => {
@@ -368,10 +421,9 @@ impl Shipper {
             };
             if work.is_empty() {
                 let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                let _ = self.cv.wait_timeout(g, Duration::from_millis(500));
+                let _ = self.cv.wait_timeout(g, Duration::from_millis(200));
                 continue;
             }
-            let mut failed = false;
             let mut persist = false;
             for w in work {
                 let _deadline = crate::deadline::arm(Some(10_000));
@@ -389,10 +441,10 @@ impl Shipper {
                                         done: false,
                                     };
                                     f.last_error = None;
+                                    f.backoff = Duration::from_millis(200);
                                 }
                             }
                             Err(e) => {
-                                failed = true;
                                 self.note_error(&url, &e);
                                 self.cv.notify_all();
                             }
@@ -414,6 +466,7 @@ impl Shipper {
                                     }
                                     f.acked = f.acked.max(at);
                                     f.last_error = None;
+                                    f.backoff = Duration::from_millis(200);
                                     persist = true;
                                     if caught_up
                                         && matches!(
@@ -429,7 +482,6 @@ impl Shipper {
                                 self.cv.notify_all();
                             }
                             Err(e) => {
-                                failed = true;
                                 // A follower that does not answer, or answers
                                 // with another term or no copy, is asked again
                                 // where it stands when it answers: what it
@@ -451,12 +503,6 @@ impl Shipper {
             }
             if persist {
                 self.persist_confirmed();
-            }
-            if failed {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            } else {
-                backoff = Duration::from_millis(200);
             }
         }
     }
@@ -487,10 +533,17 @@ impl Shipper {
         }
     }
 
+    /// A follower's failure: noted for the health, and the follower left
+    /// alone for its backoff, doubled each time to five seconds. The
+    /// backoff is the follower's and not the shipper's: one follower
+    /// down held the live one's acknowledgements for up to five seconds
+    /// a round, and under quorum the live one is the acknowledgement.
     fn note_error(&self, url: &str, e: &Error) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(f) = g.iter_mut().find(|f| f.url == url) {
             f.last_error = Some(e.to_string());
+            f.retry_at = Some(Instant::now() + f.backoff);
+            f.backoff = (f.backoff * 2).min(Duration::from_secs(5));
         }
     }
 }
@@ -511,7 +564,14 @@ mod tests {
     #[test]
     fn a_follower_away_or_catching_up_does_not_hold_the_acknowledgement() {
         let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
-        let sh = Shipper::new("items", 0, 0, vec![("tcp://127.0.0.1:1".into(), node)], true, None);
+        let sh = Shipper::new(
+            "items",
+            0,
+            0,
+            vec![("tcp://127.0.0.1:1".into(), node)],
+            Confirm::All,
+            None,
+        );
         let set = |state: FollowerState| {
             let mut g = sh.inner.lock().unwrap();
             g[0].state = state;
@@ -528,6 +588,36 @@ mod tests {
         let e = sh.wait(20, Some(200)).unwrap_err().to_string();
         assert!(e.contains("NOT confirmed"), "{e}");
         assert!(t0.elapsed() >= Duration::from_millis(200));
+        sh.stop();
+    }
+
+    /// Under quorum a majority of the copies confirms -- of three, the
+    /// holder and one follower -- and a follower away does not hold the
+    /// write; with no follower confirmed the write is refused, not
+    /// acknowledged on one disk.
+    #[test]
+    fn a_quorum_is_a_majority_of_the_copies_and_nothing_less() {
+        let mk = || Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
+        let sh = Shipper::new(
+            "items",
+            0,
+            0,
+            vec![("tcp://127.0.0.1:1".into(), mk()), ("tcp://127.0.0.1:2".into(), mk())],
+            Confirm::Quorum,
+            None,
+        );
+        {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].state = FollowerState::Live;
+            g[0].acked = 10;
+            g[1].state = FollowerState::Unknown;
+            g[1].acked = 0;
+        }
+        let t0 = Instant::now();
+        sh.wait(10, Some(2000)).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(500), "one of two followers is a majority");
+        let e = sh.wait(20, Some(200)).unwrap_err().to_string();
+        assert!(e.contains("majority of its 3 copies"), "{e}");
         sh.stop();
     }
 }
