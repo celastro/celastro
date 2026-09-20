@@ -2685,7 +2685,21 @@ impl Shard {
         if let Some(p) = t.wals.first() {
             sync_dir_of(p)?;
         }
+        // The ship mark was in the log this seal removed; on disk in its
+        // own file now, or a copy reopened after a seal with no write
+        // since stood "not caught up" and was copied from nothing.
+        self.persist_ship_mark()?;
         Ok(sealed)
+    }
+
+    /// `SHIPPED`: the instant a followed copy is caught up to, kept beside
+    /// the log because a seal truncates the log and the marks with it.
+    pub(crate) fn persist_ship_mark(&self) -> Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        if !self.caught_up || self.ship_ts == 0 {
+            return Ok(());
+        }
+        atomic_write(&dir.join("SHIPPED"), self.ship_ts.to_string().as_bytes())
     }
 
     /// A build that failed: the ticket goes back to the front of the
@@ -2909,6 +2923,7 @@ impl Shard {
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
         }
+        self.persist_ship_mark()?;
         // The rotated logs replayed at open are covered by this seal too.
         for p in std::mem::take(&mut self.unsealed_wals) {
             if p.exists() {
@@ -3324,6 +3339,19 @@ impl Shard {
                 }
                 _ => {}
             }
+        }
+        if let Some(c) = ceiling {
+            // Cut: caught up to the ceiling and no further, whatever the
+            // marks said, and the file says the same for the next open.
+            s.ship_ts = c;
+            s.caught_up = true;
+            s.persist_ship_mark()?;
+        } else if let Some(mark) = read_optional(&dir.join("SHIPPED"))?
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|t| t.trim().parse::<Timestamp>().ok())
+        {
+            s.ship_ts = s.ship_ts.max(mark);
+            s.caught_up = true;
         }
         Ok(s)
     }
@@ -4192,6 +4220,37 @@ mod tests {
         let t3 = s.clock.peek();
         assert_eq!(s.num_docs(t3), 49);
         assert!(s.get(&format!("t1{KEY_SEP}d0001"), t3).unwrap().is_none());
+    }
+
+    /// A followed copy's caught-up instant survives the seal that
+    /// truncates the log its marks were in: reopened after a seal with no
+    /// write since, the copy stands where it stood, not "not caught up"
+    /// -- which had every copy of a restarted cluster copied from nothing.
+    #[test]
+    fn a_copys_ship_mark_survives_a_seal_and_a_reopen() {
+        use crate::replication::{ShipItem, SHIP_CAUGHT_UP, SHIP_INSERT};
+        let dir = std::env::temp_dir().join(format!("celastro-shipmark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let mut items: Vec<ShipItem> = (0..20u64)
+            .map(|i| ShipItem {
+                kind: SHIP_INSERT,
+                key: format!("t0{KEY_SEP}d{i:05}"),
+                ts: 100 + i,
+                doc: Some(doc(i as usize)),
+            })
+            .collect();
+        items.push(ShipItem { kind: SHIP_CAUGHT_UP, key: String::new(), ts: 500, doc: None });
+        let (caught_up, at) = s.apply_shipped(&items).unwrap();
+        assert!(caught_up && at == 500);
+        s.flush().unwrap();
+        drop(s);
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(s.caught_up, "the reopened copy forgot it was caught up");
+        assert_eq!(s.ship_ts, 500);
+        assert_eq!(s.num_docs(u64::MAX), 20);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

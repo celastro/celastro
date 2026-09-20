@@ -6,6 +6,15 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.7 — 2026-09-20
+
+**A copy's caught-up instant survives a seal.** The ship marks a copy
+stood on were in its log, and a seal truncates the log; a copy
+reopened after a seal with no write since said "not caught up" and
+was copied from nothing -- every copy of the two-datacentre cluster,
+after every restart. The instant is kept in `SHIPPED` beside the log,
+written at every seal and at a demotion's cut, read at open.
+
 ## 0.63.6 — 2026-09-20
 
 **A re-plan of the followers agrees on every node.** `ALTER COLLECTION
