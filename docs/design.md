@@ -1586,6 +1586,26 @@ exclusive lock its try found a reader every time on a node under
 sustained reads, so followers never caught up, and every write waited
 for their confirmation until the deadline.
 
+**What the failure shapes found in the followers (0.59.1).** A holder
+stopped on the five-node cluster, and the steward's promotion of its
+follower's copy failed to open: the copy had been retired, which
+unlinks its sealed segments, before the directory was renamed and
+opened from a manifest that still named them. Forty rows in a memtable
+had never shown it. A promotion closes the copy now and its files are
+the shard's, and a promotion that fails puts the copy back as a
+follower; the demotion is the same. Two more things made a node's
+return cost minutes: a write waited for a follower that was still
+catching up, and a follower was caught up from nothing whenever its
+copy stood before the shard's version floor -- which every seal raises
+to now, so under a load every follower that had been away at all
+started from nothing. Only a live follower holds an acknowledgement
+now, and the reset is off a delete floor raised only by a compaction
+that forgot a delete, the one event a catch-up from where the copy
+stood cannot make up for. Not persisted: the floors start at zero on
+open, so a holder restarted after such a compaction accepts a follower
+that stood before it; the fix is a floor in the manifest, and it is in
+the backlog with the rest of the suite's findings.
+
 **A pooled connection is asked a hello after ten idle seconds.** The
 five-node suite, every node restarted, found the coordinators' pooled
 connections to the restarted peers half-open: a write into one

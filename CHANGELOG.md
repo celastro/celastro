@@ -6,6 +6,32 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.59.1 — 2026-09-20
+
+**A promotion keeps the copy's files; a follower catching up holds no
+write; a follower away across a seal catches up from where it stood.**
+Three things the five-node suite's failure shapes found in 0.59.0.
+The promotion of a copy retired the copy's segments, which unlinks
+them, and then opened the shard from a manifest naming files that were
+gone: `segment … named by the manifest is missing`, and the shard
+stayed down with its holder. The tests' copies had never sealed a
+segment; a copy on a real node has. The copy now closes and its files
+are the shard's; a promotion that still fails puts the copy back as a
+follower and says why. The demotion had the same retirement. Second,
+a write waited for a follower that was catching up, so a node back
+from a minute away held every write to the shards it follows until
+its copy was complete -- minutes, under a load. Only a live follower
+holds the acknowledgement now; a catching-up one is like an away one:
+the write is on the holder's disk alone, `SHOW HEALTH` says so, and
+the write reaches the copy behind its catch-up. Third, a follower
+whose copy stood before the shard's version floor was reset and copied
+from nothing, and every seal raises that floor to now -- so under a
+write load every follower that had been away at all was copied from
+nothing on return. The reset is off a delete floor now, raised only by
+a compaction that dropped a dead row, which is the only way a delete
+is forgotten. The steward also logs a candidate it passes over for
+being behind (`failover_candidate_behind`).
+
 ## 0.59.0 — 2026-09-20
 
 **The lock on a `Db` is the crate's own, and a wire read is never held

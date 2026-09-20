@@ -4097,9 +4097,11 @@ impl Db {
                 continue;
             };
             let mut items = Vec::new();
-            // A follower that stood before this shard's floor may have
-            // missed deletes a compaction has since dropped: from nothing.
-            let reset = reset || from < s.retain_floor;
+            // A follower that stood before the newest delete a compaction
+            // here has forgotten may have missed it: from nothing. (Off the
+            // version floor, which every seal raises, this reset every
+            // follower that had been away across a seal.)
+            let reset = reset || from < s.delete_floor;
             if cursor.is_none() {
                 if reset {
                     items.push(crate::replication::ShipItem {
@@ -4286,13 +4288,18 @@ impl Db {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&(collection.to_string(), shard));
-        let Some(mut copy) = copy else {
+        let Some(copy) = copy else {
             return Err(Error::Plan(format!(
                 "this node has no copy of shard {shard} of `{collection}` to promote"
             )));
         };
-        let (caught_up, at) = (copy.shard.caught_up, copy.shard.ship_ts);
-        copy.shard.retire_all();
+        let (caught_up, at, copy_term) = (copy.shard.caught_up, copy.shard.ship_ts, copy.term);
+        // The copy closes and its files stay: they are the shard now. (It
+        // was retired here, which unlinks every sealed segment the
+        // manifest names, and the first promotion of a copy with a sealed
+        // segment -- on five real nodes, not in the tests' forty rows --
+        // failed to open what it had just deleted, and the shard stayed
+        // down with its holder.)
         drop(copy);
         let cdir = dir.join("collections").join(collection);
         let from = cdir.join("followed").join(format!("shard-{shard:04}"));
@@ -4303,9 +4310,39 @@ impl Db {
         fs::rename(&from, &to)?;
         crate::shard::sync_dir(&cdir)?;
         let def = self.catalog.get(collection)?.clone();
-        let (lo, hi) = read_range(&self.cipher, &to, shard, collection)?;
-        let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
-        sh.set_key_range(lo, hi);
+        let opened = read_range(&self.cipher, &to, shard, collection).and_then(|(lo, hi)| {
+            let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
+            sh.set_key_range(lo, hi);
+            Ok(sh)
+        });
+        let mut sh = match opened {
+            Ok(sh) => sh,
+            Err(e) => {
+                // Back where it was, as the copy it was: a promotion that
+                // fails leaves the follower a follower, so the next sweep
+                // finds a candidate and the operator a copy.
+                let _ = fs::rename(&to, &from);
+                let _ = crate::shard::sync_dir(&cdir);
+                if let Ok((lo, hi)) = read_range(&self.cipher, &from, shard, collection) {
+                    if let Ok(def) = self.catalog.get(collection).cloned() {
+                        if let Ok(mut back) =
+                            Shard::open(def, self.clock.clone(), self.shard_opts(), &from)
+                        {
+                            back.set_key_range(lo, hi);
+                            back.index = shard;
+                            self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                                (collection.to_string(), shard),
+                                FollowedShard { shard: back, term: copy_term },
+                            );
+                        }
+                    }
+                }
+                return Err(Error::Storage(format!(
+                    "the copy of shard {shard} of `{collection}` did not open as the shard, \
+                     and follows again: {e}"
+                )));
+            }
+        };
         sh.index = shard;
         let v = self.shards.entry(collection.to_string()).or_default();
         v.push(sh);
@@ -4360,7 +4397,8 @@ impl Db {
             if let Some(sh) = s.shipper.take() {
                 sh.stop();
             }
-            s.retire_all();
+            // Closed, not retired: the files are the copy's now.
+            drop(s);
         }
         let cdir = dir.join("collections").join(collection);
         let from = cdir.join(format!("shard-{shard:04}"));

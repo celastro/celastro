@@ -684,6 +684,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The delete floor is raised by a compaction that forgets a delete,
+    /// and by nothing else: a seal raises the version floor to now and
+    /// keeps every tombstone, so a follower away across a seal catches up
+    /// from where it stood; one away across the compaction that dropped
+    /// the dead row starts from nothing, since the delete it missed is
+    /// gone.
+    #[test]
+    fn a_compaction_that_drops_a_dead_row_raises_the_delete_floor_and_a_seal_does_not() {
+        let dir = std::env::temp_dir().join(format!("celastro-dfloor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for seg in 0..4 {
+            for i in 0..10 {
+                s.insert(doc(seg * 10 + i)).unwrap();
+            }
+            s.flush().unwrap();
+        }
+        assert!(s.retain_floor > 0, "a seal raises the version floor");
+        assert_eq!(s.delete_floor, 0, "and not the delete floor");
+        let before = s.clock.peek();
+        s.delete(&format!("t0{KEY_SEP}d00000")).unwrap();
+        let after = s.clock.peek();
+        s.flush().unwrap();
+        assert_eq!(s.delete_floor, 0, "a seal keeps the tombstone");
+        run_to_quiescence(&mut s, &CompactionOpts::default(), 8).unwrap();
+        assert_eq!(s.segments.len(), 1);
+        assert!(
+            s.delete_floor > before && s.delete_floor <= after,
+            "the compaction forgot the delete at {} (between {before} and {after})",
+            s.delete_floor
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn everything_is_still_searchable_after_compaction() {
         use crate::bitmap::Bitmap;

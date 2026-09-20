@@ -23,13 +23,13 @@ use celastro::codec::Rng;
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::error::Result;
 use celastro::json;
+use celastro::lock::RwLock;
 use celastro::plan::exec::{QueryResult, Row};
 use celastro::serve::Server;
 use celastro::tls::Tls;
 use celastro::value::Value;
 use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use celastro::lock::RwLock;
 use std::sync::Arc;
 
 /// The command did what it was asked.

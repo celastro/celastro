@@ -250,10 +250,13 @@ impl Shipper {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             // A follower that is away (not yet asked, or asked and silent)
-            // does not hold the acknowledgement: the write is on this disk
-            // alone until it is back, which `SHOW HEALTH` says. One that is
-            // live or catching up has to confirm.
-            if g.iter().all(|f| f.state == FollowerState::Unknown || f.acked >= ts) {
+            // or still catching up does not hold the acknowledgement: the
+            // write is on this disk alone until the follower is live, which
+            // `SHOW HEALTH` says, and it reaches the follower behind its
+            // catch-up. Only a live follower has to confirm. (A catching-up
+            // one held it, and a node back from a minute away held every
+            // write to the shards it follows for the minutes its copy took.)
+            if g.iter().all(|f| f.state != FollowerState::Live || f.acked >= ts) {
                 return Ok(());
             }
             let wait_for = match deadline {
@@ -440,5 +443,36 @@ impl Shipper {
 impl Drop for Shipper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a live follower holds the acknowledgement: one not yet asked,
+    /// or catching up, leaves the write on this disk alone, said by the
+    /// health; a live one behind the write is waited for, to the budget.
+    #[test]
+    fn a_follower_away_or_catching_up_does_not_hold_the_acknowledgement() {
+        let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
+        let sh = Shipper::new("items", 0, 0, vec![("tcp://127.0.0.1:1".into(), node)], true);
+        let set = |state: FollowerState| {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].state = state;
+            g[0].acked = 10;
+        };
+        let t0 = Instant::now();
+        set(FollowerState::Unknown);
+        sh.wait(20, Some(2000)).unwrap();
+        set(FollowerState::CatchingUp { from: 0, upto: 0, cursor: None, reset: true, done: false });
+        sh.wait(20, Some(2000)).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(500), "an away follower held the write");
+        set(FollowerState::Live);
+        sh.wait(10, Some(2000)).unwrap();
+        let e = sh.wait(20, Some(200)).unwrap_err().to_string();
+        assert!(e.contains("NOT confirmed"), "{e}");
+        assert!(t0.elapsed() >= Duration::from_millis(200));
+        sh.stop();
     }
 }

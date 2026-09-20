@@ -1882,9 +1882,20 @@ fn a_write_is_confirmed_on_the_follower_and_a_follower_away_is_caught_up_on_retu
         let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
         a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
     }
-    let h = a.ack("SHOW HEALTH");
-    assert!(h.contains(&format!("shard 0 of `items`: follower {} live", b.url)), "{h}");
-    assert!(h.contains("follows shard 1 of `items` at term 0: caught up"), "{h}");
+    // A write no longer waits for a follower that is still catching up,
+    // so the copies are live a moment after the writes, not before.
+    let mut live = false;
+    for _ in 0..100 {
+        let h = a.ack("SHOW HEALTH");
+        if h.contains(&format!("shard 0 of `items`: follower {} live", b.url))
+            && h.contains("follows shard 1 of `items` at term 0: caught up")
+        {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(live, "{}", a.ack("SHOW HEALTH"));
     assert!(b.dir.join("collections/items/followed/shard-0000").exists());
     // The follower goes away: writes to shard 0 are acknowledged on a
     // alone, and the health says it.
@@ -1940,6 +1951,11 @@ fn a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns() {
     let a = Node::start("pro-a");
     let b = Node::start("pro-b");
     let c = Node::start("pro-c");
+    // b's copies seal every few rows: the promotion has to open a copy
+    // whose manifest names sealed segments, which is what a copy on a
+    // real node is. (The first promotion of one deleted its segments and
+    // failed to open; forty rows in a memtable never showed it.)
+    b.db.write().unwrap().opts.thresholds.max_bytes = 64;
     a.ack(&format!("ATTACH NODE '{}'", b.url));
     a.ack(&format!("ATTACH NODE '{}'", c.url));
     a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
@@ -1950,6 +1966,10 @@ fn a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns() {
         let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
         a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
     }
+    let sealed = std::fs::read_dir(b.dir.join("collections/items/followed/shard-0000/segments"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert!(sealed > 0, "the copy on b sealed nothing; the promotion below proves nothing");
     let e = a.exec(&format!("PROMOTE SHARD 0 OF items ON '{}'", c.url)).unwrap_err().to_string();
     assert!(e.contains("does not follow"), "{e}");
     // a, the holder of shard 0, is lost.

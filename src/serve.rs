@@ -1757,7 +1757,15 @@ fn steward_sweep(
                         best = Some((f.clone(), at));
                     }
                 }
-                Ok(_) => {}
+                Ok((_, at)) => crate::log::warn(
+                    "failover_candidate_behind",
+                    &[
+                        ("node", f.clone()),
+                        ("collection", collection.clone()),
+                        ("shard", shard.to_string()),
+                        ("copy_at", at.to_string()),
+                    ],
+                ),
                 Err(e) => crate::log::warn(
                     "failover_candidate_not_asked",
                     &[("node", f.clone()), ("error", e.to_string())],

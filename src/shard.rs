@@ -1672,6 +1672,16 @@ pub struct Shard {
     /// already has: an unpinned seal forgets only versions a write had already
     /// superseded, never a row that a snapshot below the seal can still read.
     pub(crate) retain_floor: Timestamp,
+    /// The newest delete a compaction here has forgotten: a follower that
+    /// stood before it may have missed a delete this shard no longer
+    /// remembers, so its catch-up starts from nothing. Raised only when a
+    /// compaction drops a dead row -- a seal keeps every tombstone, and
+    /// `retain_floor`, which every seal raises to now, is about superseded
+    /// versions and not deletes. Reading the catch-up off `retain_floor`
+    /// reset every follower that had been away across a seal, which under
+    /// a write load is every follower that was away at all, and the
+    /// copy from nothing was minutes of writes waiting on it.
+    pub(crate) delete_floor: Timestamp,
     /// Segments removed from the manifest whose files are still referenced by
     /// a reader. Swept whenever the last reference goes away; without this the
     /// files are simply never unlinked.
@@ -1732,6 +1742,7 @@ impl Shard {
             last_seal_error: None,
             compactions: 0,
             retain_floor: 0,
+            delete_floor: 0,
             shipper: None,
             ship_ts: 0,
             caught_up: false,
@@ -3459,6 +3470,20 @@ impl Shard {
         carried_deletes: &[(String, Timestamp, Timestamp)],
         retain_from: Timestamp,
     ) -> Result<()> {
+        // What this compaction forgets: every delete at or before the
+        // horizon in an input is dropped with its row (`collect_from_handles`
+        // skips the row), and a follower that stood before the newest of
+        // them has to start from nothing.
+        let mut forgotten = 0;
+        for h in self.segments.iter().filter(|h| input_ids.contains(&h.id())) {
+            let log = h.deletes.read().unwrap();
+            for (_, ts) in log.iter() {
+                if ts != crate::time::MAX_TS && ts <= retain_from {
+                    forgotten = forgotten.max(ts);
+                }
+            }
+        }
+        self.delete_floor = self.delete_floor.max(forgotten);
         let mut handles = Vec::new();
         for seg in outputs {
             self.adopt_segment(&seg);
