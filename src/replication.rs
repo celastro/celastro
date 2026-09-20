@@ -424,116 +424,114 @@ impl Shipper {
                 let _ = self.cv.wait_timeout(g, Duration::from_millis(200));
                 continue;
             }
-            let mut persist = false;
-            // Every follower's call at once, each on a thread of its own:
-            // sent in turn, a follower away held the round for its
-            // deadline, and under quorum the live follower's confirmation
-            // -- the write's acknowledgement -- waited those ten seconds.
-            enum Done {
-                Asked(String, Result<(bool, Timestamp)>),
-                Sent(String, usize, Result<(bool, Timestamp)>),
-            }
+            // Every follower's call at once, each on a thread of its own,
+            // and each answer applied the moment it lands: sent in turn, a
+            // follower away held the round for its deadline before the live
+            // follower was sent anything, and joined before any answer was
+            // applied, the live follower's confirmation -- under quorum the
+            // write's acknowledgement -- still waited those ten seconds.
             let this: &Shipper = &self;
-            let done: Vec<Done> = std::thread::scope(|scope| {
-                let handles: Vec<_> = work
-                    .into_iter()
-                    .map(|w| {
-                        scope.spawn(move || {
-                            let _deadline = crate::deadline::arm(Some(10_000));
-                            match w {
-                                Work::Ask(url, node) => Done::Asked(
-                                    url,
-                                    node.ship_status(&this.collection, this.shard, this.term),
-                                ),
-                                Work::Send(url, node, items) => {
-                                    let plain: Vec<&ShipItem> =
-                                        items.iter().map(|i| i.as_ref()).collect();
-                                    Done::Sent(
-                                        url,
-                                        items.len(),
-                                        node.ship(&this.collection, this.shard, this.term, &plain),
-                                    )
+            let persist = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for w in work {
+                    let persist = &persist;
+                    scope.spawn(move || {
+                        let _deadline = crate::deadline::arm(Some(10_000));
+                        match w {
+                            Work::Ask(url, node) => {
+                                let status =
+                                    node.ship_status(&this.collection, this.shard, this.term);
+                                this.asked(&url, status);
+                            }
+                            Work::Send(url, node, items) => {
+                                let plain: Vec<&ShipItem> =
+                                    items.iter().map(|i| i.as_ref()).collect();
+                                let answer =
+                                    node.ship(&this.collection, this.shard, this.term, &plain);
+                                if this.sent(&url, items.len(), answer) {
+                                    persist.store(true, Ordering::Relaxed);
                                 }
                             }
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().expect("a shipper's call panicked")).collect()
-            });
-            for d in done {
-                match d {
-                    Done::Asked(url, status) => match status {
-                        Ok((caught_up, at)) => {
-                            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                            if let Some(f) = g.iter_mut().find(|f| f.url == url) {
-                                f.state = FollowerState::CatchingUp {
-                                    from: if caught_up { at } else { 0 },
-                                    upto: 0,
-                                    cursor: None,
-                                    reset: !caught_up,
-                                    done: false,
-                                };
-                                f.last_error = None;
-                                f.backoff = Duration::from_millis(200);
-                            }
                         }
-                        Err(e) => {
-                            self.note_error(&url, &e);
-                            self.cv.notify_all();
-                        }
-                    },
-                    Done::Sent(url, sent, answer) => {
-                        match answer {
-                            Ok((caught_up, at)) => {
-                                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
-                                    let queue = if f.state == FollowerState::Live {
-                                        &mut f.backlog
-                                    } else {
-                                        &mut f.catchup
-                                    };
-                                    for _ in 0..sent {
-                                        queue.pop_front();
-                                    }
-                                    f.acked = f.acked.max(at);
-                                    f.last_error = None;
-                                    f.backoff = Duration::from_millis(200);
-                                    persist = true;
-                                    if caught_up
-                                        && matches!(
-                                            f.state,
-                                            FollowerState::CatchingUp { done: true, .. }
-                                        )
-                                        && f.caught_up_mark.is_some_and(|m| at >= m)
-                                    {
-                                        f.state = FollowerState::Live;
-                                        f.caught_up_mark = None;
-                                    }
-                                }
-                                self.cv.notify_all();
-                            }
-                            Err(e) => {
-                                // A follower that does not answer, or answers
-                                // with another term or no copy, is asked again
-                                // where it stands when it answers: what it
-                                // missed meanwhile is caught up from there.
-                                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
-                                    f.state = FollowerState::Unknown;
-                                    f.backlog.clear();
-                                    f.catchup.clear();
-                                    f.caught_up_mark = None;
-                                }
-                                drop(g);
-                                self.note_error(&url, &e);
-                                self.cv.notify_all();
-                            }
-                        }
-                    }
+                    });
                 }
-            }
+            });
+            let persist = persist.load(Ordering::Relaxed);
             if persist {
                 self.persist_confirmed();
+            }
+        }
+    }
+
+    /// A follower's answer to "where do you stand".
+    fn asked(&self, url: &str, status: Result<(bool, Timestamp)>) {
+        match status {
+            Ok((caught_up, at)) => {
+                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                    f.state = FollowerState::CatchingUp {
+                        from: if caught_up { at } else { 0 },
+                        upto: 0,
+                        cursor: None,
+                        reset: !caught_up,
+                        done: false,
+                    };
+                    f.last_error = None;
+                    f.backoff = Duration::from_millis(200);
+                }
+            }
+            Err(e) => {
+                self.note_error(url, &e);
+                self.cv.notify_all();
+            }
+        }
+    }
+
+    /// A follower's answer to a batch of `sent` items; whether its
+    /// confirmed instant grew.
+    fn sent(&self, url: &str, sent: usize, answer: Result<(bool, Timestamp)>) -> bool {
+        match answer {
+            Ok((caught_up, at)) => {
+                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                    let queue = if f.state == FollowerState::Live {
+                        &mut f.backlog
+                    } else {
+                        &mut f.catchup
+                    };
+                    for _ in 0..sent {
+                        queue.pop_front();
+                    }
+                    f.acked = f.acked.max(at);
+                    f.last_error = None;
+                    f.backoff = Duration::from_millis(200);
+                    if caught_up
+                        && matches!(f.state, FollowerState::CatchingUp { done: true, .. })
+                        && f.caught_up_mark.is_some_and(|m| at >= m)
+                    {
+                        f.state = FollowerState::Live;
+                        f.caught_up_mark = None;
+                    }
+                }
+                drop(g);
+                self.cv.notify_all();
+                true
+            }
+            Err(e) => {
+                // A follower that does not answer, or answers with another
+                // term or no copy, is asked again where it stands when it
+                // answers: what it missed meanwhile is caught up from there.
+                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                    f.state = FollowerState::Unknown;
+                    f.backlog.clear();
+                    f.catchup.clear();
+                    f.caught_up_mark = None;
+                }
+                drop(g);
+                self.note_error(url, &e);
+                self.cv.notify_all();
+                false
             }
         }
     }

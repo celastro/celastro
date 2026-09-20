@@ -6,6 +6,15 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.2 — 2026-09-20
+
+**Each follower's answer is applied as it lands.** 0.63.1 sent to
+every follower at once and then waited for every call before applying
+any answer, so the live follower's confirmation still waited out the
+cut follower's ten-second deadline: the first write after the cut was
+acknowledged ten seconds later. Each thread applies its own answer
+now, and the write is acknowledged as soon as the live copy has it.
+
 ## 0.63.1 — 2026-09-20
 
 **The shipper reaches every follower at once.** It sent to its
