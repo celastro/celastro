@@ -8030,18 +8030,21 @@ pub fn renew_lease(lease: &Lease, from: &str, term: u64) -> Result<u64> {
 
 /// A vote asked by `from` for `candidate` at `term`: granted or not, and
 /// this node's term.
-pub fn vote(lease: &Lease, from: &str, term: u64, candidate: &str) -> (bool, u64) {
+pub fn vote(lease: &Lease, from: &str, term: u64, candidate: &str, pre: bool) -> (bool, u64) {
     let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
     let Some(e) = g.election.as_mut() else { return (false, 0) };
-    let actions = e.on_message(
-        std::time::Instant::now(),
-        from,
-        crate::steward::Msg::Vote { term, candidate: candidate.to_string() },
-    );
+    let msg = if pre {
+        crate::steward::Msg::PreVote { term, candidate: candidate.to_string() }
+    } else {
+        crate::steward::Msg::Vote { term, candidate: candidate.to_string() }
+    };
+    let actions = e.on_message(std::time::Instant::now(), from, msg);
     let sends = apply_election_actions(&mut g, actions);
     for (_, m) in sends {
-        if let crate::steward::Msg::VoteAnswer { term, granted } = m {
-            return (granted, term);
+        match m {
+            crate::steward::Msg::VoteAnswer { term, granted }
+            | crate::steward::Msg::PreVoteAnswer { term, granted } => return (granted, term),
+            _ => {}
         }
     }
     (false, g.election.as_ref().map_or(0, |e| e.term()))

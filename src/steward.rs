@@ -35,14 +35,38 @@ pub enum Role {
 /// What travels between the group's nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
+    /// Asks whether a vote at `term` would be given, changing nothing on
+    /// either side: a node cut off from the group asks every timeout and
+    /// hears no, so its term never climbs, and when it is back it takes
+    /// the steward's heartbeat instead of forcing an election with a term
+    /// it inflated alone.
+    PreVote {
+        term: u64,
+        candidate: String,
+    },
+    PreVoteAnswer {
+        term: u64,
+        granted: bool,
+    },
     /// Asks for a vote at `term`.
-    Vote { term: u64, candidate: String },
+    Vote {
+        term: u64,
+        candidate: String,
+    },
     /// A vote's answer, and the answerer's term either way.
-    VoteAnswer { term: u64, granted: bool },
+    VoteAnswer {
+        term: u64,
+        granted: bool,
+    },
     /// A steward's heartbeat (the lease renewal carries it).
-    Heartbeat { term: u64 },
+    Heartbeat {
+        term: u64,
+    },
     /// A heartbeat's answer: accepted, or refused with the higher term.
-    HeartbeatAnswer { term: u64, accepted: bool },
+    HeartbeatAnswer {
+        term: u64,
+        accepted: bool,
+    },
 }
 
 /// What the machine wants done.
@@ -74,6 +98,8 @@ pub struct Election {
     /// Who leads `term`, as far as this node has heard.
     steward: Option<String>,
     votes: BTreeSet<String>,
+    /// The pre-votes gathered for the next term, while asking.
+    prevotes: BTreeSet<String>,
     /// The last heartbeat accepted from a steward, or vote granted to a
     /// candidate: what the election timeout counts from.
     heard: Instant,
@@ -113,6 +139,7 @@ impl Election {
             role: Role::Follower,
             steward: None,
             votes: BTreeSet::new(),
+            prevotes: BTreeSet::new(),
             heard: now,
             round: BTreeSet::new(),
             majority_at: now,
@@ -167,10 +194,40 @@ impl Election {
         }
         self.role = Role::Follower;
         self.votes.clear();
+        self.prevotes.clear();
         self.round.clear();
         self.became_steward = None;
         if was == Role::Steward {
             out.push(Action::SteppedDown { term: self.term });
+        }
+    }
+
+    /// Nothing heard from a steward for the timeout, and no fresh
+    /// majority of its own if it is one.
+    fn quiet(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.heard) >= self.timeout
+    }
+
+    /// The pre-votes are in: the real candidacy, at the next term.
+    fn stand(&mut self, now: Instant, out: &mut Vec<Action>) {
+        self.term += 1;
+        self.voted_for = Some(self.me.clone());
+        self.role = Role::Candidate;
+        self.steward = None;
+        self.votes.clear();
+        self.prevotes.clear();
+        self.votes.insert(self.me.clone());
+        self.heard = now;
+        out.push(Action::Persist { term: self.term, voted_for: Some(self.me.clone()) });
+        if self.votes.len() >= self.majority() {
+            self.become_steward(now, out);
+            return;
+        }
+        for p in self.peers() {
+            out.push(Action::Send {
+                to: p.clone(),
+                msg: Msg::Vote { term: self.term, candidate: self.me.clone() },
+            });
         }
     }
 
@@ -197,25 +254,22 @@ impl Election {
                 }
             }
             Role::Follower | Role::Candidate => {
-                if now.saturating_duration_since(self.heard) < self.timeout {
+                if !self.quiet(now) {
                     return out;
                 }
-                self.term += 1;
-                self.voted_for = Some(self.me.clone());
-                self.role = Role::Candidate;
-                self.steward = None;
-                self.votes.clear();
-                self.votes.insert(self.me.clone());
+                // Ask first whether the group would vote: a node alone
+                // gets no answer and stays at its term.
                 self.heard = now;
-                out.push(Action::Persist { term: self.term, voted_for: Some(self.me.clone()) });
-                if self.votes.len() >= self.majority() {
-                    self.become_steward(now, &mut out);
+                self.prevotes.clear();
+                self.prevotes.insert(self.me.clone());
+                if self.prevotes.len() >= self.majority() {
+                    self.stand(now, &mut out);
                     return out;
                 }
                 for p in self.peers() {
                     out.push(Action::Send {
                         to: p.clone(),
-                        msg: Msg::Vote { term: self.term, candidate: self.me.clone() },
+                        msg: Msg::PreVote { term: self.term + 1, candidate: self.me.clone() },
                     });
                 }
             }
@@ -227,6 +281,7 @@ impl Election {
         self.role = Role::Steward;
         self.steward = Some(self.me.clone());
         self.majority_at = now;
+        self.heard = now;
         self.became_steward = Some(now);
         self.round.clear();
         self.round.insert(self.me.clone());
@@ -241,6 +296,27 @@ impl Election {
     pub fn on_message(&mut self, now: Instant, from: &str, msg: Msg) -> Vec<Action> {
         let mut out = Vec::new();
         match msg {
+            Msg::PreVote { term, candidate: _ } => {
+                // Would be granted: a term at least this node's, and no
+                // steward heard for the timeout. Nothing changes here.
+                let granted = term >= self.term && self.role != Role::Steward && self.quiet(now);
+                out.push(Action::Send {
+                    to: from.to_string(),
+                    msg: Msg::PreVoteAnswer { term: self.term, granted },
+                });
+            }
+            Msg::PreVoteAnswer { term, granted } => {
+                if term > self.term {
+                    self.step_down(term, &mut out);
+                    return out;
+                }
+                if self.role != Role::Steward && granted && !self.prevotes.is_empty() {
+                    self.prevotes.insert(from.to_string());
+                    if self.prevotes.len() >= self.majority() {
+                        self.stand(now, &mut out);
+                    }
+                }
+            }
             Msg::Vote { term, candidate } => {
                 if term > self.term {
                     self.step_down(term, &mut out);
@@ -248,8 +324,7 @@ impl Election {
                 // Granted to the first candidate of the current term, and
                 // only when no steward has been heard for the timeout: a
                 // steward that is alive keeps its group from wandering.
-                let quiet = now.saturating_duration_since(self.heard) >= self.timeout
-                    || self.steward.is_none();
+                let quiet = self.quiet(now) || self.steward.is_none();
                 let granted = term == self.term
                     && self.role != Role::Steward
                     && quiet
@@ -309,6 +384,7 @@ impl Election {
                     self.round.insert(from.to_string());
                     if self.round.len() >= self.majority() {
                         self.majority_at = now;
+                        self.heard = now;
                     }
                 }
             }
@@ -445,11 +521,39 @@ mod tests {
         let b = g.nodes.get_mut("n2").unwrap().tick(now);
         let n0 = g.deliver(now, "n0", a);
         let n2 = g.deliver(now, "n2", b);
-        // n0 reached n1: a majority of two. n2 reached only n1, which had
-        // voted: denied.
+        // n0's pre-votes and votes reached n1: a majority of two. n2's
+        // pre-vote was granted too (nothing had changed on n1 yet), but
+        // its vote found n1 voted: denied.
         assert!(n0.contains(&Action::BecameSteward { term: 1 }), "{n0:?}");
         assert!(!n2.iter().any(|a| matches!(a, Action::BecameSteward { .. })), "{n2:?}");
         assert_eq!(g.stewards(), vec!["n0".to_string()]);
+    }
+
+    /// A node cut off from the group asks every timeout and gets no
+    /// pre-vote, so its term stays where it was; back, it takes the
+    /// steward's next heartbeat and forces no election.
+    #[test]
+    fn a_node_cut_off_keeps_its_term_and_follows_again_when_back() {
+        let mut g = Group::new(3, Duration::from_secs(10));
+        g.tick(6, "n1");
+        assert_eq!(g.stewards(), vec!["n1".to_string()]);
+        g.cut.insert(("n0".into(), "n1".into()));
+        g.cut.insert(("n0".into(), "n2".into()));
+        for t in [9, 12, 15, 18, 21, 24, 27, 30] {
+            g.tick(t, "n1");
+        }
+        for t in [12, 18, 24, 30] {
+            let n = g.tick(t, "n0");
+            assert!(!n.iter().any(|a| matches!(a, Action::Persist { .. })), "{n:?}");
+        }
+        assert_eq!(g.nodes["n0"].term(), 1, "an isolated node raised its term");
+        assert_eq!(g.stewards(), vec!["n1".to_string()]);
+        g.cut.clear();
+        g.tick(33, "n1");
+        assert_eq!(g.nodes["n0"].steward(), Some("n1"));
+        assert_eq!(g.nodes["n0"].role(), Role::Follower);
+        assert!(g.tick(34, "n0").is_empty(), "the healed node stood against a live steward");
+        assert_eq!(g.nodes["n1"].term(), 1, "the steward's term moved");
     }
 
     /// The persisted term and vote come back on restart, and a restarted

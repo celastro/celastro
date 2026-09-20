@@ -1208,11 +1208,12 @@ impl Node {
 
     /// A vote asked of a peer for `candidate` at `term`: granted, and the
     /// peer's term. A peer from before the election grants nothing.
-    pub fn vote(&self, me: &str, term: u64, candidate: &str) -> Result<(bool, u64)> {
+    pub fn vote(&self, me: &str, term: u64, candidate: &str, pre: bool) -> Result<(bool, u64)> {
         let mut body = Vec::new();
         put_u64(&mut body, term);
         put_str(&mut body, candidate);
         put_str(&mut body, me);
+        put_bool(&mut body, pre);
         match self.call(Call::Vote, "", 0, &body) {
             Ok(b) => {
                 let mut i = 0;
@@ -1865,7 +1866,9 @@ fn handle(
             let term = get_u64(body, &mut j).ok_or_else(truncated)?;
             let candidate = get_string(body, &mut j)?;
             let from = get_string(body, &mut j)?;
-            let (granted, mine) = crate::engine::vote(lease, &from, term, &candidate);
+            // A pre-vote asks and changes nothing; absent, a real vote.
+            let pre = get_bool(body, &mut j).unwrap_or(false);
+            let (granted, mine) = crate::engine::vote(lease, &from, term, &candidate, pre);
             put_bool(&mut out, granted);
             put_u64(&mut out, mine);
             return Ok(out);

@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.62.2 — 2026-09-20
+
+**A pre-vote before a vote.** A node that has heard no steward for
+the timeout first asks the group whether it would be voted for, at
+the next term, changing nothing on either side; only a majority of
+yeses makes it stand. A node cut off from the group asks every
+timeout and hears nothing, so its term stays where it was, and when
+it is back it takes the steward's next heartbeat -- where before it
+came back with a term inflated alone and forced an election the
+group did not need (the `stewardsplit` drill's old steward, back
+after the heal, was steward again at term 13). A steward with a
+fresh majority answers no pre-vote yes. The wire's `vote` carries
+the pre flag.
+
 ## 0.62.1 — 2026-09-20
 
 **The steward's heartbeats reach every peer at once.** Sent in turn,

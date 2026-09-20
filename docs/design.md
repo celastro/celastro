@@ -1641,7 +1641,11 @@ steward holds off promotions for a lease and a quarter after its
 election, longer than any lease the old one could have granted --
 with an election timeout of at least half a lease and clocks that run
 at comparable rates. A clock that runs twice as fast breaks the
-argument; the notes say so rather than pretend otherwise.
+argument; the notes say so rather than pretend otherwise. A pre-vote
+(0.62.2) comes before a vote: a node asks whether it would be voted
+for at the next term, and only a majority of yeses makes it stand, so
+a node cut off alone never raises its term and, back, follows the
+steward's next heartbeat instead of forcing an election.
 
 **The steward waits out the lease before it promotes (0.61.1).** The
 lease is what stops a holder that is cut off rather than dead: it

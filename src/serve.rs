@@ -1808,10 +1808,14 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
                         match msg {
                             Msg::Vote { term, candidate } => {
                                 // A vote that does not come back is a vote not given.
-                                node.vote(&me, term, &candidate)
+                                node.vote(&me, term, &candidate, false)
                                     .ok()
                                     .map(|(granted, t)| (to, Msg::VoteAnswer { term: t, granted }))
                             }
+                            Msg::PreVote { term, candidate } => node
+                                .vote(&me, term, &candidate, true)
+                                .ok()
+                                .map(|(granted, t)| (to, Msg::PreVoteAnswer { term: t, granted })),
                             Msg::Heartbeat { term } => match node.lease(&me, term) {
                                 Ok((accepted, t)) => {
                                     if accepted {
