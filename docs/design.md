@@ -1599,12 +1599,42 @@ catching up, and a follower was caught up from nothing whenever its
 copy stood before the shard's version floor -- which every seal raises
 to now, so under a load every follower that had been away at all
 started from nothing. Only a live follower holds an acknowledgement
-now, and the reset is off a delete floor raised only by a compaction
+now, and the reset is off a catch-up floor raised only by a compaction
 that forgot a delete, the one event a catch-up from where the copy
-stood cannot make up for. Not persisted: the floors start at zero on
-open, so a holder restarted after such a compaction accepts a follower
-that stood before it; the fix is a floor in the manifest, and it is in
-the backlog with the rest of the suite's findings.
+stood cannot make up for. The catch-up floor is in the manifest
+(0.60.0, a trailing field older readers ignore); the version floor is
+not, and need not be: it is about snapshot reads, which do not survive
+a restart.
+
+**A demotion cuts the copy at what was confirmed (0.60.0).** The
+shapes on 0.59.1 verified everything, and still every holder's return
+cost the cluster two to four minutes at the deadline: the demotion
+opened the copy "not caught up", and the new holder re-copied the
+whole shard to it from nothing while serving it. A holder's shipper
+writes `CONFIRMED` in the shard's directory -- the least instant its
+live followers have confirmed, at most once a second, never ahead of
+the truth -- and a demotion opens the copy at most there
+(`Shard::open_at_most`): the log records above it are dropped and the
+log rewritten without them, the rotated logs folded in, so what this
+node took after the promotion and nobody confirmed goes, and the copy
+follows from the cut. The instant comes from the shipper when the
+node did not restart, from the file when it did; a copy whose sealed
+segments hold a version above the cut cannot be cut there and starts
+from nothing, which the log says. The test takes a holder's follower
+away, writes on the holder alone, loses the holder, promotes the
+follower, brings the holder back and promotes it again: it answers
+the rows the other had and none of the ten nobody confirmed.
+
+**A merge reaches the followers (0.60.0).** The rows a merge absorbs
+keep their own timestamps, older than any follower's stand, so a
+catch-up from where a follower stood never carried them; and a kept
+copy's key range stayed what the map said before the merge, so even
+rows that arrived were masked out. The examples' promotion after a
+merge answered two rows of three, one run in four. A merge raises the
+catch-up floor and replaces the merged shard's shipper, so every
+follower is asked again and starts from nothing; and `ensure_followed`
+moves a kept copy's range with the map, on disk too. The merge test
+counts the copy.
 
 **A pooled connection is asked a hello after ten idle seconds.** The
 five-node suite, every node restarted, found the coordinators' pooled

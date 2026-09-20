@@ -1825,6 +1825,28 @@ fn shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median() {
     let m = b.ack("MERGE SHARDS 0 AND 1 OF items");
     assert!(m.contains("shard 0 is [, )") && m.contains("20 row(s) of shard 1 rebuilt"), "{m}");
     assert!(m.contains("map switched"), "{m}");
+    // The follower's copy of the merged shard holds the absorbed rows:
+    // they keep their own timestamps, so only a catch-up from nothing
+    // carries them, and the merge has to make one happen. (A copy
+    // promoted after a merge answered two rows of three.)
+    let mut copied = 0;
+    for _ in 0..100 {
+        copied = {
+            let followed = b.db.read().unwrap().followed();
+            let g = followed.lock().unwrap();
+            g.get(&("items".to_string(), 0)).map(|f| f.shard.num_docs(u64::MAX)).unwrap_or(0)
+        };
+        if copied == 40 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        copied,
+        40,
+        "the follower's copy of the merged shard is short: {}",
+        a.ack("SHOW HEALTH")
+    );
     settle();
     for n in [&a, &b] {
         let cat = n.ack("SHOW CATALOG items");
@@ -1966,9 +1988,18 @@ fn a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns() {
         let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
         a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
     }
-    let sealed = std::fs::read_dir(b.dir.join("collections/items/followed/shard-0000/segments"))
-        .map(|d| d.count())
-        .unwrap_or(0);
+    // The rows reach the copy behind the acknowledgements (a follower
+    // still catching up holds none), so the seal is waited for.
+    let mut sealed = 0;
+    for _ in 0..50 {
+        sealed = std::fs::read_dir(b.dir.join("collections/items/followed/shard-0000/segments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        if sealed > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     assert!(sealed > 0, "the copy on b sealed nothing; the promotion below proves nothing");
     let e = a.exec(&format!("PROMOTE SHARD 0 OF items ON '{}'", c.url)).unwrap_err().to_string();
     assert!(e.contains("does not follow"), "{e}");
@@ -2129,4 +2160,141 @@ fn a_mixed_load_over_two_nodes_closes_no_lock_cycle() {
         settle();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// A holder lost after writes its follower never confirmed: the follower
+/// is promoted with what it had; the old holder, back, is cut at the last
+/// instant the new holder confirmed and follows from there -- not from
+/// nothing, and not with the rows nobody confirmed, which would come
+/// back as ghosts at the next promotion.
+#[test]
+fn a_demoted_holder_is_cut_at_what_was_confirmed_and_follows_from_there() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("cut-a");
+    let b = Node::start("cut-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    for i in 0..40usize {
+        let key = format!("{}{i:04}", if i % 2 == 0 { 'd' } else { 'r' });
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":{i}}}')"#));
+    }
+    let mut live = false;
+    for _ in 0..100 {
+        if a.ack("SHOW HEALTH").contains(&format!("shard 0 of `items`: follower {} live", b.url)) {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(live, "{}", a.ack("SHOW HEALTH"));
+    // The shipper's CONFIRMED lands within a second of the last ack.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0040","n":40}')"#);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let confirmed = a.dir.join("collections/items/shard-0000/CONFIRMED");
+    assert!(confirmed.exists(), "the holder wrote no CONFIRMED");
+    // b away: ten rows acknowledged on a alone, confirmed by nobody.
+    let (b_port, b_dir) =
+        (b.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), b.dir.clone());
+    drop(b);
+    settle();
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    for i in 900..910usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    assert!(a.ack("SHOW HEALTH").contains("DEGRADED"));
+    // a lost; b back with its copy, promoted with what it had: 21 rows.
+    let (a_port, a_dir) =
+        (a.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), a.dir.clone());
+    let a_url = a.url.clone();
+    drop(a);
+    settle();
+    let b = Node::start_at("cut-b", b_port, Some(b_dir));
+    b.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    let m = b.ack(&format!("PROMOTE SHARD 0 OF items ON '{}'", b.url));
+    assert!(m.contains("promoted here at term 1"), "{m}");
+    b.db.write().unwrap().opts.statement_deadline_ms = Some(30_000);
+    // Shard 0's rows (the d-keys): the other shard's holder may be away.
+    let count = |n: &Node| {
+        let r = n
+            .query("SELECT count(*) AS n FROM items WHERE id < 'm' WITH (partial_results, deadline_ms = 1500)")
+            .unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    assert_eq!(count(&b), 21, "b's copy had the 20 even rows and d0040");
+    b.ack(r#"INSERT INTO items VALUES ('{"id":"d0041","n":41}')"#);
+    // a returns, hears term 1 at its attach, and is a follower cut at what
+    // b had confirmed: caught up to that instant at once, not "from
+    // nothing" until a catch-up delivers 41 rows.
+    let a = Node::start_at("cut-a", a_port, Some(a_dir));
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    assert_eq!(a.local_shards("items"), Vec::<usize>::new(), "demoted at the attach");
+    let (caught_up, at) = {
+        let followed = a.db.read().unwrap().followed();
+        celastro::engine::follower_status(&followed, "items", 0, 1).unwrap()
+    };
+    assert!(caught_up && at > 0, "the demoted copy was not cut at a confirmed instant ({at})");
+    let mut live = false;
+    for _ in 0..100 {
+        if b.ack("SHOW HEALTH").contains(&format!("shard 0 of `items`: follower {} live", a_url)) {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(live, "{}", b.ack("SHOW HEALTH"));
+    // b lost now; a promoted: it answers b's 22 rows and none of the ten
+    // nobody confirmed.
+    let b_dir = b.dir.clone();
+    drop(b);
+    settle();
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    let m = a.ack(&format!("PROMOTE SHARD 0 OF items ON '{}' TERM 2", a.url));
+    assert!(m.contains("promoted here at term 2"), "{m}");
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(30_000);
+    assert_eq!(count(&a), 22, "the cut kept a row nobody confirmed, or lost one b had");
+    let d = a.dir.clone();
+    drop(a);
+    settle();
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&b_dir);
+}
+
+/// A statement over several holders is per holder: when one refuses, the
+/// rows the others took have landed, and the error says which -- so a
+/// client knows what to run again.
+#[test]
+fn an_insert_refused_by_one_holder_says_which_rows_landed() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("landed-a");
+    let b = Node::start("landed-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    let b_dir = b.dir.clone();
+    drop(b);
+    settle();
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(2000);
+    let sql = r#"INSERT INTO items VALUES ('{"id":"d0001","n":1}'), ('{"id":"d0002","n":2}'), ('{"id":"r0001","n":3}'), ('{"id":"r0002","n":4}')"#;
+    let out = a.exec(sql).unwrap();
+    let e = out.finished_with(&a.db).unwrap_err().to_string();
+    assert!(e.contains("NOT written: 2 on"), "{e}");
+    assert!(e.contains("written: 2 here"), "{e}");
+    assert!(e.contains("idempotent"), "{e}");
+    let r = a
+        .query("SELECT count(*) AS n FROM items WHERE id < 'm' WITH (partial_results, deadline_ms = 1500)")
+        .unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(2));
+    let d = a.dir.clone();
+    drop(a);
+    settle();
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&b_dir);
 }

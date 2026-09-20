@@ -684,14 +684,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The delete floor is raised by a compaction that forgets a delete,
+    /// The catch-up floor is raised by a compaction that forgets a delete,
     /// and by nothing else: a seal raises the version floor to now and
     /// keeps every tombstone, so a follower away across a seal catches up
     /// from where it stood; one away across the compaction that dropped
     /// the dead row starts from nothing, since the delete it missed is
     /// gone.
     #[test]
-    fn a_compaction_that_drops_a_dead_row_raises_the_delete_floor_and_a_seal_does_not() {
+    fn a_compaction_that_drops_a_dead_row_raises_the_catchup_floor_and_a_seal_does_not() {
         let dir = std::env::temp_dir().join(format!("celastro-dfloor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
@@ -703,19 +703,40 @@ mod tests {
             s.flush().unwrap();
         }
         assert!(s.retain_floor > 0, "a seal raises the version floor");
-        assert_eq!(s.delete_floor, 0, "and not the delete floor");
+        assert_eq!(s.catchup_floor, 0, "and not the catch-up floor");
         let before = s.clock.peek();
         s.delete(&format!("t0{KEY_SEP}d00000")).unwrap();
         let after = s.clock.peek();
         s.flush().unwrap();
-        assert_eq!(s.delete_floor, 0, "a seal keeps the tombstone");
+        assert_eq!(s.catchup_floor, 0, "a seal keeps the tombstone");
         run_to_quiescence(&mut s, &CompactionOpts::default(), 8).unwrap();
         assert_eq!(s.segments.len(), 1);
         assert!(
-            s.delete_floor > before && s.delete_floor <= after,
+            s.catchup_floor > before && s.catchup_floor <= after,
             "the compaction forgot the delete at {} (between {before} and {after})",
-            s.delete_floor
+            s.catchup_floor
         );
+        // In the manifest, so a reopened holder still knows: without it a
+        // follower from before the delete was accepted after a restart.
+        let floor = s.catchup_floor;
+        drop(s);
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.catchup_floor, floor, "the reopened shard forgot the catch-up floor");
+        // An absorb raises it too: the rows keep their own timestamps.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let before = s.clock.peek();
+        absorb(
+            &mut s,
+            vec![PendingDoc {
+                sort_key: format!("t0{KEY_SEP}d99999"),
+                commit_ts: 1,
+                doc: doc(99999),
+            }],
+            &[],
+            &CompactionOpts::default(),
+        )
+        .unwrap();
+        assert!(s.catchup_floor >= before, "an absorb left the floor at {}", s.catchup_floor);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

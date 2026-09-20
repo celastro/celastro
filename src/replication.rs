@@ -94,6 +94,25 @@ pub struct Shipper {
     inner: Mutex<Vec<Follower>>,
     cv: Condvar,
     stop: AtomicBool,
+    /// The held shard's directory, where `CONFIRMED` records the instant
+    /// every live follower has confirmed, at most once a second and never
+    /// ahead of the truth: what a demotion cuts the copy at, so a holder
+    /// that comes back follows from where its followers stood rather
+    /// than from nothing. A stale-low value costs a longer catch-up, not
+    /// correctness.
+    dir: Option<std::path::PathBuf>,
+    confirmed_written: Mutex<(Option<Instant>, Timestamp)>,
+}
+
+/// The file a holder's shipper keeps its followers' confirmed instant in.
+pub const CONFIRMED_FILE: &str = "CONFIRMED";
+
+/// The confirmed instant a shard directory records, or zero.
+pub fn confirmed_in(dir: &std::path::Path) -> Timestamp {
+    std::fs::read_to_string(dir.join(CONFIRMED_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// One follower's standing, for `SHOW HEALTH`.
@@ -113,6 +132,7 @@ impl Shipper {
         term: u64,
         followers: Vec<(String, Arc<crate::wire::Node>)>,
         sync: bool,
+        dir: Option<std::path::PathBuf>,
     ) -> Arc<Shipper> {
         let inner = followers
             .into_iter()
@@ -135,6 +155,8 @@ impl Shipper {
             inner: Mutex::new(inner),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
+            dir,
+            confirmed_written: Mutex::new((None, 0)),
         });
         let t = s.clone();
         std::thread::Builder::new()
@@ -155,6 +177,8 @@ impl Shipper {
             inner: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             stop: AtomicBool::new(true),
+            dir: None,
+            confirmed_written: Mutex::new((None, 0)),
         }
     }
 
@@ -348,6 +372,7 @@ impl Shipper {
                 continue;
             }
             let mut failed = false;
+            let mut persist = false;
             for w in work {
                 let _deadline = crate::deadline::arm(Some(10_000));
                 match w {
@@ -389,6 +414,7 @@ impl Shipper {
                                     }
                                     f.acked = f.acked.max(at);
                                     f.last_error = None;
+                                    persist = true;
                                     if caught_up
                                         && matches!(
                                             f.state,
@@ -423,12 +449,41 @@ impl Shipper {
                     }
                 }
             }
+            if persist {
+                self.persist_confirmed();
+            }
             if failed {
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             } else {
                 backoff = Duration::from_millis(200);
             }
+        }
+    }
+
+    /// `CONFIRMED` in the shard's directory: the least instant every live
+    /// follower has confirmed, written when it grew and a second has
+    /// passed since the last write.
+    fn persist_confirmed(&self) {
+        let Some(dir) = &self.dir else { return };
+        let least = {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let live: Vec<Timestamp> =
+                g.iter().filter(|f| f.state == FollowerState::Live).map(|f| f.acked).collect();
+            match live.iter().min() {
+                Some(&m) if m > 0 => m,
+                _ => return,
+            }
+        };
+        let mut w = self.confirmed_written.lock().unwrap_or_else(|p| p.into_inner());
+        let due = w.0.map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
+        if least <= w.1 || !due {
+            return;
+        }
+        if crate::shard::atomic_write(&dir.join(CONFIRMED_FILE), least.to_string().as_bytes())
+            .is_ok()
+        {
+            *w = (Some(Instant::now()), least);
         }
     }
 
@@ -456,7 +511,7 @@ mod tests {
     #[test]
     fn a_follower_away_or_catching_up_does_not_hold_the_acknowledgement() {
         let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
-        let sh = Shipper::new("items", 0, 0, vec![("tcp://127.0.0.1:1".into(), node)], true);
+        let sh = Shipper::new("items", 0, 0, vec![("tcp://127.0.0.1:1".into(), node)], true, None);
         let set = |state: FollowerState| {
             let mut g = sh.inner.lock().unwrap();
             g[0].state = state;

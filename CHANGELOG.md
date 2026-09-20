@@ -6,6 +6,48 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.60.0 — 2026-09-20
+
+**A holder's return no longer costs minutes; a manifest carries the
+catch-up floor; an insert refused by one holder says which rows landed.**
+Every failure shape of the five-node suite that took a holder away
+crawled for two to four minutes after it came back: the demotion
+opened the old holder's copy "not caught up" and the new holder
+re-copied the whole shard to it from nothing while serving it. A
+holder's shipper now keeps `CONFIRMED` in the shard's directory -- the
+instant every live follower has confirmed, written at most once a
+second and never ahead of the truth -- and a demotion cuts the copy
+there: the log records above it, which this node took after the
+promotion and nobody confirmed, are dropped and the log rewritten, and
+the copy follows from that instant. A copy whose sealed segments hold
+versions above the cut starts from nothing, as before, and the log
+says which. The catch-up chunk is 500 rows rather than 2,000, so a
+catch-up that does run interleaves with the holder's statements.
+
+The catch-up floor (0.59.1's delete floor) is in the manifest now,
+trailing, so a holder restarted after a compaction that forgot a
+delete still starts a follower from before it from nothing; a manifest
+without the field reads as zero and is rewritten with it at the next
+seal. A merge raises it too, and replaces the merged shard's shipper:
+the rows a merge absorbs keep their own, older timestamps, so a
+follower catching up from where it stood never received them, and a
+copy promoted after a merge answered two rows of three (one run in
+four of the documented examples, since 0.59.1's floor stopped
+resetting every follower). And a kept copy's key range now follows
+the map at a split or a merge: left with the old one, the copy masked
+out the rows the merge absorbed even once they arrived.
+
+An `INSERT` over several holders is per holder: when one refuses (a
+node away, a lease run out) the rows the others took have landed, and
+the error now says so -- `NOT written: 2 on tcp://… (did not answer);
+written: 2 here, 3 on tcp://…` -- with the note that inserts are
+idempotent by key, so running the statement again is safe. The
+five-node seed lost 88 documents to a refusal it reported without
+saying what had landed.
+
+*Format:* the shard manifest gains a trailing field; 0.59.x reads a
+0.60.0 manifest (it ignores the tail) and 0.60.0 reads older ones.
+
 ## 0.59.1 — 2026-09-20
 
 **A promotion keeps the copy's files; a follower catching up holds no
@@ -27,7 +69,7 @@ the write reaches the copy behind its catch-up. Third, a follower
 whose copy stood before the shard's version floor was reset and copied
 from nothing, and every seal raises that floor to now -- so under a
 write load every follower that had been away at all was copied from
-nothing on return. The reset is off a delete floor now, raised only by
+nothing on return. The reset is off a catch-up floor now, raised only by
 a compaction that dropped a dead row, which is the only way a delete
 is forgotten. The steward also logs a candidate it passes over for
 being behind (`failover_candidate_behind`).

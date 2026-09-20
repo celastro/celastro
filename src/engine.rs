@@ -480,7 +480,7 @@ pub(crate) fn export_shard(
         handles.push(handle);
         fresh = Some((next_id, bytes));
     }
-    let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1).encode();
+    let mut manifest = Shard::manifest_of(&handles, 1, next_id + 1, 0).encode();
     let crc = crc32(&manifest);
     put_u32(&mut manifest, crc);
     // Into the file regime: what a shard directory would hold, so the
@@ -2260,11 +2260,32 @@ impl Db {
             self.drop_followed(collection, *i);
         }
         {
-            // The terms as the map says them now, for the copies kept.
+            // The terms and the ranges as the map says them now, for the
+            // copies kept. The range moves at a split or a merge, and a
+            // copy left with the old one masked out the rows a merge
+            // absorbed: they arrived, counted for nothing, and a copy
+            // promoted after the merge answered two rows of three.
             let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
             for i in wanted.iter().filter(|i| have.contains(i)) {
                 if let Some(f) = g.get_mut(&(collection.to_string(), *i)) {
-                    f.term = tablets[*i].term;
+                    let t = &tablets[*i];
+                    f.term = t.term;
+                    if f.shard.key_range() != (t.lo.clone(), t.hi.clone()) {
+                        f.shard.set_key_range(t.lo.clone(), t.hi.clone());
+                        if let Some(d) = f.shard.dir().map(|d| d.to_path_buf()) {
+                            crate::shard::write_content(
+                                &self.cipher,
+                                &format!("shard-{i:04}/RANGE"),
+                                &d.join("RANGE"),
+                                format!(
+                                    "{}\n{}",
+                                    t.lo.clone().unwrap_or_default(),
+                                    t.hi.clone().unwrap_or_default()
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -3916,6 +3937,16 @@ impl Db {
             }
             compaction::absorb(k, docs, &carried, &copts)?;
             k.set_key_range(lo.clone(), hi.clone());
+            // The shipper is replaced (`refresh_shippers`, at the persist
+            // below): a fresh one asks every follower where it stands, and
+            // the absorbed rows -- with timestamps older than any
+            // follower's stand -- reach them through the catch-up from
+            // nothing the raised floor makes of it. Kept, it stayed live
+            // and shipped nothing of the merge; the follower promoted after
+            // one answered two rows of three.
+            if let Some(sh) = k.shipper.take() {
+                sh.stop();
+            }
         }
         shards.retain(|s| s.index != b);
         let cdir = dir.join("collections").join(collection);
@@ -4039,7 +4070,14 @@ impl Db {
                 fresh.push((
                     name.clone(),
                     s.index,
-                    crate::replication::Shipper::new(name, s.index, t.term, conns, sync),
+                    crate::replication::Shipper::new(
+                        name,
+                        s.index,
+                        t.term,
+                        conns,
+                        sync,
+                        s.dir().map(|d| d.to_path_buf()),
+                    ),
                 ));
             }
         }
@@ -4101,7 +4139,7 @@ impl Db {
             // here has forgotten may have missed it: from nothing. (Off the
             // version floor, which every seal raises, this reset every
             // follower that had been away across a seal.)
-            let reset = reset || from < s.delete_floor;
+            let reset = reset || from < s.catchup_floor;
             if cursor.is_none() {
                 if reset {
                     items.push(crate::replication::ShipItem {
@@ -4393,9 +4431,28 @@ impl Db {
             self.shards.remove(collection);
         }
         self.abort_move(collection, shard);
+        // Where the new holder stood when it was promoted, as far as this
+        // node knows: what its shipper heard the new holder confirm, or
+        // the `CONFIRMED` the shipper had written before this process
+        // ended. The copy is cut there: everything above it was taken by
+        // this node alone after the promotion and nobody confirmed it.
+        let new_holder = self
+            .catalog
+            .placement
+            .get(collection)
+            .and_then(|v| v.get(shard))
+            .map(|t| t.node.clone())
+            .unwrap_or_default();
+        let mut confirmed = 0;
         for mut s in gone {
             if let Some(sh) = s.shipper.take() {
+                if let Some(f) = sh.report().into_iter().find(|f| f.url == new_holder) {
+                    confirmed = confirmed.max(f.acked);
+                }
                 sh.stop();
+            }
+            if let Some(d) = s.dir() {
+                confirmed = confirmed.max(crate::replication::confirmed_in(d));
             }
             // Closed, not retired: the files are the copy's now.
             drop(s);
@@ -4403,6 +4460,7 @@ impl Db {
         let cdir = dir.join("collections").join(collection);
         let from = cdir.join(format!("shard-{shard:04}"));
         let to = cdir.join("followed").join(format!("shard-{shard:04}"));
+        let _ = fs::remove_file(from.join(crate::replication::CONFIRMED_FILE));
         fs::create_dir_all(cdir.join("followed"))?;
         if to.exists() {
             fs::remove_dir_all(&to)?;
@@ -4421,11 +4479,47 @@ impl Db {
         if to.exists() {
             let def = self.catalog.get(collection)?.clone();
             let (lo, hi) = read_range(&self.cipher, &to, shard, collection)?;
-            let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
+            let cut = if confirmed > 0 {
+                match Shard::open_at_most(
+                    def.clone(),
+                    self.clock.clone(),
+                    self.shard_opts(),
+                    &to,
+                    confirmed,
+                ) {
+                    Ok(sh) => Some(sh),
+                    Err(e) => {
+                        crate::log::warn(
+                            "demoted_copy_from_nothing",
+                            &[
+                                ("collection", collection.to_string()),
+                                ("shard", shard.to_string()),
+                                ("error", e.to_string()),
+                            ],
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut sh = match cut {
+                Some(mut sh) => {
+                    // As the new holder's copy stood at the promotion: caught
+                    // up to there, the rest comes from it.
+                    sh.caught_up = true;
+                    sh.ship_ts = confirmed;
+                    sh
+                }
+                None => {
+                    let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
+                    sh.caught_up = false;
+                    sh.ship_ts = 0;
+                    sh
+                }
+            };
             sh.set_key_range(lo, hi);
             sh.index = shard;
-            sh.caught_up = false;
-            sh.ship_ts = 0;
             self.followed
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -4437,6 +4531,14 @@ impl Db {
                 ("collection", collection.to_string()),
                 ("shard", shard.to_string()),
                 ("term", term.to_string()),
+                (
+                    "copy",
+                    if confirmed > 0 {
+                        format!("cut at ts {confirmed}, following from there")
+                    } else {
+                        "from nothing".into()
+                    },
+                ),
             ],
         );
         Ok(())
@@ -6080,8 +6182,9 @@ impl Db {
                 let collection = i.collection.clone();
                 let remaining = crate::deadline::remaining_ms();
                 let dialer = self.dialer();
+                let here_n = n - away.values().map(|(_, d)| d.len()).sum::<usize>();
                 Ok(Outcome::Deferred(Deferred::new(move || {
-                    let last = carry_writes(&collection, away, last, remaining, &dialer)?;
+                    let last = carry_writes(&collection, away, last, here_n, remaining, &dialer)?;
                     confirm.wait()?;
                     Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
                 })))
@@ -7773,7 +7876,10 @@ impl SealJob {
 pub const DEFAULT_REPLICAS: usize = 2;
 
 /// Rows per catch-up chunk.
-const CATCHUP_CHUNK: usize = 2000;
+// 500, not 2000: a chunk is decoded and shipped by the holder while it
+// serves the shard, and a node back from away found its statements behind
+// the chunks; smaller ones interleave with the statements.
+const CATCHUP_CHUNK: usize = 500;
 
 /// The steward's lease on this node: when it was last renewed and by
 /// whom it may be, shared with the wire.
@@ -8032,39 +8138,84 @@ fn carry_writes(
     collection: &str,
     away: Away<Value>,
     last: Timestamp,
+    here_n: usize,
     remaining: Option<u64>,
     dialer: &Dialer,
 ) -> Result<Timestamp> {
-    let answers: Vec<Result<Timestamp>> = std::thread::scope(|scope| {
+    // Per holder: its url, how many rows it took, and the ts or the error.
+    // A statement over several holders is per holder, not all or nothing;
+    // when one refuses, the rows the others took have landed, and the error
+    // says so -- a client that retries the statement (inserts are
+    // idempotent by key) or the refused rows alone knows which.
+    let answers: Vec<(String, usize, usize, Result<Timestamp>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = away
-            .values()
-            .map(|(n, docs)| {
+            .iter()
+            .map(|(url, (n, docs))| {
                 let n = n.clone();
+                let url = url.clone();
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
                     let mut last = 0;
                     let mut moved = Moved::default();
+                    let mut taken = 0usize;
                     for doc in docs {
                         let ts = match n.insert(collection, doc) {
                             Ok(ts) => ts,
                             Err(e) => match moved_to(&e) {
-                                Some(url) => moved.dial(dialer, &url)?.insert(collection, doc)?,
-                                None => return Err(e),
+                                Some(to) => match moved.dial(dialer, &to) {
+                                    Ok(c) => match c.insert(collection, doc) {
+                                        Ok(ts) => ts,
+                                        Err(e) => return (url, taken, docs.len(), Err(e)),
+                                    },
+                                    Err(e) => return (url, taken, docs.len(), Err(e)),
+                                },
+                                None => return (url, taken, docs.len(), Err(e)),
                             },
                         };
+                        taken += 1;
                         last = last.max(ts);
                     }
-                    Ok(last)
+                    (url, taken, docs.len(), Ok(last))
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("a carrier thread panicked")).collect()
     });
     let mut latest = last;
-    for r in answers {
-        latest = latest.max(r?);
+    let mut landed: Vec<String> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    let mut deadline_only = true;
+    if here_n > 0 {
+        landed.push(format!("{here_n} here"));
     }
-    Ok(latest)
+    for (url, taken, of, r) in answers {
+        match r {
+            Ok(ts) => {
+                latest = latest.max(ts);
+                landed.push(format!("{of} on {url}"));
+            }
+            Err(e) => {
+                if !matches!(e, Error::Deadline(_)) {
+                    deadline_only = false;
+                }
+                if taken > 0 {
+                    landed.push(format!("{taken} on {url}"));
+                }
+                refused.push(format!("{} on {url} ({e})", of - taken));
+            }
+        }
+    }
+    if refused.is_empty() {
+        return Ok(latest);
+    }
+    let msg = format!(
+        "NOT written: {}; written: {}. A statement over several holders is per holder: run \
+         it again once the holder answers (inserts are idempotent by key), or the refused \
+         rows alone",
+        refused.join("; "),
+        if landed.is_empty() { "nothing".to_string() } else { landed.join(", ") }
+    );
+    Err(if deadline_only { Error::Deadline(msg) } else { Error::Plan(msg) })
 }
 
 /// Delete keys on their holders, holder by holder at once, holding

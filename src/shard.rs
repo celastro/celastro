@@ -575,6 +575,10 @@ pub struct Manifest {
     pub version: u64,
     pub segments: Vec<SegmentMeta>,
     pub next_segment_id: u64,
+    /// The newest delete a compaction here has forgotten (`Shard::catchup_floor`),
+    /// carried so a reopened holder still knows which followers must start
+    /// from nothing. Trailing, so a manifest without it reads as zero.
+    pub catchup_floor: Timestamp,
 }
 
 impl Manifest {
@@ -591,6 +595,7 @@ impl Manifest {
             put_str(&mut out, &s.min_key);
             put_str(&mut out, &s.max_key);
         }
+        put_u64(&mut out, self.catchup_floor);
         out
     }
 
@@ -611,7 +616,9 @@ impl Manifest {
                 max_key: get_str(b, &mut i).ok_or_else(bad)?,
             });
         }
-        Ok(Manifest { version, segments, next_segment_id })
+        // Absent in manifests written before 0.60.0.
+        let catchup_floor = get_u64(b, &mut i).unwrap_or(0);
+        Ok(Manifest { version, segments, next_segment_id, catchup_floor })
     }
 }
 
@@ -1672,16 +1679,19 @@ pub struct Shard {
     /// already has: an unpinned seal forgets only versions a write had already
     /// superseded, never a row that a snapshot below the seal can still read.
     pub(crate) retain_floor: Timestamp,
-    /// The newest delete a compaction here has forgotten: a follower that
-    /// stood before it may have missed a delete this shard no longer
-    /// remembers, so its catch-up starts from nothing. Raised only when a
-    /// compaction drops a dead row -- a seal keeps every tombstone, and
+    /// The instant before which a follower's catch-up from where it stood
+    /// is not enough, so it starts from nothing: the newest delete a
+    /// compaction here has forgotten (a follower from before it would keep
+    /// a row this shard no longer remembers deleting), or the last time a
+    /// merge absorbed rows into this shard (they keep their own, older
+    /// timestamps, so a catch-up from later than them never carries
+    /// them). Raised by nothing else -- a seal keeps every tombstone, and
     /// `retain_floor`, which every seal raises to now, is about superseded
-    /// versions and not deletes. Reading the catch-up off `retain_floor`
-    /// reset every follower that had been away across a seal, which under
-    /// a write load is every follower that was away at all, and the
-    /// copy from nothing was minutes of writes waiting on it.
-    pub(crate) delete_floor: Timestamp,
+    /// versions. Reading the catch-up off `retain_floor` reset every
+    /// follower that had been away across a seal, which under a write
+    /// load is every follower that was away at all, and the copy from
+    /// nothing was minutes of writes waiting on it.
+    pub(crate) catchup_floor: Timestamp,
     /// Segments removed from the manifest whose files are still referenced by
     /// a reader. Swept whenever the last reference goes away; without this the
     /// files are simply never unlinked.
@@ -1742,7 +1752,7 @@ impl Shard {
             last_seal_error: None,
             compactions: 0,
             retain_floor: 0,
-            delete_floor: 0,
+            catchup_floor: 0,
             shipper: None,
             ship_ts: 0,
             caught_up: false,
@@ -1765,6 +1775,12 @@ impl Shard {
     /// keeps only the ordinals inside it. A range that shrank under a
     /// split leaves the rows outside it on disk, invisible, until a
     /// compaction drops them.
+    /// The range this shard owns, as `set_key_range` left it: `(None,
+    /// None)` for a shard never given one.
+    pub(crate) fn key_range(&self) -> (Option<String>, Option<String>) {
+        self.key_range.clone().unwrap_or((None, None))
+    }
+
     pub(crate) fn set_key_range(&mut self, lo: Option<String>, hi: Option<String>) {
         self.key_range = Some((lo, hi));
         *self.memtable.range.write().unwrap() = self.key_range.clone();
@@ -2915,7 +2931,12 @@ impl Shard {
     }
 
     pub fn manifest(&self) -> Manifest {
-        Shard::manifest_of(&self.segments, self.manifest_version, self.next_segment_id)
+        Shard::manifest_of(
+            &self.segments,
+            self.manifest_version,
+            self.next_segment_id,
+            self.catchup_floor,
+        )
     }
 
     /// The manifest a given segment set would publish.
@@ -2928,10 +2949,12 @@ impl Shard {
         segments: &[Arc<SegmentHandle>],
         version: u64,
         next_segment_id: u64,
+        catchup_floor: Timestamp,
     ) -> Manifest {
         Manifest {
             version,
             next_segment_id,
+            catchup_floor,
             segments: segments
                 .iter()
                 .map(|h| SegmentMeta {
@@ -3054,7 +3077,9 @@ impl Shard {
             .write()
             .unwrap()
             .retain(|id, _| segments.iter().any(|h| h.id() == *id));
-        let mut body = Shard::manifest_of(segments, version, self.next_segment_id).encode();
+        let mut body =
+            Shard::manifest_of(segments, version, self.next_segment_id, self.catchup_floor)
+                .encode();
         let crc = crc32(&body);
         put_u32(&mut body, crc);
         let p = dir.join("MANIFEST");
@@ -3077,6 +3102,31 @@ impl Shard {
         opts: ShardOpts,
         dir: &Path,
     ) -> Result<Shard> {
+        Shard::open_inner(coll, clock, opts, dir, None)
+    }
+
+    /// Reopen as it stood at `ceiling`: every log record above it is
+    /// dropped and the log rewritten without them, so the copy holds what
+    /// the followers had confirmed and nothing a lost holder took after.
+    /// Refused when a sealed segment holds a version above the ceiling --
+    /// then the copy has to start from nothing.
+    pub(crate) fn open_at_most(
+        coll: Collection,
+        clock: Arc<Hlc>,
+        opts: ShardOpts,
+        dir: &Path,
+        ceiling: Timestamp,
+    ) -> Result<Shard> {
+        Shard::open_inner(coll, clock, opts, dir, Some(ceiling))
+    }
+
+    fn open_inner(
+        coll: Collection,
+        clock: Arc<Hlc>,
+        opts: ShardOpts,
+        dir: &Path,
+        ceiling: Option<Timestamp>,
+    ) -> Result<Shard> {
         let mut s = Shard::new(coll, clock, opts);
         s.attach_dir(dir)?;
         // `Some` or an error, never "absent" for a file that is there and
@@ -3098,6 +3148,7 @@ impl Shard {
             // counter is the lowest id it would be safe to resume at if the
             // manifest were the whole record, and it is not.
             s.next_segment_id = s.next_segment_id.max(m.next_segment_id.max(1));
+            s.catchup_floor = m.catchup_floor;
             for meta in &m.segments {
                 // Reopen reads the footer, not the file. A shard with a hundred
                 // archived segments must not pull a hundred segments' worth of
@@ -3180,6 +3231,33 @@ impl Shard {
         }
         records.extend(Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?);
         s.unsealed_wals = rotated;
+        if let Some(c) = ceiling {
+            for h in &s.segments {
+                let above = h.segment.ordinals.commit_ts.iter().any(|t| *t > c);
+                if above {
+                    return Err(Error::Storage(format!(
+                        "segment {:016x} holds a version above ts {c}; the copy cannot be \
+                         cut there",
+                        h.id()
+                    )));
+                }
+            }
+            let before = records.len();
+            records.retain(|r| r.ts <= c);
+            if records.len() < before {
+                // The log rewritten as the kept records, rotated logs folded
+                // in: what a replay of this directory finds from now on.
+                let w = s.wal.as_mut().expect("attached above");
+                w.truncate()?;
+                for r in &records {
+                    w.append(r)?;
+                }
+                w.sync()?;
+                for p in std::mem::take(&mut s.unsealed_wals) {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
         for r in records {
             s.clock.observe(r.ts);
             match r.kind {
@@ -3475,6 +3553,12 @@ impl Shard {
         // skips the row), and a follower that stood before the newest of
         // them has to start from nothing.
         let mut forgotten = 0;
+        if input_ids.is_empty() && !outputs.is_empty() {
+            // An absorb (a merge's rows from the shard that goes away):
+            // rows with timestamps of their own, older than any follower's
+            // stand, which no catch-up from there would carry.
+            forgotten = retain_from;
+        }
         for h in self.segments.iter().filter(|h| input_ids.contains(&h.id())) {
             let log = h.deletes.read().unwrap();
             for (_, ts) in log.iter() {
@@ -3483,7 +3567,7 @@ impl Shard {
                 }
             }
         }
-        self.delete_floor = self.delete_floor.max(forgotten);
+        self.catchup_floor = self.catchup_floor.max(forgotten);
         let mut handles = Vec::new();
         for seg in outputs {
             self.adopt_segment(&seg);
@@ -3919,6 +4003,7 @@ mod tests {
     fn fuzz_manifest_and_wal_never_panic() {
         let m = Manifest {
             version: 3,
+            catchup_floor: 0,
             segments: vec![SegmentMeta {
                 id: 1,
                 level: 0,
