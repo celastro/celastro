@@ -556,6 +556,10 @@ impl Server {
                 let stop = &stop;
                 scope.spawn(move || reconciler(db, stop, every));
             }
+            if read(db).auto_failover() {
+                let stop = &stop;
+                scope.spawn(move || lease_renewer(db, stop));
+            }
             // A pool of `max_connections` workers, started once: a thread
             // per connection cost a clone and a fresh stack per request --
             // a fifth of a point lookup's CPU -- for connections the console
@@ -1658,10 +1662,52 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
 
 /// One job, if any shard wants one: reserved, built, installed. Whether a
 /// job was found.
-/// The steward's part of a sweep: a lease to every peer that answered,
-/// and, with automatic failover on, a promotion for every shard whose
-/// holder has missed two sweeps -- the follower that answered with the
-/// most recent copy is promoted, at the next term, and tells everyone.
+/// The steward's leases, on a thread of their own: every quarter of the
+/// lease length, a renewal to every peer, five seconds each, no lock
+/// taken on either side. Inside the catalog sweep the renewals stretched
+/// with it -- a sweep under a load ran past the lease, and every holder
+/// refused writes for a lease the steward was late to renew -- so they
+/// no longer share its clock.
+fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool) {
+    loop {
+        let (is_steward, me, secs, peers) = {
+            let g = read(db);
+            (
+                g.is_steward(),
+                g.node().map(String::from).unwrap_or_default(),
+                g.lease_secs(),
+                g.peers(),
+            )
+        };
+        if is_steward {
+            for (url, node) in &peers {
+                if stop.load(AtomicOrdering::Acquire) {
+                    return;
+                }
+                let _deadline = crate::deadline::arm(Some(5_000));
+                if let Err(e) = node.lease(&me) {
+                    crate::log::warn(
+                        "lease_not_renewed",
+                        &[("node", url.clone()), ("error", e.to_string())],
+                    );
+                }
+            }
+        }
+        let wait = Duration::from_secs((secs / 4).max(1));
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+/// The steward's part of a sweep, with automatic failover on: a
+/// promotion for every shard whose holder has missed two sweeps -- the
+/// follower that answered with the most recent copy is promoted, at the
+/// next term, and tells everyone.
 fn steward_sweep(
     db: &RwLock<Db>,
     peers: &[(String, Arc<crate::wire::Node>)],
@@ -1677,19 +1723,7 @@ fn steward_sweep(
             g.failover_plan(answered),
         )
     };
-    if !is_steward {
-        return;
-    }
-    for (url, node) in peers.iter().filter(|(u, _)| answered.contains(u)) {
-        let _deadline = crate::deadline::arm(Some(10_000));
-        if let Err(e) = node.lease(&me) {
-            crate::log::warn(
-                "lease_not_renewed",
-                &[("node", url.clone()), ("error", e.to_string())],
-            );
-        }
-    }
-    if !auto {
+    if !is_steward || !auto {
         return;
     }
     for (collection, shard, term, followers) in plan {

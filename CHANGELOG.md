@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.1 — 2026-09-20
+
+**The steward renews leases on a thread of its own.** The renewals rode
+the catalog sweep, and on five real nodes under an ingest the sweep ran
+past the lease: every holder refused writes for a lease the steward was
+late to renew. Now a thread renews every peer's lease every quarter of
+`CELASTRO_LEASE_SECS`, five seconds a call, no lock taken; the sweep
+keeps the failover decision. The README's cargo install moved into the
+Deployment table.
+
 ## 0.58.0 — 2026-09-19
 
 Every shard has a follower, a write is acknowledged on two disks, and a

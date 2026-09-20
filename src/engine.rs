@@ -4414,6 +4414,10 @@ impl Db {
         self.opts.auto_failover
     }
 
+    pub fn lease_secs(&self) -> u64 {
+        self.opts.lease_secs
+    }
+
     /// The holder of a shard, as the map says.
     pub fn holder_of(&self, collection: &str, shard: usize) -> Option<String> {
         self.catalog.placement.get(collection).and_then(|v| v.get(shard)).map(|t| t.node.clone())

@@ -779,8 +779,11 @@ under its own lock waits for that holder, which waits for this node to
 confirm its log; the wire's ship calls take that lock alone.
 
 Automatic failover is the steward's: one node -- named, or the lowest
-attached address -- renews every node's lease on each reconcile sweep
-and, with `CELASTRO_AUTO_FAILOVER=on`, promotes the follower with the
+attached address -- renews every node's lease every quarter of the lease
+length on a thread of its own (inside the sweep the renewals stretched
+with it, and five nodes under an ingest refused writes for a lease the
+steward was late to renew) and, on each reconcile sweep with
+`CELASTRO_AUTO_FAILOVER=on`, promotes the follower with the
 most recent copy once a holder has missed two sweeps. A holder whose
 lease ran out refuses writes until it is renewed, so a holder the
 steward cannot reach is not taking writes while its follower is
