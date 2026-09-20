@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.3 — 2026-09-20
+
+**A follower's call is its own, not a round's.** 0.63.2 still joined
+each round on its slowest call, so a write arriving while the cut
+follower's call was pending was not sent to the live follower until
+that deadline ran out: ten seconds again. Each follower's call runs on
+a thread the shipper does not wait for; a follower with a call out
+gets no other until it answers, and the rest go on. The first write
+after a cut is acknowledged as fast as the live copy answers.
+
 ## 0.63.2 — 2026-09-20
 
 **Each follower's answer is applied as it lands.** 0.63.1 sent to

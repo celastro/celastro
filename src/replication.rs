@@ -81,6 +81,12 @@ pub struct Follower {
     /// acknowledgements for up to five seconds a round.
     pub retry_at: Option<Instant>,
     pub backoff: Duration,
+    /// A call to this follower is out: it gets no other until that one
+    /// answers. Each follower's calls are its own, on a thread of their
+    /// own, never a round the shipper waits for -- a round joined on the
+    /// slowest follower, and a follower away held every other's
+    /// confirmation for its deadline.
+    pub in_flight: bool,
     /// Marks sent for a catch-up chunk are in the backlog too; when the
     /// caught-up mark is confirmed the follower is live.
     pub caught_up_mark: Option<Timestamp>,
@@ -175,6 +181,7 @@ impl Shipper {
                 last_error: None,
                 retry_at: None,
                 backoff: Duration::from_millis(200),
+                in_flight: false,
                 caught_up_mark: None,
             })
             .collect();
@@ -398,9 +405,10 @@ impl Shipper {
             }
             let now = Instant::now();
             let work: Vec<Work> = {
-                let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                g.iter()
-                    .filter(|f| f.retry_at.map_or(true, |t| now >= t))
+                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let picked: Vec<Work> = g
+                    .iter()
+                    .filter(|f| !f.in_flight && f.retry_at.map_or(true, |t| now >= t))
                     .filter_map(|f| match &f.state {
                         FollowerState::Unknown => Some(Work::Ask(f.url.clone(), f.node.clone())),
                         FollowerState::CatchingUp { .. } if !f.catchup.is_empty() => {
@@ -417,48 +425,56 @@ impl Shipper {
                         )),
                         _ => None,
                     })
-                    .collect()
+                    .collect();
+                for w in &picked {
+                    let url = match w {
+                        Work::Ask(u, _) | Work::Send(u, _, _) => u,
+                    };
+                    if let Some(f) = g.iter_mut().find(|f| &f.url == url) {
+                        f.in_flight = true;
+                    }
+                }
+                picked
             };
             if work.is_empty() {
                 let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 let _ = self.cv.wait_timeout(g, Duration::from_millis(200));
                 continue;
             }
-            // Every follower's call at once, each on a thread of its own,
-            // and each answer applied the moment it lands: sent in turn, a
-            // follower away held the round for its deadline before the live
-            // follower was sent anything, and joined before any answer was
-            // applied, the live follower's confirmation -- under quorum the
-            // write's acknowledgement -- still waited those ten seconds.
-            let this: &Shipper = &self;
-            let persist = std::sync::atomic::AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                for w in work {
-                    let persist = &persist;
-                    scope.spawn(move || {
+            // Each follower's call on a thread of its own, applied the moment
+            // it answers, and not waited for: the loop goes on to the next
+            // follower with work, and this follower gets no other call until
+            // this one is back.
+            for w in work {
+                let me = self.clone();
+                std::thread::Builder::new()
+                    .name("ship-call".into())
+                    .spawn(move || {
                         let _deadline = crate::deadline::arm(Some(10_000));
-                        match w {
+                        let url = match w {
                             Work::Ask(url, node) => {
-                                let status =
-                                    node.ship_status(&this.collection, this.shard, this.term);
-                                this.asked(&url, status);
+                                let status = node.ship_status(&me.collection, me.shard, me.term);
+                                me.asked(&url, status);
+                                url
                             }
                             Work::Send(url, node, items) => {
                                 let plain: Vec<&ShipItem> =
                                     items.iter().map(|i| i.as_ref()).collect();
-                                let answer =
-                                    node.ship(&this.collection, this.shard, this.term, &plain);
-                                if this.sent(&url, items.len(), answer) {
-                                    persist.store(true, Ordering::Relaxed);
+                                let answer = node.ship(&me.collection, me.shard, me.term, &plain);
+                                if me.sent(&url, items.len(), answer) {
+                                    me.persist_confirmed();
                                 }
+                                url
                             }
+                        };
+                        let mut g = me.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                            f.in_flight = false;
                         }
-                    });
-                }
-            });
-            let persist = persist.load(Ordering::Relaxed);
-            if persist {
-                self.persist_confirmed();
+                        drop(g);
+                        me.cv.notify_all();
+                    })
+                    .expect("a thread for a shipper's call");
             }
         }
     }
