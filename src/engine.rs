@@ -5432,8 +5432,29 @@ impl Db {
         for (name, shards) in self.shards.iter_mut() {
             for (i, s) in shards.iter_mut().enumerate() {
                 if let Some(ticket) = s.seal_take() {
-                    return Some(SealJob { collection: name.clone(), shard: i, ticket });
+                    return Some(SealJob {
+                        collection: name.clone(),
+                        shard: i,
+                        followed: false,
+                        ticket,
+                    });
                 }
+            }
+        }
+        // The followed copies seal here too: a copy freezes what a held
+        // shard freezes, and with nobody to build it, its third seal was
+        // built inline under the ship lock -- fourteen to twenty-seven
+        // seconds on the two-datacentre run, every acknowledgement waiting
+        // on that copy with it.
+        let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+        for ((name, index), f) in g.iter_mut() {
+            if let Some(ticket) = f.shard.seal_take() {
+                return Some(SealJob {
+                    collection: name.clone(),
+                    shard: *index,
+                    followed: true,
+                    ticket,
+                });
             }
         }
         None
@@ -5445,6 +5466,12 @@ impl Db {
 
     /// Commit a built seal. `false` when the shard is gone.
     pub fn seal_install(&mut self, job: SealJob, built: crate::shard::SealBuilt) -> Result<bool> {
+        if job.followed {
+            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) else { return Ok(false) };
+            f.shard.seal_install(job.ticket, built)?;
+            return Ok(true);
+        }
         let Some(shards) = self.shards.get_mut(&job.collection) else { return Ok(false) };
         let Some(shard) = shards.get_mut(job.shard) else { return Ok(false) };
         shard.seal_install(job.ticket, built)?;
@@ -5457,6 +5484,13 @@ impl Db {
     /// A build that failed: the ticket goes back to its shard, retried by
     /// the next reserve; the failure is counted on the shard.
     pub fn seal_requeue(&mut self, job: SealJob, err: &Error) {
+        if job.followed {
+            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) {
+                f.shard.seal_requeue(job.ticket, err);
+            }
+            return;
+        }
         if let Some(shard) = self.shards.get_mut(&job.collection).and_then(|s| s.get_mut(job.shard))
         {
             shard.seal_requeue(job.ticket, err);
@@ -8084,12 +8118,21 @@ fn sum_term_stats(
 pub struct SealJob {
     collection: String,
     shard: usize,
+    /// A followed copy's seal, under the followed lock, rather than a
+    /// held shard's.
+    followed: bool,
     ticket: crate::shard::SealTicket,
 }
 
 impl SealJob {
     pub fn describe(&self) -> String {
-        format!("seal of shard {} of `{}`: {:?}", self.shard, self.collection, self.ticket)
+        format!(
+            "seal of {}shard {} of `{}`: {:?}",
+            if self.followed { "the followed copy of " } else { "" },
+            self.shard,
+            self.collection,
+            self.ticket
+        )
     }
 }
 
@@ -8802,6 +8845,79 @@ fn index_uses(sel: &Select) -> Vec<(String, IndexUse)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A followed copy's seals are the background sealer's as much as a
+    /// held shard's: frozen by the ship, reserved, built and installed
+    /// off the ship lock -- never built inline under it.
+    #[test]
+    fn a_followed_copys_seal_is_reserved_built_and_installed_by_the_sealer() {
+        use crate::replication::{ShipItem, SHIP_INSERT};
+        let dir = std::env::temp_dir().join(format!("celastro-fseal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        opts.thresholds.max_bytes = 64;
+        opts.statement_deadline_ms = Some(500);
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.set_background_seal(true);
+        // The shard on another node, followed by this one: the map says
+        // so, and `ensure_followed` makes the copy.
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![Tablet {
+                node: "tcp://127.0.0.1:2".into(),
+                followers: vec!["tcp://127.0.0.1:1".into()],
+                ..Default::default()
+            }],
+        );
+        db.ensure_followed("items").unwrap();
+        let followed = db.followed();
+        assert!(followed.lock().unwrap().contains_key(&("items".to_string(), 0)), "no copy");
+        let mut built = 0;
+        for batch in 0..6u64 {
+            let items: Vec<ShipItem> = (0..40u64)
+                .map(|i| ShipItem {
+                    kind: SHIP_INSERT,
+                    key: format!("k{:04}", batch * 40 + i),
+                    ts: 1_000 + batch * 40 + i,
+                    doc: Some(
+                        crate::json::parse(&format!(
+                            r#"{{"id":"k{:04}","n":{}}}"#,
+                            batch * 40 + i,
+                            i
+                        ))
+                        .unwrap(),
+                    ),
+                })
+                .collect();
+            followed
+                .lock()
+                .unwrap()
+                .get_mut(&("items".to_string(), 0))
+                .unwrap()
+                .shard
+                .apply_shipped(&items)
+                .unwrap();
+            // The sealer's turn, as the maintenance thread takes it.
+            while let Some(job) = db.seal_reserve() {
+                assert!(job.describe().contains("followed copy"), "{}", job.describe());
+                let b = Db::seal_build(&job).unwrap();
+                assert!(db.seal_install(job, b).unwrap());
+                built += 1;
+            }
+        }
+        assert!(built >= 3, "the sealer built {built} seals of the copy");
+        let g = followed.lock().unwrap();
+        let copy = &g.get(&("items".to_string(), 0)).unwrap().shard;
+        assert!(!copy.segments.is_empty(), "the copy has no sealed segment");
+        assert_eq!(copy.num_docs(u64::MAX), 240);
+        drop(g);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A shard past the flat-segment debt makes a write wait, and the wait
     /// is counted; within the debt nothing waits.

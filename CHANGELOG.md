@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.5 — 2026-09-20
+
+**A followed copy's seals go to the background sealer.** A copy
+froze its seals as a held shard does, but the sealer reserved only
+held shards, so a copy's third seal was built inline under the ship
+lock: fourteen to twenty-seven seconds on the two-datacentre run,
+every acknowledgement waiting on that copy with it, and the seed's
+carries running out their deadline behind it. The sealer reserves,
+builds and installs the copies' seals now, off the lock.
+
 ## 0.63.4 — 2026-09-20
 
 **A shard's remaining copies stay in the holder's region.** With
