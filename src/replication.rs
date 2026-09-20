@@ -425,34 +425,65 @@ impl Shipper {
                 continue;
             }
             let mut persist = false;
-            for w in work {
-                let _deadline = crate::deadline::arm(Some(10_000));
-                match w {
-                    Work::Ask(url, node) => {
-                        match node.ship_status(&self.collection, self.shard, self.term) {
-                            Ok((caught_up, at)) => {
-                                let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(f) = g.iter_mut().find(|f| f.url == url) {
-                                    f.state = FollowerState::CatchingUp {
-                                        from: if caught_up { at } else { 0 },
-                                        upto: 0,
-                                        cursor: None,
-                                        reset: !caught_up,
-                                        done: false,
-                                    };
-                                    f.last_error = None;
-                                    f.backoff = Duration::from_millis(200);
+            // Every follower's call at once, each on a thread of its own:
+            // sent in turn, a follower away held the round for its
+            // deadline, and under quorum the live follower's confirmation
+            // -- the write's acknowledgement -- waited those ten seconds.
+            enum Done {
+                Asked(String, Result<(bool, Timestamp)>),
+                Sent(String, usize, Result<(bool, Timestamp)>),
+            }
+            let this: &Shipper = &self;
+            let done: Vec<Done> = std::thread::scope(|scope| {
+                let handles: Vec<_> = work
+                    .into_iter()
+                    .map(|w| {
+                        scope.spawn(move || {
+                            let _deadline = crate::deadline::arm(Some(10_000));
+                            match w {
+                                Work::Ask(url, node) => Done::Asked(
+                                    url,
+                                    node.ship_status(&this.collection, this.shard, this.term),
+                                ),
+                                Work::Send(url, node, items) => {
+                                    let plain: Vec<&ShipItem> =
+                                        items.iter().map(|i| i.as_ref()).collect();
+                                    Done::Sent(
+                                        url,
+                                        items.len(),
+                                        node.ship(&this.collection, this.shard, this.term, &plain),
+                                    )
                                 }
                             }
-                            Err(e) => {
-                                self.note_error(&url, &e);
-                                self.cv.notify_all();
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("a shipper's call panicked")).collect()
+            });
+            for d in done {
+                match d {
+                    Done::Asked(url, status) => match status {
+                        Ok((caught_up, at)) => {
+                            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                                f.state = FollowerState::CatchingUp {
+                                    from: if caught_up { at } else { 0 },
+                                    upto: 0,
+                                    cursor: None,
+                                    reset: !caught_up,
+                                    done: false,
+                                };
+                                f.last_error = None;
+                                f.backoff = Duration::from_millis(200);
                             }
                         }
-                    }
-                    Work::Send(url, node, items) => {
-                        let plain: Vec<&ShipItem> = items.iter().map(|i| i.as_ref()).collect();
-                        match node.ship(&self.collection, self.shard, self.term, &plain) {
+                        Err(e) => {
+                            self.note_error(&url, &e);
+                            self.cv.notify_all();
+                        }
+                    },
+                    Done::Sent(url, sent, answer) => {
+                        match answer {
                             Ok((caught_up, at)) => {
                                 let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(f) = g.iter_mut().find(|f| f.url == url) {
@@ -461,7 +492,7 @@ impl Shipper {
                                     } else {
                                         &mut f.catchup
                                     };
-                                    for _ in 0..items.len() {
+                                    for _ in 0..sent {
                                         queue.pop_front();
                                     }
                                     f.acked = f.acked.max(at);

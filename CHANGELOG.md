@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.1 — 2026-09-20
+
+**The shipper reaches every follower at once.** It sent to its
+followers in turn, so a follower away held the round for its
+ten-second deadline before the live follower was sent anything, and
+under quorum the live follower's confirmation is the write's
+acknowledgement: on the `regions` drill the first write after the
+minority region was cut off was acknowledged sixteen seconds later.
+Each follower's call runs on a thread of its own now; the write after
+a cut is acknowledged as fast as the live copy answers.
+
 ## 0.63.0 — 2026-09-20
 
 **Regions, and a quorum acknowledgement (HA2, steps 1 and 2).** A node
