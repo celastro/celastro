@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.2 — 2026-09-20
+
+**A pooled connection idle for ten seconds is asked a hello before its
+next call.** On five real nodes, every node restarted, the coordinators'
+pooled connections to the restarted peers were half-open: a write into
+one succeeded and the read waited out the statement deadline, and every
+concurrent call to that peer queued behind it -- a fan-out that stalled
+thirty seconds on an idle cluster, point lookups timing out at eight
+workers. The hello costs a round trip once per idle connection and,
+when it fails within two seconds, a redial.
+
 ## 0.58.1 — 2026-09-20
 
 **The steward renews leases on a thread of its own.** The renewals rode

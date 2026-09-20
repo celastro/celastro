@@ -97,6 +97,10 @@ fn within_deadline(d: Duration) -> Duration {
 /// cluster's DNS has cached as absent (thirty seconds on kube-dns), and is
 /// not meant to: a dead node has to fail statements, not stall them.
 const DIAL_RETRY: Duration = Duration::from_secs(2);
+/// A pooled connection idle longer than this is asked a hello before it
+/// carries a call, within `REVALIDATE_TIMEOUT`.
+const POOL_REVALIDATE: Duration = Duration::from_secs(10);
+const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the listener is waited on before `stop` and the shutdown flag
 /// are read again; a connection ends the wait at once (`signal::wait_readable`).
 const ACCEPT_WAIT: Duration = Duration::from_millis(100);
@@ -623,6 +627,13 @@ pub struct Node {
     /// it fail at once instead of each retrying for the whole window: a
     /// dead node costs a statement one window, not one per call it makes.
     dial_failed: Mutex<Option<Instant>>,
+    /// When the pooled connection last carried a call: one idle longer
+    /// than `POOL_REVALIDATE` is asked a hello before the next call, so a
+    /// peer that restarted meanwhile -- the old socket half-open, a write
+    /// into it succeeding and a read waiting out the deadline -- costs a
+    /// short hello and a redial, not a deadline for every call queued
+    /// behind it.
+    last_used: Mutex<Instant>,
     /// The newest catalog format the peer said it reads, from its hello;
     /// zero until then.
     peer_format: std::sync::atomic::AtomicU8,
@@ -698,6 +709,7 @@ impl Node {
             stream: Mutex::new(None),
             tls,
             dial_failed: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
             peer_format: std::sync::atomic::AtomicU8::new(0),
             max_epoch: std::sync::atomic::AtomicU64::new(0),
             conn_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -821,6 +833,24 @@ impl Node {
         if guard.is_some() && conn > 0 && conn < self.max_epoch.load(Ordering::Relaxed) {
             *guard = None;
         }
+        let idle = self.last_used.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+        if call != Call::Hello && idle > POOL_REVALIDATE {
+            if let Some(s) = guard.as_mut() {
+                let fresh = s
+                    .set_read_timeout(Some(within_deadline(REVALIDATE_TIMEOUT)))
+                    .and_then(|_| {
+                        write_frame(s, &self.request(Call::Hello, "", 0, &[]))?;
+                        read_frame(s)
+                    })
+                    .ok()
+                    .and_then(|resp| decode_response(resp).ok())
+                    .and_then(|b| self.decode_hello(&b).ok())
+                    .is_some();
+                if !fresh {
+                    *guard = None;
+                }
+            }
+        }
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -880,7 +910,10 @@ impl Node {
                 .and_then(|_| write_frame(s, &req))
                 .and_then(|_| read_frame(s));
             match r {
-                Ok(resp) => return decode_response(resp),
+                Ok(resp) => {
+                    *self.last_used.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                    return decode_response(resp);
+                }
                 Err(e) => {
                     *guard = None;
                     let timed_out = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);

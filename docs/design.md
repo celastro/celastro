@@ -1542,6 +1542,17 @@ adopts one into another instance the same way. No `gc_horizon` is pinned:
 the entry that planned this expected to need one, but a handle's `Arc` is
 what keeps a file, and the files are what is copied.
 
+**A pooled connection is asked a hello after ten idle seconds.** The
+five-node suite, every node restarted, found the coordinators' pooled
+connections to the restarted peers half-open: a write into one
+succeeded and the read waited out the statement deadline, and since a
+pooled connection carries one call at a time, every concurrent call to
+that peer queued behind it -- a fan-out stalled thirty seconds on an
+idle cluster and point lookups timed out at eight workers. A hello
+before the first call after ten idle seconds, two seconds to answer,
+finds the dead socket and redials; the pool is still one connection
+per peer, which is the throughput limit the suite measures next.
+
 **A deployment's probes ask the database, and ready means attached.** The
 chart's probes run `celastro health` inside the pod, which asks the
 console for `/api/health` — served without the token, by decision, and
