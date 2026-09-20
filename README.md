@@ -53,30 +53,6 @@ steward when a holder stops answering. No consensus and no cross-shard
 transactions — see [What is deliberately not here](docs/design.md#what-is-deliberately-not-here).
 Releases are in [CHANGELOG.md](CHANGELOG.md).
 
-## Without Docker
-
-`cargo install celastro` puts the `celastro` command on the path (Rust
-1.75 or later, no dependencies outside `std`). It is the server, the
-client and the tools in one binary:
-
-```sh
-cat > quickstart.sql <<'EOF'
-CREATE COLLECTION notes (id TEXT PRIMARY KEY, topic TEXT);
-CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
-INSERT INTO notes VALUES ('{"id":"n1","topic":"search","body":"BM25 ranks documents by term frequency"}');
-EOF
-celastro --dir ./data run quickstart.sql     # statements from a file, no server
-celastro --dir ./data serve                  # the console on loopback; prints its URL with the token
-celastro send http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body, 'documents')"
-```
-
-`celastro --dir ./data exec "<SQL>"` runs a statement without a server,
-`EXPLAIN ANALYZE` in front of a query prints the plan that ran, and
-`celastro demo` is a guided tour in memory. Every write is on the disk
-before it is acknowledged. Two limits worth knowing early: a prefix such
-as `text_match(body, 'comp*')` expands to at most 512 dictionary terms
-and says `TRUNCATED` when cut, and `DROP` is final.
-
 ## Counting and summing
 
 ```sql
@@ -142,7 +118,7 @@ other nodes; the sections that follow have each option's details.
 
 | option | how | data | clients | notes |
 |---|---|---|---|---|
-| **one process** | `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; the quick start above |
+| **one process** | `cargo install celastro` (Rust 1.75 or later, no dependencies outside `std`), then `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; `celastro --dir ./data run quickstart.sql` runs a script with no server, `exec "<SQL>"` one statement, `demo` a guided tour in memory |
 | **a container** | `docker run ... ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **VMs** | one process per host: `serve --bind 0.0.0.0 --shard-bind 0.0.0.0`, `CELASTRO_NODE`, `CELASTRO_ATTACH`, `CELASTRO_WIRE_TOKEN`, `CELASTRO_TOKEN` | a directory per host | any node, or a balancer over them with `/api/health` as its check | [Two or more nodes](#two-or-more-nodes) |
 | **Kubernetes** | `helm install celastro chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](chart/celastro/README.md) |
@@ -157,6 +133,10 @@ rollback possible through the first days on a new release, start it with
 `CELASTRO_CATALOG_FORMAT=<previous>`, which pins the written format at
 the cost of what the newer fields carry, and lift the pin once the
 release is trusted.
+
+Two limits worth knowing early, in every shape: a prefix such as
+`text_match(body, 'comp*')` expands to at most 512 dictionary terms and
+says `TRUNCATED` when cut, and `DROP` is final.
 
 What is optional in every shape, and off until asked for: TLS on the
 console and the wire (`CELASTRO_TLS_*`), encryption at rest
