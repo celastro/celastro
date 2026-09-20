@@ -2553,13 +2553,20 @@ impl Db {
                 out.push((*n).clone());
             }
         }
-        for n in &ring {
+        // The rest from the holder's own region first, then anywhere: a
+        // majority of the copies then sits in one region and a quorum
+        // write never waits for the other datacentre. (In ring order the
+        // rest fell wherever the ring went, and four of ten shards on the
+        // two-datacentre run paid a cross-region round trip on every
+        // write.)
+        let home = self.region_of(holder);
+        let mut rest: Vec<&String> = ring.iter().copied().filter(|n| !out.contains(n)).collect();
+        rest.sort_by_key(|n| self.region_of(n) != home);
+        for n in rest {
             if out.len() + 1 >= replicas {
                 break;
             }
-            if !out.contains(n) {
-                out.push((*n).clone());
-            }
+            out.push(n.clone());
         }
         out
     }

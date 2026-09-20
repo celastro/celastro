@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.4 — 2026-09-20
+
+**A shard's remaining copies stay in the holder's region.** With
+`regions = 2` the first follower comes from the other region, as
+before; the rest now come from the holder's own region before any
+other, so a majority of the copies sits in one datacentre and a
+quorum write never waits for the other. In ring order the rest fell
+wherever the ring went, and four of ten shards on the two-datacentre
+run paid a cross-region round trip on every write. `ALTER COLLECTION
+... SET (regions = n)` re-plans an existing collection.
+
 ## 0.63.3 — 2026-09-20
 
 **A follower's call is its own, not a round's.** 0.63.2 still joined
