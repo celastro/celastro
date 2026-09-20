@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.62.4 — 2026-09-20
+
+**The elector carries what the answers make.** The votes come after
+the pre-votes are granted, and the first heartbeats after the votes:
+sends the machine makes while the answers are fed back. The elector
+carried only the sends of a tick and dropped those, so on a cluster
+the pre-votes were granted and the votes never asked -- no steward,
+ever, since 0.62.2, while the machine's own tests (whose harness
+delivers everything) passed. The answers' sends go out in turn now, a
+few rounds at most.
+
 ## 0.62.3 — 2026-09-20
 
 **The pre-vote's ask leaves the timeout alone.** 0.62.2 counted a
