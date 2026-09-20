@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.61.1 — 2026-09-20
+
+**The steward promotes nothing until the lost holder's lease has run
+out.** It promoted after two missed sweeps -- twenty seconds into a
+sixty-second lease -- so a holder cut off from the steward rather than
+stopped kept taking writes under a lease that was still good while the
+new holder took writes too, and what the old one took meanwhile was
+cut at its demotion. Nothing the drills did produced it: they stop the
+process. The steward now waits `CELASTRO_LEASE_SECS` from its last
+renewal to that holder and from its own start (a lease the previous
+process at its address granted is still good), and says so in the log
+(`failover_waits_for_lease`, with the seconds left). A failover is a
+lease long at least; the drills set the lease to ten seconds.
+
 ## 0.61.0 — 2026-09-20
 
 **A plain `count(*)` is the holders' counts summed.** `SELECT count(*)

@@ -1625,6 +1625,18 @@ away, writes on the holder alone, loses the holder, promotes the
 follower, brings the holder back and promotes it again: it answers
 the rows the other had and none of the ten nobody confirmed.
 
+**The steward waits out the lease before it promotes (0.61.1).** The
+lease is what stops a holder that is cut off rather than dead: it
+refuses writes once the lease runs out. The steward promoted a
+follower after two missed sweeps, well inside the lease, so for the
+rest of it two holders took writes and the old one's were cut at its
+demotion. The steward keeps when it last renewed each node's lease
+and when it started, and promotes nothing for a shard until a lease
+has passed by both counts (`serve::Grants`); the wait is logged. This
+is the invariant the election (HA1-3) builds on: a new steward waits
+a lease after its election before it promotes, and an old one stops
+renewing within half a lease of losing its majority.
+
 **A plain `count(*)` is counted, not scanned (0.61.0).** With no
 predicate, group or key prefix the coordinator asks each holder for
 its shard's live count at the statement's instant (`Call::Count`, the

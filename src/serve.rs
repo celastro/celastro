@@ -545,6 +545,7 @@ impl Server {
         // worker takes the next connection the moment it is free.
         let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(self.max_connections);
         let rx = Mutex::new(rx);
+        let grants = Grants::new();
         std::thread::scope(|scope| {
             if server.auto_compact {
                 // The thread that builds seals off the lock exists, so a
@@ -554,12 +555,12 @@ impl Server {
                 scope.spawn(move || maintenance(db, stop));
             }
             if let Some(every) = reconcile_interval() {
-                let stop = &stop;
-                scope.spawn(move || reconciler(db, stop, every));
+                let (stop, grants) = (&stop, &grants);
+                scope.spawn(move || reconciler(db, stop, every, grants));
             }
             if read(db).auto_failover() {
-                let stop = &stop;
-                scope.spawn(move || lease_renewer(db, stop));
+                let (stop, grants) = (&stop, &grants);
+                scope.spawn(move || lease_renewer(db, stop, grants));
             }
             // A pool of `max_connections` workers, started once: a thread
             // per connection cost a clone and a fresh stack per request --
@@ -1579,7 +1580,55 @@ fn reconcile_interval() -> Option<Duration> {
 /// Its own thread, because a peer that is unreachable costs a connect
 /// timeout, and a sweep over many such peers must delay no compaction.
 /// Dialled outside the lock; the lock is taken to fold one catalog in.
-fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
+/// What the steward has granted: when this process started acting as
+/// one, and when it last renewed each node's lease. A promotion waits
+/// until the holder's lease has run out by both counts -- a holder that
+/// is partitioned rather than dead keeps taking writes under a lease
+/// that has not, and a lease the previous steward process at this
+/// address granted is still good for a whole `lease_secs` after start.
+/// Without the wait the five-node suite's steward promoted after two
+/// missed sweeps, twenty seconds into a sixty-second lease: two writers
+/// for forty seconds, and what the old one took cut at its demotion.
+pub(crate) struct Grants {
+    since: Instant,
+    last: Mutex<std::collections::BTreeMap<String, Instant>>,
+}
+
+impl Grants {
+    fn new() -> Grants {
+        Grants::starting_at(Instant::now())
+    }
+
+    fn starting_at(since: Instant) -> Grants {
+        Grants { since, last: Mutex::new(std::collections::BTreeMap::new()) }
+    }
+
+    /// A renewal reached `node` now.
+    fn note(&self, node: &str) {
+        self.last
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(node.to_string(), Instant::now());
+    }
+
+    /// How much longer `holder`'s lease may be good for, or none once a
+    /// promotion may go ahead: `lease` since this steward started, and
+    /// `lease` since its last renewal to the holder.
+    fn promotion_wait(&self, holder: &str, lease: Duration, now: Instant) -> Option<Duration> {
+        let last = self.last.lock().unwrap_or_else(|p| p.into_inner()).get(holder).copied();
+        let mut left = lease.saturating_sub(now.saturating_duration_since(self.since));
+        if let Some(at) = last {
+            left = left.max(lease.saturating_sub(now.saturating_duration_since(at)));
+        }
+        if left.is_zero() {
+            None
+        } else {
+            Some(left)
+        }
+    }
+}
+
+fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration, grants: &Grants) {
     let mut last = Instant::now();
     // Sweeps in a row a peer has not answered, for the steward's failover.
     let mut missed: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
@@ -1628,7 +1677,7 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
             let e = missed.entry(url.clone()).or_insert(0);
             *e = if answered.contains(url) { 0 } else { e.saturating_add(1) };
         }
-        steward_sweep(db, &peers, &answered, &missed);
+        steward_sweep(db, &peers, &answered, &missed, grants);
         for (url, (hello, theirs)) in answers {
             if stop.load(AtomicOrdering::Acquire) {
                 return;
@@ -1676,7 +1725,7 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
 /// with it -- a sweep under a load ran past the lease, and every holder
 /// refused writes for a lease the steward was late to renew -- so they
 /// no longer share its clock.
-fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool) {
+fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
     loop {
         let (is_steward, me, secs, peers) = {
             let g = read(db);
@@ -1693,11 +1742,12 @@ fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool) {
                     return;
                 }
                 let _deadline = crate::deadline::arm(Some(5_000));
-                if let Err(e) = node.lease(&me) {
-                    crate::log::warn(
+                match node.lease(&me) {
+                    Ok(()) => grants.note(url),
+                    Err(e) => crate::log::warn(
                         "lease_not_renewed",
                         &[("node", url.clone()), ("error", e.to_string())],
-                    );
+                    ),
                 }
             }
         }
@@ -1721,14 +1771,16 @@ fn steward_sweep(
     peers: &[(String, Arc<crate::wire::Node>)],
     answered: &[String],
     missed: &std::collections::BTreeMap<String, u32>,
+    grants: &Grants,
 ) {
-    let (is_steward, me, auto, plan) = {
+    let (is_steward, me, auto, plan, lease) = {
         let g = read(db);
         (
             g.is_steward(),
             g.node().map(String::from).unwrap_or_default(),
             g.auto_failover(),
             g.failover_plan(answered),
+            Duration::from_secs(g.lease_secs()),
         )
     };
     if !is_steward || !auto {
@@ -1737,6 +1789,20 @@ fn steward_sweep(
     for (collection, shard, term, followers) in plan {
         let holder = read(db).holder_of(&collection, shard).unwrap_or_default();
         if missed.get(&holder).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        // Not before the holder's lease has run out: a holder cut off
+        // rather than dead is still taking writes under it.
+        if let Some(left) = grants.promotion_wait(&holder, lease, Instant::now()) {
+            crate::log::warn(
+                "failover_waits_for_lease",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("holder", holder.clone()),
+                    ("seconds_left", left.as_secs().to_string()),
+                ],
+            );
             continue;
         }
         // The follower with the most recent copy, among those that answer;
@@ -2467,6 +2533,30 @@ fn text_json(kind: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A promotion waits out the lease: from the steward's start, and
+    /// from its last renewal to the holder, whichever is later.
+    #[test]
+    fn a_promotion_waits_until_the_holders_lease_has_run_out() {
+        use super::Grants;
+        use std::time::{Duration, Instant};
+        let lease = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let g = Grants::starting_at(t0);
+        // Just started: nothing may be promoted for a whole lease, granted
+        // or not -- the previous process at this address may have granted.
+        let w = g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(20)).unwrap();
+        assert!(w > Duration::from_secs(39) && w <= Duration::from_secs(40), "{w:?}");
+        assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(61)).is_none());
+        // Granted at +50: the holder's lease runs to +110.
+        g.last.lock().unwrap().insert("tcp://h:1".into(), t0 + Duration::from_secs(50));
+        let w = g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(70)).unwrap();
+        assert!(w > Duration::from_secs(39) && w <= Duration::from_secs(40), "{w:?}");
+        assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(110)).is_none());
+        // Another holder, never granted by this process: due once the
+        // process is a lease old.
+        assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(70)).is_none());
+    }
+
     /// The metrics page names every counter once, typed, and counts what
     /// the database holds per collection; a statement run through the
     /// console moves the counters.
