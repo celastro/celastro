@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.62.1 — 2026-09-20
+
+**The steward's heartbeats reach every peer at once.** Sent in turn,
+a peer that did not answer (a name not yet resolving at start) held
+the heartbeat to the others for its three-second deadline, past the
+followers' timeout, and the group re-elected itself every timeout --
+twelve terms in three minutes on the first drill. Votes and
+heartbeats go out to every peer in parallel now, each with a deadline
+of a quarter lease at most.
+
 ## 0.62.0 — 2026-09-20
 
 **The steward by election.** `CELASTRO_STEWARDS=tcp://a:2352,tcp://b:2352,tcp://c:2352`

@@ -1793,34 +1793,49 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
             continue;
         }
         let peers = read(db).peers();
-        let mut answers: Vec<(String, Msg)> = Vec::new();
-        for (to, msg) in sends {
-            if stop.load(AtomicOrdering::Acquire) {
-                return;
-            }
-            let Some((_, node)) = peers.iter().find(|(u, _)| *u == to) else { continue };
-            let _deadline = crate::deadline::arm(Some(3_000));
-            match msg {
-                Msg::Vote { term, candidate } => {
-                    // A vote that does not come back is a vote not given.
-                    if let Ok((granted, t)) = node.vote(&me, term, &candidate) {
-                        answers.push((to, Msg::VoteAnswer { term: t, granted }));
-                    }
-                }
-                Msg::Heartbeat { term } => match node.lease(&me, term) {
-                    Ok((accepted, t)) => {
-                        if accepted {
-                            grants.note(&to);
+        // Every peer at once: one that does not answer must not hold the
+        // heartbeat to the others past their timeout -- sent in turn, a
+        // peer whose name did not resolve yet cost the rest three seconds
+        // each round, and the group re-elected itself every timeout.
+        let answers: Vec<(String, Msg)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = sends
+                .into_iter()
+                .filter_map(|(to, msg)| {
+                    let (_, node) = peers.iter().find(|(u, _)| *u == to)?;
+                    let (node, me, grants) = (node.clone(), me.clone(), grants);
+                    Some(scope.spawn(move || {
+                        let _deadline = crate::deadline::arm(Some((secs.max(1) * 250).min(3_000)));
+                        match msg {
+                            Msg::Vote { term, candidate } => {
+                                // A vote that does not come back is a vote not given.
+                                node.vote(&me, term, &candidate)
+                                    .ok()
+                                    .map(|(granted, t)| (to, Msg::VoteAnswer { term: t, granted }))
+                            }
+                            Msg::Heartbeat { term } => match node.lease(&me, term) {
+                                Ok((accepted, t)) => {
+                                    if accepted {
+                                        grants.note(&to);
+                                    }
+                                    Some((to, Msg::HeartbeatAnswer { term: t.max(term), accepted }))
+                                }
+                                Err(e) => {
+                                    crate::log::warn(
+                                        "lease_not_renewed",
+                                        &[("node", to.clone()), ("error", e.to_string())],
+                                    );
+                                    None
+                                }
+                            },
+                            _ => None,
                         }
-                        answers.push((to, Msg::HeartbeatAnswer { term: t.max(term), accepted }));
-                    }
-                    Err(e) => crate::log::warn(
-                        "lease_not_renewed",
-                        &[("node", to.clone()), ("error", e.to_string())],
-                    ),
-                },
-                _ => {}
-            }
+                    }))
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+        });
+        if stop.load(AtomicOrdering::Acquire) {
+            return;
         }
         let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
