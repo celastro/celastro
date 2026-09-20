@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.4 — 2026-09-20
+
+**Eight connections to a peer, and a call waits for one only within
+its deadline.** One connection carried every call to a peer, one call
+at a time, behind a lock without a deadline: on five real nodes under
+thirty-two concurrent lookups the calls queued on it for far longer
+than any of them took -- a slow scan ahead of a point lookup's counters
+call, and the wait for the lock not counted against the statement's
+budget -- and the statements went past their deadlines waiting for a
+connection. A node now keeps eight connections to each peer; a call
+takes the first free one or waits for one within its deadline and is
+refused naming the wait.
+
 ## 0.58.3 — 2026-09-20
 
 **The periodic work never queues for the lock.** On five real nodes,

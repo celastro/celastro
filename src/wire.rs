@@ -101,6 +101,18 @@ const DIAL_RETRY: Duration = Duration::from_secs(2);
 /// carries a call, within `REVALIDATE_TIMEOUT`.
 const POOL_REVALIDATE: Duration = Duration::from_secs(10);
 const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Connections a node keeps to one peer.
+const POOL_SLOTS: usize = 8;
+
+/// One pooled connection: the stream when dialled, and when it last
+/// carried a call -- one idle longer than `POOL_REVALIDATE` is asked a
+/// hello before the next call, so a peer that restarted meanwhile (the
+/// old socket half-open, a write into it succeeding and a read waiting
+/// out the deadline) costs a short hello and a redial.
+struct Slot {
+    stream: Option<Box<dyn Stream>>,
+    last_used: Instant,
+}
 /// How long the listener is waited on before `stop` and the shutdown flag
 /// are read again; a connection ends the wait at once (`signal::wait_readable`).
 const ACCEPT_WAIT: Duration = Duration::from_millis(100);
@@ -619,7 +631,11 @@ pub struct Node {
     url: String,
     addr: String,
     token: String,
-    stream: Mutex<Option<Box<dyn Stream>>>,
+    /// The pooled connections, one call at a time each: a call takes the
+    /// first free slot, or waits for one within its deadline. One
+    /// connection carried every call once, and under concurrent fan-out
+    /// the calls queued on its lock for far longer than any of them took.
+    slots: Vec<Mutex<Slot>>,
     /// What the connection is wrapped in and verified by, when the process
     /// has certificates; plain TCP otherwise.
     tls: Option<Arc<Tls>>,
@@ -627,13 +643,7 @@ pub struct Node {
     /// it fail at once instead of each retrying for the whole window: a
     /// dead node costs a statement one window, not one per call it makes.
     dial_failed: Mutex<Option<Instant>>,
-    /// When the pooled connection last carried a call: one idle longer
-    /// than `POOL_REVALIDATE` is asked a hello before the next call, so a
-    /// peer that restarted meanwhile -- the old socket half-open, a write
-    /// into it succeeding and a read waiting out the deadline -- costs a
-    /// short hello and a redial, not a deadline for every call queued
-    /// behind it.
-    last_used: Mutex<Instant>,
+
     /// The newest catalog format the peer said it reads, from its hello;
     /// zero until then.
     peer_format: std::sync::atomic::AtomicU8,
@@ -706,10 +716,12 @@ impl Node {
             url: url.to_string(),
             addr,
             token,
-            stream: Mutex::new(None),
+            slots: (0..POOL_SLOTS)
+                .map(|_| Mutex::new(Slot { stream: None, last_used: Instant::now() }))
+                .collect(),
             tls,
             dial_failed: Mutex::new(None),
-            last_used: Mutex::new(Instant::now()),
+
             peer_format: std::sync::atomic::AtomicU8::new(0),
             max_epoch: std::sync::atomic::AtomicU64::new(0),
             conn_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -826,14 +838,33 @@ impl Node {
     fn call(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Result<Vec<u8>> {
         let deadline_ms = crate::deadline::remaining_ms();
         let req = self.request(call, collection, shard, body);
-        let mut guard = self.stream.lock().unwrap_or_else(|p| p.into_inner());
+        // A free slot, or the wait for one within the deadline.
+        let started = Instant::now();
+        let mut slot = loop {
+            let free = self.slots.iter().find_map(|m| m.try_lock().ok());
+            if let Some(g) = free {
+                break g;
+            }
+            let waited = started.elapsed().as_millis() as u64;
+            if deadline_ms.is_some_and(|ms| waited >= ms) {
+                return Err(Error::Deadline(self.refusal(
+                    call,
+                    collection,
+                    shard,
+                    "(every connection to it busy for the whole statement deadline)",
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let guard = &mut slot.stream;
         // A pooled connection to a process an older hello has since shown to
         // be superseded is let go here; the redial below asks again.
         let conn = self.conn_epoch.load(Ordering::Relaxed);
         if guard.is_some() && conn > 0 && conn < self.max_epoch.load(Ordering::Relaxed) {
             *guard = None;
         }
-        let idle = self.last_used.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+        let idle = slot.last_used.elapsed();
+        let guard = &mut slot.stream;
         if call != Call::Hello && idle > POOL_REVALIDATE {
             if let Some(s) = guard.as_mut() {
                 let fresh = s
@@ -911,7 +942,7 @@ impl Node {
                 .and_then(|_| read_frame(s));
             match r {
                 Ok(resp) => {
-                    *self.last_used.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                    slot.last_used = Instant::now();
                     return decode_response(resp);
                 }
                 Err(e) => {
@@ -964,7 +995,11 @@ impl Node {
             let max = self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed).max(h.epoch);
             self.conn_epoch.store(h.epoch, Ordering::Relaxed);
             if h.epoch < max {
-                *self.stream.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                for m in &self.slots {
+                    if let Ok(mut g) = m.try_lock() {
+                        g.stream = None;
+                    }
+                }
             }
         }
         Ok(h)

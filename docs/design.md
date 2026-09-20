@@ -1571,8 +1571,15 @@ pooled connection carries one call at a time, every concurrent call to
 that peer queued behind it -- a fan-out stalled thirty seconds on an
 idle cluster and point lookups timed out at eight workers. A hello
 before the first call after ten idle seconds, two seconds to answer,
-finds the dead socket and redials; the pool is still one connection
-per peer, which is the throughput limit the suite measures next.
+finds the dead socket and redials. The pool was one connection per
+peer, one call at a time, behind a lock without a deadline, and the
+suite's next probe showed what that costs under concurrency: a slow
+scan ahead of a point lookup's counters call held the lookup, and the
+wait for the lock was not counted against the statement's budget, so
+thirty-two concurrent lookups went past their deadlines waiting for a
+connection. A node keeps eight connections to each peer now; a call
+takes the first free one or waits within its deadline and is refused
+naming the wait (0.58.4).
 
 **A deployment's probes ask the database, and ready means attached.** The
 chart's probes run `celastro health` inside the pod, which asks the
