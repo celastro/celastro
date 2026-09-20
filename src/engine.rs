@@ -1003,6 +1003,9 @@ pub struct Db {
     /// Each known node's region, as its hello said; this node's own
     /// under its address. Not persisted: a hello brings it back.
     regions: BTreeMap<String, String>,
+    /// The last counters each holder answered, per collection: what a
+    /// statement that does not reach a holder's shards takes for it.
+    counters_seen: Mutex<BTreeMap<(String, String), (Timestamp, u64)>>,
     /// What the last write statement wrote here, shard by shard: what its
     /// acknowledgement waits on the followers for.
     recent_writes: Vec<(String, usize, Timestamp)>,
@@ -1146,6 +1149,7 @@ impl Db {
                 dir: None,
             })),
             regions: BTreeMap::new(),
+            counters_seen: Mutex::new(BTreeMap::new()),
             clock: Arc::new(Hlc::new()),
             opts,
             dir: None,
@@ -7416,15 +7420,46 @@ impl Db {
         // partial statement's whole budget before the near shards were
         // asked, which then counted as missing too. Half to learn who is
         // there, half to read from those who are.
+        // Only the holders the statement can reach: a predicate that pins
+        // the partition key prunes to a few shards, and the counters of a
+        // holder whose shards are pruned are its last answer -- the epoch
+        // ages a little late for shards this statement never reads, and a
+        // point lookup no longer pays a round trip to every holder (across
+        // a sea, the single-shard lookup cost the sea's round trip while
+        // its own shard answered in four milliseconds).
+        let prefix = exec::partition_constraint(&coll, sel.predicate.as_ref());
+        let needed: BTreeSet<String> = tablets
+            .iter()
+            .filter(|t| !t.is_merged() && !self.is_self(&t.node))
+            .filter(|t| match &prefix {
+                Some(p) => exec::range_may_hold(Some(&(t.lo.clone(), t.hi.clone())), p),
+                None => true,
+            })
+            .map(|t| t.node.clone())
+            .collect();
         let mut conns = Vec::new();
         for url in self.holders(&sel.collection) {
-            conns.push((url.clone(), self.node_conn(&url)?));
+            let node = self.node_conn(&url)?;
+            if needed.contains(&url) {
+                conns.push((url.clone(), node));
+            } else {
+                let seen = self.counters_seen.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((t, w)) = seen.get(&(sel.collection.clone(), url.clone())) {
+                    ts = ts.max(*t);
+                    writes += w;
+                }
+                remotes.insert(url, node);
+            }
         }
         for (url, node, r) in fetch_counters(&conns, &sel.collection, partial) {
             match r {
                 Ok((t, w)) => {
                     ts = ts.max(t);
                     writes += w;
+                    self.counters_seen
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert((sel.collection.clone(), url.clone()), (t, w));
                 }
                 Err(Error::Deadline(_)) if partial => {
                     unreachable.extend(

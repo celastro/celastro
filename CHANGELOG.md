@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.63.8 — 2026-09-20
+
+**A statement asks only the holders it can reach.** Before every
+statement the coordinator asked every holder's counters, for the
+read-your-writes instant and the statistics epoch; a lookup pinned to
+one shard by its partition key paid a round trip to every holder
+anyway, and across a sea that was the sea's round trip on a lookup
+whose own shard answered in four milliseconds. The holders whose
+shards the predicate prunes away are not asked; their last answer
+stands in, so the statistics age a little late for shards the
+statement never reads. A test turns another shard's holder into a
+black hole and expects the pinned lookup to answer in its own time.
+
 ## 0.63.7 — 2026-09-20
 
 **A copy's caught-up instant survives a seal.** The ship marks a copy

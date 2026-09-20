@@ -2453,3 +2453,92 @@ fn copies_span_regions_and_a_quorum_acknowledges_with_one_follower_away() {
     }
     let _ = std::fs::remove_dir_all(&b_dir);
 }
+
+/// A statement pinned to one shard reaches that shard's holder and no
+/// other: with a holder of some other shard turned into a black hole,
+/// the lookup answers in the time its own shard takes, not in the
+/// deadline the black hole would cost -- which every statement paid,
+/// across a sea, for the counters of holders it never read.
+#[test]
+fn a_lookup_pinned_to_one_shard_asks_no_other_holder_anything() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("pin-a");
+    let b = Node::start("pin-b");
+    let c = Node::start("pin-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    // Which node holds the t0 shard, and which holds another: the
+    // lookup goes through the first, the black hole replaces the second.
+    let holder_of = |n: &Node, shard: usize| n.local_shards("items").contains(&shard);
+    let (asker, hole) =
+        if holder_of(&a, 0) { (&a, if holder_of(&b, 1) { &b } else { &c }) } else { (&b, &a) };
+    let asker_url = asker.url.clone();
+    let hole_port: u16 = hole.url.rsplit(':').next().unwrap().parse().unwrap();
+    let hole_dir = hole.dir.clone();
+    // A lookup before: answers.
+    let _ = asker
+        .db
+        .read()
+        .unwrap()
+        .read("SELECT id FROM items WHERE tenant = 't0' AND id = 'doc-000' LIMIT 1")
+        .unwrap();
+    // The other holder gone, its port a listener that never answers.
+    let keep: Vec<&Node> = [&a, &b, &c].into_iter().filter(|n| n.url != hole.url).collect();
+    let _ = keep;
+    let hole_url = hole.url.clone();
+    let nodes = [a, b, c];
+    let mut kept = Vec::new();
+    for n in nodes {
+        if n.url == hole_url {
+            drop(n);
+        } else {
+            kept.push(n);
+        }
+    }
+    settle();
+    let hole = std::net::TcpListener::bind(("127.0.0.1", hole_port)).unwrap();
+    hole.set_nonblocking(true).unwrap();
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding = {
+        let plug = plug.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    held.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(held);
+        })
+    };
+    let asker = kept.iter().find(|n| n.url == asker_url).unwrap();
+    asker.db.write().unwrap().opts.statement_deadline_ms = Some(4000);
+    let t0 = std::time::Instant::now();
+    let r = asker
+        .db
+        .read()
+        .unwrap()
+        .read("SELECT id FROM items WHERE tenant = 't0' AND id = 'doc-000' LIMIT 1")
+        .unwrap();
+    let took = t0.elapsed();
+    assert!(matches!(r, Outcome::Rows(ref q) if q.rows.len() == 1), "{r:?}");
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "the pinned lookup waited on the black hole: {took:?}"
+    );
+    plug.store(false, Ordering::Relaxed);
+    holding.join().unwrap();
+    for n in kept {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&hole_dir);
+}
