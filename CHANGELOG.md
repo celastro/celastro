@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.5 — 2026-09-20
+
+**The catalog fetch and `SHOW HEALTH` take the shared lock.** The
+sweep's catalog fetch, a read, took the write lock on the peer it
+asked, so every node queued a writer every few seconds; and `SHOW
+HEALTH` dialled every peer under the write lock, holding every reader
+on the node for as long as a peer took to answer. Both are reads now.
+With 0.58.3 and 0.58.4 this is what the five-node suite's stalls came
+to: a queued writer somewhere, readers behind it, and a statement
+holding its read lock across the fan-out on another node.
+
 ## 0.58.4 — 2026-09-20
 
 **Eight connections to a peer, and a call waits for one only within

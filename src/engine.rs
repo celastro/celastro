@@ -5736,7 +5736,7 @@ impl Db {
     /// something and takes `&mut self`.
     pub fn is_read(stmt: &Statement) -> bool {
         match stmt {
-            Statement::Select(_) => true,
+            Statement::Select(_) | Statement::ShowHealth => true,
             Statement::Explain { inner, .. } | Statement::Local(inner) => Self::is_read(inner),
             _ => false,
         }
@@ -5762,6 +5762,9 @@ impl Db {
     fn run_read(&self, stmt: Statement, sql: &str, params: &[Value]) -> Result<Outcome> {
         match stmt {
             Statement::Select(sel) => Ok(Outcome::Rows(self.run_select(&sel, sql, params, false)?)),
+            // Dials every peer: under the write lock that held every
+            // reader on the node for as long as a peer took to answer.
+            Statement::ShowHealth => Ok(Outcome::Ack(self.show_health())),
             Statement::Local(inner) => self.run_read(*inner, sql, params),
             Statement::Explain { analyze, inner } => match *inner {
                 Statement::Select(sel) => {

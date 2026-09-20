@@ -1922,10 +1922,15 @@ fn handle(
         out.push(WIRE_VERSION_MAX);
         return Ok(out);
     }
+    // A read takes the shared lock; the catalog fetch of every sweep is
+    // one, and taken as a write it queued a writer on every node every
+    // few seconds -- which held every reader behind it, and across nodes
+    // closed the cycles the design notes describe.
     let read_call = matches!(
         call,
         Call::Hello
             | Call::Counters
+            | Call::Catalog
             | Call::TermStats
             | Call::PrefixTerms
             | Call::Candidates
