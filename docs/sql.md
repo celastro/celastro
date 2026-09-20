@@ -217,7 +217,7 @@ BY`, `LIMIT` and `OFFSET` then apply to the groups. Each shard folds its
 own rows and the coordinator merges, so a count moves no document.
 
 ```sql
-SELECT count(*) FROM notes;
+SELECT count(*) FROM notes;          -- no predicate: the holders' live counts summed, no scan
 SELECT topic, count(*) AS n, sum(words) AS words, avg(words) AS avg_words FROM notes GROUP BY topic ORDER BY n DESC LIMIT 5;
 SELECT min(words), max(words) FROM notes WHERE words > 0;
 ```

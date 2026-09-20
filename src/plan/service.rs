@@ -159,6 +159,10 @@ pub trait ShardService {
     ) -> Result<Vec<Value>>;
     /// A document by primary key, visible at `ts`.
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>>;
+    /// The live documents at `ts`, what a plain `count(*)` sums: `None`
+    /// from a holder that cannot say (one from before the call), which
+    /// the coordinator answers by scanning instead.
+    fn count(&self, ts: Timestamp) -> Result<Option<u64>>;
     /// One hop of a walk over this shard of an edge collection: the live
     /// edges leaving the frontier that the filter admits, as `(from, to)`
     /// pairs, sorted and distinct, at most `limit` per `from`, and how many
@@ -229,6 +233,10 @@ impl ShardService for Local<'_> {
     fn get(&self, key: &str, ts: Timestamp) -> Result<Option<Value>> {
         self.shard.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.shard.get(key, ts)
+    }
+
+    fn count(&self, ts: Timestamp) -> Result<Option<u64>> {
+        Ok(Some(self.shard.num_docs(ts) as u64))
     }
 
     fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {

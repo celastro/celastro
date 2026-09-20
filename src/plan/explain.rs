@@ -79,6 +79,9 @@ pub struct ShardExplain {
     pub index: usize,
     pub pruned: bool,
     pub prune_reason: Option<String>,
+    /// Answered from the shard's live count, not scanned: a plain
+    /// `count(*)`.
+    pub counted: bool,
     pub manifest_version: u64,
     pub units: Vec<UnitExplain>,
     pub micros: u128,
@@ -162,7 +165,8 @@ pub struct HopExplain {
 impl Explain {
     pub fn render(&self) -> String {
         let mut o = String::new();
-        let shards_scanned = self.shards.iter().filter(|s| !s.pruned).count();
+        let shards_counted = self.shards.iter().filter(|s| s.counted).count();
+        let shards_scanned = self.shards.iter().filter(|s| !s.pruned && !s.counted).count();
         o.push_str(&format!(
             "Query plan  (snapshot ts={}, limit={}, k'={}, deadline={}{})\n",
             self.snapshot_ts,
@@ -175,10 +179,15 @@ impl Explain {
             if self.exact_mode { ", EXACT MODE" } else { "" }
         ));
         o.push_str(&format!(
-            "  scatter: {} of {} shard(s) scanned, {} pruned by partition key\n",
+            "  scatter: {} of {} shard(s) scanned, {} pruned by partition key{}\n",
             shards_scanned,
             self.shards.len(),
-            self.shards.len() - shards_scanned
+            self.shards.len() - shards_scanned - shards_counted,
+            if shards_counted > 0 {
+                format!(", {shards_counted} counted, not scanned")
+            } else {
+                String::new()
+            }
         ));
         o.push_str(&format!(
             "  term statistics: {}\n",
@@ -275,6 +284,13 @@ pub fn render_shard(s: &ShardExplain) -> String {
             "  shard {}: PRUNED ({})\n",
             s.index,
             s.prune_reason.as_deref().unwrap_or("out of key range")
+        ));
+        return o;
+    }
+    if s.counted {
+        o.push_str(&format!(
+            "  shard {} (manifest v{}): counted, not scanned\n",
+            s.index, s.manifest_version
         ));
         return o;
     }

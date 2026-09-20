@@ -291,6 +291,10 @@ impl ShardService for SimShard<'_> {
         self.deliver("get", |s| s.get(key, ts))
     }
 
+    fn count(&self, ts: Timestamp) -> Result<Option<u64>> {
+        self.deliver("count", |s| s.count(ts))
+    }
+
     fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
         self.deliver("expand", |s| s.expand(req))
     }

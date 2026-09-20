@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.61.0 — 2026-09-20
+
+**A plain `count(*)` is the holders' counts summed.** `SELECT count(*)
+FROM c` with no predicate, no `GROUP BY` and no key prefix asks each
+holder for its shard's live count at the statement's instant (a new
+wire call, `count`) and sums them: on the five-node suite's corpus the
+scan took 2.3 s and twenty seconds at thirty-two concurrent; the count
+is milliseconds. `EXPLAIN` says `counted, not scanned` per shard. A
+holder running a release from before this answers that it does not
+know the call, and the coordinator scans as before. Everything with a
+predicate or a group stays a scan: a shard's range holds any number of
+tenants, so `GROUP BY tenant` is not per shard.
+
 ## 0.60.0 — 2026-09-20
 
 **A holder's return no longer costs minutes; a manifest carries the

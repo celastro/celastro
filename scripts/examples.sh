@@ -183,7 +183,11 @@ run "the count is whole after the split" '"count\(\*\)":3' "$CEL" send $C "SELEC
 run "place shard (repair, here a no-op)" 'placed' "$CEL" send $A "LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:23521'"
 run "a cluster backup at one instant" 'backed up|instant|AS OF' "$CEL" send $A "BACKUP CLUSTER TO '$W/cluster-backups'"
 run "every shard has a follower" 'followed by tcp://127.0.0.1:2352' "$CEL" send $A "SHOW CATALOG notes"
-run "a write is confirmed on the follower" 'follower tcp://127.0.0.1:2352[0-9]* live' "$CEL" send $A "SHOW HEALTH"
+# Shard 1's follower in particular: the merge above reset its copy and
+# a catch-up refills it, and a copy promoted before that is done answers
+# what it has. (Matched on any live follower, this raced one run in four.)
+for _ in $(seq 1 100); do "$CEL" send $B "SHOW HEALTH" 2>/dev/null | grep -q 'shard 1 of `notes`: follower tcp://127.0.0.1:23523 live' && break; sleep 0.2; done
+run "a write is confirmed on the follower" 'shard 1 of `notes`: follower tcp://127.0.0.1:23523 live' "$CEL" send $B "SHOW HEALTH"
 kill "${NODE_PIDS[1]}"; sleep 0.5
 run "partial results when a node is gone" 'missing":\["shard 1"\]' "$CEL" send $A "SELECT count(*) FROM notes WITH (partial_results, deadline_ms = 3000)"
 run "without partial results, refused naming the node" 'did not answer|deadline' "$CEL" send $A "SELECT count(*) FROM notes WITH (deadline_ms = 2000)"

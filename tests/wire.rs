@@ -2298,3 +2298,45 @@ fn an_insert_refused_by_one_holder_says_which_rows_landed() {
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&b_dir);
 }
+
+/// A plain `count(*)` is the sum of the holders' live counts, no scan:
+/// it answers what the scanning shape answers, after deletes too, and
+/// the plan says the shards were counted rather than scanned.
+#[test]
+fn a_plain_count_is_the_shards_counts_and_answers_what_a_scan_answers() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("count-a");
+    let b = Node::start("count-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    for i in 0..60usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    for i in 0..10usize {
+        a.ack(&format!("DELETE FROM items WHERE id = 'doc-{i:03}'"));
+    }
+    let count = |n: &Node, sql: &str| {
+        let r = n.query(sql).unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    for n in [&a, &b] {
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items"), 50, "{}", n.url);
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items WHERE n >= 0"), 50, "{}", n.url);
+    }
+    let plan_of = |sql: &str| match a.exec(sql).unwrap() {
+        Outcome::Explain(t) => t,
+        other => panic!("{sql}: {other:?}"),
+    };
+    let plan = plan_of("EXPLAIN SELECT count(*) FROM items");
+    assert!(plan.contains("counted, not scanned"), "{plan}");
+    let plan = plan_of("EXPLAIN SELECT count(*) FROM items WHERE n >= 0");
+    assert!(!plan.contains("counted, not scanned"), "{plan}");
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

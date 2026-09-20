@@ -1625,6 +1625,16 @@ away, writes on the holder alone, loses the holder, promotes the
 follower, brings the holder back and promotes it again: it answers
 the rows the other had and none of the ten nobody confirmed.
 
+**A plain `count(*)` is counted, not scanned (0.61.0).** With no
+predicate, group or key prefix the coordinator asks each holder for
+its shard's live count at the statement's instant (`Call::Count`, the
+shard's `num_docs`) and sums them; `EXPLAIN` says so per shard. The
+five-node corpus scanned in 2.3 s and, at thirty-two concurrent, in
+twenty; the count is milliseconds. A holder from before the call
+answers that it does not know it, and the statement scans as before.
+The statistics were not the answer: a path's `present` counts the
+observed documents, dead rows included.
+
 **A merge reaches the followers (0.60.0).** The rows a merge absorbs
 keep their own timestamps, older than any follower's stand, so a
 catch-up from where a follower stood never carried them; and a kept

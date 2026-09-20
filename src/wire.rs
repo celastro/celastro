@@ -150,6 +150,11 @@ enum Call {
     ShipStatus = 22,
     /// The steward's lease renewal, its own address in the body.
     Lease = 23,
+    /// The live document count of one shard at an instant: what a plain
+    /// `count(*)` sums across the holders instead of scanning them. A
+    /// holder too old to know the call answers "unknown call", and the
+    /// coordinator scans as before.
+    Count = 24,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -172,6 +177,7 @@ impl Call {
             12 => Call::CreateCollection,
             13 => Call::Expand,
             14 => Call::Present,
+            24 => Call::Count,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -201,6 +207,7 @@ impl Call {
             Call::CreateCollection => "create_collection",
             Call::Expand => "expand",
             Call::Present => "present",
+            Call::Count => "count",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -1404,6 +1411,17 @@ impl ShardService for Remote {
         }
     }
 
+    fn count(&self, ts: Timestamp) -> Result<Option<u64>> {
+        let mut body = Vec::new();
+        put_ts(&mut body, ts);
+        match self.call(Call::Count, &body) {
+            Ok(b) => Ok(Some(get_u64(&b, &mut 0).ok_or_else(truncated)?)),
+            // A holder from before the call: the scan answers instead.
+            Err(e) if e.to_string().contains("unknown call") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn expand(&self, req: &ExpandRequest<'_>) -> Result<HopExpansion> {
         // The filter travels as the statement it came from: the holder
         // parses the same text with the same crate and takes the `walk`-th
@@ -1934,6 +1952,7 @@ fn handle(
             | Call::Get
             | Call::Expand
             | Call::Present
+            | Call::Count
     );
     let shared = db;
     let mut db = if read_call {
@@ -2029,7 +2048,8 @@ fn handle(
         | Call::Documents
         | Call::Get
         | Call::Expand
-        | Call::Present => {
+        | Call::Present
+        | Call::Count => {
             // Reads see the same statistics a local statement would: the
             // inferred path classes are folded in before planning, as
             // `Db::run_select` does for its own shards.
@@ -2161,6 +2181,10 @@ fn handle(
                         }
                         None => put_bool(&mut out, false),
                     }
+                }
+                Call::Count => {
+                    let ts = get_ts(body, &mut j)?;
+                    put_u64(&mut out, local.count(ts)?.unwrap_or(0));
                 }
                 Call::Expand => {
                     let sql = get_string(body, &mut j)?;

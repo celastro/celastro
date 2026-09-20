@@ -919,7 +919,72 @@ fn aggregate_select(
         ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
         missing.push(shard_name(*si));
     }
-    for shard in input.shards {
+    // A plain `count(*)` -- no predicate, no group, no prefix -- is the
+    // sum of the shards' live counts, which every holder keeps: no scan.
+    // (Ten shards of 25k documents scanned in 2.3 s, and thirty-two at
+    // once took twenty.) A holder from before the count call answers
+    // none, and the scan below answers as before, for every shard.
+    let plain_count = specs.len() == 1
+        && matches!(specs[0], (AggFunc::Count, None))
+        && sel.predicate.is_none()
+        && sel.group_by.is_none()
+        && prefix.is_none();
+    let mut counted: Option<u64> = None;
+    if plain_count {
+        let mut total = 0u64;
+        let mut every = true;
+        let mut ex_count = Vec::new();
+        let mut missing_count = Vec::new();
+        for shard in input.shards {
+            let si = shard.index();
+            if input.unreachable.contains(&si) {
+                continue;
+            }
+            if let Some(ms) = deadline::passed() {
+                if !partial {
+                    return Err(shard_deadline(si, ms));
+                }
+                ex_count.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
+                missing_count.push(shard_name(si));
+                continue;
+            }
+            match shard.count(input.ts) {
+                Ok(Some(n)) => {
+                    total += n;
+                    ex_count.push(ShardExplain {
+                        index: si,
+                        counted: true,
+                        manifest_version: shard.manifest_version(),
+                        ..Default::default()
+                    });
+                }
+                Ok(None) => {
+                    every = false;
+                    break;
+                }
+                Err(Error::Deadline(e)) => {
+                    if !partial {
+                        return Err(Error::Deadline(e));
+                    }
+                    ex_count.push(ShardExplain {
+                        index: si,
+                        timed_out: true,
+                        ..Default::default()
+                    });
+                    missing_count.push(shard_name(si));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if every {
+            counted = Some(total);
+            ex.shards.extend(ex_count);
+            missing.extend(missing_count);
+            groups.insert(String::new(), (Value::Null, vec![Value::Int(total as i64)]));
+        }
+    }
+    let scanned: &[Box<dyn ShardService + '_>] = if counted.is_some() { &[] } else { input.shards };
+    for shard in scanned {
         let si = shard.index();
         if input.unreachable.contains(&si) {
             continue;
