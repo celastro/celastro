@@ -6,6 +6,24 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.58.3 — 2026-09-20
+
+**The periodic work never queues for the lock.** On five real nodes,
+idle, thirty-two concurrent point lookups took thirty seconds each and
+a node's own health call eighteen: a lock wait, not work. A statement
+holds its coordinator's read lock while it waits on other nodes; the
+lock prefers writers, so a writer waiting on it holds every new reader
+behind it; and the replication step, the seals and the compactions
+took the write lock every second on every node. A statement on one node
+waiting on a second, whose wire reads waited behind its queued writer,
+which waited for its own statements, which waited on the first: cycles
+a deadline broke. The periodic work now tries the lock and skips the
+tick when it is busy (a built seal or compaction waits up to five
+seconds before it insists; a sweep's merge skips the peer until the
+next sweep), so no housekeeping writer ever holds a reader behind it.
+What remains is the statements' own writes, brief and lock-free of the
+network since 0.53.0.
+
 ## 0.58.2 — 2026-09-20
 
 **A pooled connection idle for ten seconds is asked a hello before its

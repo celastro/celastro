@@ -1453,7 +1453,20 @@ pub fn serve(
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    idle = db.write().unwrap_or_else(|p| p.into_inner()).replication_step() == 0;
+                    // Never queued behind readers: a writer waiting on the
+                    // lock holds every new reader behind it, and a reader
+                    // here is a statement of some coordinator's waiting on
+                    // this node -- while that coordinator's own readers wait
+                    // on this node's statements, which wait on it. Across
+                    // five nodes those waits closed cycles a deadline broke.
+                    // A busy lock is tried again in twenty milliseconds.
+                    idle = match db.try_write() {
+                        Ok(mut g) => g.replication_step() == 0,
+                        Err(std::sync::TryLockError::Poisoned(p)) => {
+                            p.into_inner().replication_step() == 0
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => false,
+                    };
                 }
             })
             .expect("a thread for the replication driver");

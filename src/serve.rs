@@ -1641,7 +1641,14 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration) {
                 }
             }
             let Ok(theirs) = theirs else { continue };
-            match write(db).reconcile_from(&url, &theirs) {
+            let Some(mut g) = write_soon(db, Duration::from_secs(2)) else {
+                crate::log::warn(
+                    "catalog_not_reconciled",
+                    &[("peer", url.clone()), ("error", "the lock was busy; next sweep".into())],
+                );
+                continue;
+            };
+            match g.reconcile_from(&url, &theirs) {
                 Ok(notes) => {
                     for note in notes {
                         COUNTERS.reconciled.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1809,20 +1816,30 @@ fn steward_sweep(
 fn maintenance_step(db: &RwLock<Db>) -> bool {
     // Followers catching up: the next chunk of each, cut under the lock,
     // shipped without it.
-    if write(db).replication_step() > 0 {
-        return true;
+    match write_soon(db, Duration::from_millis(100)) {
+        Some(mut g) => {
+            if g.replication_step() > 0 {
+                return true;
+            }
+        }
+        None => return false,
     }
     // A seal frozen by the write path first: the graph it builds is the
     // pause a statement would otherwise wait out under the lock. The guard
     // is bound and dropped on its own line: as a temporary in the `if let`
     // it lived through the build and the install, which takes the lock
     // again, and the first run of the check for this deadlocked the node.
-    let job = write(db).seal_reserve();
+    let Some(mut g) = write_soon(db, Duration::from_millis(200)) else { return false };
+    let job = g.seal_reserve();
+    drop(g);
     if let Some(job) = job {
         let what = job.describe();
         let started = Instant::now();
         match Db::seal_build(&job) {
-            Ok(built) => match write(db).seal_install(job, built) {
+            Ok(built) => match write_soon(db, Duration::from_secs(5))
+                .unwrap_or_else(|| write(db))
+                .seal_install(job, built)
+            {
                 Ok(_) => crate::log::info(
                     "sealed",
                     &[
@@ -1837,18 +1854,26 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
             },
             Err(e) => {
                 crate::log::warn("seal_failed", &[("what", what), ("error", e.to_string())]);
-                write(db).seal_requeue(job, &e);
+                write_soon(db, Duration::from_secs(5))
+                    .unwrap_or_else(|| write(db))
+                    .seal_requeue(job, &e);
                 // Not at once: a disk that is full is still full.
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
         return true;
     }
-    let Some(ticket) = write(db).compaction_reserve() else { return false };
+    let Some(mut g) = write_soon(db, Duration::from_millis(200)) else { return false };
+    let ticket = g.compaction_reserve();
+    drop(g);
+    let Some(ticket) = ticket else { return false };
     let what = ticket.describe();
     let started = Instant::now();
     match Db::compaction_build(&ticket) {
-        Ok(Some(built)) => match write(db).compaction_install(ticket, built) {
+        Ok(Some(built)) => match write_soon(db, Duration::from_secs(5))
+            .unwrap_or_else(|| write(db))
+            .compaction_install(ticket, built)
+        {
             Ok(true) => {
                 COUNTERS.compactions.fetch_add(1, AtomicOrdering::Relaxed);
                 COUNTERS
@@ -1887,6 +1912,30 @@ fn read(db: &RwLock<Db>) -> RwLockReadGuard<'_, Db> {
 /// The database for a statement that changes it: alone.
 fn write(db: &RwLock<Db>) -> RwLockWriteGuard<'_, Db> {
     db.write().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The write lock within `max`, or nothing: for the periodic work --
+/// the replication step, a seal, a compaction, a sweep's merge -- which
+/// must never queue behind the readers. A writer waiting on the lock
+/// holds every new reader behind it, and a reader here is a statement
+/// of some coordinator's waiting on this node while that coordinator's
+/// readers wait on this node's statements, which wait on it: across
+/// five nodes those waits closed cycles that only a deadline broke.
+/// Tried every millisecond; what is not done this tick is done the next.
+fn write_soon(db: &RwLock<Db>, max: Duration) -> Option<RwLockWriteGuard<'_, Db>> {
+    let until = Instant::now() + max;
+    loop {
+        match db.try_write() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= until {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 fn answer<W: Wire>(

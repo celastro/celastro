@@ -1542,6 +1542,27 @@ adopts one into another instance the same way. No `gc_horizon` is pinned:
 the entry that planned this expected to need one, but a handle's `Arc` is
 what keeps a file, and the files are what is copied.
 
+**The periodic work never queues for the lock.** The five-node suite,
+on an idle cluster, saw thirty-two concurrent point lookups take thirty
+seconds each and a node's own health call eighteen, with the CPUs idle:
+a lock wait. Three facts made it: a statement holds its coordinator's
+read lock while it waits on the other nodes' shards; the lock prefers
+writers, so one waiting on it holds every new reader behind it; and the
+replication step, the seals and the compactions took the write lock
+every second on every node. A statement on node A waits on node B's
+wire read, which waits behind B's queued writer, which waits for B's
+readers -- B's own statements, waiting on A's wire reads, behind A's
+queued writer, waiting for A's readers: the statement on A. Every node
+had such a writer every second, so under concurrent fan-out the cycles
+closed as fast as the deadline broke them. The periodic work now
+`try_write`s and skips the tick when the lock is busy (a built seal or
+compaction insists after five seconds; a sweep's merge waits two and
+skips the peer until the next sweep), so no housekeeping writer holds a
+reader behind it. The statements' own writes remain, brief and free of
+the network since 0.53.0; the read that holds the lock across the
+fan-out is the next thing to take apart, and the suite's mixed load is
+where it shows.
+
 **A pooled connection is asked a hello after ten idle seconds.** The
 five-node suite, every node restarted, found the coordinators' pooled
 connections to the restarted peers half-open: a write into one
