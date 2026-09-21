@@ -130,21 +130,22 @@ what was verified and how.
 
 ## What was verified
 
-For 0.71.0, on this repository's own test machines (Debian 13 and Ubuntu
-24.04, amd64):
+For 0.71.0, on this repository's own test machine (Debian 13, amd64,
+systemd 257, podman 4.9):
 
-- `celastro install` as root: one node, then the same host again from
-  a rebuilt binary (an upgrade: the service restarted on the new
-  binary with the data kept), then with `--tls` and `--client-auth`,
-  then `--no-start`; the unit's hardening (`ProtectSystem=strict`, the
-  data directory the one writable path) let the node seal, compact and
-  back up.
-- cloud-init: three fresh machines from `cloud-init/celastro.yaml` as
-  single nodes at first boot, each serving before the ssh key was
-  accepted.
-- Ansible: the role over those three machines, forming the cluster
-  with `--node` and `--attach` from the inventory; a collection split
-  three ways spread one shard per host; the same play run again as the
-  rolling restart with the cluster answering throughout.
-- quadlet: the image under podman on one host, a statement through the
+- `celastro install` as root: one node, then the same host again with
+  a new setting (the service restarted on the rewritten settings with
+  the data kept, the shape of an upgrade), then with `--tls` and
+  `--client-auth` as a cluster of one, then `--no-start`; a backup and
+  `SHOW HEALTH` under the unit's hardening (`ProtectSystem=strict`,
+  the data directory the one writable path); the journal without the
+  token; the refusal when not root.
+- The Ansible role against that host: the release fetched and checked
+  against `SHA256SUMS`, the install, the health wait; the play again
+  with `celastro_binary` as the restart with the data kept; the
+  refusal without a token before anything is touched.
+- The quadlet: the image under podman, a statement through the
   console, a stop and a start with the data kept on the named volume.
+- Not yet run on fresh machines: the cloud-init file at first boot,
+  and the role forming a cluster over several hosts. Both are the same
+  install with the addresses filled in; they are next.
