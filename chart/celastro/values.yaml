@@ -65,6 +65,11 @@ tls:
       group: cert-manager.io
   # Validity of the certificate the Job makes, in days.
   days: 3650
+  # `required` makes every pod's wire ask its peers for a certificate the
+  # CA signed and refuse one without (CELASTRO_TLS_CLIENT_AUTH); the
+  # console keeps answering the token alone. Every pod has a certificate
+  # from the Secret above, so a release with tls.enabled can require it.
+  clientAuth: ""
 
 # Encryption at rest: every file on every pod's volume, the tier and the
 # backups under a data key the pods share, wrapped under a master key.

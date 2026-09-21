@@ -1936,7 +1936,19 @@ point lookups the coordinator costs more than the lookup, so the role
 buys nothing there. What would move the ratio: cheaper JSON on the
 console (the fixed 1 ms), and a merge that stops early once the top `k`
 cannot change. The numbers are relative -- every pod shared four cores
--- and the ratio is what they are for.
+-- and the ratio is what they are for. Measured again on 2026-09-21 as
+processes on one four-core machine (three data nodes, 40,000 documents
+over ten shards, sixteen query workers over five shapes and one writer
+for a minute, once through a data node's console and once through a
+dedicated coordinator's): the coordinator costs 2.4 ms of CPU per
+statement against 4.3-5.8 ms on each data node, so on shards of 4,000
+documents a coordinator is saturated by two data nodes' worth of
+traffic and the design's ratio holds (it rises with the shard); and
+with every process on the same cores the dedicated coordinator buys
+nothing and pays a hop -- hybrid p95 181 ms became 199 ms, throughput
+32 became 31 statements a second. The isolation the role is for shows
+only where the coordinator has cores the data nodes do not: below four
+or five data nodes, leave `coordinators.replicas` at zero.
 
 **Durability is unix-shaped, and every mover is inside it.** The guarantee
 rests on fsyncing the directory a rename landed in, which is a POSIX
@@ -1993,6 +2005,56 @@ explicit `OR`. Each has a defensible semantics that is not implemented; refusing
 is cheaper to reason about than a plausible wrong answer.
 
 ---
+
+**Client certificates on the wire (0.65.0).** With
+`CELASTRO_TLS_CLIENT_AUTH=required` the wire's server side sends
+CertificateRequest after EncryptedExtensions (context empty, the
+signature schemes this build verifies), and after its Finished reads
+the client's Certificate and CertificateVerify before the client's
+Finished: an empty Certificate is refused naming the requirement, a
+chain that does not reach an anchor is refused naming the chain
+(`x509::chain_reaches_anchor`, the verifier without the name check --
+a client's certificate names no host to match), and the signature is
+checked over the transcript with the leaf's key. The client presents
+its own chain and signs with its key when asked; a console client, or
+the archive client, has none and answers with an empty Certificate as
+before. The console never asks. A resumed handshake shows no
+certificate by design (the ticket stands for one shown), so the ticket
+key is derived differently when the wire requires certificates: a
+ticket from before the requirement does not resume past it. The ticket
+key also takes the day (sealed under today's, opened under today's or
+yesterday's), so a TLS key that leaks opens two days of tickets.
+
+**The data key rotates (0.65.0).** `celastro key rotate <DIR>` walks
+the directory with the database closed: the root files by name, the
+shard directories (held and followed, whichever of `segments/`,
+`archive/` or `deletes/` holds a file) by the shard's name and the
+file's, the logs record by record with the ordinal kept, and the plain
+marks (`LOCK`, `KEY`, `STEWARD`, `CONFIRMED`, `SHIPPED`) left alone;
+each file opened under the old key, sealed under the new and replaced
+atomically. The new key is written to `KEY.next` before anything else
+and renamed over `KEY` after everything, so a rotation cut short is
+finished by running it again -- a file that opens under the new key is
+counted and left -- and `open_key` refuses a directory with a
+`KEY.next` until then. A move in flight (`incoming/`) refuses the
+rotation; so does an index at the archived tier, whose objects are in a
+store the walk does not reach (the choice was that, or a key ring the
+frames cannot name a key into). `celastro check <DIR>` is the same walk
+opening everything and writing nothing.
+
+**Measured, not proven: the constant-time claim and the build.** The
+crate's timing test (`crypto::timing`, ignored, run by hand in release)
+samples pairs of inputs that differ only in the secret, in alternation,
+and compares medians: on the box on 2026-09-21, `ct_eq` over 64 bytes
+equal and differing in the first byte 38 ns and 38 ns; X25519 with a
+scalar of one set bit and of every bit 108.1 µs and 107.2 µs (0.9 %
+apart); Ed25519 signing under two seeds 12.75 ms and 12.77 ms (0.1 %);
+the AEAD opening a tag wrong in its first byte and in its last 550 ns
+and 550 ns. `scripts/reproducible.sh` builds one commit twice at a
+fixed path with the paths remapped out and compares the binaries: v0.64.1
+builds to `93795dcd…3eda4e5` both times on rustc 1.98.1. A signed
+release stays open: the crate has no CI identity to sign with, and a
+key the maintainer holds is a decision for the maintainer.
 
 ## A worked query
 

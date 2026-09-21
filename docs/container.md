@@ -234,7 +234,8 @@ $ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0
 Plain HTTP unless the image is also given certificates: mount them and set
 `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM,
 Ed25519 — `celastro tls init` makes a set) and the console and the wire
-serve TLS 1.3, with the CA verifying every peer. The chart's `console.expose`
+serve TLS 1.3, with the CA verifying every peer; `CELASTRO_TLS_CLIENT_AUTH=required`
+makes the wire ask every peer for its certificate as well. The chart's `console.expose`
 and `tls.enabled` are these two, with the token and the certificates in
 Secrets and a Service over the pods.
 

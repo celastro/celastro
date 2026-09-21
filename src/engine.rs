@@ -1994,9 +1994,10 @@ impl Db {
                 )
             };
             out.push_str(&format!(
-                "tls: {}; {}\n",
+                "tls: {}; {}{}\n",
                 describe("certificate", tls.expires_at()),
-                describe("CA", tls.anchors_expire_at())
+                describe("CA", tls.anchors_expire_at()),
+                if tls.client_auth() { "; the wire requires a peer's certificate" } else { "" }
             ));
         }
         let mut up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -8294,6 +8295,14 @@ fn cache_key(collection: &str, path: &str) -> String {
 /// with data is asked to be encrypted (that is a rewrite: export, and import
 /// into a fresh directory opened with the key).
 fn open_key(dir: &Path, opts: &DbOpts) -> Result<crate::cipher::Shared> {
+    if dir.join(crate::cipher::KEY_NEXT).exists() {
+        return Err(Error::Storage(format!(
+            "{}: a data-key rotation was interrupted (KEY.next is there); run `celastro key \
+             rotate {}` to finish it before opening",
+            dir.display(),
+            dir.display()
+        )));
+    }
     let key_path = dir.join("KEY");
     let key_file = crate::shard::read_optional(&key_path)?;
     match (key_file, &opts.master_key) {

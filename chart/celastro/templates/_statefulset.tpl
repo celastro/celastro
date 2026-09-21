@@ -74,6 +74,10 @@ spec:
               value: /tls/tls.key
             - name: CELASTRO_TLS_CA
               value: /tls/ca.crt
+            {{- if $r.Values.tls.clientAuth }}
+            - name: CELASTRO_TLS_CLIENT_AUTH
+              value: {{ $r.Values.tls.clientAuth | quote }}
+            {{- end }}
             {{- end }}
             {{- if $r.Values.encryption.existingSecret }}
             - name: CELASTRO_MASTER_KEY_FILE

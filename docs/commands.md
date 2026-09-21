@@ -148,6 +148,29 @@ wrote a master key to ./master2.key
 ./data.key is now wrapped under the master key in ./master2.key
 ```
 
+The data key itself rotates with **`key rotate <DIR>`**: every file and
+every log record under the directory is sealed again under a fresh data
+key and `KEY` rewrapped, with no process serving the directory (a
+cluster rotates node by node, each stopped for its turn -- the nodes
+no longer need to share one data key once they hold their own copies).
+The new key goes to `KEY.next` first, so a rotation cut short is
+finished by running it again, and a node refuses to open a directory
+with a `KEY.next` until then. Backups and exports made before carry
+their own `KEY` and open as they did; an index at the archived tier is
+refused (its objects are under the old key), move it back first.
+**`check <DIR>`** opens every frame of every file and names what does
+not open, with nothing written: what to run on a volume you doubt.
+
+```sh
+CELASTRO_MASTER_KEY_FILE=./master.key celastro key rotate ./data
+CELASTRO_MASTER_KEY_FILE=./master.key celastro check ./data
+```
+
+```
+./data: 14 file(s) and 120 log record(s) sealed under a new data key; KEY rewrapped
+./data: 14 file(s) and 120 log record(s) open under the data key; nothing is damaged
+```
+
 ## TLS
 
 **`tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`** writes a CA and a

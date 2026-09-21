@@ -72,6 +72,9 @@ COMMANDS:
   key init <FILE>            write a new data key to FILE, wrapped under the master key: the KEY
                              every node of an encrypted cluster starts with (CELASTRO_KEY_FILE)
   key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER
+  key rotate <DIR>           a new data key for the database at DIR: every file sealed again,
+                             KEY rewrapped; with no process serving DIR; resumable if interrupted
+  check <DIR>                open every frame of every file under DIR and name what does not open
   tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
                              write a CA and a certificate for NAME (and NAMES, comma-separated
                              DNS names and IP addresses) into DIR, valid DAYS days (3650)
@@ -225,6 +228,14 @@ enum Cmd {
     KeyRekey {
         key: PathBuf,
         master: PathBuf,
+    },
+    /// `key rotate <DIR>`: a new data key for the database at DIR, every
+    /// file sealed again; `check <DIR>`: every frame of it opened.
+    KeyRotate {
+        dir: PathBuf,
+    },
+    Check {
+        dir: PathBuf,
     },
     /// `tls init <DIR> <NAME> [<NAMES>] [<DAYS>]`: a CA and a certificate.
     TlsInit {
@@ -444,6 +455,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "key" => match (rest.first().map(String::as_str), rest.len()) {
             (Some("master"), 2) => Cmd::KeyMaster { file: PathBuf::from(&rest[1]) },
             (Some("init"), 2) => Cmd::KeyInit { file: PathBuf::from(&rest[1]) },
+            (Some("rotate"), 2) => Cmd::KeyRotate { dir: PathBuf::from(&rest[1]) },
             (Some("rekey"), 3) => {
                 Cmd::KeyRekey { key: PathBuf::from(&rest[1]), master: PathBuf::from(&rest[2]) }
             }
@@ -464,6 +476,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                     "`export` takes a collection and a directory to write".to_string(),
                 )
             }
+        },
+        "check" => match rest.len() {
+            1 => Cmd::Check { dir: PathBuf::from(&rest[0]) },
+            _ => return Cli::Usage("`check` takes the database directory".to_string()),
         },
         "import" => match rest.len() {
             1 => Cmd::Import { from: PathBuf::from(&rest[0]) },
@@ -639,6 +655,12 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::KeyRekey { key, master } = cmd {
         return key_rekey(&key, &master, json);
     }
+    if let Cmd::KeyRotate { dir } = cmd {
+        return key_rotate(&dir, json);
+    }
+    if let Cmd::Check { dir } = cmd {
+        return check_dir(&dir, json);
+    }
     if let Cmd::TlsSecret { secret, name, names, days } = cmd {
         return tls_secret(&secret, &name, &names, days, json);
     }
@@ -675,7 +697,9 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         | Cmd::Send { .. }
         | Cmd::KeyMaster { .. }
         | Cmd::KeyInit { .. }
-        | Cmd::KeyRekey { .. } => {
+        | Cmd::KeyRekey { .. }
+        | Cmd::KeyRotate { .. }
+        | Cmd::Check { .. } => {
             unreachable!("answered before the database was opened")
         }
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
@@ -1420,6 +1444,101 @@ fn key_rekey(key: &Path, master: &Path, json: bool) -> i32 {
         &format!("{} is now wrapped under the master key in {}", key.display(), master.display()),
     );
     EXIT_OK
+}
+
+/// The master key the environment names, or the reason there is none.
+fn master_or_fail(json: bool, what: &str) -> std::result::Result<[u8; 32], i32> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    match celastro::cipher::master_from_env(&var) {
+        Ok(Some(m)) => Ok(m),
+        Ok(None) => Err(fail(
+            json,
+            &format!("`{what}` opens the database's KEY under its master: set CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY"),
+        )),
+        Err(e) => Err(fail(json, &e.to_string())),
+    }
+}
+
+/// `key rotate <DIR>`: every file under DIR sealed again under a fresh data
+/// key, then KEY rewrapped; with no process serving DIR.
+fn key_rotate(dir: &Path, json: bool) -> i32 {
+    let master = match master_or_fail(json, "key rotate") {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    match celastro::cipher::rotate_data_key(dir, &master) {
+        Ok(w) => {
+            ack(
+                json,
+                &format!(
+                    "{}: {} file(s) and {} log record(s) sealed under a new data key{}; KEY rewrapped",
+                    dir.display(),
+                    w.files,
+                    w.records,
+                    if w.already > 0 {
+                        format!(" ({} file(s) were under it already: a rotation resumed)", w.already)
+                    } else {
+                        String::new()
+                    }
+                ),
+            );
+            EXIT_OK
+        }
+        Err(e) => fail(
+            json,
+            &format!(
+                "could not rotate {}: {e} (run `key rotate` again to finish a rotation this interrupted)",
+                dir.display()
+            ),
+        ),
+    }
+}
+
+/// `check <DIR>`: every frame of every file under DIR opened under its data
+/// key, and every file that does not open named.
+fn check_dir(dir: &Path, json: bool) -> i32 {
+    let master = match master_or_fail(json, "check") {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let wrapped = match std::fs::read(dir.join("KEY")) {
+        Ok(b) => b,
+        Err(e) => {
+            return fail(
+                json,
+                &format!("{}/KEY: {e} (an encrypted database has one)", dir.display()),
+            )
+        }
+    };
+    let cipher = match celastro::cipher::Cipher::unwrap(&wrapped, &master) {
+        Ok(c) => c,
+        Err(e) => return fail(json, &e.to_string()),
+    };
+    match celastro::cipher::check_dir(dir, &cipher) {
+        Ok(w) if w.failures.is_empty() => {
+            ack(
+                json,
+                &format!(
+                    "{}: {} file(s) and {} log record(s) open under the data key; nothing is damaged",
+                    dir.display(),
+                    w.files,
+                    w.records
+                ),
+            );
+            EXIT_OK
+        }
+        Ok(w) => fail(
+            json,
+            &format!(
+                "{}: {} file(s) open, {} do(es) not:\n  {}",
+                dir.display(),
+                w.files,
+                w.failures.len(),
+                w.failures.join("\n  ")
+            ),
+        ),
+        Err(e) => fail(json, &format!("could not check {}: {e}", dir.display())),
+    }
 }
 
 fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> i32 {

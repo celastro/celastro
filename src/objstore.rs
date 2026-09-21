@@ -633,7 +633,10 @@ fn connect(endpoint: &str, tls: Option<&ArchiveTls>) -> Result<Box<dyn crate::tl
         None => Ok(Box::new(s)),
         Some(t) => {
             use crate::crypto::tls13::{ClientSide, TlsStream};
-            Ok(Box::new(TlsStream::client(s, ClientSide { anchors: &t.anchors, host: &t.host })))
+            Ok(Box::new(TlsStream::client(
+                s,
+                ClientSide { anchors: &t.anchors, host: &t.host, chain_der: None, key: None },
+            )))
         }
     }
 }

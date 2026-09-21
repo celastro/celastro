@@ -24,6 +24,9 @@ pub const KEY_ENV: &str = "CELASTRO_TLS_KEY";
 /// The CA every node's certificate chains to, PEM; what a peer is verified
 /// against.
 pub const CA_ENV: &str = "CELASTRO_TLS_CA";
+/// `required` makes the wire ask every peer for a certificate the CA
+/// signed and refuse one without; unset or `off` asks for none.
+pub const CLIENT_AUTH_ENV: &str = "CELASTRO_TLS_CLIENT_AUTH";
 
 /// The four PEM files `celastro tls init` writes: a CA, its key, and a
 /// certificate it signed with its key.
@@ -103,6 +106,10 @@ pub struct Tls {
     /// The earliest end among the anchors: when this node stops accepting
     /// everyone else.
     anchors_not_after: i64,
+    /// Whether the wire asks every peer for a certificate the CA signed
+    /// and refuses one without: `CELASTRO_TLS_CLIENT_AUTH=required`. The
+    /// console never asks; browsers and tools speak to it with the token.
+    client_auth: bool,
 }
 
 impl fmt::Debug for Tls {
@@ -154,13 +161,31 @@ impl Tls {
             return Err(read_err("CA", &ca, "no certificate in the file"));
         }
         let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
+        let client_auth = match std::env::var(CLIENT_AUTH_ENV).ok().filter(|v| !v.is_empty()) {
+            None => false,
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "required" | "require" | "on" => true,
+                "off" | "none" | "no" => false,
+                other => {
+                    return Err(Error::Plan(format!(
+                        "{CLIENT_AUTH_ENV}: `{other}` is not `required` or `off`"
+                    )))
+                }
+            },
+        };
         Ok(Some(Tls {
             chain_der,
             key: pair,
             anchors,
             not_after: leaf.not_after,
             anchors_not_after,
+            client_auth,
         }))
+    }
+
+    /// Whether the wire requires a peer's certificate.
+    pub fn client_auth(&self) -> bool {
+        self.client_auth
     }
 
     /// When this node's certificate expires, seconds since the epoch.
@@ -179,15 +204,39 @@ impl Tls {
         use crate::crypto::tls13::{ServerSide, TlsStream};
         Ok(Box::new(TlsStream::server(
             sock,
-            ServerSide { chain_der: &self.chain_der, key: &self.key },
+            ServerSide { chain_der: &self.chain_der, key: &self.key, client_anchors: None },
+        )))
+    }
+
+    /// A connection the wire accepted: as [`accept`](Self::accept), and
+    /// the peer is asked for a certificate the CA signed when this node
+    /// requires one.
+    pub fn accept_wire(&self, sock: TcpStream) -> io::Result<Box<dyn Stream>> {
+        use crate::crypto::tls13::{ServerSide, TlsStream};
+        Ok(Box::new(TlsStream::server(
+            sock,
+            ServerSide {
+                chain_der: &self.chain_der,
+                key: &self.key,
+                client_anchors: self.client_auth.then_some(self.anchors.as_slice()),
+            },
         )))
     }
 
     /// A connection this node opened to `host`, encrypted and verified on
     /// its first use: the peer's chain reaches the CA and names `host`.
+    /// This node's own certificate is presented when the peer asks.
     pub fn connect(&self, sock: TcpStream, host: &str) -> io::Result<Box<dyn Stream>> {
         use crate::crypto::tls13::{ClientSide, TlsStream};
-        Ok(Box::new(TlsStream::client(sock, ClientSide { anchors: &self.anchors, host })))
+        Ok(Box::new(TlsStream::client(
+            sock,
+            ClientSide {
+                anchors: &self.anchors,
+                host,
+                chain_der: Some(&self.chain_der),
+                key: Some(&self.key),
+            },
+        )))
     }
 }
 
@@ -239,7 +288,10 @@ pub fn https_request(
         return Err(Error::Plan("no certificate in the CA given".into()));
     }
     let sock = dial(addr, timeout)?;
-    let mut s = TlsStream::client(sock, ClientSide { anchors: &anchors, host: server_name });
+    let mut s = TlsStream::client(
+        sock,
+        ClientSide { anchors: &anchors, host: server_name, chain_der: None, key: None },
+    );
     let request = http_text(server_name, req);
     s.write_all(request.as_bytes()).map_err(Error::Io)?;
     let mut raw = Vec::new();
@@ -343,6 +395,15 @@ fn dechunk(text: &str) -> String {
 pub fn accept(tls: Option<&Arc<Tls>>, sock: TcpStream) -> io::Result<Box<dyn Stream>> {
     match tls {
         Some(t) => t.accept(sock),
+        None => Ok(Box::new(sock)),
+    }
+}
+
+/// `sock` as the wire accepted it: [`accept`] with the peer asked for its
+/// certificate when the node requires one.
+pub fn accept_wire(tls: Option<&Arc<Tls>>, sock: TcpStream) -> io::Result<Box<dyn Stream>> {
+    match tls {
+        Some(t) => t.accept_wire(sock),
         None => Ok(Box::new(sock)),
     }
 }

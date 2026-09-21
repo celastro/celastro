@@ -488,3 +488,262 @@ mod tests {
         assert!(c.open_file("f", &swapped).is_err());
     }
 }
+
+// ------------------------------------------------------- rotation, check
+
+/// What a walk over an encrypted directory did or found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Walked {
+    /// Framed files opened (and, on a rotation, sealed again).
+    pub files: usize,
+    /// Records of the logs opened (and sealed again).
+    pub records: usize,
+    /// Files a rotation found already under the new key: a run resumed.
+    pub already: usize,
+    /// Files that opened under neither key, or not at all: what a check
+    /// reports and a rotation stops on. Each names the file and why.
+    pub failures: Vec<String>,
+}
+
+/// The files a database directory holds that are not framed under the
+/// data key: the lock, the wrapped key itself (and the one a rotation is
+/// moving to), and the marks written as plain text.
+fn is_plain_file(name: &str) -> bool {
+    matches!(name, "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED")
+}
+
+/// A shard's log: a frame per record, the record's ordinal in the AAD.
+fn is_log(name: &str) -> bool {
+    name.starts_with("wal") && name.ends_with(".log")
+}
+
+/// Every framed file under `dir`, in the order the walk finds them:
+/// `f(path, id, is_log)`. The identity is what the shard gives a file --
+/// the shard directory's name and the file's own, whichever of
+/// `segments/`, `archive/` or `deletes/` holds it -- and a root file's is
+/// its name. A move in flight (an `incoming/` directory) is refused: its
+/// files are the source's until the move ends.
+fn walk_framed(
+    dir: &std::path::Path,
+    f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+) -> Result<()> {
+    fn shard_dir(
+        dir: &std::path::Path,
+        shard: &str,
+        f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+    ) -> Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type()?.is_dir() {
+                if name == "incoming" {
+                    return Err(Error::Storage(format!(
+                        "{}: a move is in flight (incoming/); finish or abort it first",
+                        dir.display()
+                    )));
+                }
+                shard_dir(&entry.path(), shard, f)?;
+            } else if !is_plain_file(&name) {
+                f(&entry.path(), &format!("{shard}/{name}"), is_log(&name))?;
+            }
+        }
+        Ok(())
+    }
+    fn shards_in(
+        dir: &std::path::Path,
+        f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+    ) -> Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if name.starts_with("shard-") {
+                shard_dir(&entry.path(), &name, f)?;
+            } else if name == "followed" {
+                shards_in(&entry.path(), f)?;
+            } else if name == "incoming" {
+                return Err(Error::Storage(format!(
+                    "{}: a move is in flight (incoming/); finish or abort it first",
+                    dir.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.file_type()?.is_dir() {
+            if name == "collections" {
+                let mut colls: Vec<_> =
+                    std::fs::read_dir(entry.path())?.collect::<std::io::Result<_>>()?;
+                colls.sort_by_key(|e| e.file_name());
+                for c in colls {
+                    if c.file_type()?.is_dir() {
+                        shards_in(&c.path(), f)?;
+                    }
+                }
+            }
+        } else if !is_plain_file(&name) {
+            f(&entry.path(), &name, is_log(&name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every framed file and every log record under `dir` opened under
+/// `cipher`, nothing written: what `celastro check` prints. A file that
+/// does not open is a failure named with its reason, not an error, so one
+/// run reports every damaged file.
+pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
+    let mut w = Walked::default();
+    walk_framed(dir, &mut |path, id, log| {
+        let bytes = std::fs::read(path)?;
+        if log {
+            let records = cipher.open_records(id, &bytes);
+            let opened: usize = records.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
+            if opened < bytes.len() {
+                w.failures.push(format!(
+                    "{}: {} record(s) open, then the log does not (torn or under another key)",
+                    path.display(),
+                    records.len()
+                ));
+            }
+            w.records += records.len();
+            w.files += 1;
+        } else {
+            match cipher.open_file(id, &bytes) {
+                Ok(_) => w.files += 1,
+                Err(e) => w.failures.push(format!("{}: {e}", path.display())),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(w)
+}
+
+/// Every framed file and every log record under `dir` opened under `from`
+/// and sealed under `to`, each file replaced atomically. Resumable: a file
+/// that opens under `to` already is counted and left; one that opens
+/// under neither stops the walk with the file named, nothing else
+/// touched. The plain files stay as they are.
+pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<Walked> {
+    let mut w = Walked::default();
+    walk_framed(dir, &mut |path, id, log| {
+        let bytes = std::fs::read(path)?;
+        if log {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let records = from.open_records(id, &bytes);
+            let opened: usize = records.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
+            if records.is_empty() || opened < bytes.len() {
+                // Under the new key already, or damaged: told apart by
+                // opening under the new one.
+                let under_new = to.open_records(id, &bytes);
+                let opened_new: usize = under_new.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
+                if opened_new == bytes.len() {
+                    w.already += 1;
+                    return Ok(());
+                }
+                return Err(Error::Storage(format!(
+                    "{}: {} record(s) open under the current key, then the log does not; \
+                     nothing was changed",
+                    path.display(),
+                    records.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(bytes.len());
+            for (i, r) in records.iter().enumerate() {
+                out.extend_from_slice(&to.seal_record(id, i as u64, r)?);
+            }
+            crate::shard::atomic_write(path, &out)?;
+            w.records += records.len();
+            w.files += 1;
+        } else {
+            let plain = match from.open_file(id, &bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    if to.open_file(id, &bytes).is_ok() {
+                        w.already += 1;
+                        return Ok(());
+                    }
+                    return Err(Error::Storage(format!(
+                        "{}: {e}; nothing was changed",
+                        path.display()
+                    )));
+                }
+            };
+            crate::shard::atomic_write(path, &to.seal_file(id, &plain)?)?;
+            w.files += 1;
+        }
+        Ok(())
+    })?;
+    Ok(w)
+}
+
+/// The file a rotation writes its new wrapped key to before it touches
+/// anything; its presence is a rotation not finished.
+pub const KEY_NEXT: &str = "KEY.next";
+
+/// A new data key for the database at `dir`: every framed file and log
+/// record sealed again under a fresh key, then `KEY` rewrapped. The
+/// database must not be open. The new key goes to `KEY.next` first, so an
+/// interrupted rotation is finished by running it again (files already
+/// under the new key are recognised) and a node refuses to open a
+/// directory with a `KEY.next` until then. Backups and exports made
+/// before carry their own `KEY` and open as they did; an index at the
+/// archived tier is refused, since its objects are under the old key
+/// where a rotation does not reach.
+pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walked> {
+    let key_path = dir.join("KEY");
+    let wrapped = std::fs::read(&key_path).map_err(|e| {
+        Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))
+    })?;
+    let old = Cipher::unwrap(&wrapped, master)?;
+    let next_path = dir.join(KEY_NEXT);
+    let new = match crate::shard::read_optional(&next_path)? {
+        Some(next) => Cipher::unwrap(&next, master).map_err(|e| {
+            Error::Storage(format!("{}: {e}; the interrupted rotation's key", next_path.display()))
+        })?,
+        None => {
+            let c = Cipher::generate()?;
+            crate::shard::atomic_write(&next_path, &c.wrap(master)?)?;
+            c
+        }
+    };
+    // The catalog first: an index at the archived tier has objects the
+    // walk does not reach.
+    if let Some(bytes) = crate::shard::read_optional(&dir.join("CATALOG"))? {
+        let plain =
+            old.open_file("CATALOG", &bytes).or_else(|_| new.open_file("CATALOG", &bytes))?;
+        let catalog = crate::catalog::Catalog::decode(&plain)?;
+        let archived: Vec<String> = catalog
+            .collections
+            .values()
+            .flat_map(|c| {
+                c.indexes
+                    .iter()
+                    .filter(|i| i.tier == crate::residency::Tier::Archived)
+                    .map(move |i| format!("{}.{}", c.name, i.name))
+            })
+            .collect();
+        if !archived.is_empty() {
+            let _ = std::fs::remove_file(&next_path);
+            return Err(Error::Storage(format!(
+                "a rotation does not reach the archived tier; move {} back first (ALTER INDEX \
+                 ... SET TIER)",
+                archived.join(", ")
+            )));
+        }
+    }
+    let w = recode_dir(dir, &old, &new)?;
+    std::fs::rename(&next_path, &key_path)?;
+    crate::shard::sync_dir(dir)?;
+    Ok(w)
+}

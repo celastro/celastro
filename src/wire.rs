@@ -1688,7 +1688,7 @@ pub fn serve(
                 // The handshake happens on the connection's own thread, with
                 // its first read; a peer that never speaks costs that thread
                 // its idle poll and nothing else.
-                let s = match tls::accept(tls.as_ref(), s) {
+                let s = match tls::accept_wire(tls.as_ref(), s) {
                     Ok(s) => s,
                     Err(e) => {
                         crate::log::warn("wire_connection_failed", &[("error", e.to_string())]);

@@ -170,8 +170,15 @@ share (PSK with (EC)DHE only, so forward secrecy is kept), skips the
 certificate flight; a ticket the server cannot open, or a binder that does
 not verify, is a full handshake or a refusal, never a downgrade. This
 client offers a ticket only to the name, address and trust anchors it was
-issued under. No client certificates, no HelloRetryRequest, no 0-RTT, no
-key update; a stock client speaks that subset. Every primitive is pinned against its RFC
+issued under. Client certificates on the wire (0.65.0): with
+`CELASTRO_TLS_CLIENT_AUTH=required` a node's wire sends CertificateRequest
+and refuses a peer whose Certificate is empty or whose chain does not
+reach the CA, before the token is looked at; every node presents its own
+certificate when asked, so the token becomes a second factor. The
+console never asks (browsers and tools speak to it with the token), and a
+ticket sealed before the requirement does not resume past it (the ticket
+key differs). No HelloRetryRequest, no 0-RTT, no key update; a stock
+client speaks that subset. Every primitive is pinned against its RFC
 vectors and the key schedule against RFC 8448; nothing branches on or
 indexes by a secret, by masks rather than by asking the compiler. The
 archive client reaches an `https://` store over the same TLS, verifying
@@ -204,7 +211,11 @@ of plaintext each, a fresh random nonce per frame, the file's identity and
 the frame's index authenticated) under a key HKDF derives per file from
 one data key; the data key is drawn at the first open and kept in
 `<dir>/KEY` wrapped under the master key, which is never written. The
-same in-tree, unaudited primitives as the TLS.
+same in-tree, unaudited primitives as the TLS. The master key rotates
+with `key rekey` (one small rewrap); the data key with `key rotate`
+(0.65.0: every file sealed again with the process stopped, resumable,
+the archived tier refused), and `check` opens every frame and names
+what does not open.
 
 What it protects against: a copied volume, a lost disk, a bucket or a
 backup read by someone without the master key -- none of it is readable

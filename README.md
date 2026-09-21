@@ -184,6 +184,9 @@ In transit: `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA`
 (PEM) put the console and the wire on TLS 1.3, with session tickets so a
 client's next connection skips the certificate; `celastro tls init
 ./tls <name>` makes a set, and the chart's `tls.enabled` does it for you.
+`CELASTRO_TLS_CLIENT_AUTH=required` (the chart's `tls.clientAuth`) makes
+the wire ask every peer for its certificate too and refuse one the CA did
+not sign, so the token is the second factor rather than the only one.
 At rest: `celastro key master ./master.key`, then
 `CELASTRO_MASTER_KEY_FILE=./master.key` on every start, encrypts every file
 under `--dir`, the archived tier, backups and exports; a cluster shares one

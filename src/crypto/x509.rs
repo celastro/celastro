@@ -363,6 +363,21 @@ pub fn verify_chain(
             }
         )));
     }
+    chain_reaches_anchor(chain, anchors, now)
+}
+
+/// [`verify_chain`] without the name: the leaf is valid now and the chain
+/// links up to a certificate in `anchors`. What a server checks of a
+/// client's certificate, which names no host to match.
+pub fn chain_reaches_anchor(
+    chain: &[Certificate],
+    anchors: &[Certificate],
+    now: i64,
+) -> Result<()> {
+    let leaf = chain.first().ok_or_else(|| refuse("no certificate was presented".into()))?;
+    if !leaf.valid_at(now) {
+        return Err(refuse(format!("the certificate is not valid at this time ({now})")));
+    }
     let mut current = leaf;
     for depth in 0..chain.len().max(1) {
         if anchors.iter().any(|a| current.signed_by(a) && a.valid_at(now)) {

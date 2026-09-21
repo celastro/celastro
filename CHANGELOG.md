@@ -6,6 +6,38 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.65.0 — 2026-09-21
+
+**Client certificates on the wire.** `CELASTRO_TLS_CLIENT_AUTH=required`
+(the chart's `tls.clientAuth`) makes a node's wire ask every peer for
+its certificate and refuse one that presents none or a chain the CA
+did not sign, before the token is looked at; every node presents its
+own certificate when asked, so the shared token is a second factor
+rather than the only one. The console keeps answering the token alone,
+and `SHOW HEALTH` says the wire requires a peer's certificate. A
+ticket issued before the requirement does not resume past it.
+
+**The data key rotates.** `celastro key rotate <DIR>` seals every file
+and every log record under the directory again under a fresh data key
+and rewraps `KEY`, with no process serving it; the new key goes to
+`KEY.next` first, so a rotation cut short is finished by running it
+again, and a node refuses to open a directory with a `KEY.next` until
+then. Backups and exports made before open as they did (each carries
+its `KEY`); an index at the archived tier is refused, move it back
+first. `celastro check <DIR>` opens every frame of every file and
+names what does not open, writing nothing.
+
+**A ticket key per day.** A TLS session ticket is sealed under a key
+derived from the node's TLS key and the day, and opened under today's
+or yesterday's: a TLS key that leaks opens two days of tickets rather
+than its whole life.
+
+**Measured, not changed.** `scripts/reproducible.sh` builds one commit
+twice at a fixed path and compares the binaries; the crate's timing
+test (`cargo test --release --lib crypto::timing -- --ignored`) samples
+the constant-time claims on a real CPU. Both are run by hand; their
+numbers are in the design notes.
+
 ## 0.64.1 — 2026-09-21
 
 **The steward's first replacement no longer stops it.** The read lock

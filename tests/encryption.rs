@@ -400,3 +400,85 @@ fn a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves()
         let _ = std::fs::remove_dir_all(p);
     }
 }
+
+/// The data key rotates: every file and every log record sealed again
+/// under a fresh key and `KEY` rewrapped, nothing opening under the old
+/// key after, the database answering the same when reopened; a rotation
+/// cut short leaves `KEY.next`, the node refuses to open until it is
+/// finished, and running it again finishes it, recognising the files
+/// already under the new key.
+#[test]
+fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let d = dir("rotate");
+    let m = master(3);
+    let keys = |db: &mut Db, sql: &str| -> Vec<String> {
+        db.query(sql).unwrap().rows.iter().map(|r| r.key.clone()).collect()
+    };
+    let (q_before, v_before) = {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        setup(&mut db, 40);
+        // Rows after the last flush: the log holds records to reseal.
+        for i in 40..50 {
+            db.insert("items", doc(i)).unwrap();
+        }
+        (keys(&mut db, QUERY), keys(&mut db, VECTOR))
+    };
+    let all_before = {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        // The harness's setup deletes a row: what is there is the reference.
+        let all = keys(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100");
+        assert!(all.len() >= 45, "before the rotation, reopened: {all:?}");
+        all
+    };
+    let key_before = std::fs::read(d.join("KEY")).unwrap();
+    let old = celastro::cipher::Cipher::unwrap(&key_before, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w.files > 5 && w.records >= 10 && w.already == 0, "{w:?}");
+    assert!(w.failures.is_empty(), "{w:?}");
+    let key_after = std::fs::read(d.join("KEY")).unwrap();
+    assert_ne!(key_before, key_after, "KEY was rewrapped around a new data key");
+    assert!(!d.join("KEY.next").exists());
+    // Under the new key everything opens; under the old, nothing sealed.
+    let new = celastro::cipher::Cipher::unwrap(&key_after, &m).unwrap();
+    let c = celastro::cipher::check_dir(&d, &new).unwrap();
+    assert!(c.failures.is_empty() && c.files >= w.files && c.records == w.records, "{c:?}");
+    let c = celastro::cipher::check_dir(&d, &old).unwrap();
+    assert!(c.failures.iter().any(|f| f.contains("segments")), "{c:?}");
+    assert!(c.failures.iter().any(|f| f.contains("wal")), "{c:?}");
+    {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        assert_eq!(keys(&mut db, QUERY), q_before);
+        assert_eq!(keys(&mut db, VECTOR), v_before);
+        let got = keys(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100");
+        assert_eq!(got, all_before, "after the rotation");
+    }
+    // Cut short after every file moved but before KEY was replaced: the
+    // node refuses the directory, and a second run finishes the rotation
+    // with nothing to reseal.
+    let fresh = celastro::cipher::Cipher::generate().unwrap();
+    std::fs::write(d.join("KEY.next"), fresh.wrap(&m).unwrap()).unwrap();
+    let moved = celastro::cipher::recode_dir(&d, &new, &fresh).unwrap();
+    assert!(moved.files >= w.files && moved.already == 0, "{moved:?}");
+    let e = Db::open(&d, opts(Some(m))).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("rotation was interrupted"), "{e}");
+    let w2 = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w2.files == 0 && w2.records == 0 && w2.already == moved.files, "{w2:?}");
+    assert!(!d.join("KEY.next").exists());
+    {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        assert_eq!(keys(&mut db, QUERY), q_before);
+        let got = keys(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100");
+        assert_eq!(got, all_before, "after the resumed rotation");
+    }
+    // A plain directory has no key to rotate.
+    let p = dir("rotate-plain");
+    {
+        let mut db = Db::open(&p, opts(None)).unwrap();
+        setup(&mut db, 5);
+    }
+    let e = celastro::cipher::rotate_data_key(&p, &m).unwrap_err().to_string();
+    assert!(e.contains("KEY"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&p);
+}

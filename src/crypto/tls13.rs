@@ -168,9 +168,26 @@ fn now_secs() -> u64 {
 /// The key a server seals its tickets under, derived from its TLS key: the
 /// same on every node that serves the same certificate, so a ticket from
 /// one pod resumes at another behind the same Service, and gone with the
-/// key. Never written anywhere.
-fn ticket_key(key: &KeyPair) -> [u8; 32] {
-    hkdf::extract(b"celastro tls ticket v1", &key.seed)
+/// key. Never written anywhere. A wire that requires client certificates
+/// seals under another key, so a ticket from before the requirement (a
+/// resumed handshake shows no certificate) does not resume past it. The
+/// day is in the derivation: a server seals under today's key and opens
+/// under today's or yesterday's (a ticket lives a day), so a TLS key that
+/// leaks opens the tickets of two days, not of its whole life.
+fn ticket_key(key: &KeyPair, client_auth: bool, day: u64) -> [u8; 32] {
+    let salt: &[u8] =
+        if client_auth { b"celastro tls ticket v1 mtls" } else { b"celastro tls ticket v1" };
+    let mut ikm = [0u8; 40];
+    ikm[..32].copy_from_slice(&key.seed);
+    ikm[32..].copy_from_slice(&day.to_be_bytes());
+    let out = hkdf::extract(salt, &ikm);
+    crate::cipher::wipe(&mut ikm);
+    out
+}
+
+/// Today, as the ticket key counts days.
+fn ticket_day() -> u64 {
+    now_secs() / 86_400
 }
 
 const TICKET_AAD: &[u8] = b"celastro tls ticket v1";
@@ -290,16 +307,34 @@ fn finished_verify(base: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
 pub struct ServerSide<'a> {
     pub chain_der: &'a [Vec<u8>],
     pub key: &'a KeyPair,
+    /// The anchors a peer's certificate must reach when this side asks
+    /// for one -- the wire under `CELASTRO_TLS_CLIENT_AUTH=required`;
+    /// `None` asks for nothing, as the console never does.
+    pub client_anchors: Option<&'a [Certificate]>,
 }
 
 pub struct ClientSide<'a> {
     pub anchors: &'a [Certificate],
     pub host: &'a str,
+    /// This side's own chain and key, presented when the server asks for
+    /// a certificate; without them such a request is answered with an
+    /// empty Certificate, which a server that requires one refuses.
+    pub chain_der: Option<&'a [Vec<u8>]>,
+    pub key: Option<&'a KeyPair>,
 }
 
 enum Role {
-    Server { chain_der: Vec<Vec<u8>>, key: KeyPair },
-    Client { anchors: Vec<Certificate>, host: String },
+    Server {
+        chain_der: Vec<Vec<u8>>,
+        key: KeyPair,
+        client_anchors: Option<Vec<Certificate>>,
+    },
+    Client {
+        anchors: Vec<Certificate>,
+        host: String,
+        chain_der: Option<Vec<Vec<u8>>>,
+        key: Option<KeyPair>,
+    },
 }
 
 /// A TCP socket speaking TLS 1.3, the handshake done on first use.
@@ -326,14 +361,23 @@ impl TlsStream {
     pub fn server(sock: TcpStream, side: ServerSide<'_>) -> TlsStream {
         TlsStream::new(
             sock,
-            Role::Server { chain_der: side.chain_der.to_vec(), key: side.key.clone() },
+            Role::Server {
+                chain_der: side.chain_der.to_vec(),
+                key: side.key.clone(),
+                client_anchors: side.client_anchors.map(<[Certificate]>::to_vec),
+            },
         )
     }
 
     pub fn client(sock: TcpStream, side: ClientSide<'_>) -> TlsStream {
         TlsStream::new(
             sock,
-            Role::Client { anchors: side.anchors.to_vec(), host: side.host.to_string() },
+            Role::Client {
+                anchors: side.anchors.to_vec(),
+                host: side.host.to_string(),
+                chain_der: side.chain_der.map(<[Vec<u8>]>::to_vec),
+                key: side.key.cloned(),
+            },
         )
     }
 
@@ -364,8 +408,12 @@ impl TlsStream {
     pub fn handshake(&mut self) -> io::Result<()> {
         let Some(role) = self.role.take() else { return Ok(()) };
         let r = match role {
-            Role::Server { chain_der, key } => self.server_handshake(&chain_der, &key),
-            Role::Client { anchors, host } => self.client_handshake(&anchors, &host),
+            Role::Server { chain_der, key, client_anchors } => {
+                self.server_handshake(&chain_der, &key, client_anchors.as_deref())
+            }
+            Role::Client { anchors, host, chain_der, key } => {
+                self.client_handshake(&anchors, &host, chain_der.as_deref(), key.as_ref())
+            }
         };
         if let Err(e) = &r {
             // Tell the peer, once, and never mind if that fails too.
@@ -523,7 +571,12 @@ impl TlsStream {
 
     // ------------------------------------------------------------- server
 
-    fn server_handshake(&mut self, chain_der: &[Vec<u8>], key: &KeyPair) -> io::Result<()> {
+    fn server_handshake(
+        &mut self,
+        chain_der: &[Vec<u8>],
+        key: &KeyPair,
+        client_anchors: Option<&[Certificate]>,
+    ) -> io::Result<()> {
         let mut transcript = Vec::new();
         let mut hs_buf = Vec::new();
         let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
@@ -545,18 +598,24 @@ impl TlsStream {
         // the certificate flight is skipped. Anything short of that -- no
         // offer, another node's ticket, a stale one -- is a full handshake,
         // for which the client has to accept our signature.
-        let tkey = ticket_key(key);
+        let tkey = ticket_key(key, client_anchors.is_some(), ticket_day());
         let psk: Option<[u8; 32]> = match &hello.psk {
-            Some(offer) if hello.psk_dhe => match open_ticket(&tkey, &offer.identity) {
-                Some(psk) => {
-                    let truncated = sha256(&transcript[..4 + offer.binders_at]);
-                    if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
-                        return Err(err("the PSK binder does not verify"));
+            Some(offer) if hello.psk_dhe => {
+                match open_ticket(&tkey, &offer.identity).or_else(|| {
+                    let yesterday =
+                        ticket_key(key, client_anchors.is_some(), ticket_day().saturating_sub(1));
+                    open_ticket(&yesterday, &offer.identity)
+                }) {
+                    Some(psk) => {
+                        let truncated = sha256(&transcript[..4 + offer.binders_at]);
+                        if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
+                            return Err(err("the PSK binder does not verify"));
+                        }
+                        Some(psk)
                     }
-                    Some(psk)
+                    None => None,
                 }
-                None => None,
-            },
+            }
             _ => None,
         };
         if psk.is_none() && !hello.sig_algs.contains(&SIG_ED25519) {
@@ -609,6 +668,25 @@ impl TlsStream {
         // the middle two only when the client did not resume.
         self.write_handshake(HS_ENCRYPTED_EXTENSIONS, &[0, 0], &mut transcript)?;
         if psk.is_none() {
+            if client_anchors.is_some() {
+                // CertificateRequest: no context, and the one extension
+                // the RFC requires, the signature schemes this side
+                // verifies. The client answers between our Finished and
+                // its own.
+                let mut req = vec![0u8];
+                let mut list = Vec::new();
+                for s in [SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256, SIG_ECDSA_SECP256R1_SHA256] {
+                    list.extend_from_slice(&s.to_be_bytes());
+                }
+                let mut sa = Vec::with_capacity(2 + list.len());
+                sa.extend_from_slice(&(list.len() as u16).to_be_bytes());
+                sa.extend_from_slice(&list);
+                let mut exts = Vec::new();
+                extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sa);
+                req.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+                req.extend_from_slice(&exts);
+                self.write_handshake(HS_CERTIFICATE_REQUEST, &req, &mut transcript)?;
+            }
             let mut cert = vec![0u8];
             let mut list = Vec::new();
             for c in chain_der {
@@ -637,11 +715,43 @@ impl TlsStream {
         let master = hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32]);
         let c_ap = derive_secret(&master, "c ap traffic", &th_server_fin);
         let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
-        let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        // The client's Certificate and CertificateVerify when this side
+        // asked for them and the handshake is a full one: its chain
+        // reaches an anchor and the signature is its key's over the
+        // transcript so far. A peer with nothing to show is refused here,
+        // before the token. Its Finished then covers those messages too.
+        let mut th_fin = th_server_fin;
+        let (mut ty, mut body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        if let (Some(anchors), true) = (client_anchors, psk.is_none()) {
+            if ty != HS_CERTIFICATE {
+                return Err(err("expected the client's Certificate"));
+            }
+            let chain = parse_certificate_message(&body)?;
+            if chain.is_empty() {
+                return Err(err(
+                    "the peer presented no certificate, and this node requires one on the wire \
+                     (CELASTRO_TLS_CLIENT_AUTH=required)",
+                ));
+            }
+            let now = crate::time::now_micros() / 1_000_000;
+            x509::chain_reaches_anchor(&chain, anchors, now)
+                .map_err(|e| err(format!("the peer's certificate: {e}")))?;
+            let th_before_cv = sha256(&transcript);
+            (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+            if ty != HS_CERTIFICATE_VERIFY {
+                return Err(err("expected the client's CertificateVerify"));
+            }
+            let content = verify_content(false, &th_before_cv);
+            if !verify_signature(&body, &chain[0].public_key, &content)? {
+                return Err(err("the peer's CertificateVerify does not verify"));
+            }
+            th_fin = sha256(&transcript);
+            (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+        }
         if ty != HS_FINISHED {
             return Err(err("expected the client's Finished"));
         }
-        let expected = finished_verify(&c_hs, &th_server_fin);
+        let expected = finished_verify(&c_hs, &th_fin);
         if !super::ct_eq(&expected, &body) {
             return Err(err("the client's Finished does not verify"));
         }
@@ -673,7 +783,13 @@ impl TlsStream {
 
     // ------------------------------------------------------------- client
 
-    fn client_handshake(&mut self, anchors: &[Certificate], host: &str) -> io::Result<()> {
+    fn client_handshake(
+        &mut self,
+        anchors: &[Certificate],
+        host: &str,
+        chain_der: Option<&[Vec<u8>]>,
+        key: Option<&KeyPair>,
+    ) -> io::Result<()> {
         let mut transcript = Vec::new();
         let mut hs_buf = Vec::new();
         // The ticket for this server, if one is held and still young. Keyed
@@ -820,7 +936,7 @@ impl TlsStream {
             if !super::ct_eq(&finished_verify(&s_hs, &th_before_next), &body) {
                 return Err(err("the server's Finished does not verify"));
             }
-            return self.client_finish(&transcript, &hs_secret, &c_hs, None);
+            return self.client_finish(&transcript, &hs_secret, &c_hs, None, chain_der, key);
         }
         if ty == HS_CERTIFICATE_REQUEST {
             let n = *body.first().ok_or_else(|| err("a malformed CertificateRequest"))? as usize;
@@ -841,35 +957,8 @@ impl TlsStream {
         if ty != HS_CERTIFICATE_VERIFY {
             return Err(err("expected CertificateVerify"));
         }
-        if body.len() < 4 {
-            return Err(err("a malformed CertificateVerify"));
-        }
-        let scheme = u16::from_be_bytes([body[0], body[1]]);
-        let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
-        if body.len() != 4 + sig_len {
-            return Err(err("a malformed CertificateVerify"));
-        }
-        let sig = &body[4..];
         let content = verify_content(true, &th_before_cv);
-        let ok = match (scheme, &chain[0].public_key) {
-            (SIG_ED25519, x509::PublicKey::Ed25519(pk)) if sig.len() == 64 => {
-                let mut s = [0u8; 64];
-                s.copy_from_slice(sig);
-                ed25519::verify(pk, &content, &s)
-            }
-            (SIG_RSA_PSS_RSAE_SHA256, x509::PublicKey::Rsa(pk)) => {
-                pk.verify_pss_sha256(&content, sig)
-            }
-            (SIG_ECDSA_SECP256R1_SHA256, x509::PublicKey::P256(pk)) => {
-                pk.verify_sha256_der(&content, sig)
-            }
-            _ => {
-                return Err(err(
-                    "the server signed with a scheme this build does not verify for its key",
-                ))
-            }
-        };
-        if !ok {
+        if !verify_signature(&body, &chain[0].public_key, &content)? {
             return Err(err("the server's CertificateVerify does not verify"));
         }
         let th_before_fin = sha256(&transcript);
@@ -880,19 +969,22 @@ impl TlsStream {
         if !super::ct_eq(&finished_verify(&s_hs, &th_before_fin), &body) {
             return Err(err("the server's Finished does not verify"));
         }
-        self.client_finish(&transcript, &hs_secret, &c_hs, request_context)
+        self.client_finish(&transcript, &hs_secret, &c_hs, request_context, chain_der, key)
     }
 
     /// The client's last flight, after the server's Finished was verified:
-    /// the application keys from the transcript so far, an empty
-    /// Certificate if one was asked for, our Finished, and the resumption
-    /// master secret kept for the ticket the server sends next.
+    /// the application keys from the transcript so far, our Certificate
+    /// and CertificateVerify if one was asked for and we have one (an
+    /// empty Certificate if not), our Finished, and the resumption master
+    /// secret kept for the ticket the server sends next.
     fn client_finish(
         &mut self,
         transcript: &[u8],
         hs_secret: &[u8; 32],
         c_hs: &[u8; 32],
         request_context: Option<Vec<u8>>,
+        chain_der: Option<&[Vec<u8>]>,
+        key: Option<&KeyPair>,
     ) -> io::Result<()> {
         let mut transcript = transcript.to_vec();
         let empty_hash = sha256(&[]);
@@ -903,10 +995,32 @@ impl TlsStream {
         // Middlebox compatibility: a CCS before our first encrypted record.
         self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
         if let Some(context) = request_context {
-            let mut empty = vec![context.len() as u8];
-            empty.extend_from_slice(&context);
-            empty.extend_from_slice(&[0, 0, 0]);
-            self.write_handshake(HS_CERTIFICATE, &empty, &mut transcript)?;
+            let mut cert = vec![context.len() as u8];
+            cert.extend_from_slice(&context);
+            match (chain_der, key) {
+                (Some(chain), Some(key)) => {
+                    let mut list = Vec::new();
+                    for c in chain {
+                        list.extend_from_slice(&(c.len() as u32).to_be_bytes()[1..]);
+                        list.extend_from_slice(c);
+                        list.extend_from_slice(&[0, 0]);
+                    }
+                    cert.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
+                    cert.extend_from_slice(&list);
+                    self.write_handshake(HS_CERTIFICATE, &cert, &mut transcript)?;
+                    let th = sha256(&transcript);
+                    let sig = ed25519::sign(&key.seed, &verify_content(false, &th));
+                    let mut cv = Vec::with_capacity(4 + sig.len());
+                    cv.extend_from_slice(&SIG_ED25519.to_be_bytes());
+                    cv.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+                    cv.extend_from_slice(&sig);
+                    self.write_handshake(HS_CERTIFICATE_VERIFY, &cv, &mut transcript)?;
+                }
+                _ => {
+                    cert.extend_from_slice(&[0, 0, 0]);
+                    self.write_handshake(HS_CERTIFICATE, &cert, &mut transcript)?;
+                }
+            }
         }
         // Our Finished covers our (empty) Certificate too; the application
         // keys above do not, by the RFC's key schedule.
@@ -949,6 +1063,35 @@ fn extension(out: &mut Vec<u8>, ty: u16, body: &[u8]) {
     out.extend_from_slice(&ty.to_be_bytes());
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(body);
+}
+
+/// A CertificateVerify's signature checked against `key` over `content`:
+/// the scheme it names must be the one the key verifies with. An error
+/// for a malformed message or a scheme this build does not verify.
+fn verify_signature(body: &[u8], key: &x509::PublicKey, content: &[u8]) -> io::Result<bool> {
+    if body.len() < 4 {
+        return Err(err("a malformed CertificateVerify"));
+    }
+    let scheme = u16::from_be_bytes([body[0], body[1]]);
+    let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+    if body.len() != 4 + sig_len {
+        return Err(err("a malformed CertificateVerify"));
+    }
+    let sig = &body[4..];
+    Ok(match (scheme, key) {
+        (SIG_ED25519, x509::PublicKey::Ed25519(pk)) if sig.len() == 64 => {
+            let mut s = [0u8; 64];
+            s.copy_from_slice(sig);
+            ed25519::verify(pk, content, &s)
+        }
+        (SIG_RSA_PSS_RSAE_SHA256, x509::PublicKey::Rsa(pk)) => pk.verify_pss_sha256(content, sig),
+        (SIG_ECDSA_SECP256R1_SHA256, x509::PublicKey::P256(pk)) => {
+            pk.verify_sha256_der(content, sig)
+        }
+        _ => {
+            return Err(err("the peer signed with a scheme this build does not verify for its key"))
+        }
+    })
 }
 
 /// The signed content of a CertificateVerify.
@@ -1184,9 +1327,10 @@ fn parse_certificate_message(body: &[u8]) -> io::Result<Vec<Certificate>> {
         let _exts = l.vec16()?;
         chain.push(x509::parse(der).map_err(|e| err(e.to_string()))?);
     }
-    if chain.is_empty() {
-        return Err(err("the server sent no certificate"));
-    }
+    // An empty list is a message, not an error here: a client answers a
+    // CertificateRequest it cannot meet with one, and each side says what
+    // it makes of it -- the chain verifier refuses it as "no certificate
+    // was presented", the wire that requires one names the requirement.
     Ok(chain)
 }
 
@@ -1319,7 +1463,7 @@ mod tests {
         cert.extend_from_slice(&list);
         let key =
             KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
-        let tkey = ticket_key(&key);
+        let tkey = ticket_key(&key, false, ticket_day());
         let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7).unwrap();
         let mut nst = Vec::new();
         nst.extend_from_slice(&86_400u32.to_be_bytes());
@@ -1473,6 +1617,104 @@ mod tests {
         );
     }
 
+    /// A server that requires a client certificate: a client presenting a
+    /// chain the CA signed is served; one presenting none is refused
+    /// naming the requirement; one whose chain is another CA's is refused
+    /// too; and a server that requires nothing serves a client that would
+    /// have presented one, without asking.
+    #[test]
+    fn a_server_that_requires_a_client_certificate_refuses_a_peer_without_one() {
+        let m = x509::make(
+            "localhost",
+            &["localhost".to_string()],
+            &["127.0.0.1".parse().unwrap()],
+            30,
+        )
+        .unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let other = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let other_chain = pem::decode_all(&other.cert, "CERTIFICATE").unwrap();
+        let other_key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&other.key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+        // An echo server that reports, per connection, what it read or why
+        // the handshake failed.
+        let start =
+            |chain_der: Vec<Vec<u8>>, key: KeyPair, anchors: Option<Vec<Certificate>>, n: usize| {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let h = std::thread::spawn(move || {
+                    let mut seen: Vec<Result<Vec<u8>, String>> = Vec::new();
+                    for _ in 0..n {
+                        let (sock, _) = listener.accept().unwrap();
+                        let mut s = TlsStream::server(
+                            sock,
+                            ServerSide {
+                                chain_der: &chain_der,
+                                key: &key,
+                                client_anchors: anchors.as_deref(),
+                            },
+                        );
+                        let mut buf = Vec::new();
+                        match s.read_to_end(&mut buf) {
+                            Ok(_) => {
+                                s.write_all(&buf).unwrap();
+                                let _ = s.close_notify();
+                                seen.push(Ok(buf));
+                            }
+                            Err(e) => seen.push(Err(e.to_string())),
+                        }
+                    }
+                    seen
+                });
+                (addr, h)
+            };
+        // Each client under a name of its own, so none offers the ticket
+        // the one before it was handed: a resumed handshake shows no
+        // certificate by design, since the ticket stands for one shown.
+        let talk = |addr: std::net::SocketAddr,
+                    host: &str,
+                    chain: Option<&[Vec<u8>]>,
+                    key: Option<&KeyPair>|
+         -> Result<Vec<u8>, String> {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide { anchors: std::slice::from_ref(&anchor), host, chain_der: chain, key },
+            );
+            c.write_all(b"hello").map_err(|e| e.to_string())?;
+            c.close_notify().map_err(|e| e.to_string())?;
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).map_err(|e| e.to_string())?;
+            Ok(got)
+        };
+        let (addr, server) = start(chain_der.clone(), key.clone(), Some(vec![anchor.clone()]), 3);
+        assert_eq!(talk(addr, "127.0.0.1", Some(&chain_der), Some(&key)), Ok(b"hello".to_vec()));
+        assert_ne!(talk(addr, "localhost", None, None), Ok(b"hello".to_vec()), "no certificate");
+        forget_tickets();
+        assert_ne!(
+            talk(addr, "localhost", Some(&other_chain), Some(&other_key)),
+            Ok(b"hello".to_vec()),
+            "another CA's certificate, no echo"
+        );
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0], Ok(b"hello".to_vec()));
+        let e1 = seen[1].clone().unwrap_err();
+        assert!(e1.contains("presented no certificate"), "{e1}");
+        let e2 = seen[2].clone().unwrap_err();
+        assert!(e2.contains("the peer's certificate"), "{e2}");
+        // Nothing required: the client's chain is never asked for.
+        let (addr, server) = start(chain_der.clone(), key.clone(), None, 1);
+        assert_eq!(
+            talk(addr, "127.0.0.1", Some(&other_chain), Some(&other_key)),
+            Ok(b"hello".to_vec())
+        );
+        assert_eq!(server.join().unwrap()[0], Ok(b"hello".to_vec()));
+    }
+
     /// Two connections to one server: the first in full and it hands out a
     /// ticket, the second resumes on both sides and hands out another; a
     /// server under another key cannot open the ticket and the handshake
@@ -1493,8 +1735,10 @@ mod tests {
                 let mut resumed = Vec::new();
                 for _ in 0..n {
                     let (sock, _) = listener.accept().unwrap();
-                    let mut s =
-                        TlsStream::server(sock, ServerSide { chain_der: &chain_der, key: &key });
+                    let mut s = TlsStream::server(
+                        sock,
+                        ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                    );
                     let mut buf = Vec::new();
                     s.read_to_end(&mut buf).unwrap();
                     s.write_all(&buf).unwrap();
@@ -1507,8 +1751,15 @@ mod tests {
         };
         let talk = |addr: std::net::SocketAddr, anchor: &Certificate, host: &str| -> bool {
             let sock = TcpStream::connect(addr).unwrap();
-            let mut c =
-                TlsStream::client(sock, ClientSide { anchors: std::slice::from_ref(anchor), host });
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(anchor),
+                    host,
+                    chain_der: None,
+                    key: None,
+                },
+            );
             c.write_all(b"hello").unwrap();
             c.close_notify().unwrap();
             let mut got = Vec::new();
@@ -1588,8 +1839,10 @@ mod tests {
             let mut answers = Vec::new();
             for _ in 0..2 {
                 let (sock, _) = listener.accept().unwrap();
-                let mut s =
-                    TlsStream::server(sock, ServerSide { chain_der: &chain_s, key: &key_s });
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide { chain_der: &chain_s, key: &key_s, client_anchors: None },
+                );
                 let mut buf = Vec::new();
                 match s.read_to_end(&mut buf) {
                     Ok(_) => {
@@ -1606,7 +1859,12 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let mut c = TlsStream::client(
             sock,
-            ClientSide { anchors: std::slice::from_ref(&anchor), host: "localhost" },
+            ClientSide {
+                anchors: std::slice::from_ref(&anchor),
+                host: "localhost",
+                chain_der: None,
+                key: None,
+            },
         );
         let payload = vec![7u8; 40_000];
         c.write_all(&payload).unwrap();
@@ -1622,7 +1880,12 @@ mod tests {
         let sock = TcpStream::connect(addr).unwrap();
         let mut c = TlsStream::client(
             sock,
-            ClientSide { anchors: std::slice::from_ref(&other_anchor), host: "localhost" },
+            ClientSide {
+                anchors: std::slice::from_ref(&other_anchor),
+                host: "localhost",
+                chain_der: None,
+                key: None,
+            },
         );
         let e = c.write_all(b"x").unwrap_err();
         assert!(e.to_string().contains("does not reach"), "{e}");

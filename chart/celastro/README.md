@@ -62,7 +62,12 @@ Service spreads clients over the coordinators alone. Each keeps only its
 catalog, on `coordinators.persistence.size` (1Gi). Zero, the default,
 keeps every data pod coordinating what reaches it.
 
-How many: measured on kind (the binary's docs/design.md has the method),
+How many: below four or five data pods, none -- measured with every
+process on one machine's cores, a dedicated coordinator pays a hop
+(hybrid p95 181 to 199 ms, throughput down 5 %) and isolates nothing, since
+the cores are the same; the role earns its place where the coordinator's
+cores are its own and the data pods are many. Measured on kind (the
+binary's docs/design.md has the method),
 a coordinator spends about 2 ms of CPU per data node per hybrid request
 (0.5 ms for a text or a vector query), while a data node spends what its
 shard costs it -- 11 ms per hybrid request at 17,000 documents a shard,
@@ -108,7 +113,10 @@ helm install celastro chart/celastro --set replicas=3 --set console.expose=true 
 ```
 
 Every pod then serves the wire and the console over TLS 1.3 with one
-certificate and verifies every other pod against one CA. The certificate is
+certificate and verifies every other pod against one CA; `--set
+tls.clientAuth=required` makes every pod's wire ask its peers for that
+certificate too and refuse one the CA did not sign, with the console still
+answering the token alone. The certificate is
 Ed25519 (the binary's TLS signs with nothing else; the CA above it may also
 be RSA or P-256), from one of three places:
 
