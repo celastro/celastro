@@ -110,6 +110,32 @@ pub struct Tls {
     /// and refuses one without: `CELASTRO_TLS_CLIENT_AUTH=required`. The
     /// console never asks; browsers and tools speak to it with the token.
     client_auth: bool,
+    /// Whether this node's own certificate can be presented as a client
+    /// certificate: its extended key usage names client authentication,
+    /// or names nothing. A set made by `tls init` before 0.67.0 names
+    /// server authentication alone.
+    serves_as_client: bool,
+}
+
+/// Refused when the wire is to require client certificates and this
+/// node's own cannot be one: every peer would refuse this node, and the
+/// cluster would fail on the wire with nothing to say which certificate
+/// was at fault.
+fn check_client_purpose(
+    leaf: &crate::crypto::x509::Certificate,
+    cert_path: &str,
+    client_auth: bool,
+) -> Result<()> {
+    if client_auth && leaf.fit_for(crate::crypto::x509::Purpose::ClientAuth).is_err() {
+        return Err(Error::Plan(format!(
+            "{CLIENT_AUTH_ENV}=required, but the certificate at {cert_path} cannot serve as a \
+             client certificate: its extended key usage names server authentication alone (a \
+             set made by `celastro tls init` before 0.67.0, or an issuer asked for that alone). \
+             Make a new set with `celastro tls init`, or have the issuer name client \
+             authentication too, on every node, before turning the requirement on"
+        )));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for Tls {
@@ -173,6 +199,8 @@ impl Tls {
                 }
             },
         };
+        check_client_purpose(&leaf, &cert, client_auth)?;
+        let serves_as_client = leaf.fit_for(crate::crypto::x509::Purpose::ClientAuth).is_ok();
         Ok(Some(Tls {
             chain_der,
             key: pair,
@@ -180,12 +208,19 @@ impl Tls {
             not_after: leaf.not_after,
             anchors_not_after,
             client_auth,
+            serves_as_client,
         }))
     }
 
     /// Whether the wire requires a peer's certificate.
     pub fn client_auth(&self) -> bool {
         self.client_auth
+    }
+
+    /// Whether this node's certificate can be presented as a client
+    /// certificate, which a peer requiring one needs of it.
+    pub fn serves_as_client(&self) -> bool {
+        self.serves_as_client
     }
 
     /// When this node's certificate expires, seconds since the epoch.
@@ -413,5 +448,34 @@ pub fn connect(tls: Option<&Arc<Tls>>, sock: TcpStream, host: &str) -> io::Resul
     match tls {
         Some(t) => t.connect(sock, host),
         None => Ok(Box::new(sock)),
+    }
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+    use crate::crypto::x509::{self, ExtKeyUsage, Purpose};
+
+    /// A certificate naming server authentication alone is refused with
+    /// the requirement on and taken without it; one naming both, or
+    /// nothing, is taken either way.
+    #[test]
+    fn a_server_only_certificate_is_refused_when_client_certificates_are_required() {
+        let pem = std::fs::read_to_string(format!(
+            "{}/tests/pki/client-only.crt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut leaf =
+            x509::parse(&crate::crypto::pem::decode_all(&pem, "CERTIFICATE").unwrap()[0]).unwrap();
+        leaf.ext_key_usage = Some(ExtKeyUsage { server_auth: true, client_auth: false });
+        assert!(leaf.fit_for(Purpose::ClientAuth).is_err());
+        let e = check_client_purpose(&leaf, "./tls/tls.crt", true).unwrap_err().to_string();
+        assert!(e.contains("before 0.67.0") && e.contains("./tls/tls.crt"), "{e}");
+        check_client_purpose(&leaf, "./tls/tls.crt", false).unwrap();
+        leaf.ext_key_usage = Some(ExtKeyUsage { server_auth: true, client_auth: true });
+        check_client_purpose(&leaf, "./tls/tls.crt", true).unwrap();
+        leaf.ext_key_usage = None;
+        check_client_purpose(&leaf, "./tls/tls.crt", true).unwrap();
     }
 }

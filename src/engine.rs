@@ -2126,6 +2126,13 @@ impl Db {
                 describe("CA", tls.anchors_expire_at()),
                 if tls.client_auth() { "; the wire requires a peer's certificate" } else { "" }
             ));
+            if !tls.serves_as_client() {
+                out.push_str(
+                    "tls: this node's certificate names server authentication alone (a set from \
+                     before 0.67.0): a peer requiring client certificates would refuse it; make \
+                     a new set with `celastro tls init` before turning the requirement on\n",
+                );
+            }
         }
         if let Some(c) = &self.cipher {
             if c.previous_keys() > 0 {

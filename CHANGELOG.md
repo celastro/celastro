@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.70.1 — 2026-09-21
+
+**An old certificate set is caught before it breaks the wire.** A set
+made by `tls init` before 0.67.0 names server authentication alone and
+cannot serve as a client certificate; a node with such a set and
+`CELASTRO_TLS_CLIENT_AUTH=required` refuses to start, naming the
+certificate and the fix (a new set with `celastro tls init`, or an
+issuer that names client authentication too), where before every
+peer would have refused it on the wire with nothing to say why. `SHOW
+HEALTH` warns of such a set even with the requirement off.
+
 ## 0.70.0 — 2026-09-21
 
 **A backup streams each segment from its file.** The copy held every

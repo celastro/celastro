@@ -183,7 +183,11 @@ issued under. Client certificates on the wire (0.65.0): with
 `CELASTRO_TLS_CLIENT_AUTH=required` a node's wire sends CertificateRequest
 and refuses a peer whose Certificate is empty or whose chain does not
 reach the CA, before the token is looked at; every node presents its own
-certificate when asked, so the token becomes a second factor. The
+certificate when asked, so the token becomes a second factor. A
+certificate from a `tls init` before 0.67.0 names server authentication
+alone and cannot be a client certificate: a node refuses to start with
+the requirement on such a set, naming the fix, and `SHOW HEALTH` warns of
+one before the requirement is on (0.70.1). The
 console never asks (browsers and tools speak to it with the token), and a
 ticket sealed before the requirement does not resume past it (the ticket
 key differs). KeyUpdate (0.67.0): a peer's is answered and this
