@@ -2168,7 +2168,28 @@ last, so a copy cut short claims nothing and `RESTORE ... AS OF` refuses
 it by name), the others' standing. A peer from before 0.68.0 does not
 know `DETACHED` and is asked the old way, bounded at ten minutes. The
 wire test turns a peer into a black hole and expects the answer within
-a minute; on the box it comes in fourteen seconds. B2_LOAD_NUMBERS
+a minute; on the box it comes in fourteen seconds, on kind in
+eighteen with a peer cut off by iptables. The drill's second case, a
+pod deleted a second after the cluster backup started, found the
+poll's other gap: the pod came back with no memory of the copy and
+said "none started", and the coordinator named it `NOT on` though the
+copy had completed before the kill (0.68.1: the coordinator looks for
+the peer's record at the destination, present only for a complete
+copy, and names the backup complete or the peer restarted during its
+copy). Under a load (`backupload`: a write through every pod for the
+backup's whole length) the pin costs the writers nothing measurable --
+202 acknowledged a second without a backup, 210 with one, three pods
+on four shared cores -- since the copy runs with the lock let go and
+holds only handles to sealed segments and one segment built from the
+memtable at the instant; peak resident memory went from 11-14 MB to
+16-21 MB a pod for a backup of half a megabyte, the built segment and
+the copy's buffers; and the restore on the box at the instant, node by
+node, added up to 16,239 rows against 16,165 counted before the
+statement and 16,787 after, which is the cut. Not measured: a backup
+long enough for the pin to hold sealed segments through a compaction
+(the handles keep the files; the compaction's output stands beside
+them until the backup drops them), and a destination slow enough for
+the memtable's segment to matter -- both proportional, neither seen.
 
 ## A worked query
 
