@@ -1552,6 +1552,11 @@ impl Db {
         }
         let escaped = dest.replace('\'', "''");
         let keep_sql = keep.map(|k| format!(" KEEP {k}")).unwrap_or_default();
+        // The destination, for the record of a peer that forgot: a peer
+        // restarted mid-backup answers "none started", and its record at
+        // the destination is what says whether its copy completed.
+        let target =
+            crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), dest)?;
         let start = format!("LOCAL BACKUP TO '{escaped}'{keep_sql} AS OF {ts} DETACHED");
         let legacy = format!("LOCAL BACKUP TO '{escaped}'{keep_sql} AS OF {ts}");
         let status = format!("LOCAL BACKUP STATUS {ts}");
@@ -1595,7 +1600,17 @@ impl Db {
                             } else if let Some(rest) = m.split_once(": failed: ").map(|(_, r)| r) {
                                 failed.push(format!("{url}: {rest}"));
                             } else if m.contains(": none started") {
-                                failed.push(format!("{url}: the backup it started is not there"));
+                                if crate::backup::has_record(&target, &url, ts) {
+                                    done.push(format!(
+                                        "{url}: backup {ts} complete at the destination (the \
+                                         node restarted after its copy)"
+                                    ));
+                                } else {
+                                    failed.push(format!(
+                                        "{url}: restarted during its copy; no backup {ts} of it \
+                                         at the destination"
+                                    ));
+                                }
                             } else {
                                 still.push((url, node, 0));
                             }

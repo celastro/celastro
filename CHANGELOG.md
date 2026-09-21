@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.68.1 — 2026-09-21
+
+**A peer that restarted mid-backup is judged by its record.** A cluster
+backup polling a peer that came back with no memory of the copy it
+was asked for named it `NOT on` even when the copy had completed
+before the restart; the coordinator now looks for that peer's record
+at the destination -- written last, so present only for a complete
+copy -- and names the backup complete or the peer restarted during
+its copy. Found by the `backupnode` drill.
+
 ## 0.68.0 — 2026-09-21
 
 **A cluster backup no longer waits forever for a peer.** `BACKUP

@@ -341,6 +341,16 @@ fn instants(target: &Target, mine: &str) -> Result<Vec<u64>> {
 
 /// The newest complete backup of `node` at the destination, or the one at
 /// `as_of`, read and verified.
+/// Whether `node`'s backup at `ts` is at the destination with its record:
+/// what a cluster backup asks when a peer says it started no such backup
+/// -- a peer that restarted mid-way keeps no memory of it, and the record
+/// is written last, so its presence is the copy's completeness.
+pub(crate) fn has_record(target: &Target, node: &str, ts: u64) -> bool {
+    let slug = node_slug(node);
+    let key = target.key(&format!("nodes/{slug}/backups/{}/BACKUP", ts_key(ts)));
+    target.store.get(&key).is_ok()
+}
+
 pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<Fetched> {
     let slug = node_slug(node);
     let mine = format!("nodes/{slug}/");
