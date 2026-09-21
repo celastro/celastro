@@ -2700,3 +2700,49 @@ fn a_lost_copy_is_replaced_and_the_lost_node_back_drops_its_own() {
 fn b_url(port: u16) -> String {
     format!("tcp://127.0.0.1:{port}")
 }
+
+/// `ALTER ... SET (replicas = n)` names a follower that never had the
+/// collection: it is handed the definition and the map whole, makes its
+/// copy and is caught up, where before the carried `LOCAL ALTER` was
+/// refused there and no copy was ever made.
+#[test]
+fn a_replica_count_raised_hands_the_collection_to_a_follower_that_never_had_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("alt-a");
+    let b = Node::start("alt-b");
+    let c = Node::start("alt-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 2, nodes = ['{a}', \
+         '{b}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .as_str(),
+    );
+    for i in 0..8usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    assert!(c.exec("SHOW CATALOG items").is_err(), "c never had the collection");
+    let m = a.ack("ALTER COLLECTION items SET (replicas = 3)");
+    assert!(m.contains(&format!("{} (adopted the collection)", c.url)), "{m}");
+    let cat = c.ack("SHOW CATALOG items");
+    let followers = cat.split("followed by ").nth(1).unwrap_or("").lines().next().unwrap_or("");
+    assert!(followers.contains(&b.url) && followers.contains(&c.url), "{cat}");
+    let mut ok = false;
+    for _ in 0..100 {
+        if c.ack("SHOW HEALTH").contains("follows shard 0 of `items` at term 0: caught up") {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(ok, "{}", c.ack("SHOW HEALTH"));
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

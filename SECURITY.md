@@ -177,8 +177,13 @@ reach the CA, before the token is looked at; every node presents its own
 certificate when asked, so the token becomes a second factor. The
 console never asks (browsers and tools speak to it with the token), and a
 ticket sealed before the requirement does not resume past it (the ticket
-key differs). No HelloRetryRequest, no 0-RTT, no key update; a stock
-client speaks that subset. Every primitive is pinned against its RFC
+key differs). HelloRetryRequest (0.66.0): a client that offers X25519
+among its groups but sends a share of another group first is asked for
+an X25519 share and the handshake completes on its second flight, the
+transcript restarted from the message hash as the RFC has it; as a
+client the node answers a retry that asks for the share it withheld or
+carries a cookie, and refuses one asking for a group it lacks. No 0-RTT,
+no key update; a stock client speaks that subset. Every primitive is pinned against its RFC
 vectors and the key schedule against RFC 8448; nothing branches on or
 indexes by a secret, by masks rather than by asking the compiler. The
 archive client reaches an `https://` store over the same TLS, verifying
@@ -213,9 +218,10 @@ one data key; the data key is drawn at the first open and kept in
 `<dir>/KEY` wrapped under the master key, which is never written. The
 same in-tree, unaudited primitives as the TLS. The master key rotates
 with `key rekey` (one small rewrap); the data key with `key rotate`
-(0.65.0: every file sealed again with the process stopped, resumable,
-the archived tier refused), and `check` opens every frame and names
-what does not open.
+(0.65.0: every file sealed again with the process stopped, resumable;
+0.66.0: an archived tier keeps the old key in a ring behind the new
+one until `key retire`), and `check` opens every frame and names what
+does not open.
 
 What it protects against: a copied volume, a lost disk, a bucket or a
 backup read by someone without the master key -- none of it is readable

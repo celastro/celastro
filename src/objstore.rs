@@ -753,7 +753,7 @@ pub(crate) mod sigv4 {
             canonical.push_str(&format!("{k}:{v}\n"));
         }
         canonical.push_str(&format!("\n{signed_headers}\n{payload_hash}"));
-        let date = &amz_date[..8];
+        let date = amz_date.get(..8).unwrap_or(amz_date);
         let scope = format!("{date}/{region}/{service}/aws4_request");
         let to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -875,6 +875,42 @@ mod tests {
     /// The GET Object example from the S3 developer guide's signature
     /// calculations, signature and all. A signer that passes this one is
     /// accepted by S3; one that is off by a byte is refused by every request.
+    /// The signer over whatever a request carries -- a path, a query, a
+    /// set of headers, a date -- cut and mutated: it signs or it does not,
+    /// and never panics on a length or a boundary.
+    #[test]
+    fn fuzz_sigv4_canonicalisation_never_panics() {
+        let sample = b"GET\n/a%20b/c.txt\nx=1&y=2\nhost:example.com\nx-amz-date:20130524T000000Z\n20130524T000000Z"
+            .to_vec();
+        crate::fuzz::sweep(33, &[sample], 4000, |bytes| {
+            let text = String::from_utf8_lossy(bytes);
+            let mut parts = text.split('\n');
+            let method = parts.next().unwrap_or("");
+            let uri = parts.next().unwrap_or("");
+            let query = parts.next().unwrap_or("");
+            let mut headers = Vec::new();
+            let mut date = String::new();
+            for p in parts {
+                match p.split_once(':') {
+                    Some((k, v)) => headers.push((k.to_string(), v.to_string())),
+                    None => date = p.to_string(),
+                }
+            }
+            let _ = sigv4::authorization(
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "us-east-1",
+                "s3",
+                method,
+                uri,
+                query,
+                &headers,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                &date,
+            );
+        });
+    }
+
     #[test]
     fn sigv4_reproduces_the_aws_worked_example() {
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

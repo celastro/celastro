@@ -74,6 +74,7 @@ COMMANDS:
   key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER
   key rotate <DIR>           a new data key for the database at DIR: every file sealed again,
                              KEY rewrapped; with no process serving DIR; resumable if interrupted
+  key retire <DIR>           drop the previous data keys a rotation kept for the archived tier
   check <DIR>                open every frame of every file under DIR and name what does not open
   tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
                              write a CA and a certificate for NAME (and NAMES, comma-separated
@@ -232,6 +233,10 @@ enum Cmd {
     /// `key rotate <DIR>`: a new data key for the database at DIR, every
     /// file sealed again; `check <DIR>`: every frame of it opened.
     KeyRotate {
+        dir: PathBuf,
+    },
+    /// `key retire <DIR>`: the previous data keys a rotation kept, dropped.
+    KeyRetire {
         dir: PathBuf,
     },
     Check {
@@ -456,6 +461,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
             (Some("master"), 2) => Cmd::KeyMaster { file: PathBuf::from(&rest[1]) },
             (Some("init"), 2) => Cmd::KeyInit { file: PathBuf::from(&rest[1]) },
             (Some("rotate"), 2) => Cmd::KeyRotate { dir: PathBuf::from(&rest[1]) },
+            (Some("retire"), 2) => Cmd::KeyRetire { dir: PathBuf::from(&rest[1]) },
             (Some("rekey"), 3) => {
                 Cmd::KeyRekey { key: PathBuf::from(&rest[1]), master: PathBuf::from(&rest[2]) }
             }
@@ -658,6 +664,9 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::KeyRotate { dir } = cmd {
         return key_rotate(&dir, json);
     }
+    if let Cmd::KeyRetire { dir } = cmd {
+        return key_retire(&dir, json);
+    }
     if let Cmd::Check { dir } = cmd {
         return check_dir(&dir, json);
     }
@@ -699,6 +708,7 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         | Cmd::KeyInit { .. }
         | Cmd::KeyRekey { .. }
         | Cmd::KeyRotate { .. }
+        | Cmd::KeyRetire { .. }
         | Cmd::Check { .. } => {
             unreachable!("answered before the database was opened")
         }
@@ -1471,12 +1481,21 @@ fn key_rotate(dir: &Path, json: bool) -> i32 {
             ack(
                 json,
                 &format!(
-                    "{}: {} file(s) and {} log record(s) sealed under a new data key{}; KEY rewrapped",
+                    "{}: {} file(s) and {} log record(s) sealed under a new data key{}; KEY rewrapped{}",
                     dir.display(),
                     w.files,
                     w.records,
                     if w.already > 0 {
                         format!(" ({} file(s) were under it already: a rotation resumed)", w.already)
+                    } else {
+                        String::new()
+                    },
+                    if w.kept_keys > 0 {
+                        format!(
+                            " keeping {} previous key(s) for the archived tier; `key retire` drops \
+                             them once nothing is under them",
+                            w.kept_keys
+                        )
                     } else {
                         String::new()
                     }
@@ -1491,6 +1510,36 @@ fn key_rotate(dir: &Path, json: bool) -> i32 {
                 dir.display()
             ),
         ),
+    }
+}
+
+/// `key retire <DIR>`: the previous data keys a rotation kept for the
+/// archived tier dropped from KEY; what is still under them stops opening.
+fn key_retire(dir: &Path, json: bool) -> i32 {
+    let master = match master_or_fail(json, "key retire") {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    match celastro::cipher::retire_keys(dir, &master) {
+        Ok(0) => {
+            ack(
+                json,
+                &format!("{}: KEY keeps no previous data key; nothing to retire", dir.display()),
+            );
+            EXIT_OK
+        }
+        Ok(n) => {
+            ack(
+                json,
+                &format!(
+                    "{}: {n} previous data key(s) dropped from KEY; an archived object still \
+                     sealed under one of them no longer opens",
+                    dir.display()
+                ),
+            );
+            EXIT_OK
+        }
+        Err(e) => fail(json, &format!("could not retire {}'s keys: {e}", dir.display())),
     }
 }
 

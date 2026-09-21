@@ -5368,17 +5368,13 @@ impl Db {
     fn insert_many_local(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
         let _deadline = self.arm_default_deadline();
         let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        let mut away: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut last = self.last_commit;
         for doc in docs {
             let coll = self.catalog.get(collection)?;
             let key = sort_key(coll, &doc)?;
             match self.owner_of(collection, &key)? {
-                Some(url) => {
-                    let ts = self.node_conn(&url)?.insert(collection, &doc)?;
-                    self.writes += 1;
-                    self.last_commit = self.last_commit.max(ts);
-                    last = last.max(ts);
-                }
+                Some(url) => away.entry(url).or_default().push(doc),
                 None => {
                     self.refuse_if_moving(collection, &key)?;
                     let shards = self.shards.get(collection).ok_or_else(|| {
@@ -5391,6 +5387,31 @@ impl Db {
                     here.entry(idx).or_default().push(doc);
                 }
             }
+        }
+        // The documents of other holders, each holder's in one call; a
+        // holder too old to know the call is fed one at a time.
+        for (url, docs) in away {
+            let conn = self.node_conn(&url)?;
+            let ts = match conn.insert_many(collection, &docs) {
+                Ok((taken, ts, stopped)) => {
+                    self.writes += taken as u64;
+                    self.last_commit = self.last_commit.max(ts);
+                    last = last.max(ts);
+                    stopped?;
+                    ts
+                }
+                Err(e) if e.to_string().contains("unknown call") => {
+                    let mut ts = 0;
+                    for doc in &docs {
+                        ts = ts.max(conn.insert(collection, doc)?);
+                        self.writes += 1;
+                    }
+                    ts
+                }
+                Err(e) => return Err(e),
+            };
+            self.last_commit = self.last_commit.max(ts);
+            last = last.max(ts);
         }
         let chunk = self.opts.insert_batch.max(1);
         if !here.is_empty() {
@@ -6461,7 +6482,31 @@ impl Db {
         if let Statement::ReplaceCopy { collection, shard, node, with, term } = &stmt {
             return self.replace_copy(collection, *shard, node, with, *term, local);
         }
+        let alter_of = match &stmt {
+            Statement::AlterCollection { collection, .. } => Some(collection.clone()),
+            _ => None,
+        };
         let out = self.run_one(stmt, sql, params, analyze)?;
+        // A re-plan of the followers (`replicas`, `regions`) names nodes the
+        // map did not: they hear the statement too, with the nodes it no
+        // longer names, and one that never had the collection is handed
+        // the definition and the map whole, as CREATE hands them -- a
+        // `LOCAL ALTER` of a collection a node does not have is refused,
+        // and the follower it was to become never made its copy.
+        let (holders, adopt) = match &alter_of {
+            Some(c) if !local => {
+                let mut targets = holders;
+                for t in self.ddl_targets(c) {
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                    }
+                }
+                let coll = self.catalog.get(c)?.clone();
+                let tablets = self.catalog.placement.get(c).cloned().unwrap_or_default();
+                (targets, Some((coll, tablets)))
+            }
+            _ => (holders, None),
+        };
         if holders.is_empty() {
             return Ok(out);
         }
@@ -6483,7 +6528,24 @@ impl Db {
         let sql = sql.to_string();
         let remaining = crate::deadline::remaining_ms();
         Ok(Outcome::Deferred(Deferred::new(move || {
-            let (done, more) = carry_statement(&conns, &local, &params, remaining);
+            let (mut done, mut more) = carry_statement(&conns, &local, &params, remaining);
+            if let Some((coll, tablets)) = &adopt {
+                let mut kept = Vec::new();
+                for f in more.drain(..) {
+                    let url = f.split(": ").next().unwrap_or("").to_string();
+                    if f.contains("no such collection") {
+                        if let Some((_, n)) = conns.iter().find(|(u, _)| *u == url) {
+                            match n.create_collection(coll, tablets) {
+                                Ok(()) => done.push(format!("{url} (adopted the collection)")),
+                                Err(e) => kept.push(format!("{url}: {e}")),
+                            }
+                            continue;
+                        }
+                    }
+                    kept.push(f);
+                }
+                more = kept;
+            }
             failures.extend(more);
             if !failures.is_empty() && !reconciled {
                 return Err(Db::not_propagated(&done, &failures, &sql));
@@ -8872,10 +8934,26 @@ fn carry_writes(
                 let url = url.clone();
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
+                    // The holder's documents in one call and one sync there;
+                    // a holder too old to know the call, or a shard that
+                    // moved under the batch, is fed one at a time from where
+                    // the batch stopped, as before.
                     let mut last = 0;
                     let mut moved = Moved::default();
                     let mut taken = 0usize;
-                    for doc in docs {
+                    match n.insert_many(collection, docs) {
+                        Ok((n_taken, ts, Ok(()))) => return (url, n_taken, docs.len(), Ok(ts)),
+                        Ok((n_taken, ts, Err(e))) => {
+                            taken = n_taken;
+                            last = ts;
+                            if moved_to(&e).is_none() {
+                                return (url, taken, docs.len(), Err(e));
+                            }
+                        }
+                        Err(e) if e.to_string().contains("unknown call") => {}
+                        Err(e) => return (url, 0, docs.len(), Err(e)),
+                    }
+                    for doc in docs.iter().skip(taken) {
                         let ts = match n.insert(collection, doc) {
                             Ok(ts) => ts,
                             Err(e) => match moved_to(&e) {

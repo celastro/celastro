@@ -231,7 +231,10 @@ $ docker run -d -p 8787:8787 -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef 
 $ curl -s -H 'X-Celastro-Token: 0123456789abcdef0123456789abcdef' http://127.0.0.1:8787/api/health
 ```
 
-Plain HTTP unless the image is also given certificates: mount them and set
+The image is published for amd64 and arm64 under one tag (from 0.66.0;
+`scripts/image.sh` builds both, the arm64 half from a cross-compiled
+binary through `Dockerfile.prebuilt`), so a pull on either machine gets
+its own. Plain HTTP unless the image is also given certificates: mount them and set
 `CELASTRO_TLS_CERT`, `CELASTRO_TLS_KEY` and `CELASTRO_TLS_CA` (all three, PEM,
 Ed25519 — `celastro tls init` makes a set) and the console and the wire
 serve TLS 1.3, with the CA verifying every peer; `CELASTRO_TLS_CLIENT_AUTH=required`

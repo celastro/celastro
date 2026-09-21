@@ -156,8 +156,12 @@ no longer need to share one data key once they hold their own copies).
 The new key goes to `KEY.next` first, so a rotation cut short is
 finished by running it again, and a node refuses to open a directory
 with a `KEY.next` until then. Backups and exports made before carry
-their own `KEY` and open as they did; an index at the archived tier is
-refused (its objects are under the old key), move it back first.
+their own `KEY` and open as they did. An index at the archived tier has
+objects the rotation does not reach: the old key is kept in a ring
+behind the new one in `KEY`, those objects open as before, and **`key
+retire <DIR>`** drops the ring once nothing is under it (the index
+moved back and out again, or dropped) -- an object still under a
+retired key no longer opens.
 **`check <DIR>`** opens every frame of every file and names what does
 not open, with nothing written: what to run on a volume you doubt.
 

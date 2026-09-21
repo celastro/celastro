@@ -41,9 +41,13 @@ const fn framed(n: usize) -> usize {
 }
 const FRAME: usize = framed(CHUNK);
 
-/// The data key, ready to derive file keys.
+/// The data key, ready to derive file keys, and the data keys before it
+/// that a rotation kept because the archived tier's objects are still
+/// under them: a file that does not open under the current key is tried
+/// under each in turn, so a rotation need not move an archive back first.
 pub struct Cipher {
     data_key: [u8; 32],
+    previous: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Cipher {
@@ -52,61 +56,139 @@ impl std::fmt::Debug for Cipher {
     }
 }
 
-/// The wrapped data key as `KEY` holds it: `"CELK1"` | nonce | ciphertext | tag.
+/// The wrapped data key as `KEY` holds it: `"CELK1"` | nonce | ciphertext |
+/// tag for one key; `"CELK2"` | count | that many (nonce | ciphertext | tag),
+/// the current key first and the ring of previous ones after it.
 const KEY_MAGIC: &[u8; 5] = b"CELK1";
+const KEY_MAGIC_RING: &[u8; 5] = b"CELK2";
 const KEY_AAD: &[u8] = b"celastro data key v1";
+const WRAPPED: usize = NONCE + 32 + TAG;
 
 impl Cipher {
     /// A fresh data key, from the kernel's randomness.
     pub fn generate() -> Result<Cipher> {
-        Ok(Cipher { data_key: crate::crypto::random::array32()? })
+        Ok(Cipher { data_key: crate::crypto::random::array32()?, previous: Vec::new() })
     }
 
-    /// The data key wrapped under `master`, as the bytes of `KEY`.
+    /// A cipher over `data_key` with `previous` behind it (tests).
+    pub fn with_previous(data_key: [u8; 32], previous: Vec<[u8; 32]>) -> Cipher {
+        Cipher { data_key, previous }
+    }
+
+    /// How many previous data keys this cipher still opens files under.
+    pub fn previous_keys(&self) -> usize {
+        self.previous.len()
+    }
+
+    /// Keep `old`'s current key and ring behind this one's: what a rotation
+    /// does when the archived tier's objects stay under the old key.
+    pub fn keep_previous(&mut self, old: &Cipher) {
+        let mut ring = vec![old.data_key];
+        ring.extend(old.previous.iter().copied());
+        ring.retain(|k| *k != self.data_key);
+        self.previous = ring;
+    }
+
+    /// Forget the previous keys: `key retire`, once nothing is under them.
+    pub fn retire_previous(&mut self) {
+        for k in self.previous.iter_mut() {
+            wipe(k);
+        }
+        self.previous.clear();
+    }
+
+    /// The data key wrapped under `master`, as the bytes of `KEY`: the one
+    /// key in the form every release reads, the ring in the form from
+    /// 0.66.0 when there is one.
     pub fn wrap(&self, master: &[u8; 32]) -> Result<Vec<u8>> {
-        let nonce_bytes = crate::crypto::random::bytes(NONCE)?;
-        let mut nonce = [0u8; NONCE];
-        nonce.copy_from_slice(&nonce_bytes);
-        let mut data = self.data_key.to_vec();
-        let tag = seal(master, &nonce, KEY_AAD, &mut data);
-        let mut out = Vec::with_capacity(KEY_MAGIC.len() + NONCE + 32 + TAG);
-        out.extend_from_slice(KEY_MAGIC);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&data);
-        out.extend_from_slice(&tag);
+        let wrap_one = |k: &[u8; 32], out: &mut Vec<u8>| -> Result<()> {
+            let nonce_bytes = crate::crypto::random::bytes(NONCE)?;
+            let mut nonce = [0u8; NONCE];
+            nonce.copy_from_slice(&nonce_bytes);
+            let mut data = k.to_vec();
+            let tag = seal(master, &nonce, KEY_AAD, &mut data);
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&data);
+            out.extend_from_slice(&tag);
+            Ok(())
+        };
+        let mut out = Vec::with_capacity(6 + WRAPPED * (1 + self.previous.len()));
+        if self.previous.is_empty() {
+            out.extend_from_slice(KEY_MAGIC);
+            wrap_one(&self.data_key, &mut out)?;
+            return Ok(out);
+        }
+        out.extend_from_slice(KEY_MAGIC_RING);
+        out.push((1 + self.previous.len()) as u8);
+        wrap_one(&self.data_key, &mut out)?;
+        for k in &self.previous {
+            wrap_one(k, &mut out)?;
+        }
         Ok(out)
     }
 
-    /// The data key `KEY` holds, unwrapped under `master`; refused with the
-    /// reason when the master key is not the one it was wrapped under.
+    /// The data key `KEY` holds, unwrapped under `master`, with its ring if
+    /// it has one; refused with the reason when the master key is not the
+    /// one it was wrapped under.
     pub fn unwrap(key_file: &[u8], master: &[u8; 32]) -> Result<Cipher> {
-        if key_file.len() != KEY_MAGIC.len() + NONCE + 32 + TAG || &key_file[..5] != KEY_MAGIC {
-            return Err(Error::Storage("KEY is not a wrapped data key".into()));
+        let unwrap_one = |at: usize| -> Result<[u8; 32]> {
+            let mut nonce = [0u8; NONCE];
+            nonce.copy_from_slice(&key_file[at..at + NONCE]);
+            let mut data = key_file[at + NONCE..at + NONCE + 32].to_vec();
+            let mut tag = [0u8; TAG];
+            tag.copy_from_slice(&key_file[at + NONCE + 32..at + WRAPPED]);
+            if !open(master, &nonce, KEY_AAD, &mut data, &tag) {
+                return Err(Error::Storage(
+                    "the master key does not open this database's KEY; the database was \
+                     encrypted under another"
+                        .into(),
+                ));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&data);
+            wipe(&mut data);
+            Ok(k)
+        };
+        if key_file.len() == 5 + WRAPPED && &key_file[..5] == KEY_MAGIC {
+            return Ok(Cipher { data_key: unwrap_one(5)?, previous: Vec::new() });
         }
-        let mut nonce = [0u8; NONCE];
-        nonce.copy_from_slice(&key_file[5..5 + NONCE]);
-        let mut data = key_file[5 + NONCE..5 + NONCE + 32].to_vec();
-        let mut tag = [0u8; TAG];
-        tag.copy_from_slice(&key_file[5 + NONCE + 32..]);
-        if !open(master, &nonce, KEY_AAD, &mut data, &tag) {
-            return Err(Error::Storage(
-                "the master key does not open this database's KEY; the database was encrypted \
-                 under another"
-                    .into(),
-            ));
+        if key_file.len() >= 6 && &key_file[..5] == KEY_MAGIC_RING {
+            let n = key_file[5] as usize;
+            if n == 0 || key_file.len() != 6 + n * WRAPPED {
+                return Err(Error::Storage("KEY is not a wrapped data key ring".into()));
+            }
+            let data_key = unwrap_one(6)?;
+            let mut previous = Vec::with_capacity(n - 1);
+            for i in 1..n {
+                previous.push(unwrap_one(6 + i * WRAPPED)?);
+            }
+            return Ok(Cipher { data_key, previous });
         }
-        let mut data_key = [0u8; 32];
-        data_key.copy_from_slice(&data);
-        Ok(Cipher { data_key })
+        Err(Error::Storage("KEY is not a wrapped data key".into()))
     }
 
-    /// The key of one file, from its identity.
+    /// The key of one file, from its identity, under the current data key.
     fn file_key(&self, id: &str) -> [u8; 32] {
-        let prk = hkdf::extract(b"celastro file key v1", &self.data_key);
+        Self::file_key_under(&self.data_key, id)
+    }
+
+    fn file_key_under(data_key: &[u8; 32], id: &str) -> [u8; 32] {
+        let prk = hkdf::extract(b"celastro file key v1", data_key);
         let okm = hkdf::expand(&prk, id.as_bytes(), 32);
         let mut k = [0u8; 32];
         k.copy_from_slice(&okm);
         k
+    }
+
+    /// The file's key under the current data key, then under each previous
+    /// one: what a reader tries in turn.
+    fn file_keys(&self, id: &str) -> Vec<[u8; 32]> {
+        let mut v = Vec::with_capacity(1 + self.previous.len());
+        v.push(self.file_key(id));
+        for k in &self.previous {
+            v.push(Self::file_key_under(k, id));
+        }
+        v
     }
 
     /// The whole of `plain` as frames.
@@ -144,9 +226,22 @@ impl Cipher {
         Ok(())
     }
 
-    /// The whole of a framed file.
+    /// The whole of a framed file: under the current key, or under a
+    /// previous one the ring keeps.
     pub fn open_file(&self, id: &str, framed_bytes: &[u8]) -> Result<Vec<u8>> {
-        let key = self.file_key(id);
+        let keys = self.file_keys(id);
+        let mut last = None;
+        for key in &keys {
+            match self.open_file_under(key, id, framed_bytes) {
+                Ok(p) => return Ok(p),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("at least one key"))
+    }
+
+    fn open_file_under(&self, key: &[u8; 32], id: &str, framed_bytes: &[u8]) -> Result<Vec<u8>> {
+        let key = *key;
         let mut out = Vec::with_capacity(framed_bytes.len());
         let mut index = 0u64;
         let mut rest = framed_bytes;
@@ -204,10 +299,30 @@ impl Cipher {
         off: u64,
         len: u64,
     ) -> Result<Vec<u8>> {
+        // Under the current key, then under each the ring keeps.
+        let keys = self.file_keys(id);
+        let mut last = None;
+        for key in &keys {
+            match self.read_range_under(key, id, read, off, len) {
+                Ok(p) => return Ok(p),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("at least one key"))
+    }
+
+    fn read_range_under(
+        &self,
+        key: &[u8; 32],
+        id: &str,
+        read: &dyn Fn(u64, u64) -> Result<Vec<u8>>,
+        off: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let key = self.file_key(id);
+        let key = *key;
         let first = off / CHUNK as u64;
         let last = (off + len - 1) / CHUNK as u64;
         let framed_off = first * FRAME as u64;
@@ -264,7 +379,20 @@ impl Cipher {
     /// at the first frame that is torn or does not authenticate -- the
     /// rule a WAL's CRC applies to a torn tail.
     pub fn open_records(&self, id: &str, log: &[u8]) -> Vec<Vec<u8>> {
-        let key = self.file_key(id);
+        // The key the first record opens under decides the log's: a log is
+        // under one key, the current or one the ring keeps.
+        let keys = self.file_keys(id);
+        for key in &keys {
+            let out = self.open_records_under(key, id, log);
+            if !out.is_empty() || log.len() < 4 {
+                return out;
+            }
+        }
+        Vec::new()
+    }
+
+    fn open_records_under(&self, key: &[u8; 32], id: &str, log: &[u8]) -> Vec<Vec<u8>> {
+        let key = *key;
         let mut out = Vec::new();
         let mut i = 0usize;
         let mut index = 0u64;
@@ -348,6 +476,9 @@ impl<const N: usize> Drop for Secret<N> {
 impl Drop for Cipher {
     fn drop(&mut self) {
         wipe(&mut self.data_key);
+        for k in self.previous.iter_mut() {
+            wipe(k);
+        }
     }
 }
 
@@ -449,7 +580,7 @@ mod tests {
     /// by range; the identity and the frame index are bound.
     #[test]
     fn files_round_trip_whole_and_by_range_and_frames_cannot_move() {
-        let c = Cipher { data_key: [7; 32] };
+        let c = Cipher { data_key: [7; 32], previous: Vec::new() };
         for n in [0usize, 1, 100, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + 17, 3 * CHUNK] {
             let plain: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
             let framed = c.seal_file("shard-0000/segments/1.seg", &plain).unwrap();
@@ -503,6 +634,9 @@ pub struct Walked {
     /// Files that opened under neither key, or not at all: what a check
     /// reports and a rotation stops on. Each names the file and why.
     pub failures: Vec<String>,
+    /// Previous data keys the rotation kept in a ring, for an archived
+    /// tier whose objects are still under them.
+    pub kept_keys: usize,
 }
 
 /// The files a database directory holds that are not framed under the
@@ -698,8 +832,9 @@ pub const KEY_NEXT: &str = "KEY.next";
 /// under the new key are recognised) and a node refuses to open a
 /// directory with a `KEY.next` until then. Backups and exports made
 /// before carry their own `KEY` and open as they did; an index at the
-/// archived tier is refused, since its objects are under the old key
-/// where a rotation does not reach.
+/// archived tier keeps the old key in a ring behind the new one, since
+/// its objects are under the old key where a rotation does not reach, and
+/// `retire_keys` drops the ring once they are not.
 pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walked> {
     let key_path = dir.join("KEY");
     let wrapped = std::fs::read(&key_path).map_err(|e| {
@@ -707,43 +842,101 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
     })?;
     let old = Cipher::unwrap(&wrapped, master)?;
     let next_path = dir.join(KEY_NEXT);
-    let new = match crate::shard::read_optional(&next_path)? {
+    let mut new = match crate::shard::read_optional(&next_path)? {
         Some(next) => Cipher::unwrap(&next, master).map_err(|e| {
             Error::Storage(format!("{}: {e}; the interrupted rotation's key", next_path.display()))
         })?,
-        None => {
-            let c = Cipher::generate()?;
-            crate::shard::atomic_write(&next_path, &c.wrap(master)?)?;
-            c
-        }
+        None => Cipher::generate()?,
     };
     // The catalog first: an index at the archived tier has objects the
-    // walk does not reach.
+    // walk does not reach, so the old key stays behind the new one in a
+    // ring and those objects open as before, until `key retire`.
     if let Some(bytes) = crate::shard::read_optional(&dir.join("CATALOG"))? {
         let plain =
             old.open_file("CATALOG", &bytes).or_else(|_| new.open_file("CATALOG", &bytes))?;
         let catalog = crate::catalog::Catalog::decode(&plain)?;
-        let archived: Vec<String> = catalog
+        let archived = catalog
             .collections
             .values()
-            .flat_map(|c| {
-                c.indexes
-                    .iter()
-                    .filter(|i| i.tier == crate::residency::Tier::Archived)
-                    .map(move |i| format!("{}.{}", c.name, i.name))
-            })
-            .collect();
-        if !archived.is_empty() {
-            let _ = std::fs::remove_file(&next_path);
-            return Err(Error::Storage(format!(
-                "a rotation does not reach the archived tier; move {} back first (ALTER INDEX \
-                 ... SET TIER)",
-                archived.join(", ")
-            )));
+            .any(|c| c.indexes.iter().any(|i| i.tier == crate::residency::Tier::Archived));
+        if archived && new.previous.is_empty() {
+            new.keep_previous(&old);
         }
     }
-    let w = recode_dir(dir, &old, &new)?;
+    if !next_path.exists() {
+        crate::shard::atomic_write(&next_path, &new.wrap(master)?)?;
+    }
+    let mut w = recode_dir(dir, &old, &new)?;
+    w.kept_keys = new.previous.len();
     std::fs::rename(&next_path, &key_path)?;
     crate::shard::sync_dir(dir)?;
     Ok(w)
+}
+
+/// `key retire`: the ring of previous data keys dropped from `KEY`, once
+/// nothing is under them any more (an archived index moved back and out
+/// again after the rotation, or dropped). Objects still under them stop
+/// opening. How many were dropped.
+pub fn retire_keys(dir: &std::path::Path, master: &[u8; 32]) -> Result<usize> {
+    let key_path = dir.join("KEY");
+    let wrapped = std::fs::read(&key_path).map_err(|e| {
+        Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))
+    })?;
+    let mut cipher = Cipher::unwrap(&wrapped, master)?;
+    let n = cipher.previous_keys();
+    if n > 0 {
+        cipher.retire_previous();
+        crate::shard::atomic_write(&key_path, &cipher.wrap(master)?)?;
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    /// A file sealed under one data key opens under a cipher that keeps
+    /// that key behind its own, and the ring survives a wrap and unwrap;
+    /// a one-key file wraps in the form every release reads; retiring
+    /// the ring is what stops the old file opening.
+    #[test]
+    fn a_previous_key_in_the_ring_opens_what_was_sealed_under_it() {
+        let master = [9u8; 32];
+        let old = Cipher::generate().unwrap();
+        let sealed = old.seal_file("shard-0000/a.seg", b"rows").unwrap();
+        let log = [
+            old.seal_record("shard-0000/wal.log", 0, b"r0").unwrap(),
+            old.seal_record("shard-0000/wal.log", 1, b"r1").unwrap(),
+        ]
+        .concat();
+        let mut new = Cipher::generate().unwrap();
+        assert!(new.open_file("shard-0000/a.seg", &sealed).is_err());
+        new.keep_previous(&old);
+        assert_eq!(new.previous_keys(), 1);
+        assert_eq!(new.open_file("shard-0000/a.seg", &sealed).unwrap(), b"rows");
+        assert_eq!(new.open_records("shard-0000/wal.log", &log).len(), 2);
+        let range = new
+            .read_range(
+                "shard-0000/a.seg",
+                &|off, len| {
+                    Ok(sealed[off as usize..(off + len).min(sealed.len() as u64) as usize].to_vec())
+                },
+                1,
+                2,
+            )
+            .unwrap();
+        assert_eq!(range, b"ow");
+        let wrapped = new.wrap(&master).unwrap();
+        assert_eq!(&wrapped[..5], b"CELK2");
+        let back = Cipher::unwrap(&wrapped, &master).unwrap();
+        assert_eq!(back.previous_keys(), 1);
+        assert_eq!(back.open_file("shard-0000/a.seg", &sealed).unwrap(), b"rows");
+        let plain = old.wrap(&master).unwrap();
+        assert_eq!(&plain[..5], b"CELK1");
+        assert_eq!(Cipher::unwrap(&plain, &master).unwrap().previous_keys(), 0);
+        let mut retired = back;
+        retired.retire_previous();
+        assert!(retired.open_file("shard-0000/a.seg", &sealed).is_err());
+        assert_eq!(&retired.wrap(&master).unwrap()[..5], b"CELK1");
+    }
 }

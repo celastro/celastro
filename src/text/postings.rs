@@ -119,7 +119,7 @@ fn encode_term_postings(tp: &TermPostings, doc_lens: &[u32], out: &mut Vec<u8>) 
     let nblocks = n.div_ceil(BLOCK_SIZE);
     let mut data = Vec::new();
     let mut pos = Vec::new();
-    let mut metas: Vec<[u32; 6]> = Vec::with_capacity(nblocks);
+    let mut metas: Vec<[u32; 6]> = Vec::with_capacity(nblocks.min(1024));
     for b in 0..nblocks {
         let lo = b * BLOCK_SIZE;
         let hi = (lo + BLOCK_SIZE).min(n);
@@ -234,7 +234,10 @@ impl DictParts {
         let mut i = 0;
         let num_terms = get_u32(b, &mut i).ok_or_else(bad)?;
         let nidx = get_u32(b, &mut i).ok_or_else(bad)? as usize;
-        let mut index = Vec::with_capacity(nidx);
+        // Capacities from a count the bytes gave are bounded: a mutated
+        // count of four billion was an allocation that aborted the process,
+        // which is a crash a file can cause.
+        let mut index = Vec::with_capacity(nidx.min(1024));
         for _ in 0..nidx {
             let t = get_str(b, &mut i).ok_or_else(bad)?;
             let off = get_u32(b, &mut i).ok_or_else(bad)?;
@@ -394,6 +397,44 @@ pub struct BlockMeta {
 
 pub const EXHAUSTED: u32 = u32::MAX;
 
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    /// The dictionary and the posting lists, mutated: a parser that reads
+    /// a count and a cursor that walks blocks must refuse or stop, never
+    /// panic or loop, whatever the bytes say.
+    #[test]
+    fn fuzz_dictionary_and_postings_never_panic() {
+        let mut b = InvertedBuilder::new();
+        let words = ["graph", "search", "vector", "index", "segment", "fusion", "rank", "hop"];
+        for ord in 0..300u32 {
+            let toks: Vec<(String, u32)> = (0..6)
+                .map(|k| {
+                    (words[(ord as usize * 3 + k) % words.len()].to_string(), (k as u32 % 3) + 1)
+                })
+                .collect();
+            b.add_doc(ord, &toks);
+        }
+        let (dict, postings, _lens) = b.finish();
+        assert!(DictParts::parse(&dict).is_ok());
+        crate::fuzz::sweep(31, &[dict], 6000, |bytes| {
+            let _ = DictParts::parse(bytes);
+        });
+        crate::fuzz::sweep(32, &[postings], 6000, |bytes| {
+            if let Ok(mut c) = PostingCursor::open(bytes) {
+                let _ = c.doc_freq();
+                let mut at = c.advance(0);
+                let mut steps = 0;
+                while at != EXHAUSTED && steps < 10_000 {
+                    at = c.advance(at.saturating_add(1));
+                    steps += 1;
+                }
+            }
+        });
+    }
+}
+
 /// A cursor over one term's postings. `advance` is the only movement
 /// primitive; block skipping happens inside it.
 pub struct PostingCursor<'a> {
@@ -418,7 +459,7 @@ impl<'a> PostingCursor<'a> {
         let mut i = 0;
         let num_docs = get_u32(b, &mut i).ok_or_else(bad)?;
         let nblocks = get_u32(b, &mut i).ok_or_else(bad)? as usize;
-        let mut meta = Vec::with_capacity(nblocks);
+        let mut meta = Vec::with_capacity(nblocks.min(1024));
         for _ in 0..nblocks {
             let last_ord = get_u32(b, &mut i).ok_or_else(bad)?;
             let max_tf = get_u32(b, &mut i).ok_or_else(bad)?;
@@ -454,13 +495,18 @@ impl<'a> PostingCursor<'a> {
         let mut i = m.data_off as usize;
         self.buf_ords.clear();
         self.buf_tfs.clear();
+        // A count the file gave, bounded by the bytes behind it (a posting
+        // is a byte at least), and a delta summed without overflow: a
+        // mutated block was an allocation that ended the process, and a
+        // sum that panicked.
+        let count = (m.count as usize).min(self.data.len().saturating_sub(i).max(1));
         let mut prev = 0u32;
-        for _ in 0..m.count {
+        for _ in 0..count {
             let d = get_uvarint(self.data, &mut i).unwrap_or(0) as u32;
-            prev += d;
+            prev = prev.saturating_add(d);
             self.buf_ords.push(prev);
         }
-        for _ in 0..m.count {
+        for _ in 0..count {
             self.buf_tfs.push(get_uvarint(self.data, &mut i).unwrap_or(1) as u32);
         }
         self.block = b;

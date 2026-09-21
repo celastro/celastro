@@ -6,6 +6,62 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.66.0 — 2026-09-21
+
+**HelloRetryRequest.** A client that lists X25519 among its groups but
+sends a share of another group first is asked for an X25519 share and
+the handshake completes on its second flight, the transcript restarted
+from the message hash as the RFC has it; a stock client configured
+that way (`openssl s_client -groups P-256:X25519`) now connects where
+it was refused. As a client the node answers a retry that asks for the
+share it withheld or carries a cookie, and refuses one asking for a
+group this build lacks, or asking again for a share it sent.
+
+**Forwarded documents travel in one call per holder.** A statement's
+documents for another node's shards went one wire call and one sync
+each; they go as the wire's `insert_many` now, written and confirmed
+there as one, the answer saying how many landed and what stopped it. A
+holder too old to know the call, or a shard that moved under the
+batch, is fed one at a time from where the batch stopped, as before.
+
+**A raised replica count reaches a follower that never had the
+collection.** `ALTER ... SET (replicas = n)` or `(regions = n)` hands
+a node the map now names, and that never had the collection, the
+definition and the map whole, as CREATE hands them, and it makes its
+copy; the carried `LOCAL ALTER` was refused there before and the copy
+was never made. The nodes the map no longer names hear the statement
+too.
+
+**The data key rotates under an archived tier.** A rotation no longer
+refuses an index at the archived tier: the old key stays in a ring
+behind the new one in `KEY` (a `CELK2` form; a `KEY` with one key
+keeps the form every release reads), a file that does not open under
+the current key is tried under each previous one, and `celastro key
+retire <DIR>` drops the ring once nothing is under it.
+
+**The image is built for arm64 too.** `scripts/image.sh` builds the
+amd64 image as before and an arm64 one from a cross-compiled static
+binary (`Dockerfile.prebuilt`), and pushes one manifest under the tag,
+so a pull on either machine gets its own.
+
+**Three more parsers under the fuzzer.** The text dictionary and the
+posting lists (from a built component, mutated), the TLS record layer
+end to end (a proxy that damages one byte of every connection, either
+way, through the handshake and the data), and SigV4's canonicalisation
+(which took a date shorter than eight bytes as a panic; it takes it as
+it is now). The posting-list sweep found two more: a capacity taken
+from a count the bytes gave, which on a mutated count was an
+allocation that aborted the process, and a block offset summed
+without a bound; both are bounded now. A file a peer or a disk hands
+this node cannot end it.
+
+**Measured: compaction runs itself after a load.** 40,000 documents
+seeded into a served node in 21 seconds left each shard four flat
+segments; the maintenance thread compacted them into one level-1
+segment per shard within three minutes, 18 seconds each, with nothing
+asked of it. The backlog's "automatic compaction after a load" was a
+note from before the maintenance thread; it is closed as measured.
+
 ## 0.65.0 — 2026-09-21
 
 **Client certificates on the wire.** `CELASTRO_TLS_CLIENT_AUTH=required`

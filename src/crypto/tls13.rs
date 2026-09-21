@@ -43,6 +43,14 @@ const HS_CERTIFICATE_REQUEST: u8 = 13;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
 const HS_KEY_UPDATE: u8 = 24;
+/// The synthetic message a transcript restarts from after a
+/// HelloRetryRequest: `message_hash` over the first ClientHello.
+const HS_MESSAGE_HASH: u8 = 254;
+/// A HelloRetryRequest is a ServerHello whose random is this value.
+const HRR_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
 
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_SUPPORTED_GROUPS: u16 = 10;
@@ -50,6 +58,7 @@ const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_PRE_SHARED_KEY: u16 = 41;
+const EXT_COOKIE: u16 = 44;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const PSK_DHE_KE: u8 = 1;
 
@@ -351,6 +360,11 @@ pub struct TlsStream {
     closed: bool,
     /// Whether the handshake resumed from a ticket.
     resumed: bool,
+    /// Whether the handshake went through a HelloRetryRequest.
+    retried: bool,
+    /// A test's hook: send the first ClientHello without a key share, so
+    /// the server's HelloRetryRequest and this side's answer to it run.
+    pub(crate) omit_first_share: bool,
     /// A client's, after its handshake: the resumption master secret a
     /// NewSessionTicket's PSK derives from, and the store key it goes under.
     res_master: Option<[u8; 32]>,
@@ -392,6 +406,8 @@ impl TlsStream {
             inbuf: Vec::new(),
             closed: false,
             resumed: false,
+            retried: false,
+            omit_first_share: false,
             res_master: None,
             store_key: None,
         }
@@ -401,6 +417,11 @@ impl TlsStream {
     /// full. Meaningful once the handshake has happened.
     pub fn resumed(&self) -> bool {
         self.resumed
+    }
+
+    /// Whether the handshake went through a HelloRetryRequest.
+    pub fn retried(&self) -> bool {
+        self.retried
     }
 
     /// Complete the handshake if it has not been done. An error here is
@@ -590,8 +611,51 @@ impl TlsStream {
         if !hello.suites.contains(&SUITE_CHACHA) {
             return Err(err("the client does not offer TLS_CHACHA20_POLY1305_SHA256"));
         }
+        // No X25519 share in the first flight but X25519 among the groups
+        // the client supports: a HelloRetryRequest asks for one. The
+        // transcript restarts from a message_hash of the first ClientHello
+        // and the retry, as the RFC has it, and the second ClientHello is
+        // read in the first one's place -- its PSK binder, if any, covers
+        // the restarted transcript.
+        let mut hello = hello;
+        let mut ch_start = 0usize;
+        if hello.x25519_share.is_none() && hello.groups.contains(&GROUP_X25519) {
+            let ch1_hash = sha256(&transcript);
+            transcript.clear();
+            transcript.push(HS_MESSAGE_HASH);
+            transcript.extend_from_slice(&[0, 0, 32]);
+            transcript.extend_from_slice(&ch1_hash);
+            let mut hrr = Vec::new();
+            hrr.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
+            hrr.extend_from_slice(&HRR_RANDOM);
+            hrr.push(hello.session_id.len() as u8);
+            hrr.extend_from_slice(&hello.session_id);
+            hrr.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
+            hrr.push(0);
+            let mut exts = Vec::new();
+            extension(&mut exts, EXT_SUPPORTED_VERSIONS, &VERSION_13.to_be_bytes());
+            extension(&mut exts, EXT_KEY_SHARE, &GROUP_X25519.to_be_bytes());
+            hrr.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            hrr.extend_from_slice(&exts);
+            self.write_handshake(HS_SERVER_HELLO, &hrr, &mut transcript)?;
+            if !hello.session_id.is_empty() {
+                self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
+            }
+            self.retried = true;
+            ch_start = transcript.len();
+            let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+            if ty != HS_CLIENT_HELLO {
+                return Err(err("expected the client's second ClientHello"));
+            }
+            hello = parse_client_hello(&body)?;
+            if hello.x25519_share.is_none() {
+                return Err(err("the client's second ClientHello still has no X25519 key share"));
+            }
+        }
         let Some(client_share) = hello.x25519_share else {
-            return Err(err("the client sent no X25519 key share; a retry is not supported"));
+            return Err(err(
+                "the client sent no X25519 key share and supports no group this build has",
+            ));
         };
         // A ticket this server sealed, offered with the DHE mode and a
         // binder that verifies, resumes: the early secret is the PSK's and
@@ -607,7 +671,7 @@ impl TlsStream {
                     open_ticket(&yesterday, &offer.identity)
                 }) {
                     Some(psk) => {
-                        let truncated = sha256(&transcript[..4 + offer.binders_at]);
+                        let truncated = sha256(&transcript[..ch_start + 4 + offer.binders_at]);
                         if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
                             return Err(err("the PSK binder does not verify"));
                         }
@@ -813,86 +877,146 @@ impl TlsStream {
         let our_share = x25519::public_key(&eph);
         let client_random = random::array32().map_err(|e| err(e.to_string()))?;
         let session_id = random::array32().map_err(|e| err(e.to_string()))?;
-        let mut ch = Vec::new();
-        ch.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
-        ch.extend_from_slice(&client_random);
-        ch.push(32);
-        ch.extend_from_slice(&session_id);
-        ch.extend_from_slice(&2u16.to_be_bytes());
-        ch.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
-        ch.push(1);
-        ch.push(0);
-        let mut exts = Vec::new();
-        if host.parse::<std::net::IpAddr>().is_err() {
-            let mut sni = Vec::new();
-            let mut entry = vec![0u8];
-            entry.extend_from_slice(&(host.len() as u16).to_be_bytes());
-            entry.extend_from_slice(host.as_bytes());
-            sni.extend_from_slice(&(entry.len() as u16).to_be_bytes());
-            sni.extend_from_slice(&entry);
-            extension(&mut exts, EXT_SERVER_NAME, &sni);
-        }
-        let mut versions = vec![2u8];
-        versions.extend_from_slice(&VERSION_13.to_be_bytes());
-        extension(&mut exts, EXT_SUPPORTED_VERSIONS, &versions);
-        let mut groups = Vec::new();
-        groups.extend_from_slice(&2u16.to_be_bytes());
-        groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
-        extension(&mut exts, EXT_SUPPORTED_GROUPS, &groups);
-        // Ed25519 for our own peers; RSA-PSS and ECDSA P-256 for a server
-        // whose certificate another issuer signed, such as a cluster's API.
-        let mut sigs = Vec::new();
-        sigs.extend_from_slice(&6u16.to_be_bytes());
-        sigs.extend_from_slice(&SIG_ED25519.to_be_bytes());
-        sigs.extend_from_slice(&SIG_ECDSA_SECP256R1_SHA256.to_be_bytes());
-        sigs.extend_from_slice(&SIG_RSA_PSS_RSAE_SHA256.to_be_bytes());
-        extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sigs);
-        let mut ks = Vec::new();
-        let mut entry = Vec::new();
-        entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
-        entry.extend_from_slice(&32u16.to_be_bytes());
-        entry.extend_from_slice(&our_share);
-        ks.extend_from_slice(&(entry.len() as u16).to_be_bytes());
-        ks.extend_from_slice(&entry);
-        extension(&mut exts, EXT_KEY_SHARE, &ks);
-        if let Some(t) = &ticket {
-            // PSK with (EC)DHE only -- the key share above stays -- and the
-            // offer last, its binder computed over everything before it.
-            extension(&mut exts, EXT_PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
-            let age_ms = (now - t.received).saturating_mul(1000) as u32;
-            let obfuscated = age_ms.wrapping_add(t.age_add);
-            let mut psk = Vec::new();
-            let mut identities = Vec::new();
-            identities.extend_from_slice(&(t.ticket.len() as u16).to_be_bytes());
-            identities.extend_from_slice(&t.ticket);
-            identities.extend_from_slice(&obfuscated.to_be_bytes());
-            psk.extend_from_slice(&(identities.len() as u16).to_be_bytes());
-            psk.extend_from_slice(&identities);
-            psk.extend_from_slice(&33u16.to_be_bytes());
-            psk.push(32);
-            psk.extend_from_slice(&[0u8; 32]);
-            extension(&mut exts, EXT_PRE_SHARED_KEY, &psk);
-        }
-        ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-        ch.extend_from_slice(&exts);
-        if let Some(t) = &ticket {
-            // The binder: over the message with its header, cut where the
-            // binders list begins, then written into place.
-            let cut = ch.len() - 35;
-            let mut prefix = Vec::with_capacity(4 + cut);
-            prefix.push(HS_CLIENT_HELLO);
-            prefix.extend_from_slice(&(ch.len() as u32).to_be_bytes()[1..]);
-            prefix.extend_from_slice(&ch[..cut]);
-            let binder = psk_binder(&t.psk, &sha256(&prefix));
-            let at = ch.len() - 32;
-            ch[at..].copy_from_slice(&binder);
-        }
+        // The ClientHello, built for the first flight and again after a
+        // HelloRetryRequest: the same random and session id, the key share
+        // the server asked for, its cookie echoed, and a PSK offer's
+        // binder over `prefix` (the transcript so far) and the message cut
+        // before the binders.
+        let build = |share: Option<&[u8; 32]>, cookie: Option<&[u8]>, prefix: &[u8]| -> Vec<u8> {
+            let mut ch = Vec::new();
+            ch.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
+            ch.extend_from_slice(&client_random);
+            ch.push(32);
+            ch.extend_from_slice(&session_id);
+            ch.extend_from_slice(&2u16.to_be_bytes());
+            ch.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
+            ch.push(1);
+            ch.push(0);
+            let mut exts = Vec::new();
+            if host.parse::<std::net::IpAddr>().is_err() {
+                let mut sni = Vec::new();
+                let mut entry = vec![0u8];
+                entry.extend_from_slice(&(host.len() as u16).to_be_bytes());
+                entry.extend_from_slice(host.as_bytes());
+                sni.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+                sni.extend_from_slice(&entry);
+                extension(&mut exts, EXT_SERVER_NAME, &sni);
+            }
+            let mut versions = vec![2u8];
+            versions.extend_from_slice(&VERSION_13.to_be_bytes());
+            extension(&mut exts, EXT_SUPPORTED_VERSIONS, &versions);
+            let mut groups = Vec::new();
+            groups.extend_from_slice(&2u16.to_be_bytes());
+            groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
+            extension(&mut exts, EXT_SUPPORTED_GROUPS, &groups);
+            // Ed25519 for our own peers; RSA-PSS and ECDSA P-256 for a server
+            // whose certificate another issuer signed, such as a cluster's API.
+            let mut sigs = Vec::new();
+            sigs.extend_from_slice(&6u16.to_be_bytes());
+            sigs.extend_from_slice(&SIG_ED25519.to_be_bytes());
+            sigs.extend_from_slice(&SIG_ECDSA_SECP256R1_SHA256.to_be_bytes());
+            sigs.extend_from_slice(&SIG_RSA_PSS_RSAE_SHA256.to_be_bytes());
+            extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sigs);
+            if let Some(share) = share {
+                let mut ks = Vec::new();
+                let mut entry = Vec::new();
+                entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
+                entry.extend_from_slice(&32u16.to_be_bytes());
+                entry.extend_from_slice(share);
+                ks.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+                ks.extend_from_slice(&entry);
+                extension(&mut exts, EXT_KEY_SHARE, &ks);
+            }
+            if let Some(c) = cookie {
+                let mut body = Vec::with_capacity(2 + c.len());
+                body.extend_from_slice(&(c.len() as u16).to_be_bytes());
+                body.extend_from_slice(c);
+                extension(&mut exts, EXT_COOKIE, &body);
+            }
+            if let Some(t) = &ticket {
+                // PSK with (EC)DHE only -- the key share above stays -- and
+                // the offer last, its binder computed over everything
+                // before it.
+                extension(&mut exts, EXT_PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
+                let age_ms = (now - t.received).saturating_mul(1000) as u32;
+                let obfuscated = age_ms.wrapping_add(t.age_add);
+                let mut psk = Vec::new();
+                let mut identities = Vec::new();
+                identities.extend_from_slice(&(t.ticket.len() as u16).to_be_bytes());
+                identities.extend_from_slice(&t.ticket);
+                identities.extend_from_slice(&obfuscated.to_be_bytes());
+                psk.extend_from_slice(&(identities.len() as u16).to_be_bytes());
+                psk.extend_from_slice(&identities);
+                psk.extend_from_slice(&33u16.to_be_bytes());
+                psk.push(32);
+                psk.extend_from_slice(&[0u8; 32]);
+                extension(&mut exts, EXT_PRE_SHARED_KEY, &psk);
+            }
+            ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            ch.extend_from_slice(&exts);
+            if let Some(t) = &ticket {
+                // The binder: over the transcript so far and the message
+                // with its header, cut where the binders list begins, then
+                // written into place.
+                let cut = ch.len() - 35;
+                let mut covered = Vec::with_capacity(prefix.len() + 4 + cut);
+                covered.extend_from_slice(prefix);
+                covered.push(HS_CLIENT_HELLO);
+                covered.extend_from_slice(&(ch.len() as u32).to_be_bytes()[1..]);
+                covered.extend_from_slice(&ch[..cut]);
+                let binder = psk_binder(&t.psk, &sha256(&covered));
+                let at = ch.len() - 32;
+                ch[at..].copy_from_slice(&binder);
+            }
+            ch
+        };
+        let first_share = if self.omit_first_share { None } else { Some(&our_share) };
+        let ch = build(first_share, None, &[]);
         self.write_handshake(HS_CLIENT_HELLO, &ch, &mut transcript)?;
         let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         if ty != HS_SERVER_HELLO {
             return Err(err("expected a ServerHello"));
         }
-        let sh = parse_server_hello(&body)?;
+        let mut sh = parse_server_hello(&body)?;
+        if sh.retry {
+            // A HelloRetryRequest: for the X25519 share this side did not
+            // send (a test's first flight), or a cookie to echo; a group
+            // this build lacks, or a share it already sent, is a refusal.
+            match sh.retry_group {
+                Some(GROUP_X25519) if first_share.is_some() => {
+                    return Err(err("the server asked again for the X25519 key share it was sent"))
+                }
+                Some(GROUP_X25519) => {}
+                Some(_) => {
+                    return Err(err(
+                        "the server asked for a key-exchange group this build does not have",
+                    ))
+                }
+                None if sh.cookie.is_none() => {
+                    return Err(err("a HelloRetryRequest that asks for nothing"))
+                }
+                None => {}
+            }
+            let ch1_len = 4 + ch.len();
+            let hrr_msg = transcript[ch1_len..].to_vec();
+            let ch1_hash = sha256(&transcript[..ch1_len]);
+            transcript.clear();
+            transcript.push(HS_MESSAGE_HASH);
+            transcript.extend_from_slice(&[0, 0, 32]);
+            transcript.extend_from_slice(&ch1_hash);
+            transcript.extend_from_slice(&hrr_msg);
+            self.retried = true;
+            let ch2 = build(Some(&our_share), sh.cookie.as_deref(), &transcript);
+            self.write_handshake(HS_CLIENT_HELLO, &ch2, &mut transcript)?;
+            let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
+            if ty != HS_SERVER_HELLO {
+                return Err(err("expected a ServerHello after the retry"));
+            }
+            sh = parse_server_hello(&body)?;
+            if sh.retry {
+                return Err(err("a second HelloRetryRequest"));
+            }
+        }
         let psk: Option<[u8; 32]> = match (sh.selected_psk, &ticket) {
             (Some(0), Some(t)) => Some(t.psk),
             (Some(_), _) => return Err(err("the server selected a PSK that was not offered")),
@@ -1183,6 +1307,9 @@ struct ClientHello {
     versions: Vec<u16>,
     sig_algs: Vec<u16>,
     x25519_share: Option<[u8; 32]>,
+    /// The groups the client supports, for a retry when it sent no X25519
+    /// share but lists the group.
+    groups: Vec<u16>,
     /// The first identity of a pre_shared_key offer, if the extension was
     /// the last one as the protocol requires.
     psk: Option<PskOffer>,
@@ -1209,6 +1336,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let mut versions = Vec::new();
     let mut sig_algs = Vec::new();
     let mut x25519_share = None;
+    let mut groups = Vec::new();
     let mut psk = None;
     let mut psk_dhe = false;
     if !r.done() {
@@ -1246,6 +1374,11 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
                     sig_algs =
                         list.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 }
+                EXT_SUPPORTED_GROUPS => {
+                    let list = d.vec16()?;
+                    groups =
+                        list.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                }
                 EXT_KEY_SHARE => {
                     let list = d.vec16()?;
                     let mut l = Reader::new(list);
@@ -1263,7 +1396,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
             }
         }
     }
-    Ok(ClientHello { session_id, suites, versions, sig_algs, x25519_share, psk, psk_dhe })
+    Ok(ClientHello { session_id, suites, versions, sig_algs, x25519_share, groups, psk, psk_dhe })
 }
 
 struct ServerHello {
@@ -1271,23 +1404,26 @@ struct ServerHello {
     version: Option<u16>,
     x25519_share: Option<[u8; 32]>,
     selected_psk: Option<u16>,
+    /// A HelloRetryRequest: the ServerHello with the fixed random, asking
+    /// for a key share of `retry_group` and, if given, a cookie to echo.
+    retry: bool,
+    retry_group: Option<u16>,
+    cookie: Option<Vec<u8>>,
 }
 
 fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
     let mut r = Reader::new(body);
     let _legacy_version = r.u16()?;
     let random = r.bytes(32)?;
-    // A HelloRetryRequest is a ServerHello with a fixed random; not supported.
-    const HRR: [u8; 8] = [0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11];
-    if random[..8] == HRR {
-        return Err(err("the server asked for a retry, which this build does not support"));
-    }
+    let retry = random == HRR_RANDOM;
     let _session_id = r.vec8()?;
     let suite = r.u16()?;
     let _compression = r.u8()?;
     let mut version = None;
     let mut x25519_share = None;
     let mut selected_psk = None;
+    let mut retry_group = None;
+    let mut cookie = None;
     if !r.done() {
         let exts = r.vec16()?;
         let mut e = Reader::new(exts);
@@ -1298,6 +1434,8 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
             match ty {
                 EXT_SUPPORTED_VERSIONS => version = Some(d.u16()?),
                 EXT_PRE_SHARED_KEY => selected_psk = Some(d.u16()?),
+                EXT_COOKIE => cookie = Some(d.vec16()?.to_vec()),
+                EXT_KEY_SHARE if retry => retry_group = Some(d.u16()?),
                 EXT_KEY_SHARE => {
                     let group = d.u16()?;
                     let share = d.vec16()?;
@@ -1311,7 +1449,7 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
             }
         }
     }
-    Ok(ServerHello { suite, version, x25519_share, selected_psk })
+    Ok(ServerHello { suite, version, x25519_share, selected_psk, retry, retry_group, cookie })
 }
 
 fn parse_certificate_message(body: &[u8]) -> io::Result<Vec<Certificate>> {
@@ -1615,6 +1753,166 @@ mod tests {
             crate::crypto::hex(&offer.binder),
             "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
         );
+    }
+
+    /// The record layer end to end, under a proxy that damages one byte
+    /// of every connection somewhere in the bytes the client sends or the
+    /// server answers: each side refuses (an alert, a read error) and
+    /// neither panics, over the handshake and the data alike.
+    #[test]
+    fn fuzz_a_damaged_byte_on_the_wire_is_refused_and_never_a_panic() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        const ROUNDS: usize = 40;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for _ in 0..ROUNDS {
+                let (sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                );
+                let mut buf = Vec::new();
+                let r = s.read_to_end(&mut buf).and_then(|_| s.write_all(&buf));
+                let _ = s.close_notify();
+                outcomes.push(r.is_ok());
+            }
+            outcomes
+        });
+        // The proxy: every byte through, one of them (in a position drawn
+        // per round, in either direction) flipped.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let proxy_thread = std::thread::spawn(move || {
+            let mut rng = crate::codec::Rng::new(41);
+            for round in 0..ROUNDS {
+                let (client, _) = proxy.accept().unwrap();
+                let upstream = TcpStream::connect(server_addr).unwrap();
+                let hit_pos = (rng.next_u64() % 600) as usize;
+                let hit_dir = round % 2;
+                let pump = |mut from: TcpStream, mut to: TcpStream, damage: Option<usize>| {
+                    std::thread::spawn(move || {
+                        let mut seen = 0usize;
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            let n = match from.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if let Some(p) = damage {
+                                if p >= seen && p < seen + n {
+                                    buf[p - seen] ^= 0x5a;
+                                }
+                            }
+                            seen += n;
+                            if to.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Write);
+                    })
+                };
+                let a = pump(
+                    client.try_clone().unwrap(),
+                    upstream.try_clone().unwrap(),
+                    (hit_dir == 0).then_some(hit_pos),
+                );
+                let b = pump(upstream, client, (hit_dir == 1).then_some(hit_pos));
+                let _ = a.join();
+                let _ = b.join();
+            }
+        });
+        let mut refused = 0;
+        for _ in 0..ROUNDS {
+            let sock = TcpStream::connect(proxy_addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: None,
+                    key: None,
+                },
+            );
+            let payload = vec![0x61u8; 700];
+            let r = c.write_all(&payload).and_then(|_| c.close_notify()).and_then(|_| {
+                let mut got = Vec::new();
+                c.read_to_end(&mut got).map(|_| got)
+            });
+            // A damaged record is an error on one side or the other; what
+            // the client sees is an error, or a connection the server shut
+            // with nothing echoed. What it never sees is damaged data.
+            match r {
+                Ok(got) if got.is_empty() => refused += 1,
+                Ok(got) => assert_eq!(got, payload, "an echo that came back is intact"),
+                Err(_) => refused += 1,
+            }
+        }
+        proxy_thread.join().unwrap();
+        let outcomes = server.join().unwrap();
+        assert!(refused > 0, "a flipped byte was never noticed");
+        assert!(outcomes.len() == ROUNDS);
+    }
+
+    /// A client whose first flight carries no key share is asked for one
+    /// with a HelloRetryRequest and completes on the second: both sides say
+    /// they retried, the echo comes back, and a ticket from that handshake
+    /// resumes the next connection, which does not retry.
+    #[test]
+    fn a_client_without_a_first_key_share_is_asked_again_and_completes() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().unwrap();
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                );
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).unwrap();
+                s.write_all(&buf).unwrap();
+                s.close_notify().unwrap();
+                seen.push((buf, s.retried(), s.resumed()));
+            }
+            seen
+        });
+        let talk = |omit: bool| {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: None,
+                    key: None,
+                },
+            );
+            c.omit_first_share = omit;
+            c.write_all(b"again").unwrap();
+            c.close_notify().unwrap();
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).unwrap();
+            (got, c.retried(), c.resumed())
+        };
+        assert_eq!(talk(true), (b"again".to_vec(), true, false));
+        assert_eq!(talk(false), (b"again".to_vec(), false, true), "resumed, no retry");
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0], (b"again".to_vec(), true, false));
+        assert_eq!(seen[1], (b"again".to_vec(), false, true));
     }
 
     /// A server that requires a client certificate: a client presenting a

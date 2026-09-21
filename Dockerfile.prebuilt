@@ -1,0 +1,32 @@
+# celastro in a container, from a binary already built: the image stage of
+# Dockerfile with the build stage replaced by a COPY, for an architecture
+# this machine cross-compiles for (scripts/image.sh builds the arm64 image
+# this way). The final stage is Dockerfile's, line for line in effect.
+#
+#   docker build --platform linux/arm64 -f Dockerfile.prebuilt \
+#     --build-arg BINDIR=target/aarch64-unknown-linux-musl/release -t celastro:arm64 .
+
+FROM alpine:3.21 AS stage
+ARG BINDIR
+COPY $BINDIR/celastro /celastro
+COPY $BINDIR/celastro-cli /celastro-cli
+COPY LICENSE /LICENSE
+COPY COPYRIGHT /COPYRIGHT
+RUN chmod 0755 /celastro /celastro-cli && chmod 0644 /LICENSE /COPYRIGHT \
+    && mkdir -p /data && chown 65532:65532 /data && touch /data/.keep \
+    && chown 65532:65532 /data/.keep
+
+FROM scratch
+LABEL org.opencontainers.image.title="celastro" \
+      org.opencontainers.image.description="Hybrid document database: SQL, BM25 and vector retrieval in a single query plan" \
+      org.opencontainers.image.source="https://github.com/celastro/celastro" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+COPY --from=stage /celastro /celastro
+COPY --from=stage /celastro-cli /celastro-cli
+COPY --from=stage /LICENSE /LICENSE
+COPY --from=stage /COPYRIGHT /COPYRIGHT
+COPY --from=stage --chown=65532:65532 /data /data
+USER 65532:65532
+WORKDIR /data
+ENTRYPOINT ["/celastro"]
+CMD ["repl"]

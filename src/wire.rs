@@ -163,6 +163,12 @@ enum Call {
     /// It carries the coordinator's read-your-writes instant and is never
     /// forwarded on from there.
     Query = 26,
+    /// Documents for a holder's shards in one call, each written as
+    /// `Insert` writes one and the followers' confirmation waited for
+    /// once; the answer says how many landed and, after them, what
+    /// stopped it. A holder too old to know the call answers "unknown
+    /// call" and is fed one at a time.
+    InsertMany = 27,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -188,6 +194,7 @@ impl Call {
             24 => Call::Count,
             25 => Call::Vote,
             26 => Call::Query,
+            27 => Call::InsertMany,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -220,6 +227,7 @@ impl Call {
             Call::Count => "count",
             Call::Vote => "vote",
             Call::Query => "query",
+            Call::InsertMany => "insert_many",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -1157,6 +1165,25 @@ impl Node {
         put_value(&mut body, doc);
         let b = self.call(Call::Insert, collection, 0, &body)?;
         get_ts(&b, &mut 0)
+    }
+
+    /// `docs` to the holder in one call: how many it took (durable there
+    /// and confirmed on its followers), the latest instant among them, and
+    /// after the ones it took the error that stopped it, if one did.
+    pub fn insert_many(
+        &self,
+        collection: &str,
+        docs: &[Value],
+    ) -> Result<(usize, Timestamp, Result<()>)> {
+        let mut body = Vec::new();
+        put_values(&mut body, docs);
+        let b = self.call(Call::InsertMany, collection, 0, &body)?;
+        let mut i = 0;
+        let taken = get_num(&b, &mut i)?;
+        let last = get_ts(&b, &mut i)?;
+        let stopped =
+            if get_bool(&b, &mut i)? { Ok(()) } else { Err(Error::Plan(get_string(&b, &mut i)?)) };
+        Ok((taken, last, stopped))
     }
 
     pub fn delete(&self, collection: &str, key: &str) -> Result<bool> {
@@ -2145,6 +2172,44 @@ fn handle(
             drop(db);
             confirm.wait()?;
             put_ts(&mut out, ts);
+            return Ok(out);
+        }
+        Call::InsertMany => {
+            let docs = get_values(body, &mut 0)?;
+            let n = docs.len();
+            let (taken, last, stopped, confirm) = {
+                let d = db.exclusive();
+                let (mut taken, mut last, mut stopped) = (0usize, 0, None);
+                for doc in docs {
+                    match d.insert_here(&collection, doc) {
+                        Ok(ts) => {
+                            taken += 1;
+                            last = last.max(ts);
+                        }
+                        Err(e) => {
+                            stopped = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                (taken, last, stopped, d.confirmation())
+            };
+            drop(db);
+            // What landed is confirmed on the followers before the answer,
+            // as one document is.
+            if taken > 0 {
+                confirm.wait()?;
+            }
+            let _ = n;
+            put_uvarint(&mut out, taken as u64);
+            put_ts(&mut out, last);
+            match stopped {
+                None => put_bool(&mut out, true),
+                Some(m) => {
+                    put_bool(&mut out, false);
+                    put_str(&mut out, &m);
+                }
+            }
             return Ok(out);
         }
         Call::Delete => {

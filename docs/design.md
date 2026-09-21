@@ -1794,7 +1794,7 @@ the binder is pinned to RFC 8448's resumed trace, the truncation of the
 ClientHello included; a ticket that does not open is a full handshake, a
 binder that does not verify is a refusal; the server never accepts a PSK
 without a key share), but no 0-RTT, client certificates,
-HelloRetryRequest or key update. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
+key update; HelloRetryRequest from 0.66.0, for a client whose first share is of another group. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
 is wider than signing: chains and CertificateVerify from RSA (PKCS#1 v1.5
 and PSS, SHA-256) and ECDSA P-256 are accepted (0.29.0; `bignum`, `rsa`,
 `p256`, public-key operations only, so no timing concern), which is what
@@ -2055,6 +2055,37 @@ fixed path with the paths remapped out and compares the binaries: v0.64.1
 builds to `93795dcd…3eda4e5` both times on rustc 1.98.1. A signed
 release stays open: the crate has no CI identity to sign with, and a
 key the maintainer holds is a decision for the maintainer.
+
+**What 0.66.0 closed from the "not queued" list.** HelloRetryRequest:
+the server, on a ClientHello with no X25519 share but X25519 among its
+groups, writes a ServerHello with the fixed random and a key_share
+naming the group, restarts the transcript from `message_hash` over the
+first hello as RFC 8446 §4.4.1 has it, and reads the second hello
+where the first stood (a PSK binder in it covers the restarted
+transcript); the client answers a retry for the share it withheld or
+with a cookie, and refuses a group it lacks or a share it already
+sent. `openssl s_client -groups P-256:X25519` connects where it was
+refused. Forwarded documents: a statement's rows for another holder go
+as one `insert_many` call, written there as `insert` writes one and
+the followers' confirmation waited for once; the answer carries how
+many landed, the latest instant and what stopped it, so the
+coordinator's acknowledgement names the rows that did not, and a
+holder too old to know the call is fed one at a time from where the
+batch stopped. A raised replica count: the DDL carry's target set is
+taken after the statement ran as well as before, and a target that
+refuses the `LOCAL ALTER` with "no such collection" is handed the
+definition and the map through the `create_collection` call, which is
+what CREATE hands a node. The data-key ring: `KEY` in its `CELK2` form
+holds the current key and the previous ones; `open_file`,
+`open_records` and `read_range` try each in turn on failure, so a
+rotation under an archived tier keeps the old key rather than refusing,
+and `key retire` drops the ring. The fuzz remainders found what the
+first sweeps found elsewhere: a capacity from a count the bytes gave
+(the dictionary's index, the cursor's block count) and a sum that
+overflowed, each an end of the process a file could cause; bounded.
+Compaction after a load was measured rather than built: four flat
+segments a shard after a 40,000-row seed, one level-1 segment a shard
+three minutes later with nothing asked, 18 seconds each.
 
 ## A worked query
 
