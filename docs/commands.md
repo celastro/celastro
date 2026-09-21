@@ -267,6 +267,36 @@ CELASTRO_TLS_CERT=./tls/tls.crt CELASTRO_TLS_KEY=./tls/tls.key CELASTRO_TLS_CA=.
 CELASTRO_TLS_CA=./tls/ca.crt celastro send https://127.0.0.1:18788 "SELECT id FROM notes LIMIT 1"
 ```
 
+
+## Installing on a host
+
+**`install [flags]`** makes this binary the systemd service `celastro`
+on the host, as root: the binary under `/usr/local/bin`, the system user
+`celastro`, the data directory (`--dir`, `/var/lib/celastro`), the
+settings in `/etc/celastro/celastro.env` and the unit, started and
+answering the health probe before the command returns. `CELASTRO_TOKEN`
+comes from the environment, never a flag; `--node ADDR` and `--attach
+A,B,C` (with `CELASTRO_WIRE_TOKEN`) make a node of a cluster, `--tls DIR`
+copies a set from `tls init`, `--master-key` and `--data-key` the keys,
+`--role coordinator` and `--env NAME=VALUE` the rest, `--bind` and
+`--port` are `serve`'s. Run again from a newer binary, or with other
+flags, it rewrites the files and restarts the service; the data
+directory is never touched. `--root DIR` writes the same files under
+DIR and starts nothing, which is how a package is built and how this
+example runs without root:
+
+```sh
+CELASTRO_TOKEN=sixteen-bytes-ok! CELASTRO_WIRE_TOKEN=wire celastro install --root ./root --node 10.0.0.2 --attach 10.0.0.2,10.0.0.3
+```
+
+```
+installed celastro 0.71.0 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
+written under the root; nothing started
+```
+
+[deploy/](../deploy/README.md) has the install as a cloud-init file, an
+Ansible role and a podman quadlet.
+
 ## The console's HTTP API
 
 Every request but `/api/health` carries the token in the

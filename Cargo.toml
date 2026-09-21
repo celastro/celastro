@@ -1,6 +1,6 @@
 [package]
 name = "celastro"
-version = "0.70.1"
+version = "0.71.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Hybrid document database: SQL, BM25 and vector retrieval in a single query plan"
@@ -16,7 +16,7 @@ repository = "https://github.com/celastro/celastro"
 # crate as downloaded — cargo also warns on every publish that it is ignoring
 # the test targets. Note this list is the only thing that trims the package:
 # .dockerignore has no effect on `cargo package`, which ships tracked files.
-exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*", "chart/*"]
+exclude = ["assets/*", "Dockerfile", ".dockerignore", ".github/*", "deploy/*"]
 
 [dependencies]
 # Intentionally none. Celastro is std-only: JSON, bitmaps, term dictionaries,

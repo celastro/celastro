@@ -128,6 +128,7 @@ run "an encrypted directory" 'created' env CELASTRO_MASTER_KEY_FILE="$W/master.k
 run "a write into it" '1 document\(s\) written' env CELASTRO_MASTER_KEY_FILE="$W/master.key" "$CEL" --dir "$W/enc" exec "INSERT INTO s VALUES ('{\"id\":\"secret\"}')"
 run "opened without the key, refused" 'key|encrypt' "$CEL" --dir "$W/enc" exec "SELECT id FROM s"
 run "tls init" 'ca|cert|wrote|written' "$CEL" tls init "$W/tls" localhost 127.0.0.1 365
+run "install under a root" 'written under the root; nothing started' env CELASTRO_TOKEN=sixteen-bytes-ok! CELASTRO_WIRE_TOKEN=wire "$CEL" install --root "$W/root" --node 10.0.0.2 --attach 10.0.0.2,10.0.0.3
 ls "$W/tls" | sed 's/^/    tls: /'
 
 echo "== a served console"

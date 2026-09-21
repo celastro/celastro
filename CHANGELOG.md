@@ -6,6 +6,25 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.71.0 — 2026-09-21
+
+**The binary installs itself, and the releases carry it.** `celastro
+install` makes the binary the systemd service `celastro` on the host it
+runs on -- the binary under `/usr/local/bin`, a system user, the data
+directory, the tokens and addresses in `/etc/celastro/celastro.env`, the
+unit -- starts it and waits until it answers; the same command on every
+host, with `--node` and `--attach`, is the cluster, and the same command
+from a newer binary is the upgrade. Each release now attaches
+`celastro-<version>-linux-amd64` and `-arm64` tarballs with a
+`SHA256SUMS`: the static binaries the image carries, taken from it.
+`deploy/` holds the ways to run it: the Helm chart, moved there from
+`chart/` (`helm install celastro deploy/chart/celastro`; the chart
+itself is unchanged), a cloud-init file that installs at a machine's
+first boot, an Ansible role that installs one host at a time from its
+inventory, and a podman quadlet that runs the image under systemd.
+`--port`, `--bind` and `--shard-bind` mean something to `install` as
+well as to `serve`.
+
 ## 0.70.1 — 2026-09-21
 
 **An old certificate set is caught before it breaks the wire.** A set

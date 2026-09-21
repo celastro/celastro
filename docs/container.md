@@ -280,3 +280,12 @@ container over the same volume). `--restart on-failure:N` fits `serve` — a
 panic exits non-zero — and only `serve`: the one-shot verbs are jobs, and an
 `exec` against an unwritable directory under `on-failure:3` was dutifully
 restarted three times.
+
+## Under systemd
+
+A host that should run the image rather than the binary runs it as a
+podman quadlet: [deploy/quadlet/celastro.container](../deploy/quadlet/celastro.container)
+is the unit, with the host's network, a named volume and an environment
+file, and systemd starts, stops and restarts it. The binary installed
+directly (`celastro install`) is the lighter choice on a host with no
+container runtime; [deploy/](../deploy/README.md) has both.

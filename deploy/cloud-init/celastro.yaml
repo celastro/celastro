@@ -1,0 +1,55 @@
+#cloud-config
+# celastro on a virtual machine at its first boot: the release binary
+# fetched and checked, then `celastro install`, which writes the service
+# user, the data directory, the settings and the systemd unit, and starts
+# it. Hand this file to the cloud as user-data (`user_data` in Terraform,
+# a `--user-data` flag on a cloud's own tool, "custom data" and "startup
+# script" elsewhere).
+#
+# Fill in the settings below. For one node leave CELASTRO_NODE and
+# CELASTRO_ATTACH empty. For a cluster, every node gets its own address in
+# CELASTRO_NODE and the same list of every node in CELASTRO_ATTACH -- so
+# the addresses have to be known before the machines exist: a static
+# network, a plan that assigns them, or names your DNS will resolve. When
+# they are not, install one node per machine with this file and attach
+# them afterwards with `ATTACH NODE` from any console, or use the Ansible
+# role beside this file, which reads the addresses from its inventory.
+write_files:
+  - path: /root/celastro-install.env
+    permissions: "0600"
+    content: |
+      CELASTRO_VERSION=0.71.0
+      # The token every client presents: at least sixteen printable bytes,
+      # the same on every node of a cluster.
+      CELASTRO_TOKEN=change-this-to-a-long-random-token
+      # A cluster's nodes share this one on the wire between them.
+      CELASTRO_WIRE_TOKEN=change-this-too
+      # This node's wire address, tcp://host:port, for a node of a cluster.
+      # `$(hostname -I | cut -d' ' -f1)` is the machine's first address.
+      CELASTRO_NODE=
+      # Every node of the cluster, comma-separated, the same on every node.
+      CELASTRO_ATTACH=
+      # Anything else `celastro install` takes: --role coordinator,
+      # --env CELASTRO_AUTO_FAILOVER=on, --tls DIR ...
+      CELASTRO_INSTALL_FLAGS=
+
+runcmd:
+  - |
+    set -eu
+    . /root/celastro-install.env
+    case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "no release for $(uname -m)" >&2; exit 1 ;; esac
+    base="https://github.com/celastro/celastro/releases/download/v$CELASTRO_VERSION"
+    file="celastro-$CELASTRO_VERSION-linux-$arch.tar.gz"
+    cd /tmp
+    curl -fsSLO "$base/$file"
+    curl -fsSLO "$base/SHA256SUMS"
+    sha256sum --check --ignore-missing SHA256SUMS
+    tar -xzC /usr/local/bin -f "$file" celastro
+    rm -f "$file" SHA256SUMS
+    flags=""
+    [ -n "$CELASTRO_NODE" ] && flags="--node $CELASTRO_NODE"
+    [ -n "$CELASTRO_ATTACH" ] && flags="$flags --attach $CELASTRO_ATTACH"
+    # shellcheck disable=SC2086
+    CELASTRO_TOKEN="$CELASTRO_TOKEN" CELASTRO_WIRE_TOKEN="$CELASTRO_WIRE_TOKEN" \
+      /usr/local/bin/celastro install $flags $CELASTRO_INSTALL_FLAGS
+    rm -f /root/celastro-install.env

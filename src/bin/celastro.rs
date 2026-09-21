@@ -13,6 +13,9 @@
 //! script runner — and this one is additive. Nothing is shared between them but
 //! the library, because a binary cannot import another binary.
 
+#[path = "celastro/install.rs"]
+mod install;
+
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -85,6 +88,24 @@ COMMANDS:
   send <URL> <SQL>           one statement to the console at URL (http:// or https://, the CA
                              from CELASTRO_TLS_CA), the token from CELASTRO_TOKEN; prints the
                              console's answer, exit 1 when it says ok:false
+  install [flags]            this binary as the systemd service `celastro` on this host, as
+                             root: the binary under /usr/local/bin, a system user, the data
+                             directory (--dir, /var/lib/celastro), the settings in
+                             /etc/celastro/celastro.env, the unit; started, and restarted by a
+                             second install. CELASTRO_TOKEN from the environment (never a flag);
+                             --bind and --port as for serve (0.0.0.0, 8787)
+        --node ADDR              a node of a cluster: its wire address, tcp://host:port,
+                                 served on --shard-bind (0.0.0.0:2352); CELASTRO_WIRE_TOKEN
+                                 from the environment
+        --attach A,B,C           every node of the cluster, the same list on every node
+        --role coordinator       a node that holds no shards
+        --tls DIR                tls.crt, tls.key and ca.crt from DIR (`tls init` writes them);
+        [--client-auth]          --client-auth makes the wire require a peer's certificate
+        --master-key F --data-key F   encryption at rest (`key master`, `key init`)
+        --env NAME=VALUE         any further CELASTRO_* setting (docs/tuning.md), repeatable
+        --user NAME              the service user (celastro)
+        --no-start               write and enable, do not start
+        --root DIR               write the same files under DIR and start nothing
   help                       this
   version                    print the version
 
@@ -263,6 +284,8 @@ enum Cmd {
         url: String,
         sql: String,
     },
+    /// `install [flags]`: this binary as a systemd service on this host.
+    Install(Box<install::Opts>),
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
@@ -357,6 +380,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
             },
             "-h" | "--help" => want_help = true,
             "-V" | "--version" => want_version = true,
+            // `install` has flags of its own, read by its own parser once
+            // the verb is known; before it, a flag is a global one or a typo.
+            _ if verb.as_deref() == Some("install") => rest.push(arg),
             other => return Cli::Usage(format!("unknown flag `{other}`")),
         }
     }
@@ -491,6 +517,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
             1 => Cmd::Import { from: PathBuf::from(&rest[0]) },
             _ => return Cli::Usage("`import` takes the directory an export wrote".to_string()),
         },
+        "install" => match install::parse(&rest, port, bind, shard_bind.clone(), dir.clone()) {
+            Ok(o) => Cmd::Install(Box::new(o)),
+            Err(e) => return Cli::Usage(e),
+        },
         "help" => return Cli::Help { json },
         "version" => return Cli::Version { json },
         other => return Cli::Usage(format!("unknown command `{other}`")),
@@ -498,19 +528,25 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
 
     // A flag that does nothing where it was written is a mistake, not a
     // courtesy: someone who wrote `--port` expected a server to be listening.
-    if !matches!(cmd, Cmd::Serve { .. } | Cmd::Health { .. }) {
+    if !matches!(cmd, Cmd::Serve { .. } | Cmd::Health { .. } | Cmd::Install(_)) {
         if port.is_some() {
-            return Cli::Usage("`--port` only means something to `serve` and `health`".to_string());
-        }
-        if open {
-            return Cli::Usage("`--open` only means something to `serve`".to_string());
+            return Cli::Usage(
+                "`--port` only means something to `serve`, `health` and `install`".to_string(),
+            );
         }
         if shard_bind.is_some() {
-            return Cli::Usage("`--shard-bind` only means something to `serve`".to_string());
+            return Cli::Usage(
+                "`--shard-bind` only means something to `serve` and `install`".to_string(),
+            );
         }
         if bind.is_some() {
-            return Cli::Usage("`--bind` only means something to `serve`".to_string());
+            return Cli::Usage(
+                "`--bind` only means something to `serve` and `install`".to_string(),
+            );
         }
+    }
+    if open && !matches!(cmd, Cmd::Serve { .. }) {
+        return Cli::Usage("`--open` only means something to `serve`".to_string());
     }
     if attached.is_some() && !matches!(cmd, Cmd::Health { .. }) {
         return Cli::Usage("`--attached` only means something to `health`".to_string());
@@ -643,6 +679,15 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::Send { url, sql } = cmd {
         return send(&url, &sql, json);
     }
+    // The install reads the secrets from the environment itself, and the
+    // TLS material it copies is named by its flags, not by the environment.
+    if let Cmd::Install(opts) = cmd {
+        let secrets = install::Secrets {
+            token: std::env::var(celastro::serve::TOKEN_ENV).ok(),
+            wire_token: std::env::var("CELASTRO_WIRE_TOKEN").ok(),
+        };
+        return install::run(&opts, &secrets, json);
+    }
     let tls = match Tls::from_env() {
         Ok(t) => t.map(Arc::new),
         Err(e) => return fail(json, &e.to_string()),
@@ -710,7 +755,8 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         | Cmd::KeyRekey { .. }
         | Cmd::KeyRotate { .. }
         | Cmd::KeyRetire { .. }
-        | Cmd::Check { .. } => {
+        | Cmd::Check { .. }
+        | Cmd::Install(_) => {
             unreachable!("answered before the database was opened")
         }
         Cmd::Export { collection, to } => match db.export_collection(&collection) {
@@ -2690,6 +2736,45 @@ mod tests {
         match parse(&["--colour", "repl"]) {
             Cli::Usage(msg) => assert!(msg.contains("--colour")),
             other => panic!("an unknown flag must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_takes_its_own_flags_after_the_verb_and_the_global_ones_before_it() {
+        match parse(&[
+            "--dir",
+            "/srv/celastro",
+            "--port",
+            "9000",
+            "install",
+            "--node",
+            "10.0.0.2",
+            "--attach=10.0.0.2,10.0.0.3",
+            "--env",
+            "CELASTRO_AUTO_FAILOVER=on",
+        ]) {
+            Cli::Run { cmd: Cmd::Install(o), .. } => {
+                assert_eq!(o.node.as_deref(), Some("tcp://10.0.0.2:2352"));
+                assert_eq!(o.attach.len(), 2);
+                assert_eq!(o.port, 9000);
+                assert_eq!(o.dir, PathBuf::from("/srv/celastro"));
+                assert_eq!(o.env, vec![("CELASTRO_AUTO_FAILOVER".to_string(), "on".to_string())]);
+            }
+            other => panic!("`install` with its flags must parse, got {other:?}"),
+        }
+        match parse(&["install", "--node"]) {
+            Cli::Usage(msg) => assert!(msg.contains("--node"), "{msg}"),
+            other => panic!("a flag without its value must be refused, got {other:?}"),
+        }
+        match parse(&["--node", "10.0.0.2", "install"]) {
+            Cli::Usage(msg) => assert!(msg.contains("--node"), "{msg}"),
+            other => panic!(
+                "an install flag before the verb is unknown to the global parser, got {other:?}"
+            ),
+        }
+        match parse(&["--open", "install"]) {
+            Cli::Usage(msg) => assert!(msg.contains("--open"), "{msg}"),
+            other => panic!("`--open` means nothing to install, got {other:?}"),
         }
     }
 

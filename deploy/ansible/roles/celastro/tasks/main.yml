@@ -1,0 +1,121 @@
+---
+# The binary onto the host, then `celastro install`, which writes the
+# user, the directories, the settings and the unit and starts the service.
+# Every run installs: the binary is replaced, the settings rewritten, the
+# service restarted -- that is what an upgrade or a change of settings is,
+# and the play runs one host at a time so a cluster stays up through it.
+
+- name: Refuse to run without the tokens
+  ansible.builtin.assert:
+    that:
+      - celastro_token | length >= 16
+      - not (celastro_cluster | bool) or celastro_wire_token | length > 0
+    fail_msg: "celastro_token needs at least sixteen printable bytes, and a cluster needs celastro_wire_token"
+    quiet: true
+
+- name: Name the release for this architecture
+  ansible.builtin.set_fact:
+    celastro_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_architecture] }}"
+    celastro_staging: /etc/celastro/staging
+    # The probe speaks what the console speaks; the installed copies are
+    # root's to read.
+    celastro_probe_env: "{{ {'CELASTRO_TLS_CERT': '/etc/celastro/tls/tls.crt', 'CELASTRO_TLS_KEY': '/etc/celastro/tls/tls.key', 'CELASTRO_TLS_CA': '/etc/celastro/tls/ca.crt'} if celastro_tls_dir else {} }}"
+
+- name: Fetch the release, checked against its SHA256SUMS
+  ansible.builtin.get_url:
+    url: "{{ celastro_release_url }}/celastro-{{ celastro_version }}-linux-{{ celastro_arch }}.tar.gz"
+    dest: "/tmp/celastro-{{ celastro_version }}-linux-{{ celastro_arch }}.tar.gz"
+    checksum: "sha256:{{ celastro_release_url }}/SHA256SUMS"
+    mode: "0644"
+  when: celastro_binary == ""
+
+- name: Unpack the binary
+  ansible.builtin.unarchive:
+    src: "/tmp/celastro-{{ celastro_version }}-linux-{{ celastro_arch }}.tar.gz"
+    dest: /usr/local/bin
+    remote_src: true
+    include: [celastro]
+    mode: "0755"
+    owner: root
+    group: root
+  when: celastro_binary == ""
+
+- name: Copy the binary given instead of the release
+  ansible.builtin.copy:
+    src: "{{ celastro_binary }}"
+    dest: /usr/local/bin/celastro
+    mode: "0755"
+    owner: root
+    group: root
+  when: celastro_binary != ""
+
+- name: Stage the certificates and keys for the install to copy into place
+  ansible.builtin.file:
+    path: "{{ celastro_staging }}"
+    state: directory
+    mode: "0700"
+  when: celastro_tls_dir != "" or celastro_master_key != ""
+
+- name: Stage the certificates
+  ansible.builtin.copy:
+    src: "{{ celastro_tls_dir }}/{{ item }}"
+    dest: "{{ celastro_staging }}/tls/{{ item }}"
+    mode: "0600"
+  loop: [tls.crt, tls.key, ca.crt]
+  when: celastro_tls_dir != ""
+
+- name: Stage the keys
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ celastro_staging }}/{{ item.dest }}"
+    mode: "0600"
+  loop:
+    - { src: "{{ celastro_master_key }}", dest: master.key }
+    - { src: "{{ celastro_data_key }}", dest: data.key }
+  when: celastro_master_key != ""
+
+- name: Assemble the install's flags
+  ansible.builtin.set_fact:
+    celastro_install_flags: >-
+      {{ (['--node', celastro_node, '--attach', celastro_attach] if celastro_cluster | bool else [])
+         + (['--role', celastro_role] if celastro_role else [])
+         + (['--tls', celastro_staging ~ '/tls'] if celastro_tls_dir else [])
+         + (['--client-auth'] if celastro_client_auth | bool else [])
+         + (['--master-key', celastro_staging ~ '/master.key', '--data-key', celastro_staging ~ '/data.key'] if celastro_master_key else [])
+         + (['--user', celastro_user] if celastro_user != 'celastro' else [])
+         + (celastro_env | dict2items | map(attribute='key') | zip(celastro_env | dict2items | map(attribute='value')) | map('join', '=') | map('regex_replace', '^', '--env=') | list) }}
+
+- name: Install, or upgrade, or change the settings, and (re)start the service
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/bin/celastro', '--dir', celastro_data_dir, '--port', celastro_port | string, '--bind', celastro_bind, 'install'] + celastro_install_flags }}"
+  environment:
+    CELASTRO_TOKEN: "{{ celastro_token }}"
+    CELASTRO_WIRE_TOKEN: "{{ celastro_wire_token }}"
+  register: celastro_install
+  changed_when: true
+  # The tokens are in the task's environment; with no_log the failure
+  # message is hidden too -- drop it to read what the install said.
+  no_log: true
+
+- name: Remove the staged copies; the install put them where the service reads them
+  ansible.builtin.file:
+    path: "{{ celastro_staging }}"
+    state: absent
+
+- name: Wait until the node serves
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/bin/celastro', '--port', celastro_port | string, 'health'] + (['--attached', (groups[celastro_group] | length - 1) | string] if celastro_cluster | bool else []) }}"
+  environment: "{{ celastro_probe_env }}"
+  register: celastro_health
+  # Serving is enough here: a node installed before its peers cannot have
+  # verified them yet. The play's last part asks every node for its peers
+  # once all are installed.
+  until: celastro_health.rc == 0 or 'attached so far' in (celastro_health.stderr | default(''))
+  retries: "{{ celastro_health_retries }}"
+  delay: "{{ celastro_health_delay }}"
+  changed_when: false
+  failed_when: celastro_health.rc != 0 and 'attached so far' not in (celastro_health.stderr | default(''))
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ celastro_health.stdout_lines + celastro_health.stderr_lines }}"

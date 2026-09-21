@@ -10,7 +10,7 @@ one holder — so a pod that is down is its shards down until it is back.
 ## A cluster
 
 ```
-helm install celastro chart/celastro --set replicas=3
+helm install celastro deploy/chart/celastro --set replicas=3
 ```
 
 Every pod is started with its address, the wire token from a `Secret` the
@@ -31,7 +31,7 @@ cluster network, encrypted with `tls.enabled` (below).
 Clients reach a cluster through the console, exposed:
 
 ```
-helm install celastro chart/celastro --set replicas=3 --set console.expose=true
+helm install celastro deploy/chart/celastro --set replicas=3 --set console.expose=true
 ```
 
 Every pod then serves the console on all interfaces with one token from the
@@ -49,7 +49,7 @@ inside a network you trust, put an ingress in front of it
 ### Dedicated coordinators
 
 ```
-helm install celastro chart/celastro --set replicas=6 --set coordinators.replicas=1 --set console.expose=true
+helm install celastro deploy/chart/celastro --set replicas=6 --set coordinators.replicas=1 --set console.expose=true
 ```
 
 `coordinators.replicas` adds a second StatefulSet, `<release>-coord`, of
@@ -86,10 +86,10 @@ is never ready); three do not, each leaving every pair of pods a token in
 common:
 
 ```
-helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=NEW
+helm upgrade celastro deploy/chart/celastro --reuse-values --set wire.tokenAlso=NEW
 kubectl create secret generic celastro-wire --from-literal=CELASTRO_WIRE_TOKEN=NEW --dry-run=client -o yaml | kubectl apply -f -
-helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=OLD   # pods restart on the new Secret
-helm upgrade celastro chart/celastro --reuse-values --set wire.tokenAlso=
+helm upgrade celastro deploy/chart/celastro --reuse-values --set wire.tokenAlso=OLD   # pods restart on the new Secret
+helm upgrade celastro deploy/chart/celastro --reuse-values --set wire.tokenAlso=
 ```
 
 `wire.existingSecret` names the Secret when it is yours; the middle step
@@ -109,7 +109,7 @@ it.
 ### Encryption in transit
 
 ```
-helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true
+helm install celastro deploy/chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true
 ```
 
 Every pod then serves the wire and the console over TLS 1.3 with one
@@ -137,7 +137,7 @@ be RSA or P-256), from one of three places:
   ```
   celastro tls init ./tls celastro celastro-0.celastro,celastro-1.celastro,celastro-2.celastro,celastro-console,celastro.default.svc,celastro-console.default.svc
   kubectl create secret generic celastro-tls --from-file=./tls/tls.crt --from-file=./tls/tls.key --from-file=./tls/ca.crt
-  helm install celastro chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true --set tls.existingSecret=celastro-tls
+  helm install celastro deploy/chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true --set tls.existingSecret=celastro-tls
   ```
 
   The certificate has to name every pod (`<release>-<i>.<release>`), both
@@ -172,7 +172,7 @@ at install:
 celastro key master ./master.key
 CELASTRO_MASTER_KEY_FILE=./master.key celastro key init ./KEY
 kubectl create secret generic celastro-keys --from-file=master.key=./master.key --from-file=KEY=./KEY
-helm install celastro chart/celastro --set replicas=3 --set encryption.existingSecret=celastro-keys
+helm install celastro deploy/chart/celastro --set replicas=3 --set encryption.existingSecret=celastro-keys
 ```
 
 Every pod then writes every file on its volume, the tier and its backups
@@ -188,7 +188,7 @@ not touched.
 ### Backups, and the archived tier on a mount
 
 ```
-helm install celastro chart/celastro --set replicas=3 --set archive.existingClaim=celastro-nfs --set backup.schedule="0 3 * * *"
+helm install celastro deploy/chart/celastro --set replicas=3 --set archive.existingClaim=celastro-nfs --set backup.schedule="0 3 * * *"
 ```
 
 `archive.existingClaim` is a ReadWriteMany claim — an NFS volume is the
@@ -216,7 +216,7 @@ The chart pulls `ghcr.io/celastro/celastro:<appVersion>`, the image each
 release publishes from the tagged tree.
 
 ```
-helm install celastro chart/celastro
+helm install celastro deploy/chart/celastro
 ```
 
 For an image of your own, build it, put it where the cluster can pull it (or
@@ -225,7 +225,7 @@ load it into a local cluster), and point the chart at it:
 ```
 docker build -t celastro:0.53.0 .
 kind load docker-image celastro:0.53.0        # for a kind cluster
-helm install celastro chart/celastro --set image.repository=celastro
+helm install celastro deploy/chart/celastro --set image.repository=celastro
 ```
 
 `image.repository` and `image.tag` take a registry of your own the same way.

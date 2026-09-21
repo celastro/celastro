@@ -1,0 +1,31 @@
+---
+# celastro on every host of the `celastro` group, one host at a time:
+#
+#   ansible-playbook -i inventory.yml celastro.yml
+#
+# A first pass installs; a later pass with a new celastro_version upgrades,
+# node by node, each waited for before the next; a pass with changed
+# settings rewrites them and restarts the same way. The role is thin on
+# purpose: it puts the binary on the host and runs `celastro install`,
+# which does the rest. inventory.example.yml is the shape of the inventory
+# and roles/celastro/defaults/main.yml every setting.
+
+- name: Facts from every node first, so each node's install can name the others
+  hosts: "{{ celastro_group | default('celastro') }}"
+  gather_facts: true
+  tasks: []
+
+- name: celastro on every node, one at a time
+  hosts: "{{ celastro_group | default('celastro') }}"
+  become: true
+  serial: "{{ celastro_serial | default(1) }}"
+  roles:
+    - celastro
+
+- name: Every node has verified every other, now that all are installed
+  hosts: "{{ celastro_group | default('celastro') }}"
+  become: true
+  tasks:
+    - ansible.builtin.import_role:
+        name: celastro
+        tasks_from: peers

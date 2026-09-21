@@ -1,0 +1,17 @@
+---
+# After every node is installed: each one has verified every other, or
+# the play fails naming the one that has not.
+- name: Ask the node for its peers
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/bin/celastro', '--port', celastro_port | string, 'health', '--attached', (groups[celastro_group] | length - 1) | string] }}"
+  environment: "{{ celastro_probe_env | default({}) }}"
+  register: celastro_peers
+  until: celastro_peers.rc == 0
+  retries: "{{ celastro_health_retries }}"
+  delay: "{{ celastro_health_delay }}"
+  changed_when: false
+  when: celastro_cluster | bool
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ celastro_peers.stdout | default('one node, no peers') }}"

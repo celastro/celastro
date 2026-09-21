@@ -1,0 +1,56 @@
+---
+# Every setting of the celastro role, with its default. Override in the
+# inventory (per host or for the group) or with -e.
+
+# The release to install: the tarball for the host's architecture from the
+# GitHub release v<version>, checked against the release's SHA256SUMS.
+celastro_version: 0.71.0
+celastro_release_url: "https://github.com/celastro/celastro/releases/download/v{{ celastro_version }}"
+# A binary of your own on this machine (`cargo build --release`, or
+# scripts/reproducible.sh) instead of the release: copied as it is, so it
+# must be built for the host's architecture.
+celastro_binary: ""
+
+# The inventory group the cluster is; its members attach each other.
+celastro_group: celastro
+# A cluster when the group has more than one host; set it true for a
+# single host that will be joined by others later, so its wire is served.
+celastro_cluster: "{{ groups[celastro_group] | length > 1 }}"
+# The address the other nodes reach this one at.
+celastro_address: "{{ ansible_default_ipv4.address }}"
+celastro_wire_port: 2352
+celastro_node: "tcp://{{ celastro_address }}:{{ celastro_wire_port }}"
+# Every node, the same list on every node; each skips its own.
+celastro_attach: "{{ groups[celastro_group] | map('extract', hostvars, 'celastro_node') | join(',') }}"
+# `coordinator` for a node that holds no shards; empty otherwise.
+celastro_role: ""
+
+# The tokens, from a vault: the console's (at least sixteen printable
+# bytes) and, for a cluster, the wire's.
+celastro_token: ""
+celastro_wire_token: ""
+
+# The console: every interface, port 8787, as `serve --bind --port`.
+celastro_bind: 0.0.0.0
+celastro_port: 8787
+celastro_data_dir: /var/lib/celastro
+celastro_user: celastro
+
+# TLS: a directory on this machine with tls.crt, tls.key and ca.crt
+# (`celastro tls init`); client_auth makes the wire require a peer's
+# certificate.
+celastro_tls_dir: ""
+celastro_client_auth: false
+# Encryption at rest: both files, or neither (`celastro key master`,
+# `celastro key init`).
+celastro_master_key: ""
+celastro_data_key: ""
+
+# Further CELASTRO_* settings, each an --env of the install.
+celastro_env: {}
+
+# Hosts per batch of the rolling play (celastro.yml reads it).
+celastro_serial: 1
+# How long a node is given to serve and see its peers after the install.
+celastro_health_retries: 45
+celastro_health_delay: 2

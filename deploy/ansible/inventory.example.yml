@@ -1,0 +1,41 @@
+---
+# The shape of an inventory for celastro.yml. Copy it to inventory.yml and
+# fill it in; keep the tokens in a vault (`ansible-vault encrypt_string`).
+celastro:
+  hosts:
+    node-0:
+      ansible_host: 203.0.113.10
+      # The address the other nodes reach this one at: the private one on
+      # a cloud, the only one on a plain network. Without it the role takes
+      # the host's default IPv4 address.
+      celastro_address: 10.0.0.2
+    node-1:
+      ansible_host: 203.0.113.11
+      celastro_address: 10.0.0.3
+    node-2:
+      ansible_host: 203.0.113.12
+      celastro_address: 10.0.0.4
+      # A node that holds no shards and only coordinates (optional).
+      # celastro_role: coordinator
+  vars:
+    ansible_user: root
+    celastro_version: 0.71.0
+    # At least sixteen printable bytes, the same on every node.
+    celastro_token: !vault |
+      $ANSIBLE_VAULT;1.1;AES256
+      ...
+    celastro_wire_token: !vault |
+      $ANSIBLE_VAULT;1.1;AES256
+      ...
+    # Further CELASTRO_* settings for every node (docs/tuning.md).
+    celastro_env:
+      CELASTRO_AUTO_FAILOVER: "on"
+    # TLS between the nodes and to the clients: a directory on this
+    # machine holding tls.crt, tls.key and ca.crt from `celastro tls init
+    # DIR celastro 10.0.0.2,10.0.0.3,10.0.0.4`.
+    # celastro_tls_dir: ./tls
+    # celastro_client_auth: true
+    # Encryption at rest: `celastro key master ./master.key`, then
+    # `CELASTRO_MASTER_KEY_FILE=./master.key celastro key init ./data.key`.
+    # celastro_master_key: ./master.key
+    # celastro_data_key: ./data.key
