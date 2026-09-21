@@ -44,13 +44,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::hex;
-use crate::crypto::sha2::{hmac_sha256, sha256};
+use crate::crypto::sha2::{hmac_sha256, sha256, Sha256};
 use crate::error::{Error, Result};
 
 /// The four operations the archive tier needs, and the listing a backup
 /// needs.
 pub trait ObjectStore: Send + Sync + fmt::Debug {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    /// The file at `path` as the object `key`, streamed rather than held:
+    /// its length and SHA-256, hashed on the way. The default reads the
+    /// file whole; a store that can do better does.
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<(u64, [u8; 32])> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| Error::Storage(format!("archive: PUT {key}: {}: {e}", path.display())))?;
+        self.put(key, &bytes)?;
+        Ok((bytes.len() as u64, sha256(&bytes)))
+    }
     /// `len` bytes from `off`. Short reads are errors, not partial answers.
     fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
@@ -285,8 +294,30 @@ impl S3Store {
         range: Option<(u64, u64)>,
         body: &[u8],
     ) -> Result<Response> {
-        let path = format!("/{}/{}", uri_encode(&self.bucket), uri_encode(key));
         let payload_hash = hex(&sha256(body));
+        self.request_with(method, key, query, range, &payload_hash, body.len() as u64, &mut |w| {
+            w.write_all(body)
+        })
+    }
+
+    /// A request whose body `write_body` streams, `content_len` bytes
+    /// hashing to `payload_hash` (SigV4 signs the hash, so the caller has
+    /// read the body once already). The read timeout grows with the body:
+    /// a second per 100 KB on top of the base, so a slow destination takes
+    /// long rather than failing on a large object.
+    #[allow(clippy::too_many_arguments)]
+    fn request_with(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        range: Option<(u64, u64)>,
+        payload_hash: &str,
+        content_len: u64,
+        write_body: &mut dyn FnMut(&mut dyn crate::tls::Stream) -> std::io::Result<()>,
+    ) -> Result<Response> {
+        let path = format!("/{}/{}", uri_encode(&self.bucket), uri_encode(key));
+        let payload_hash = payload_hash.to_string();
         let date = amz_date(now_secs());
         let mut headers: Vec<(String, String)> = vec![
             ("host".into(), self.host_header.clone()),
@@ -317,12 +348,12 @@ impl S3Store {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
         req.push_str(&format!(
-            "authorization: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
+            "authorization: {auth}\r\ncontent-length: {content_len}\r\nconnection: close\r\n\r\n"
         ));
         let mut stream = connect(&self.endpoint, self.tls.as_deref())?;
+        stream.set_read_timeout(Some(IO_TIMEOUT + Duration::from_secs(content_len / 100_000)))?;
         stream.write_all(req.as_bytes())?;
-        stream.write_all(body)?;
+        write_body(stream.as_mut())?;
         stream.flush()?;
         read_response(stream.as_mut(), method == "HEAD")
     }
@@ -339,6 +370,35 @@ impl ObjectStore for S3Store {
         let r = self.request("PUT", key, "", None, bytes)?;
         if r.status == 200 {
             Ok(())
+        } else {
+            Err(self.fail("PUT", key, &r))
+        }
+    }
+
+    /// Two passes over the file and none over memory: the hash first,
+    /// since the signature covers it, then the body in pieces.
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<(u64, [u8; 32])> {
+        let (len, hash) = file_sha256(path)
+            .map_err(|e| Error::Storage(format!("archive: PUT {key}: {}: {e}", path.display())))?;
+        let r = self.request_with("PUT", key, "", None, &hex(&hash), len, &mut |w| {
+            let mut f = std::fs::File::open(path)?;
+            let mut buf = vec![0u8; 1 << 16];
+            let mut left = len;
+            while left > 0 {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the file shrank while it was copied",
+                    ));
+                }
+                w.write_all(&buf[..n])?;
+                left = left.saturating_sub(n as u64);
+            }
+            Ok(())
+        })?;
+        if r.status == 200 {
+            Ok((len, hash))
         } else {
             Err(self.fail("PUT", key, &r))
         }
@@ -528,6 +588,23 @@ impl DirStore {
     }
 }
 
+/// A file's length and SHA-256 in one pass, held nowhere.
+pub(crate) fn file_sha256(path: &std::path::Path) -> std::io::Result<(u64, [u8; 32])> {
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut len = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((len, h.finish()))
+}
+
 impl ObjectStore for DirStore {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let p = self.path(key)?;
@@ -535,6 +612,47 @@ impl ObjectStore for DirStore {
             std::fs::create_dir_all(parent)?;
         }
         crate::shard::atomic_write(&p, bytes)
+    }
+
+    /// Copied in pieces through a temporary beside the target, hashed on
+    /// the way, then published by rename as `put` publishes.
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<(u64, [u8; 32])> {
+        let p = self.path(key)?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = p.with_extension("part");
+        let copied = (|| -> std::io::Result<(u64, [u8; 32])> {
+            let mut src = std::fs::File::open(path)?;
+            let mut dst = std::fs::File::create(&tmp)?;
+            let mut h = Sha256::new();
+            let mut buf = vec![0u8; 1 << 16];
+            let mut len = 0u64;
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                dst.write_all(&buf[..n])?;
+                len += n as u64;
+            }
+            dst.sync_all()?;
+            std::fs::rename(&tmp, &p)?;
+            Ok((len, h.finish()))
+        })();
+        match copied {
+            Ok(out) => {
+                if let Some(parent) = p.parent() {
+                    crate::shard::sync_dir(parent)?;
+                }
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(Error::Storage(format!("archive: PUT {key}: {e}")))
+            }
+        }
     }
 
     fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>> {

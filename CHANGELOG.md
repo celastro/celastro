@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.70.0 — 2026-09-21
+
+**A backup streams each segment from its file.** The copy held every
+segment whole in memory for its put, so a node's peak memory during a
+backup followed its largest segment (measured: 150 MB over the
+baseline for a 30 MB segment, more for the larger segments a
+compaction makes). A sealed segment now streams from its file to the
+destination, hashed on the way for the record, whether the destination
+is a directory or an S3 store; only the segment built from the memtable
+at the pin is bytes. The store client's read timeout scales with the
+object's size (a second per 100 KB on top of thirty), so a slow
+destination takes long rather than failing on a large object. Measured
+against a store capped at 4 Mbit/s with the numbers in the design
+notes.
+
 ## 0.69.0 — 2026-09-21
 
 **What the reviews had accepted, done.** Randomness comes from

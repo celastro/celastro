@@ -2196,8 +2196,33 @@ statement and 16,787 after, which is the cut. A pin held through a compaction is
 backup's deferred work is held, `COMPACT` retires the segments it
 named, rows land after, and the copy still verifies and restores what
 was there at the pin -- the handles keep the files until the copy
-drops them. Not measured: a destination slow enough for the memtable's
-segment to matter, which is proportional and was not seen.
+drops them. A slow destination was then measured on the box (`do/slowbk/`): an
+S3-compatible store in a container behind a link shaped to 4 Mbit/s
+with 50 ms of latency, a node holding 40,000 documents with a text and
+a vector index (103 MB in eight segments, the largest 30 MB), a
+writer through the console. The same backup took 1 s to a local
+directory, 1 s to the store unshaped, and 230 s shaped (106 MB at the
+cap, near enough), and verified object by object. What it cost, on
+0.69.0 and then on 0.70.0: resident memory 465 MB before; during the
+unshaped copy 557 MB on 0.69.0, which held each segment whole for its
+put, and 466 MB on 0.70.0, which streams a sealed segment from its
+file and hashes it on the way; during the shaped copy with no writer
+542 MB on 0.70.0, the difference being the one segment built from the
+memtable at the pin (here 30 MB of rows a writer had left there, and
+bounded by the memtable's caps) and the store client's buffers; under
+a writer 618 MB, the rest the writer's own memtables. The data
+directory grew from 103 to 162 MB over the quiet shaped copy and 206
+MB under the writer -- the pinned segments standing beside what
+fourteen compactions wrote meanwhile -- and shrank once the copy
+dropped them. The writer, 305 a second alone, made 146 a second over a
+run that held the copy for three quarters of it: about half its rate
+during the copy, which is the copy's reading, hashing and sending on
+the same cores and the compactions the pin makes larger, not the pin
+itself, which holds nothing a writer waits for; not isolated further.
+The store client's read timeout starts after the last write is
+accepted and scales with the object from 0.70.0 (a second per 100 KB
+on top of thirty), so a destination slower than about 100 KB/s takes
+long rather than failing on a large object.
 
 ## A worked query
 

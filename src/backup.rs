@@ -173,25 +173,59 @@ fn run(
             shards += 1;
             let sdir = format!("{name}/shard-{index:04}");
             for h in &ex.sealed {
-                let data = handle_bytes(h)?;
                 let key = format!("pool/{sdir}/{:016x}.seg", h.id());
-                match target.store.size(&target.key(&key))? {
-                    Some(n) if n == data.len() as u64 => present += 1,
-                    Some(n) => {
-                        return Err(Error::Storage(format!(
-                            "backup: {} holds {key} at {n} bytes, the segment is {}; a segment id \
-                             came back with other contents, which the pool cannot hold",
-                            target.display,
-                            data.len()
-                        )))
+                // A segment on disk streams from its file, hashed on the
+                // way: the copy holds no segment whole, so a node's memory
+                // during a backup does not follow its largest segment. One
+                // held as bytes (a memtable's, a remote tier's) goes as
+                // bytes.
+                let (len, hash) = match h.segment.source().path().map(|p| p.to_path_buf()) {
+                    Some(path) => {
+                        let len = std::fs::metadata(&path)?.len();
+                        match target.store.size(&target.key(&key))? {
+                            Some(n) if n == len => {
+                                present += 1;
+                                crate::objstore::file_sha256(&path)?
+                            }
+                            Some(n) => {
+                                return Err(Error::Storage(format!(
+                                    "backup: {} holds {key} at {n} bytes, the segment is {len}; a \
+                                     segment id came back with other contents, which the pool \
+                                     cannot hold",
+                                    target.display
+                                )))
+                            }
+                            None => {
+                                let out = target.store.put_file(&target.key(&key), &path)?;
+                                copied += 1;
+                                bytes += out.0;
+                                out
+                            }
+                        }
                     }
                     None => {
-                        target.store.put(&target.key(&key), &data)?;
-                        copied += 1;
-                        bytes += data.len() as u64;
+                        let data = handle_bytes(h)?;
+                        match target.store.size(&target.key(&key))? {
+                            Some(n) if n == data.len() as u64 => present += 1,
+                            Some(n) => {
+                                return Err(Error::Storage(format!(
+                                    "backup: {} holds {key} at {n} bytes, the segment is {}; a \
+                                     segment id came back with other contents, which the pool \
+                                     cannot hold",
+                                    target.display,
+                                    data.len()
+                                )))
+                            }
+                            None => {
+                                target.store.put(&target.key(&key), &data)?;
+                                copied += 1;
+                                bytes += data.len() as u64;
+                            }
+                        }
+                        (data.len() as u64, sha256(&data))
                     }
-                }
-                files.push((key, data.len() as u64, hex(&sha256(&data))));
+                };
+                files.push((key, len, hex(&hash)));
             }
             for (id, log) in &ex.deletes {
                 if let Some(data) = log {

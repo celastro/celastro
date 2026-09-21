@@ -37,19 +37,66 @@ const K256: [u32; 64] = [
 ];
 
 /// SHA-256, FIPS 180-4, straight from the specification.
-pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut data = msg.to_vec();
-    let bit_len = (msg.len() as u64).wrapping_mul(8);
-    data.push(0x80);
-    while data.len() % 64 != 56 {
-        data.push(0);
+/// SHA-256 fed a piece at a time: what hashes a file without holding it,
+/// and what the one-shot `sha256` is made of.
+pub(crate) struct Sha256 {
+    h: [u32; 8],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl Sha256 {
+    pub(crate) fn new() -> Sha256 {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: Vec::with_capacity(64),
+            len: 0,
+        }
     }
-    data.extend_from_slice(&bit_len.to_be_bytes());
-    for block in data.chunks(64) {
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        let mut data = data;
+        if !self.buf.is_empty() {
+            let take = (64 - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == 64 {
+                let block = std::mem::take(&mut self.buf);
+                compress(&mut self.h, &block);
+            }
+        }
+        let mut chunks = data.chunks_exact(64);
+        for block in &mut chunks {
+            compress(&mut self.h, block);
+        }
+        self.buf.extend_from_slice(chunks.remainder());
+    }
+
+    pub(crate) fn finish(mut self) -> [u8; 32] {
+        let bit_len = self.len.wrapping_mul(8);
+        let mut tail = std::mem::take(&mut self.buf);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bit_len.to_be_bytes());
+        for block in tail.chunks(64) {
+            compress(&mut self.h, block);
+        }
+        let mut out = [0u8; 32];
+        for (i, v) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn compress(h: &mut [u32; 8], block: &[u8]) {
+    {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -64,7 +111,7 @@ pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
             w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
@@ -85,11 +132,12 @@ pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
             h[i] = h[i].wrapping_add(*v);
         }
     }
-    let mut out = [0u8; 32];
-    for (i, v) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
+}
+
+pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
+    let mut s = Sha256::new();
+    s.update(msg);
+    s.finish()
 }
 
 const K512: [u64; 80] = [
@@ -293,6 +341,34 @@ mod tests {
         assert_eq!(
             hex(&sha512(two)),
             "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    /// Fed in pieces of every awkward size, the streaming hash is the
+    /// one-shot hash.
+    #[test]
+    fn the_streaming_hash_agrees_with_the_one_shot_hash_at_every_split() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let whole = sha256(&data);
+        for split in [0usize, 1, 55, 56, 63, 64, 65, 127, 128, 500, 999, 1000] {
+            let mut h = Sha256::new();
+            h.update(&data[..split]);
+            h.update(&data[split..]);
+            assert_eq!(h.finish(), whole, "split at {split}");
+        }
+        let mut h = Sha256::new();
+        for b in &data {
+            h.update(std::slice::from_ref(b));
+        }
+        assert_eq!(h.finish(), whole, "a byte at a time");
+        assert_eq!(
+            crate::crypto::hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }
