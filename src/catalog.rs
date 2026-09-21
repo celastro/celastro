@@ -83,8 +83,9 @@ pub struct Tablet {
     pub node: String,
     pub lo: Option<String>,
     pub hi: Option<String>,
-    /// Raised by every promotion: the map entry with the higher term wins
-    /// when two nodes' maps disagree about a shard. Format 9.
+    /// Raised by every promotion and every copy replaced: the map entry
+    /// with the higher term wins when two nodes' maps disagree about a
+    /// shard. Format 9.
     pub term: u64,
     /// The nodes that hold a copy of the shard and take its log: a
     /// promotion makes one of them the holder. Format 9.

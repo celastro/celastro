@@ -220,6 +220,20 @@ impl<'a> Parser<'a> {
             let term = if self.eat_kw("TERM") { Some(self.usize_literal()? as u64) } else { None };
             return Ok(Statement::PromoteShard { collection, shard, node, term });
         }
+        if self.eat_kw("REPLACE") {
+            self.expect_kw("COPY")?;
+            self.expect_kw("OF")?;
+            self.expect_kw("SHARD")?;
+            let shard = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            self.expect_kw("ON")?;
+            let node = self.node_address()?;
+            self.expect_kw("WITH")?;
+            let with = self.node_address()?;
+            let term = if self.eat_kw("TERM") { Some(self.usize_literal()? as u64) } else { None };
+            return Ok(Statement::ReplaceCopy { collection, shard, node, with, term });
+        }
         if self.eat_kw("MERGE") {
             self.expect_kw("SHARDS")?;
             let a = self.usize_literal()?;

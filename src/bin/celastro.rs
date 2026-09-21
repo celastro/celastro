@@ -2158,6 +2158,12 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         o.lease_secs =
             v.trim().parse().map_err(|_| format!("CELASTRO_LEASE_SECS: `{v}` is not a number"))?;
     }
+    if let Some(v) = var("CELASTRO_REPLACE_SECS") {
+        o.replace_secs = v
+            .trim()
+            .parse()
+            .map_err(|_| format!("CELASTRO_REPLACE_SECS: `{v}` is not a number"))?;
+    }
     if let Some(v) = var("CELASTRO_ROLE") {
         o.role = celastro::engine::Role::parse(&v)
             .ok_or_else(|| format!("CELASTRO_ROLE: `{v}` is not data or coordinator"))?;

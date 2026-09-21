@@ -2542,3 +2542,161 @@ fn a_lookup_pinned_to_one_shard_asks_no_other_holder_anything() {
     }
     let _ = std::fs::remove_dir_all(&hole_dir);
 }
+
+/// A statement whose every shard is on one other node goes there whole,
+/// as one call, and comes back as that node's own answer: the plan says
+/// so, the rows are the holder's, a write the same node just forwarded
+/// is read back through it at once, and a statement over shards on
+/// three nodes is not forwarded.
+#[test]
+fn a_statement_reaching_one_other_holder_travels_whole_as_one_call() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fwd-a");
+    let b = Node::start("fwd-b");
+    let c = Node::start("fwd-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let nodes = [&a, &b, &c];
+    let holder = *nodes.iter().find(|n| n.local_shards("items").contains(&0)).unwrap();
+    let asker = *nodes.iter().find(|n| n.url != holder.url).unwrap();
+    let plan_of = |n: &Node, sql: &str| match n.db.read().unwrap().read(sql).unwrap() {
+        Outcome::Explain(t) => t,
+        other => panic!("{other:?}"),
+    };
+    let rows_of = |n: &Node, sql: &str| match n.db.read().unwrap().read(sql).unwrap() {
+        Outcome::Rows(q) => shape(&q),
+        other => panic!("{other:?}"),
+    };
+    let sql = "SELECT id, n FROM items WHERE tenant = 't0' ORDER BY id LIMIT 5";
+    let plan = plan_of(asker, &format!("EXPLAIN ANALYZE {sql}"));
+    assert!(plan.contains(&format!("forwarded whole to {} as one call", holder.url)), "{plan}");
+    assert!(plan.contains("  Query plan  (snapshot"), "the holder's plan follows: {plan}");
+    let direct = plan_of(holder, &format!("EXPLAIN ANALYZE {sql}"));
+    assert!(!direct.contains("forwarded"), "{direct}");
+    let via = rows_of(asker, sql);
+    assert_eq!(via.len(), 5, "{via:?}");
+    assert_eq!(via, rows_of(holder, sql));
+    // Read-your-writes through the forwarding node.
+    asker.ack(r#"INSERT INTO items VALUES ('{"id":"doc-000-new","tenant":"t0","n":1000}')"#);
+    let back =
+        rows_of(asker, "SELECT id FROM items WHERE tenant = 't0' AND id = 'doc-000-new' LIMIT 1");
+    assert_eq!(back.len(), 1, "{back:?}");
+    let all = plan_of(asker, "EXPLAIN ANALYZE SELECT id FROM items ORDER BY id LIMIT 3");
+    assert!(!all.contains("forwarded"), "{all}");
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A copy lost for good is replaced: `REPLACE COPY` strikes the lost
+/// follower from the map at the next term, a live node follows in its
+/// place and is shipped from nothing until it is caught up, writes are
+/// confirmed on it, and the lost node, back, takes the map at the
+/// higher term and drops the copy it kept.
+#[test]
+fn a_lost_copy_is_replaced_and_the_lost_node_back_drops_its_own() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("rep-a");
+    let b = Node::start("rep-b");
+    let c = Node::start("rep-c");
+    let d = Node::start("rep-d");
+    for n in [&b, &c, &d] {
+        a.ack(&format!("ATTACH NODE '{}'", n.url));
+    }
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 2, nodes = ['{a}', \
+         '{b}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .as_str(),
+    );
+    for i in 0..10usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    let health_says = |n: &Node, what: &str| {
+        for _ in 0..100 {
+            if n.ack("SHOW HEALTH").contains(what) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    };
+    assert!(health_says(&a, &format!("follower {} live", b.url)), "{}", a.ack("SHOW HEALTH"));
+    // Refused: not a follower, the holder, a follower already, a stranger.
+    for (sql, why) in [
+        (
+            format!("REPLACE COPY OF SHARD 0 OF items ON '{}' WITH '{}'", c.url, d.url),
+            "does not follow",
+        ),
+        (
+            format!("REPLACE COPY OF SHARD 0 OF items ON '{}' WITH '{}'", b.url, a.url),
+            "holds shard 0",
+        ),
+        (format!("REPLACE COPY OF SHARD 0 OF items ON '{}' WITH '{}'", b.url, b.url), "already"),
+        (
+            format!("REPLACE COPY OF SHARD 0 OF items ON '{}' WITH 'tcp://127.0.0.1:9'", b.url),
+            "ATTACH NODE",
+        ),
+    ] {
+        let e = a.exec(&sql).unwrap_err().to_string();
+        assert!(e.contains(why), "{sql}: {e}");
+    }
+    // b lost: its copy replaced by one on d.
+    let (b_port, b_dir) =
+        (b.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(), b.dir.clone());
+    drop(b);
+    settle();
+    let m =
+        a.ack(&format!("REPLACE COPY OF SHARD 0 OF items ON '{}' WITH '{}'", b_url(b_port), d.url));
+    assert!(m.contains(&format!("replaced by one on {} at term 1", d.url)), "{m}");
+    assert!(
+        m.contains(&format!("map switched here and on {}", c.url)) || m.contains(&d.url),
+        "{m}"
+    );
+    assert!(m.contains(&format!("{} adopted the collection and follows", d.url)), "{m}");
+    for n in [&a, &d] {
+        let cat = n.ack("SHOW CATALOG items");
+        assert!(cat.contains(&format!("followed by {}", d.url)) && cat.contains("term 1"), "{cat}");
+        assert!(!cat.contains(&b_url(b_port)), "{cat}");
+    }
+    // c, attached but never given the collection, is not told its map.
+    assert!(c.exec("SHOW CATALOG items").is_err());
+    assert!(health_says(&a, &format!("follower {} live", d.url)), "{}", a.ack("SHOW HEALTH"));
+    assert!(
+        health_says(&d, "follows shard 0 of `items` at term 1: caught up"),
+        "{}",
+        d.ack("SHOW HEALTH")
+    );
+    assert_eq!(d.ack("SHOW HEALTH").matches("caught up").count(), 1);
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(3000);
+    a.ack(r#"INSERT INTO items VALUES ('{"id":"d0100","n":100}')"#);
+    let m = a.ack("SHOW HEALTH");
+    assert!(!m.contains("DEGRADED"), "{m}");
+    // b back: the map at the higher term, its copy gone.
+    let b = Node::start_at("rep-b", b_port, Some(b_dir));
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    let cat = b.ack("SHOW CATALOG items");
+    assert!(cat.contains(&format!("followed by {}", d.url)) && cat.contains("term 1"), "{cat}");
+    assert!(!b.ack("SHOW HEALTH").contains("follows shard 0"), "{}", b.ack("SHOW HEALTH"));
+    assert!(!b.dir.join("collections").join("items").join("followed").join("shard-0000").exists());
+    for n in [a, b, c, d] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+fn b_url(port: u16) -> String {
+    format!("tcp://127.0.0.1:{port}")
+}

@@ -114,6 +114,10 @@ pub struct Explain {
     pub fetch_micros: u128,
     pub missing: Vec<String>,
     pub notes: Vec<String>,
+    /// The statement went whole to one other node, as one call, and this
+    /// is that node and the plan as it rendered it there: every shard
+    /// the statement reached was on it and none here.
+    pub forwarded: Option<(String, String)>,
     /// Each `WITHIN k HOPS OF` of the statement, as the coordinator walked
     /// it before the scatter: the frontier after every hop and what cut it.
     pub walks: Vec<WalkExplain>,
@@ -164,6 +168,19 @@ pub struct HopExplain {
 
 impl Explain {
     pub fn render(&self) -> String {
+        if let Some((url, plan)) = &self.forwarded {
+            let mut o = format!(
+                "Query plan  (forwarded whole to {url} as one call, {:.2} ms: every shard it \
+                 reaches is there)\n",
+                self.total_micros as f64 / 1000.0
+            );
+            for line in plan.lines() {
+                o.push_str("  ");
+                o.push_str(line);
+                o.push('\n');
+            }
+            return o;
+        }
         let mut o = String::new();
         let shards_counted = self.shards.iter().filter(|s| s.counted).count();
         let shards_scanned = self.shards.iter().filter(|s| !s.pruned && !s.counted).count();

@@ -270,7 +270,10 @@ SELECT count(*) FROM notes WITH (partial_results, deadline_ms = 3000);
 
 `EXPLAIN` in front of a `SELECT` prints the plan; `EXPLAIN ANALYZE` the
 plan that ran with its timings: what each shard scanned, which index
-served which predicate, the vector strategy, the fusion, the fetch.
+served which predicate, the vector strategy, the fusion, the fetch. A
+statement whose every shard is on one other node goes there whole, as
+one call, and the plan says `forwarded whole to tcp://... as one call`
+above the plan as that node rendered it.
 
 ```sql
 EXPLAIN ANALYZE SELECT id FROM notes WHERE topic = 'storage' ORDER BY embedding <=> [0.0,0.0,1.0,0.0] LIMIT 2;
@@ -438,6 +441,24 @@ PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:23523';
 
 ```
 shard 1 of `notes` promoted here at term 1 (was on tcp://127.0.0.1:23522); tcp://127.0.0.1:23522 follow it; map switched here and on tcp://127.0.0.1:23521; not on tcp://127.0.0.1:23522: ...
+```
+
+`REPLACE COPY OF SHARD i OF c ON 'lost' WITH 'node'` is for a follower
+that is not coming back: the copy on `lost` is struck from the map at
+the next term and `node` -- any attached data node that neither holds
+nor follows the shard -- follows in its place, shipped from nothing by
+the holder until it is caught up. The lost node, back, takes the map at
+the higher term and drops the copy it kept. With
+`CELASTRO_AUTO_FAILOVER=on` the steward does it once a follower has
+been away for `CELASTRO_REPLACE_SECS` (ten minutes), placing the copy
+where the collection's `regions` ask, else in the holder's region.
+
+```sql
+REPLACE COPY OF SHARD 1 OF notes ON 'tcp://127.0.0.1:23522' WITH 'tcp://127.0.0.1:23521';
+```
+
+```
+shard 1 of `notes`: the copy on tcp://127.0.0.1:23522 is replaced by one on tcp://127.0.0.1:23521 at term 2; the holder ships it from nothing; map switched here and on tcp://127.0.0.1:23521; not on tcp://127.0.0.1:23522: ...
 ```
 
 `MOVE SHARD` carries a shard to another node without stopping the

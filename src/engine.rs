@@ -275,6 +275,10 @@ pub struct DbOpts {
     pub auto_failover: bool,
     /// How long a lease lasts, seconds: `CELASTRO_LEASE_SECS`.
     pub lease_secs: u64,
+    /// How long a follower is away before the steward gives its copy up
+    /// for lost and places one on a live node instead, seconds; zero
+    /// never does: `CELASTRO_REPLACE_SECS`. Only with `auto_failover`.
+    pub replace_secs: u64,
     /// Who this node is and which nodes share its tablets. Only the `minimal`
     /// tier consults it, and only to decide whether this node is the one
     /// keeping a given index decoded.
@@ -315,6 +319,7 @@ impl Default for DbOpts {
             region: None,
             auto_failover: false,
             lease_secs: 60,
+            replace_secs: 600,
             node: None,
             tls: None,
         }
@@ -4438,6 +4443,140 @@ impl Db {
         })))
     }
 
+    /// `REPLACE COPY OF SHARD i OF c ON 'old' WITH 'new'`: the follower on
+    /// `old` is struck from the map and `new` follows in its place, at the
+    /// next term so that every map agrees -- a node back from being lost
+    /// carries the old entry, and the higher term wins, so it drops the
+    /// copy it kept. The holder's shipper takes the new follower at the
+    /// persist and ships it from nothing. What the steward runs for a copy
+    /// lost for good, and what to run by hand for a node that is not
+    /// coming back. Not `local`: this node switches its map and carries
+    /// the statement to every peer; `local`: this node's map alone.
+    pub fn replace_copy(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        old: &str,
+        new: &str,
+        term: Option<u64>,
+        local: bool,
+    ) -> Result<Outcome> {
+        let _deadline = self.arm_default_deadline();
+        crate::wire::parse_url(old)?;
+        crate::wire::parse_url(new)?;
+        self.catalog.get(collection)?;
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let Some(t) = tablets.get(shard).cloned() else {
+            return Err(Error::Plan(format!(
+                "`{collection}` has {} shard(s); there is no shard {shard}",
+                tablets.len()
+            )));
+        };
+        if t.is_merged() {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` was merged away and owns no key"
+            )));
+        }
+        let new_term = term.unwrap_or(t.term + 1);
+        if local && new_term <= t.term {
+            return Ok(Outcome::Ack(format!(
+                "shard {shard} of `{collection}` is at term {} already",
+                t.term
+            )));
+        }
+        let same = |a: &str, b: &str| a == b || (self.is_self(a) && self.is_self(b));
+        if !local {
+            if !t.followers.iter().any(|f| same(f, old)) {
+                return Err(Error::Plan(format!(
+                    "{old} does not follow shard {shard} of `{collection}` (its followers: {}); \
+                     only a follower's copy can be replaced",
+                    if t.followers.is_empty() {
+                        "none".to_string()
+                    } else {
+                        t.followers.join(", ")
+                    }
+                )));
+            }
+            if same(&t.node, new) {
+                return Err(Error::Plan(format!(
+                    "{new} holds shard {shard} of `{collection}`; a copy goes on another node"
+                )));
+            }
+            if t.followers.iter().any(|f| same(f, new)) {
+                return Err(Error::Plan(format!(
+                    "{new} follows shard {shard} of `{collection}` already"
+                )));
+            }
+            if !self.data_nodes().iter().any(|n| same(n, new)) {
+                return Err(Error::Plan(format!(
+                    "{new} is not a data node this one knows; ATTACH NODE it first"
+                )));
+            }
+        }
+        let mut updated = tablets.clone();
+        updated[shard] = Tablet {
+            followers: t
+                .followers
+                .iter()
+                .map(|f| if same(f, old) { new.to_string() } else { f.clone() })
+                .collect(),
+            term: new_term,
+            ..t.clone()
+        };
+        self.catalog.placement.insert(collection.to_string(), updated.clone());
+        self.persist_catalog()?;
+        crate::log::info(
+            "copy_replaced",
+            &[
+                ("collection", collection.to_string()),
+                ("shard", shard.to_string()),
+                ("lost", old.to_string()),
+                ("placed", new.to_string()),
+                ("term", new_term.to_string()),
+            ],
+        );
+        let ack = format!(
+            "shard {shard} of `{collection}`: the copy on {old} is replaced by one on {new} at \
+             term {new_term}; the holder ships it from nothing"
+        );
+        if local {
+            return Ok(Outcome::Ack(ack));
+        }
+        // The new follower apart from the rest: a node that never had the
+        // collection -- attached after its create, or named for a copy only
+        // now -- cannot take a map entry for it, and is handed the
+        // definition and the map whole instead, as CREATE hands them; its
+        // copy follows from that.
+        let placed = if self.is_self(new) { None } else { Some(self.node_conn(new)?) };
+        let peers: Vec<(String, Arc<crate::wire::Node>)> =
+            self.every_peer(&updated)?.into_iter().filter(|(u, _)| u != new).collect();
+        let coll = self.catalog.get(collection)?.clone();
+        let sql = format!(
+            "REPLACE COPY OF SHARD {shard} OF {collection} ON '{old}' WITH '{new}' TERM {new_term}"
+        );
+        let switch = Switch { sql: sql.clone(), peers };
+        let new = new.to_string();
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let on_new = match &placed {
+                None => String::new(),
+                Some(node) => match node.statement(&format!("LOCAL {sql}"), &[]) {
+                    Ok(_) => format!("; {new} follows"),
+                    Err(e) if e.to_string().contains("no such collection") => {
+                        match node.create_collection(&coll, &updated) {
+                            Ok(()) => format!("; {new} adopted the collection and follows"),
+                            Err(e) => format!("; not on {new}: {e}"),
+                        }
+                    }
+                    Err(e) => format!("; not on {new}: {e}"),
+                },
+            };
+            let switched = Db::carry_switch(&switch);
+            Ok(Outcome::Ack(format!("{ack}; {switched}{on_new}")))
+        })))
+    }
+
     /// The map entry after a promotion: the node promoted holds, the old
     /// holder follows, the term raised.
     fn promoted_tablet(t: &Tablet, node: &str, term: u64) -> Tablet {
@@ -4754,6 +4893,10 @@ impl Db {
         self.opts.lease_secs
     }
 
+    pub fn replace_secs(&self) -> u64 {
+        self.opts.replace_secs
+    }
+
     /// The holder of a shard, as the map says.
     pub fn holder_of(&self, collection: &str, shard: usize) -> Option<String> {
         self.catalog.placement.get(collection).and_then(|v| v.get(shard)).map(|t| t.node.clone())
@@ -4837,6 +4980,64 @@ impl Db {
                     .collect();
                 if !up.is_empty() {
                     out.push((name.clone(), i, t.term, up));
+                }
+            }
+        }
+        out
+    }
+
+    /// The copies the steward replaces: for every shard whose holder is
+    /// live and one of whose followers is `lost`, that follower and the
+    /// live data node to follow instead -- one that neither holds nor
+    /// follows the shard, in another region than the copies left when
+    /// the collection's `regions` asks for one not covered, else in the
+    /// holder's own, else the first in address order. A lost holder is
+    /// not here: it is a promotion first, and its copy is replaced once
+    /// the promotion made it a follower. `(collection, shard, lost, new)`.
+    pub fn replacement_plan(
+        &self,
+        lost: &[String],
+        live: &[String],
+    ) -> Vec<(String, usize, String, String)> {
+        let is_live = |n: &str| self.is_self(n) || live.iter().any(|l| l == n);
+        let mut nodes: Vec<String> = self.data_nodes().into_iter().filter(|n| is_live(n)).collect();
+        nodes.sort();
+        nodes.dedup();
+        let mut out = Vec::new();
+        for (name, tablets) in &self.catalog.placement {
+            let regions =
+                self.catalog.collections.get(name).map(|c| c.regions as usize).unwrap_or(0);
+            for (i, t) in tablets.iter().enumerate() {
+                if t.is_merged() || !is_live(&t.node) {
+                    continue;
+                }
+                let Some(old) = t.followers.iter().find(|f| lost.contains(f)) else { continue };
+                let home = self.region_of(&t.node);
+                let mut covered: Vec<Option<String>> = vec![home.clone()];
+                for f in t.followers.iter().filter(|f| *f != old) {
+                    let r = self.region_of(f);
+                    if !covered.contains(&r) {
+                        covered.push(r);
+                    }
+                }
+                let want_away = regions > 1 && covered.len() < regions;
+                let pick = nodes
+                    .iter()
+                    .filter(|n| {
+                        !(**n == t.node || (self.is_self(n) && self.is_self(&t.node)))
+                            && !t.followed_by(n)
+                            && !lost.contains(n)
+                    })
+                    .min_by_key(|n| {
+                        let r = self.region_of(n);
+                        if want_away {
+                            covered.contains(&r)
+                        } else {
+                            r != home
+                        }
+                    });
+                if let Some(new) = pick {
+                    out.push((name.clone(), i, old.clone(), new.clone()));
                 }
             }
         }
@@ -6256,6 +6457,9 @@ impl Db {
         if let Statement::PromoteShard { collection, shard, node, term } = &stmt {
             return self.promote_shard(collection, *shard, node, *term, local);
         }
+        if let Statement::ReplaceCopy { collection, shard, node, with, term } = &stmt {
+            return self.replace_copy(collection, *shard, node, with, *term, local);
+        }
         let out = self.run_one(stmt, sql, params, analyze)?;
         if holders.is_empty() {
             return Ok(out);
@@ -6696,6 +6900,9 @@ impl Db {
                 Statement::PromoteShard { collection, shard, node, term } => {
                     self.promote_shard(&collection, shard, &node, term, true)
                 }
+                Statement::ReplaceCopy { collection, shard, node, with, term } => {
+                    self.replace_copy(&collection, shard, &node, &with, term, true)
+                }
                 other => self.run_one(other, sql, params, analyze),
             },
             Statement::SplitShard { collection, shard, at } => {
@@ -6706,6 +6913,9 @@ impl Db {
             }
             Statement::PromoteShard { collection, shard, node, term } => {
                 self.promote_shard(&collection, shard, &node, term, false)
+            }
+            Statement::ReplaceCopy { collection, shard, node, with, term } => {
+                self.replace_copy(&collection, shard, &node, &with, term, false)
             }
             Statement::DropIndex { collection, index } => {
                 self.drop_index(&collection, &index)?;
@@ -7375,6 +7585,48 @@ impl Db {
         params: &[Value],
         analyze: bool,
     ) -> Result<QueryResult> {
+        self.run_select_from(sel, sql, params, analyze, 0, false)
+    }
+
+    /// A statement another node forwarded whole (the wire's `query`
+    /// call): parsed here, run as this node's own at no older an instant
+    /// than `floor`, and never forwarded on.
+    pub fn forwarded_select(
+        &self,
+        sql: &str,
+        params: &[Value],
+        floor: Timestamp,
+        analyze: bool,
+    ) -> Result<QueryResult> {
+        let mut stmt = sql::parse(sql, params)?;
+        loop {
+            stmt = match stmt {
+                Statement::Local(inner) | Statement::Explain { inner, .. } => *inner,
+                Statement::Select(sel) => {
+                    return self.run_select_from(&sel, sql, params, analyze, floor, true)
+                }
+                other => {
+                    return Err(Error::Plan(format!(
+                        "`{}` was forwarded as a query; only a SELECT is",
+                        statement_kind(&other)
+                    )))
+                }
+            };
+        }
+    }
+
+    /// `run_select` with the instant it may not read before and whether
+    /// it arrived forwarded, in which case it is run here whatever the map
+    /// says.
+    fn run_select_from(
+        &self,
+        sel: &Select,
+        sql: &str,
+        params: &[Value],
+        analyze: bool,
+        floor: Timestamp,
+        forwarded: bool,
+    ) -> Result<QueryResult> {
         // The statement's budget: none if it said `no_deadline`, its own if
         // it named one, else the `Db`'s.
         let budget = if sel.with.no_deadline {
@@ -7388,7 +7640,7 @@ impl Db {
         self.note_touches(&sel.collection, &index_uses(sel));
         // Read-your-writes: pin at least the last commit timestamp this client
         // observed (§6).
-        let ts = self.clock.peek().max(self.last_commit);
+        let ts = self.clock.peek().max(self.last_commit).max(floor);
         let coll = self.planning_collection(&sel.collection)?;
         if let Some(path) = exec::undeclared_text_path(&coll, sel) {
             return Err(Error::Plan(format!(
@@ -7437,6 +7689,49 @@ impl Db {
             })
             .map(|t| t.node.clone())
             .collect();
+        // Every shard the statement reaches on one other node and none
+        // here: the statement goes there whole, as one call, and that
+        // node coordinates it over its own shards by direct call. The
+        // counters, the scan and the fetch were three round trips --
+        // across a sea, three times the sea's -- for a statement whose
+        // every answer came from the one node. It carries this node's
+        // read-your-writes instant, and the holder never forwards it on:
+        // what reached it over the wire is run where it stands. A holder
+        // too old to know the call is asked shard by shard, as before.
+        if !forwarded && needed.len() == 1 && self.sim.is_none() {
+            let reach_here = self.shards_here(&sel.collection).iter().any(|s| match &prefix {
+                Some(p) => exec::shard_may_hold(s, p),
+                None => true,
+            });
+            if !reach_here {
+                let url = needed.iter().next().cloned().unwrap_or_default();
+                let node = self.node_conn(&url)?;
+                let shard = tablets
+                    .iter()
+                    .position(|t| {
+                        !t.is_merged()
+                            && t.node == url
+                            && prefix.as_deref().map_or(true, |p| {
+                                exec::range_may_hold(Some(&(t.lo.clone(), t.hi.clone())), p)
+                            })
+                    })
+                    .unwrap_or(0);
+                let started = std::time::Instant::now();
+                match node.query(&sel.collection, shard, sql, params, ts, analyze) {
+                    Ok(mut r) => {
+                        if let Some(e) = r.explain.as_mut() {
+                            e.total_micros = started.elapsed().as_micros();
+                        }
+                        return Ok(r);
+                    }
+                    // Under `partial_results` the node that did not answer
+                    // is the counters' to mark missing, as before.
+                    Err(Error::Deadline(_)) if partial => {}
+                    Err(e) if e.to_string().contains("unknown call") => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         let mut conns = Vec::new();
         for url in self.holders(&sel.collection) {
             let node = self.node_conn(&url)?;
@@ -8783,6 +9078,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::SplitShard { .. } => "SPLIT SHARD",
         Statement::MergeShards { .. } => "MERGE SHARDS",
         Statement::PromoteShard { .. } => "PROMOTE SHARD",
+        Statement::ReplaceCopy { .. } => "REPLACE COPY",
         Statement::VerifyBackup { .. } => "VERIFY BACKUP",
         _ => "this statement",
     }
@@ -8935,6 +9231,58 @@ mod tests {
                 "shard {i}: {regs:?}"
             );
         }
+    }
+
+    /// The steward's replacement goes where the collection's regions ask:
+    /// the away copy lost, another away node; a home copy lost, a home
+    /// node; never the holder, a follower, or a node that is lost too; and
+    /// nothing for a shard whose holder is the one lost.
+    #[test]
+    fn a_replacement_goes_where_the_regions_rule_says() {
+        let dir = std::env::temp_dir().join(format!("celastro-replan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        opts.region = Some("eu".into());
+        let mut db = Db::open(&dir, opts).unwrap();
+        let n = |i: u32| format!("tcp://127.0.0.1:{i}");
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 3;
+        coll.regions = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.nodes = vec![n(2), n(3), n(4), n(5)];
+        for (i, r) in [(2, "us"), (3, "eu"), (4, "eu"), (5, "us")] {
+            db.regions.insert(n(i), r.to_string());
+        }
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![
+                Tablet { node: n(1), followers: vec![n(2), n(3)], ..Default::default() },
+                Tablet { node: n(2), followers: vec![n(1), n(3)], ..Default::default() },
+            ],
+        );
+        let live = |lost: &[String]| -> Vec<String> {
+            [n(2), n(3), n(4), n(5)].into_iter().filter(|x| !lost.contains(x)).collect()
+        };
+        // The away copy (us) lost: the other us node, not the eu one.
+        let lost = vec![n(2)];
+        let plan = db.replacement_plan(&lost, &live(&lost));
+        assert_eq!(plan, vec![("items".to_string(), 0, n(2), n(5))], "shard 1's holder is lost");
+        // A home copy lost: a node in the holder's region, though the other
+        // sorts first -- shard 0's home is eu, shard 1's is us.
+        let lost = vec![n(3)];
+        let plan = db.replacement_plan(&lost, &live(&lost));
+        assert_eq!(
+            plan,
+            vec![("items".to_string(), 0, n(3), n(4)), ("items".to_string(), 1, n(3), n(5))]
+        );
+        // Both followers lost: one replacement per sweep, the first lost
+        // follower's, on a node that is not lost either.
+        let lost = vec![n(2), n(3)];
+        let plan = db.replacement_plan(&lost, &live(&lost));
+        assert_eq!(plan, vec![("items".to_string(), 0, n(2), n(5))]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A followed copy's seals are the background sealer's as much as a

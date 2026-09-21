@@ -53,7 +53,7 @@ use crate::codec::*;
 use crate::engine::Db;
 use crate::error::{Error, Result};
 use crate::plan::exec;
-use crate::plan::explain::{self, ShardExplain};
+use crate::plan::explain::{self, Explain, ShardExplain};
 use crate::plan::fusion::Candidate;
 use crate::plan::service::{
     CandidatesRequest, Local, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
@@ -157,6 +157,12 @@ enum Call {
     Count = 24,
     /// A vote asked for a candidate steward at a term (the election).
     Vote = 25,
+    /// A statement run whole on the node as its own: what a coordinator
+    /// sends the one other node every shard the statement reaches is on,
+    /// in place of the counters, the scan and the fetch as three calls.
+    /// It carries the coordinator's read-your-writes instant and is never
+    /// forwarded on from there.
+    Query = 26,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -181,6 +187,7 @@ impl Call {
             14 => Call::Present,
             24 => Call::Count,
             25 => Call::Vote,
+            26 => Call::Query,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -212,6 +219,7 @@ impl Call {
             Call::Present => "present",
             Call::Count => "count",
             Call::Vote => "vote",
+            Call::Query => "query",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -549,6 +557,53 @@ fn get_scan(b: &[u8], i: &mut usize) -> Result<ShardScan> {
     let explain = get_explain(b, i)?;
     let timed_out = get_bool(b, i)?;
     Ok(ShardScan { hits, explain, timed_out })
+}
+
+/// A statement's whole answer in a frame: the rows, the plan rendered
+/// (when asked for), and what the answer says it left out.
+fn put_query_result(out: &mut Vec<u8>, r: &exec::QueryResult) {
+    put_uvarint(out, r.rows.len() as u64);
+    for row in &r.rows {
+        put_str(out, &row.key);
+        put_value(out, &row.doc);
+        for f in [row.score, row.distance] {
+            match f {
+                Some(v) => {
+                    put_bool(out, true);
+                    put_f32(out, v);
+                }
+                None => put_bool(out, false),
+            }
+        }
+    }
+    put_opt_str(out, r.explain.as_ref().map(|e| e.render()).as_deref());
+    put_strs(out, &r.missing);
+    put_strs(out, &r.truncated_prefixes);
+    put_strs(out, &r.cut_walks);
+    put_opt_str(out, r.next_cursor.as_deref());
+}
+
+fn get_query_result(b: &[u8], i: &mut usize) -> Result<(exec::QueryResult, Option<String>)> {
+    let n = get_count(b, i)?;
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = get_string(b, i)?;
+        let doc = get_value(b, i)?;
+        let mut f = [None, None];
+        for slot in f.iter_mut() {
+            if get_bool(b, i)? {
+                *slot = Some(get_f32(b, i).ok_or_else(truncated)?);
+            }
+        }
+        rows.push(exec::Row { key, doc, score: f[0], distance: f[1] });
+    }
+    let plan = get_opt(b, i)?;
+    let mut r = exec::QueryResult::of_rows(rows);
+    r.missing = get_strs(b, i)?;
+    r.truncated_prefixes = get_strs(b, i)?;
+    r.cut_walks = get_strs(b, i)?;
+    r.next_cursor = get_opt(b, i)?;
+    Ok((r, plan))
 }
 
 /// Tablets in a frame: the term and the followers ride along from wire
@@ -1119,6 +1174,41 @@ impl Node {
         put_values(&mut body, params);
         let b = self.call(Call::Statement, "", 0, &body)?;
         get_string(&b, &mut 0)
+    }
+
+    /// A statement run whole on the node, as its own coordinator, at no
+    /// older an instant than `floor`: the rows, and the plan rendered
+    /// there when `explain` asks for it, which comes back as this side's
+    /// plan naming the node. `shard` is the one (or the first) the
+    /// statement reaches there, for the refusal when the node does not
+    /// answer. A node too old to know the call answers "unknown call",
+    /// which the caller treats as "ask shard by shard".
+    pub fn query(
+        &self,
+        collection: &str,
+        shard: usize,
+        sql: &str,
+        params: &[Value],
+        floor: Timestamp,
+        explain: bool,
+    ) -> Result<exec::QueryResult> {
+        let mut body = Vec::new();
+        put_str(&mut body, sql);
+        put_values(&mut body, params);
+        put_ts(&mut body, floor);
+        put_bool(&mut body, explain);
+        // The shard rides along for the refusal's sake: a node that does
+        // not answer is named with the shard the statement wanted of it.
+        let b = self.call(Call::Query, collection, shard, &body)?;
+        let (mut r, plan) = get_query_result(&b, &mut 0)?;
+        if let Some(text) = plan {
+            r.explain = Some(Explain {
+                statement: sql.to_string(),
+                forwarded: Some((self.url.clone(), text)),
+                ..Default::default()
+            });
+        }
+        Ok(r)
     }
 
     /// Have the node adopt a collection: its definition and the whole
@@ -2012,6 +2102,7 @@ fn handle(
             | Call::Expand
             | Call::Present
             | Call::Count
+            | Call::Query
     );
     let shared = db;
     let mut db = if read_call {
@@ -2100,6 +2191,20 @@ fn handle(
                 })?;
             let tablets = get_tablets(body, &mut j, version >= 6)?;
             db.exclusive().adopt_collection(coll, tablets)?;
+        }
+        Call::Query => {
+            // The statement whole, as this node's own: its coordinator
+            // here, over the shards here by direct call, at no older an
+            // instant than the sender's. Under the served shared lock like
+            // every read.
+            let mut j = 0;
+            let sql = get_string(body, &mut j)?;
+            let params = get_values(body, &mut j)?;
+            let floor = get_ts(body, &mut j)?;
+            let explain = get_bool(body, &mut j)?;
+            let r = db.forwarded_select(&sql, &params, floor, explain)?;
+            put_query_result(&mut out, &r);
+            return Ok(out);
         }
         Call::TermStats
         | Call::PrefixTerms

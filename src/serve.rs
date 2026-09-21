@@ -1688,7 +1688,7 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration, grants: &Gran
             let e = missed.entry(url.clone()).or_insert(0);
             *e = if answered.contains(url) { 0 } else { e.saturating_add(1) };
         }
-        steward_sweep(db, &peers, &answered, &missed, grants);
+        steward_sweep(db, &peers, &answered, &missed, grants, every);
         for (url, (hello, theirs)) in answers {
             if stop.load(AtomicOrdering::Acquire) {
                 return;
@@ -1921,6 +1921,7 @@ fn steward_sweep(
     answered: &[String],
     missed: &std::collections::BTreeMap<String, u32>,
     grants: &Grants,
+    every: Duration,
 ) {
     let (is_steward, me, auto, plan, lease) = {
         let g = read(db);
@@ -2043,6 +2044,53 @@ fn steward_sweep(
                 &[
                     ("collection", collection.clone()),
                     ("shard", shard.to_string()),
+                    ("error", e.to_string()),
+                ],
+            ),
+        }
+    }
+    // A copy lost for good: a follower away for `CELASTRO_REPLACE_SECS`
+    // -- that many seconds of missed sweeps -- is struck from the map and
+    // a live node follows in its place, so the shard has its copies again
+    // rather than one short until someone notices. Only a live holder's
+    // followers: a lost holder is a promotion first, above, and its copy
+    // is replaced here once the promotion made it a follower.
+    let replace = read(db).replace_secs();
+    if replace == 0 {
+        return;
+    }
+    let lost: Vec<String> = missed
+        .iter()
+        .filter(|(_, n)| u64::from(**n).saturating_mul(every.as_secs()) >= replace)
+        .map(|(u, _)| u.clone())
+        .collect();
+    if lost.is_empty() {
+        return;
+    }
+    for (collection, shard, old, new) in read(db).replacement_plan(&lost, answered) {
+        let sql = format!("REPLACE COPY OF SHARD {shard} OF {collection} ON '{old}' WITH '{new}'");
+        let out = write(db).execute_with(&sql, &[]);
+        let answer = out.and_then(|o| o.finished_with(db)).map(|o| match o {
+            Outcome::Ack(m) => m,
+            other => format!("{other:?}"),
+        });
+        match answer {
+            Ok(m) => crate::log::warn(
+                "copy_replaced",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("lost", old.clone()),
+                    ("placed", new.clone()),
+                    ("answer", m),
+                ],
+            ),
+            Err(e) => crate::log::warn(
+                "copy_not_replaced",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("lost", old.clone()),
                     ("error", e.to_string()),
                 ],
             ),

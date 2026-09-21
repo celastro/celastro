@@ -6,6 +6,34 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.64.0 — 2026-09-21
+
+**A statement whose every shard is on one other node goes there whole,
+as one call.** The coordinator asked that node its counters, then the
+scan, then the fetch: three round trips for an answer that came from
+the one node, and across a sea three times the sea's. Now the
+statement itself travels, as the wire's `query` call, and the holder
+coordinates it over its own shards by direct call, at no older an
+instant than the sender's read-your-writes one, so a write just
+forwarded through the same node is in the answer. `EXPLAIN` says
+`forwarded whole to tcp://... as one call` above the plan as the
+holder rendered it. A holder too old to know the call is asked shard
+by shard as before; a forwarded statement is never forwarded on; a
+statement with a shard here, or on two nodes, scatters as before.
+
+**A copy lost for good is replaced.** `REPLACE COPY OF SHARD i OF c ON
+'lost' WITH 'node'` strikes the lost follower from the map at the next
+term and has `node` -- an attached data node that neither holds nor
+follows the shard -- follow in its place, shipped from nothing by the
+holder; the lost node, back, takes the map at the higher term and
+drops the copy it kept. With `CELASTRO_AUTO_FAILOVER=on` the steward
+runs it once a follower has been away for `CELASTRO_REPLACE_SECS`
+(ten minutes; zero never), placing the copy in a region the
+collection's `regions` still asks for, else in the holder's own. A
+lost holder is promoted first and its copy replaced after the same
+wait. Until now a shard whose follower was gone stayed one copy short
+until an operator re-planned the collection by hand.
+
 ## 0.63.8 — 2026-09-20
 
 **A statement asks only the holders it can reach.** Before every

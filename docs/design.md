@@ -760,8 +760,9 @@ which is what makes two copies usable rather than three. A live delete
 applied before an older row the catch-up carries would let the row come
 back, so live records are held back until the catch-up is whole.
 
-The map entry of a shard carries a term. `PROMOTE SHARD i OF c ON
-'follower'` is made on the follower: its copy's directory moves beside
+The map entry of a shard carries a term, raised by every promotion and
+every copy replaced. `PROMOTE SHARD i OF c ON 'follower'` is made on the
+follower: its copy's directory moves beside
 the held ones -- the files are sealed under `shard-NNNN/<name>`
 whether they sit under `followed/` or not, so nothing is re-sealed --
 the shard opens from it, the term is raised, the old holder becomes a
@@ -792,12 +793,37 @@ before. Off by default: promotion is the operator's. The steward by
 consensus, quorum acknowledgement over three copies, and copies placed
 across regions are the entries after this one.
 
+A copy lost for good is the steward's too: a follower that has missed
+sweeps for `CELASTRO_REPLACE_SECS` (ten minutes) is struck from the
+map by `REPLACE COPY OF SHARD i OF c ON 'lost' WITH 'node'`, at the
+next term, and a live data node that neither holds nor follows the
+shard follows in its place -- in a region the collection's `regions`
+still asks for when the copies left do not cover them, else in the
+holder's own -- shipped from nothing. The term is what makes the
+lost node harmless when it is back: its map names itself a follower
+at the old term, the higher term wins at the first sweep, and it drops
+the copy it kept. A lost holder is a promotion first; the promotion
+makes it a follower, and the same rule replaces it after the same
+wait. Only a live holder's followers are replaced, and one per shard
+per sweep.
+
 What replication does not change: one writer per shard at one term, no
 cross-shard transactions, and that a node down is its shards refused --
 for a lease length, then promoted -- as before (0.34.0): the counters call every statement
 opens with does not fail the statement when a holder is silent; the
 statement fails at the first shard call it makes to that node, which a
-predicate that pins the key to a live shard never makes. A text query is
+predicate that pins the key to a live shard never makes. The counters
+are asked only of the holders the statement can reach (0.63.8), and a
+statement whose every shard is on one other node does not scatter at
+all: it goes there whole, as the wire's `query` call, and that node
+coordinates it over its own shards by direct call, at no older an
+instant than the sender's read-your-writes one (0.64.0). The counters,
+the scan and the fetch were three round trips for an answer that came
+from the one node -- across a sea, three times the sea's -- and are
+one; the plan says `forwarded whole`. A node too old to know the call
+is asked shard by shard as before, and a forwarded statement is never
+forwarded on.
+ A text query is
 the exception by design: its scores come from every holder's term
 statistics, so it is refused or, under `partial_results`, served from the
 rest and says so. Measured on kind with five pods and one scaled away:

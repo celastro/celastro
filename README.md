@@ -209,6 +209,7 @@ MOVE SHARD 1 OF notes TO 'tcp://10.0.0.3:2352';
 SPLIT SHARD 2 OF notes AT 'w';              -- shard 3 takes [w, ...) on the same node; then move it
 MERGE SHARDS 2 AND 3 OF notes;              -- the way back, once they are on one node
 PROMOTE SHARD 0 OF notes ON 'tcp://10.0.0.3:2352';  -- its follower becomes the holder
+REPLACE COPY OF SHARD 0 OF notes ON 'tcp://10.0.0.2:2352' WITH 'tcp://10.0.0.4:2352';  -- a follower lost for good
 REBALANCE notes;
 ```
 

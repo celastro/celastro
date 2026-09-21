@@ -158,6 +158,18 @@ pub enum Statement {
         node: String,
         term: Option<u64>,
     },
+    /// `REPLACE COPY OF SHARD <i> OF <collection> ON 'tcp://old' WITH
+    /// 'tcp://new' [TERM <n>]` -- the follower on `old` is struck from the
+    /// map and `new` follows in its place, at the next term (or the term
+    /// carried); the holder ships the new copy from nothing. For a copy
+    /// lost for good; the steward runs it after `CELASTRO_REPLACE_SECS`.
+    ReplaceCopy {
+        collection: String,
+        shard: usize,
+        node: String,
+        with: String,
+        term: Option<u64>,
+    },
     /// `PLACE SHARD <i> OF <collection> ON 'tcp://host:port'` — this node's
     /// placement map records the shard on that node; a copy this node holds
     /// of a shard placed elsewhere is dropped. What a move sends every holder
