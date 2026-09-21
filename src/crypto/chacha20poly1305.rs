@@ -166,7 +166,7 @@ pub fn poly1305(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     g3 &= 0x3ffffff;
     let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
     // If g4's top bit is clear the subtraction did not borrow: h >= p, take g.
-    let mask = (g4 >> 31).wrapping_sub(1);
+    let mask = std::hint::black_box((g4 >> 31).wrapping_sub(1));
     let nmask = !mask;
     h0 = (h0 & nmask) | (g0 & mask);
     h1 = (h1 & nmask) | (g1 & mask);

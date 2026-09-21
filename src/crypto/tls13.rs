@@ -70,6 +70,7 @@ const TICKET_LIFETIME_SECS: u64 = 86_400;
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
 const ALERT_BAD_CERTIFICATE: u8 = 42;
+const ALERT_ILLEGAL_PARAMETER: u8 = 47;
 const ALERT_DECRYPT_ERROR: u8 = 51;
 const ALERT_PROTOCOL_VERSION: u8 = 70;
 const ALERT_INTERNAL_ERROR: u8 = 80;
@@ -80,6 +81,15 @@ fn err(what: impl Into<String>) -> io::Error {
 }
 
 // ------------------------------------------------------------ key schedule
+
+/// The next application traffic secret from the current one (RFC 8446
+/// §7.2): what a KeyUpdate moves both sides to.
+fn next_secret(secret: &[u8; 32]) -> [u8; 32] {
+    let v = expand_label(secret, "traffic upd", &[], 32);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    out
+}
 
 fn expand_label(secret: &[u8; 32], label: &str, context: &[u8], len: usize) -> Vec<u8> {
     let full = format!("tls13 {label}");
@@ -203,7 +213,7 @@ const TICKET_AAD: &[u8] = b"celastro tls ticket v1";
 
 /// A ticket as the server hands it out: `1 | nonce(12) | ciphertext | tag`
 /// over `psk(32) | issued_at(8) | age_add(4)`. Opaque to the client.
-fn seal_ticket(
+pub(super) fn seal_ticket(
     tkey: &[u8; 32],
     psk: &[u8; 32],
     issued_at: u64,
@@ -228,7 +238,7 @@ fn seal_ticket(
 /// older than the lifetime. `None` for anything else -- another node's
 /// key, a tampered byte, an old ticket -- and the handshake goes on in
 /// full, which is what the protocol says happens.
-fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
+pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
     if ticket.len() != 1 + 12 + 44 + 16 || ticket[0] != 1 {
         return None;
     }
@@ -362,6 +372,10 @@ pub struct TlsStream {
     resumed: bool,
     /// Whether the handshake went through a HelloRetryRequest.
     retried: bool,
+    /// The application traffic secrets, kept so a KeyUpdate can derive the
+    /// next generation of keys from them.
+    read_secret: Option<[u8; 32]>,
+    write_secret: Option<[u8; 32]>,
     /// A test's hook: send the first ClientHello without a key share, so
     /// the server's HelloRetryRequest and this side's answer to it run.
     pub(crate) omit_first_share: bool,
@@ -407,6 +421,8 @@ impl TlsStream {
             closed: false,
             resumed: false,
             retried: false,
+            read_secret: None,
+            write_secret: None,
             omit_first_share: false,
             res_master: None,
             store_key: None,
@@ -422,6 +438,34 @@ impl TlsStream {
     /// Whether the handshake went through a HelloRetryRequest.
     pub fn retried(&self) -> bool {
         self.retried
+    }
+
+    /// The next generation of this side's write keys, announced to the
+    /// peer with a KeyUpdate that asks it to do the same when `ask_peer`.
+    /// After the handshake only.
+    pub fn update_keys(&mut self, ask_peer: bool) -> io::Result<()> {
+        self.handshake()?;
+        let Some(secret) = self.write_secret else {
+            return Err(err("no application keys to update yet"));
+        };
+        let msg = [HS_KEY_UPDATE, 0, 0, 1, ask_peer as u8];
+        self.write_record(CT_HANDSHAKE, &msg)?;
+        let next = next_secret(&secret);
+        self.write_keys = Some(Keys::from_secret(&next));
+        self.write_secret = Some(next);
+        Ok(())
+    }
+
+    /// The peer announced its next generation of keys: read under them
+    /// from here on.
+    fn next_read_keys(&mut self) -> io::Result<()> {
+        let Some(secret) = self.read_secret else {
+            return Err(err("a KeyUpdate before the application keys"));
+        };
+        let next = next_secret(&secret);
+        self.read_keys = Some(Keys::from_secret(&next));
+        self.read_secret = Some(next);
+        Ok(())
     }
 
     /// Complete the handshake if it has not been done. An error here is
@@ -450,14 +494,14 @@ impl TlsStream {
     /// when the read keys are on.
     fn read_record(&mut self) -> io::Result<(u8, Vec<u8>)> {
         let mut header = [0u8; 5];
-        self.read_exact_from_sock(&mut header)?;
+        self.read_exact_from_sock(&mut header, false)?;
         let ctype = header[0];
         let len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if len > MAX_PLAINTEXT + 256 {
             return Err(err("a record longer than the protocol allows"));
         }
         let mut body = vec![0u8; len];
-        self.read_exact_from_sock(&mut body)?;
+        self.read_exact_from_sock(&mut body, true)?;
         match &mut self.read_keys {
             None => Ok((ctype, body)),
             Some(keys) => {
@@ -490,7 +534,13 @@ impl TlsStream {
         }
     }
 
-    fn read_exact_from_sock(&mut self, buf: &mut [u8]) -> io::Result<()> {
+    /// `buf` filled from what was read ahead and the socket. A connection
+    /// that ends before a record starts is the peer's close (an
+    /// `UnexpectedEof`, which the reader takes as the end of the stream);
+    /// one that ends inside a record's header or body is a truncation --
+    /// a middlebox or an attacker cutting the stream where no close_notify
+    /// was -- and is an error, never a quiet end.
+    fn read_exact_from_sock(&mut self, buf: &mut [u8], inside_record: bool) -> io::Result<()> {
         let mut filled = 0;
         let take = self.inbuf.len().min(buf.len());
         if take > 0 {
@@ -499,11 +549,23 @@ impl TlsStream {
             filled = take;
         }
         while filled < buf.len() {
-            let n = self.sock.read(&mut buf[filled..])?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tls: the peer closed"));
+            match self.sock.read(&mut buf[filled..]) {
+                Ok(0) if filled == 0 && !inside_record => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the peer closed the connection",
+                    ))
+                }
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the connection ended inside a TLS record: truncated, not closed",
+                    ))
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
-            filled += n;
         }
         Ok(())
     }
@@ -692,6 +754,9 @@ impl TlsStream {
         let eph = random::array32().map_err(|e| err(e.to_string()))?;
         let our_share = x25519::public_key(&eph);
         let shared = x25519::x25519(&eph, &client_share);
+        if shared == [0u8; 32] {
+            return Err(err("the key share is a low-order point: the shared secret would be zero"));
+        }
         let server_random = random::array32().map_err(|e| err(e.to_string()))?;
         // ServerHello.
         let mut sh = Vec::new();
@@ -774,11 +839,19 @@ impl TlsStream {
         let fin = finished_verify(&s_hs, &th);
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         // Application keys derive from the transcript through the server
-        // Finished; the client's Finished is read under the handshake keys.
+        // Finished. This side writes under its application keys from here
+        // on (RFC 8446 §7.1: the server's traffic key changes after its
+        // Finished), so an alert about the client's flight -- a missing
+        // certificate -- reaches a conforming client, which reads under
+        // those keys by then; sent under the handshake keys it was "bad
+        // record MAC" at Go's client. The client's flight is still read
+        // under the handshake keys.
         let th_server_fin = sha256(&transcript);
         let master = hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32]);
         let c_ap = derive_secret(&master, "c ap traffic", &th_server_fin);
         let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
+        self.write_keys = Some(Keys::from_secret(&s_ap));
+        self.write_secret = Some(s_ap);
         // The client's Certificate and CertificateVerify when this side
         // asked for them and the handshake is a full one: its chain
         // reaches an anchor and the signature is its key's over the
@@ -819,8 +892,8 @@ impl TlsStream {
         if !super::ct_eq(&expected, &body) {
             return Err(err("the client's Finished does not verify"));
         }
-        self.write_keys = Some(Keys::from_secret(&s_ap));
         self.read_keys = Some(Keys::from_secret(&c_ap));
+        self.read_secret = Some(c_ap);
         // A ticket for next time, under the application keys: the PSK it
         // stands for derives from this handshake's resumption master
         // secret, so a resumed connection hands out a fresh ticket too.
@@ -1033,6 +1106,9 @@ impl TlsStream {
             return Err(err("the server sent no X25519 key share"));
         };
         let shared = x25519::x25519(&eph, &server_share);
+        if shared == [0u8; 32] {
+            return Err(err("the key share is a low-order point: the shared secret would be zero"));
+        }
         let early = hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
         let empty_hash = sha256(&[]);
         let hs_secret = hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared);
@@ -1153,6 +1229,8 @@ impl TlsStream {
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         self.read_keys = Some(Keys::from_secret(&s_ap));
         self.write_keys = Some(Keys::from_secret(&c_ap));
+        self.read_secret = Some(s_ap);
+        self.write_secret = Some(c_ap);
         let th_client_fin = sha256(&transcript);
         self.res_master = Some(derive_secret(&master, "res master", &th_client_fin));
         Ok(())
@@ -1249,6 +1327,11 @@ fn alert_for(e: &io::Error) -> u8 {
         ALERT_BAD_CERTIFICATE
     } else if m.contains("TLS 1.3") {
         ALERT_PROTOCOL_VERSION
+    } else if m.contains("low-order")
+        || m.contains("HelloRetryRequest")
+        || m.contains("asked again")
+    {
+        ALERT_ILLEGAL_PARAMETER
     } else if m.contains("expected") {
         ALERT_UNEXPECTED_MESSAGE
     } else if m.contains("does not offer")
@@ -1521,7 +1604,16 @@ impl Read for TlsStream {
                         match body[i] {
                             HS_NEW_SESSION_TICKET => self.take_ticket(msg)?,
                             HS_KEY_UPDATE => {
-                                return Err(err("a key update, which this build does not support"))
+                                // The peer's next generation of keys, and
+                                // ours if it asked (RFC 8446 §4.6.3).
+                                match msg.first().copied() {
+                                    Some(0) => self.next_read_keys()?,
+                                    Some(1) => {
+                                        self.next_read_keys()?;
+                                        self.update_keys(false)?;
+                                    }
+                                    _ => return Err(err("a malformed KeyUpdate")),
+                                }
                             }
                             _ => return Err(err("an unexpected handshake message")),
                         }
@@ -1859,6 +1951,64 @@ mod tests {
         let outcomes = server.join().unwrap();
         assert!(refused > 0, "a flipped byte was never noticed");
         assert!(outcomes.len() == ROUNDS);
+    }
+
+    /// A KeyUpdate from either side moves that side's keys to the next
+    /// generation and, when it asks, the other side's too: data written
+    /// after it reads whole, and the peer's answer under its new keys
+    /// reads whole.
+    #[test]
+    fn a_key_update_from_either_side_keeps_the_stream_readable() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut s = TlsStream::server(
+                sock,
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+            );
+            let mut buf = [0u8; 3];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"one");
+            // Our keys move, and the client is asked to move its own.
+            s.update_keys(true).unwrap();
+            s.write_all(b"two").unwrap();
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"three", "under the client's next keys");
+            // The client moves on its own, asking nothing.
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"four");
+            s.write_all(b"five").unwrap();
+            let _ = s.close_notify();
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let mut c = TlsStream::client(
+            sock,
+            ClientSide {
+                anchors: std::slice::from_ref(&anchor),
+                host: "127.0.0.1",
+                chain_der: None,
+                key: None,
+            },
+        );
+        c.write_all(b"one").unwrap();
+        let mut buf = [0u8; 3];
+        c.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"two", "read under the server's next keys");
+        c.write_all(b"three").unwrap();
+        c.update_keys(false).unwrap();
+        c.write_all(b"four").unwrap();
+        let mut buf = [0u8; 4];
+        c.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"five");
+        server.join().unwrap();
     }
 
     /// A client whose first flight carries no key share is asked for one

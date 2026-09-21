@@ -28,7 +28,10 @@ fn reduce_once(a: &mut [u64; 4]) {
         borrow = (b1 | b2) as u64;
     }
     // borrow == 1 means a < L: keep a.
-    let keep = 0u64.wrapping_sub(borrow);
+    // The mask through a barrier: `keep` is 0 or all ones, and a compiler
+    // that sees that may turn the select into a branch on it, which is a
+    // branch on the scalar's bits. `black_box` keeps the value opaque.
+    let keep = std::hint::black_box(0u64.wrapping_sub(borrow));
     for i in 0..4 {
         a[i] = (a[i] & keep) | (d[i] & !keep);
     }

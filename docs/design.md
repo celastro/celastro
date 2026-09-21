@@ -2087,6 +2087,68 @@ Compaction after a load was measured rather than built: four flat
 segments a shard after a 40,000-row seed, one level-1 segment a shard
 three minutes later with nothing asked, 18 seconds each.
 
+**H4: the crypto module reviewed, and what the review found (0.67.0).**
+The review the backlog asked for, by this side, in six parts; each
+finding fixed with a test that failed before it. (1) Vectors: every
+primitive runs Wycheproof's file beside the RFC's (`src/crypto/
+wycheproof.rs` over `tests/wycheproof/`): X25519 518 cases (the
+low-order and non-canonical public keys compute what the RFC says, and
+the TLS refuses the zero they yield), Ed25519 151 (the non-canonical
+and malleable signatures refused as expected), ChaCha20-Poly1305 325,
+HKDF-SHA-256 86, ECDSA P-256 484 -- which found the verifier taking a
+BER integer (a high bit without a leading zero, a leading zero without
+need) for a DER one, a second encoding of one signature -- and RSA-PSS
+108. (2) The constant-time claim, line by line: `fe25519` (masks for
+select and swap, limbs kept below 2^52, the canonical reduction by a
+carry), `sc25519` (the bitwise reduction with a masked subtract),
+`ed25519` (the ladder a masked select per bit; the point decode
+branches on public bytes only), `x25519` (the Montgomery ladder, a
+masked swap), `chacha20poly1305` (the tag compared by `ct_eq` before
+anything is decrypted; the final reduction of Poly1305 by masks) and
+the ticket open (one AEAD either way) -- nothing found; the timing test
+extended to `fe25519::mul` and `invert`, `sc25519::reduce_512` and the
+ticket open. That test found the one thing the reading did not: on
+the box, `sc25519::reduce_512` over a scalar of one set bit against
+one of every bit came out 4.5 % and then 8.4 % apart, every other pair
+under 1 % -- the compiler had turned the masked select in
+`reduce_once` (a mask that is 0 or all ones) back into the branch it
+stands for. The masks in `reduce_once`, `Fe::cswap`, `Fe::select`,
+`ct_eq` and Poly1305's final reduction now go through
+`std::hint::black_box`, and the pair reads 4,949 ns against 4,944
+(0.10 %); the rest: `ct_eq` over 64 bytes 41/41 ns, X25519 86.7/86.7
+µs, Ed25519 sign 14.49/14.44 ms, `fe25519::mul` 84/84 ns, `invert`
+7.43/7.43 µs, the ticket open with a wrong tag 541/541 ns, the AEAD
+open with a wrong tag 809/809 ns. A barrier is a request to the
+compiler, not a proof; the test is what says it held. (3) The TLS state machine against RFC
+8446: the zero shared secret was not refused (§7.4.2), a KeyUpdate was
+refused rather than handled (§4.6.3), a truncation read as a close, and
+the server's alert about the client's flight went out under the
+handshake keys (§7.1; Go's client reported a bad record MAC where the
+alert was, and reports `bad certificate` now) -- all fixed; the record
+size limits, the alerts, the resumption's binder and age, HRR's
+one-retry rule and the 0-RTT refusal (`early_data` never offered, so a
+client never sends it) stand. Against Go's crypto/tls: a Go client with
+X25519 first, with P-256 first (a HelloRetryRequest), resuming,
+presenting a certificate to the wire and refused without one, and this
+node's client against a Go server, with and without a
+client-certificate requirement (refused with `certificate_required` as
+it should be); against OpenSSL's `s_client` in each group
+configuration and over HTTP; against Python's `ssl`. (4) X.509 and DER:
+the DER reader refuses indefinite and non-minimal lengths already; the
+parser ignored critical extensions it did not read, key usage and
+extended key usage -- a constrained intermediate could have issued any
+name, an intermediate without keyCertSign could have signed, a
+client-only leaf could have served -- fixed and tested with
+openssl-made material (`tests/pki/`); the certificates this crate
+issues name both purposes now, so one certificate serves a node's wire
+both ways. (5) The random source is `/dev/urandom` by file, once per
+draw, which is the kernel's and refuses if it cannot open (a getrandom
+syscall would spare a descriptor; not done); the wiping covers every
+long-lived key (E1) and not stack copies (not attempted: the compiler
+decides those); the process refuses core dumps from its first line.
+(6) This list; the README says "reviewed in-tree, unaudited outside
+it".
+
 ## A worked query
 
 ```sql

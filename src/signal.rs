@@ -106,6 +106,26 @@ pub fn shutdown_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
+/// No core dump of this process: it holds a data key and TLS private keys
+/// in memory, and a dump is those keys on a disk the operator did not
+/// choose. Linux only (`prctl(PR_SET_DUMPABLE, 0)`, which also keeps
+/// another user's debugger out); elsewhere nothing changes. Called at the
+/// tool's start, before any key is read.
+pub fn refuse_core_dumps() {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+        }
+        const PR_SET_DUMPABLE: i32 = 4;
+        // The one failure is EINVAL for an option this kernel lacks, which
+        // every kernel since 2.3 has; nothing to do about a failure anyway.
+        unsafe {
+            prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -573,6 +573,7 @@ fn bad_port(given: &str) -> String {
 // --------------------------------------------------------------------------
 
 fn main() {
+    celastro::signal::refuse_core_dumps();
     celastro::log::from_env();
     match parse_args(std::env::args().skip(1)) {
         Cli::Help { json } => print!("{}", help_output(json)),

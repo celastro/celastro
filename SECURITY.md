@@ -91,6 +91,10 @@ byte), so a key does not outlive its use in freed memory that a later
 allocation, a core dump or a swap file could show. A running process
 holds them; that is the boundary.
 
+The process refuses core dumps from its first line (`prctl(PR_SET_DUMPABLE,
+0)` on Linux, which also keeps another user's debugger out): a dump of a
+process holding a data key and a TLS key would be those keys on disk.
+
 ## What is not in scope
 
 - Anything requiring write access to the data directory. A caller who can
@@ -177,19 +181,32 @@ reach the CA, before the token is looked at; every node presents its own
 certificate when asked, so the token becomes a second factor. The
 console never asks (browsers and tools speak to it with the token), and a
 ticket sealed before the requirement does not resume past it (the ticket
-key differs). HelloRetryRequest (0.66.0): a client that offers X25519
+key differs). KeyUpdate (0.67.0): a peer's is answered and this
+side's keys move with it; the node sends one when asked by its own
+code, never on a schedule. HelloRetryRequest (0.66.0): a client that offers X25519
 among its groups but sends a share of another group first is asked for
 an X25519 share and the handshake completes on its second flight, the
 transcript restarted from the message hash as the RFC has it; as a
 client the node answers a retry that asks for the share it withheld or
 carries a cookie, and refuses one asking for a group it lacks. No 0-RTT,
 no key update; a stock client speaks that subset. Every primitive is pinned against its RFC
-vectors and the key schedule against RFC 8448; nothing branches on or
-indexes by a secret, by masks rather than by asking the compiler. The
+vectors and Wycheproof's (1,672 cases across the six files under
+`tests/wycheproof/`), the key schedule against RFC 8448, and the TLS
+against Go's crypto/tls and OpenSSL as clients and servers (0.67.0);
+nothing branches on or indexes by a secret, by masks rather than by
+asking the compiler, and a timing test samples that claim on a real CPU
+(`docs/design.md` has the numbers). The module was reviewed in-tree in
+0.67.0, the findings fixed and listed in docs/design.md; nobody outside
+this repository has reviewed it. The
 archive client reaches an `https://` store over the same TLS, verifying
 the chain against the bundle `CELASTRO_ARCHIVE_CA` names or the system's,
 with wildcard names in the leftmost label as RFC 6125 has them; a plain
-`http://` endpoint is what it says. A finding against any of this is in
+`http://` endpoint is what it says. X.509 (0.67.0): a critical extension
+the parser does not read refuses the certificate, key usage and extended
+key usage are enforced (an intermediate signs only with keyCertSign, a
+leaf serves only the purpose its extended key usage names), and a
+signature's DER is read strictly; a connection cut inside a record is an
+error, not an end. A finding against any of this is in
 scope. Every parser -- X.509, PEM, the handshake messages, the console's
 request heads, the store's responses, the wire's frames, and every file
 format -- is fuzzed in the test suite with a seeded mutator

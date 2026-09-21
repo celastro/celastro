@@ -1,0 +1,5 @@
+These files are Wycheproof's published test vectors (v1 JSON), from
+https://github.com/C2SP/wycheproof, under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0), unmodified. They are read
+by the crate's test suite (src/crypto/wycheproof.rs) and ship in no
+artefact.

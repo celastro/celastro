@@ -197,6 +197,16 @@ fn parse_der_signature(sig: &[u8]) -> Option<(Big, Big)> {
     if !rest.is_empty() {
         return None;
     }
+    // DER, not BER: a signature integer is positive (no high bit without a
+    // leading zero) and minimal (no leading zero before a low byte), and
+    // one that is not is another encoding of the same signature, which a
+    // verifier must not accept twice.
+    let der_positive = |x: &[u8]| {
+        !x.is_empty() && x[0] & 0x80 == 0 && !(x.len() > 1 && x[0] == 0 && x[1] & 0x80 == 0)
+    };
+    if !der_positive(r) || !der_positive(s) {
+        return None;
+    }
     Some((Big::from_be_bytes(r), Big::from_be_bytes(s)))
 }
 

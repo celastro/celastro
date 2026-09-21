@@ -33,6 +33,8 @@ pub mod rsa;
 pub mod sc25519;
 pub mod sha2;
 pub mod tls13;
+#[cfg(test)]
+mod wycheproof;
 pub mod x25519;
 pub mod x509;
 
@@ -45,7 +47,9 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     for (x, y) in a.iter().zip(b) {
         diff |= x ^ y;
     }
-    diff == 0
+    // The fold is opaque to the compiler, so it cannot be told to stop at
+    // the first difference.
+    std::hint::black_box(diff) == 0
 }
 
 /// Lowercase hex, the one spelling of bytes the crate prints.
@@ -142,6 +146,66 @@ mod timing {
             },
             || {
                 black_box(super::ed25519::sign(black_box(&[0xfeu8; 32]), b"the message"));
+            },
+        );
+        // The field: a product and an inversion of a small element against
+        // one of every bit, and the scalar reduction of a small value
+        // against a large one -- the arithmetic under every signature.
+        let small = super::fe25519::Fe::from_u64(3);
+        let big = super::fe25519::Fe::from_bytes(&[0x7fu8; 32]);
+        flat(
+            "fe25519 mul",
+            50_000,
+            || {
+                black_box(black_box(small).mul(black_box(small)));
+            },
+            || {
+                black_box(black_box(big).mul(black_box(big)));
+            },
+        );
+        flat(
+            "fe25519 invert",
+            3_000,
+            || {
+                black_box(black_box(small).invert());
+            },
+            || {
+                black_box(black_box(big).invert());
+            },
+        );
+        let mut low = [0u8; 64];
+        low[0] = 1;
+        let high = [0xffu8; 64];
+        flat(
+            "sc25519 reduce_512",
+            10_000,
+            || {
+                black_box(super::sc25519::reduce_512(black_box(&low)));
+            },
+            || {
+                black_box(super::sc25519::reduce_512(black_box(&high)));
+            },
+        );
+        // A ticket wrong in the first byte of its tag against one wrong in
+        // the last: the open must reject both in the same time. (A ticket
+        // that opens takes longer than one that does not -- the AEAD
+        // decrypts only after the tag verifies -- and that difference is
+        // the outcome the peer sees anyway, not a secret.)
+        let tkey = [6u8; 32];
+        let ticket = super::tls13::seal_ticket(&tkey, &[8u8; 32], 1_700_000_000, 5).unwrap();
+        let last = ticket.len() - 1;
+        let mut wrong_first = ticket.clone();
+        wrong_first[last - 15] ^= 1;
+        let mut wrong_last = ticket.clone();
+        wrong_last[last] ^= 1;
+        flat(
+            "ticket open, a wrong tag",
+            20_000,
+            || {
+                black_box(super::tls13::open_ticket(&tkey, black_box(&wrong_first)));
+            },
+            || {
+                black_box(super::tls13::open_ticket(&tkey, black_box(&wrong_last)));
             },
         );
         // A tag wrong in its first byte against one wrong in its last: a

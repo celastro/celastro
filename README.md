@@ -191,8 +191,8 @@ At rest: `celastro key master ./master.key`, then
 `CELASTRO_MASTER_KEY_FILE=./master.key` on every start, encrypts every file
 under `--dir`, the archived tier, backups and exports; a cluster shares one
 data key (`celastro key init`, `CELASTRO_KEY_FILE`, the chart's
-`encryption.existingSecret`). Both are written in this repository and
-unaudited; [SECURITY.md](SECURITY.md) says what each protects and what it
+`encryption.existingSecret`). Both are written in this repository,
+reviewed in-tree and unaudited outside it; [SECURITY.md](SECURITY.md) says what each protects and what it
 does not.
 
 ## Two or more nodes

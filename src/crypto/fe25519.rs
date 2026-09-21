@@ -198,7 +198,9 @@ impl Fe {
 
     /// Swap `a` and `b` when `bit` is 1, by masks.
     pub fn cswap(a: &mut Fe, b: &mut Fe, bit: u64) {
-        let mask = 0u64.wrapping_sub(bit);
+        // Through a barrier, so the mask is never turned back into the
+        // branch it replaces.
+        let mask = std::hint::black_box(0u64.wrapping_sub(bit));
         for i in 0..5 {
             let t = mask & (a.0[i] ^ b.0[i]);
             a.0[i] ^= t;
@@ -208,7 +210,7 @@ impl Fe {
 
     /// `if bit { b } else { a }`, by masks.
     pub fn select(a: Fe, b: Fe, bit: u64) -> Fe {
-        let mask = 0u64.wrapping_sub(bit);
+        let mask = std::hint::black_box(0u64.wrapping_sub(bit));
         let mut out = [0u64; 5];
         for i in 0..5 {
             out[i] = a.0[i] ^ (mask & (a.0[i] ^ b.0[i]));

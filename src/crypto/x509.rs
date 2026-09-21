@@ -15,6 +15,7 @@ const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 /// `subjectKeyIdentifier` and `authorityKeyIdentifier`: what lets a
 /// client that keeps two CAs under one name -- a rotation's middle step
 /// -- pick the one that signed a leaf. The identifier is the leading 160
@@ -27,6 +28,7 @@ pub fn key_identifier(public: &[u8]) -> Vec<u8> {
     super::sha2::sha256(public)[..20].to_vec()
 }
 const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+const OID_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
 /// 1.2.840.113549.1.1.1, rsaEncryption; 1.2.840.113549.1.1.11, sha256WithRSAEncryption.
 const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
@@ -75,6 +77,10 @@ pub struct Certificate {
     pub dns_names: Vec<String>,
     pub ip_addresses: Vec<Vec<u8>>,
     pub is_ca: bool,
+    /// The key usage extension, when present.
+    pub key_usage: Option<KeyUsage>,
+    /// The extended key usage extension, when present.
+    pub ext_key_usage: Option<ExtKeyUsage>,
 }
 
 /// Parse a DER certificate whose keys and signature are Ed25519.
@@ -126,6 +132,8 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     let mut dns_names = Vec::new();
     let mut ip_addresses = Vec::new();
     let mut is_ca = false;
+    let mut key_usage = None;
+    let mut ext_key_usage = None;
     // Skip issuerUniqueID / subjectUniqueID if present ([1], [2]).
     let (_, rest) = der::optional(rest, 0x81)?;
     let (_, rest) = der::optional(rest, 0x82)?;
@@ -136,9 +144,30 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
             let (ext, rest) = der::expect(exts, SEQUENCE)?;
             exts = rest;
             let (oid, ext_rest) = der::expect(ext, OID)?;
-            let (_critical, ext_rest) = der::optional(ext_rest, BOOLEAN)?;
+            let (critical, ext_rest) = der::optional(ext_rest, BOOLEAN)?;
+            let critical = critical.is_some_and(|c| c.first().copied().unwrap_or(0) != 0);
             let (value, _) = der::expect(ext_rest, OCTET_STRING)?;
-            if oid == OID_SAN {
+            if oid == OID_KEY_USAGE {
+                // A BIT STRING: the unused-bit count, then the bits from the
+                // most significant of the first byte; digitalSignature is
+                // bit 0 and keyCertSign bit 5.
+                let (bits, _) = der::expect(value, BIT_STRING)?;
+                let byte0 = bits.get(1).copied().unwrap_or(0);
+                key_usage = Some(KeyUsage {
+                    digital_signature: byte0 & 0x80 != 0,
+                    key_cert_sign: byte0 & 0x04 != 0,
+                });
+            } else if oid == OID_EXT_KEY_USAGE {
+                let (mut purposes, _) = der::expect(value, SEQUENCE)?;
+                let mut eku = ExtKeyUsage::default();
+                while !purposes.is_empty() {
+                    let (purpose, rest) = der::expect(purposes, OID)?;
+                    purposes = rest;
+                    eku.server_auth |= purpose == OID_SERVER_AUTH;
+                    eku.client_auth |= purpose == OID_CLIENT_AUTH;
+                }
+                ext_key_usage = Some(eku);
+            } else if oid == OID_SAN {
                 let (mut names, _) = der::expect(value, SEQUENCE)?;
                 while !names.is_empty() {
                     let (tag, body, rest) = der::read(names)?;
@@ -154,6 +183,15 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
                 if let (Some(flag), _) = der::optional(bc, BOOLEAN)? {
                     is_ca = flag.first().copied().unwrap_or(0) != 0;
                 }
+            } else if critical && oid != OID_SKID && oid != OID_AKID {
+                // RFC 5280 §4.2: an extension marked critical that this
+                // parser does not understand -- name or policy constraints,
+                // say -- is a certificate it must not accept, since the
+                // constraint would go unenforced.
+                return Err(bad(&format!(
+                    "a critical extension this parser does not understand ({})",
+                    super::hex(oid)
+                )));
             }
         }
     }
@@ -170,7 +208,31 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
         dns_names,
         ip_addresses,
         is_ca,
+        key_usage,
+        ext_key_usage,
     })
+}
+
+/// The key usage bits a certificate carries, when it carries the extension.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyUsage {
+    pub digital_signature: bool,
+    pub key_cert_sign: bool,
+}
+
+/// The extended key usages, when the extension is present.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtKeyUsage {
+    pub server_auth: bool,
+    pub client_auth: bool,
+}
+
+/// What a chain is verified for: the purpose the leaf's extended key
+/// usage must name when the extension is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    ServerAuth,
+    ClientAuth,
 }
 
 fn expect_ed25519_algorithm(alg: &[u8]) -> Result<()> {
@@ -306,6 +368,38 @@ impl Certificate {
         self.not_before <= now && now <= self.not_after
     }
 
+    /// Whether this certificate may sign others: its key usage names
+    /// keyCertSign, or it names nothing (RFC 5280 §4.2.1.3).
+    pub fn may_sign_certificates(&self) -> bool {
+        self.key_usage.map_or(true, |k| k.key_cert_sign)
+    }
+
+    /// Refused unless the leaf's extensions allow `purpose`: the extended
+    /// key usage, when present, must name it (§4.2.1.12), and the key
+    /// usage, when present, must allow a signature (§4.2.1.3) -- the TLS
+    /// only ever asks a certificate to sign.
+    pub fn fit_for(&self, purpose: Purpose) -> Result<()> {
+        if let Some(k) = self.key_usage {
+            if !k.digital_signature {
+                return Err(refuse(
+                    "the certificate's key usage does not allow a signature".into(),
+                ));
+            }
+        }
+        if let Some(e) = self.ext_key_usage {
+            let (named, what) = match purpose {
+                Purpose::ServerAuth => (e.server_auth, "server authentication"),
+                Purpose::ClientAuth => (e.client_auth, "client authentication"),
+            };
+            if !named {
+                return Err(refuse(format!(
+                    "the certificate's extended key usage does not name {what}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the certificate names `host`: a DNS name, case-insensitively,
     /// exactly or by a wildcard in the leftmost label only (`*.example.com`
     /// names `a.example.com`, not `example.com` or `a.b.example.com`, as RFC
@@ -363,28 +457,46 @@ pub fn verify_chain(
             }
         )));
     }
-    chain_reaches_anchor(chain, anchors, now)
+    chain_reaches_anchor_for(chain, anchors, now, Purpose::ServerAuth)
 }
 
-/// [`verify_chain`] without the name: the leaf is valid now and the chain
-/// links up to a certificate in `anchors`. What a server checks of a
-/// client's certificate, which names no host to match.
+/// [`verify_chain`] without the name: the leaf is valid now, fit for
+/// `purpose`, and the chain links up to a certificate in `anchors`. What a
+/// server checks of a client's certificate, which names no host to match.
 pub fn chain_reaches_anchor(
     chain: &[Certificate],
     anchors: &[Certificate],
     now: i64,
 ) -> Result<()> {
+    chain_reaches_anchor_for(chain, anchors, now, Purpose::ClientAuth)
+}
+
+/// [`chain_reaches_anchor`] with the leaf's purpose named; a server's chain
+/// goes through [`verify_chain`], which names `ServerAuth`.
+pub fn chain_reaches_anchor_for(
+    chain: &[Certificate],
+    anchors: &[Certificate],
+    now: i64,
+    purpose: Purpose,
+) -> Result<()> {
     let leaf = chain.first().ok_or_else(|| refuse("no certificate was presented".into()))?;
     if !leaf.valid_at(now) {
         return Err(refuse(format!("the certificate is not valid at this time ({now})")));
     }
+    leaf.fit_for(purpose)?;
     let mut current = leaf;
     for depth in 0..chain.len().max(1) {
         if anchors.iter().any(|a| current.signed_by(a) && a.valid_at(now)) {
             return Ok(());
         }
         let Some(next) = chain.get(depth + 1) else { break };
-        if !(next.is_ca && next.valid_at(now) && current.signed_by(next)) {
+        // An intermediate is a CA whose key usage, when it names any,
+        // allows it to sign certificates.
+        if !(next.is_ca
+            && next.valid_at(now)
+            && next.may_sign_certificates()
+            && current.signed_by(next))
+        {
             return Err(refuse(
                 "the chain does not link: a certificate is not signed by the next".into(),
             ));
@@ -507,7 +619,7 @@ pub fn issue(
         extensions.push(ext(
             OID_EXT_KEY_USAGE,
             false,
-            der::sequence(&[&der::tlv(OID, OID_SERVER_AUTH)]),
+            der::sequence(&[&der::tlv(OID, OID_SERVER_AUTH), &der::tlv(OID, OID_CLIENT_AUTH)]),
         ));
     }
     // The subject's key identifier, and the issuer's as the authority's:
@@ -694,6 +806,54 @@ mod tests {
 
     fn pki(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/pki/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// What the parser and the chain refuse, from openssl-made material: a
+    /// CA carrying a critical extension this parser does not read (a name
+    /// constraint) does not parse; a leaf whose extended key usage names
+    /// client authentication alone serves no server but is a client; and
+    /// a leaf signed by an intermediate whose key usage does not allow
+    /// certificate signing does not reach the root through it.
+    #[test]
+    fn a_critical_extension_a_key_usage_and_a_purpose_are_enforced() {
+        let now = crate::time::now_micros() / 1_000_000;
+        let der = |f: &str| pem::decode_all(&pki(f), "CERTIFICATE").unwrap().remove(0);
+        let e = parse(&der("nc-ca.crt")).unwrap_err().to_string();
+        assert!(e.contains("critical extension"), "{e}");
+        let client = parse(&der("client-only.crt")).unwrap();
+        assert_eq!(
+            client.ext_key_usage,
+            Some(ExtKeyUsage { server_auth: false, client_auth: true })
+        );
+        let e = verify_chain(
+            std::slice::from_ref(&client),
+            std::slice::from_ref(&client),
+            "localhost",
+            now,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("server authentication"), "{e}");
+        chain_reaches_anchor(std::slice::from_ref(&client), std::slice::from_ref(&client), now)
+            .unwrap();
+        let root = parse(&der("root2.crt")).unwrap();
+        let inter = parse(&der("inter-nosign.crt")).unwrap();
+        let leaf = parse(&der("leaf-by-inter.crt")).unwrap();
+        assert!(root.may_sign_certificates() && !inter.may_sign_certificates());
+        assert!(inter.is_ca && leaf.signed_by(&inter) && inter.signed_by(&root));
+        let e = verify_chain(
+            &[leaf.clone(), inter.clone()],
+            std::slice::from_ref(&root),
+            "localhost",
+            now,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("does not link"), "{e}");
+        // The same leaf under an intermediate allowed to sign links: the
+        // check is the key usage, nothing else about the chain.
+        let ec_ca = parse(&der("ec-ca.crt")).unwrap();
+        assert!(ec_ca.may_sign_certificates());
     }
 
     /// Chains another issuer signed: an RSA-2048 CA and a P-256 CA, made by

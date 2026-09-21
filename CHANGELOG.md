@@ -6,6 +6,58 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.67.0 — 2026-09-21
+
+**The crypto module reviewed in-tree, and what the review found fixed.**
+Every primitive now also runs Wycheproof's vectors (`tests/wycheproof/`,
+the project's files as published: X25519, Ed25519, ChaCha20-Poly1305,
+HKDF-SHA-256, ECDSA P-256, RSA-PSS -- 1,672 cases) beside the RFCs';
+the constant-time claim was read line by line and the timing test
+extended to the field arithmetic, the scalar reduction and the ticket;
+the TLS was run against Go's crypto/tls and OpenSSL as clients and
+servers in every mode; X.509 was read against RFC 5280 with hostile
+material made by openssl. Found and fixed:
+
+- The TLS never checked an X25519 shared secret for zero, which a
+  low-order public key yields (RFC 8446 §7.4.2 says abort); both sides
+  refuse it now with `illegal_parameter`.
+- A server's refusal of a client's flight -- a missing certificate
+  under `CELASTRO_TLS_CLIENT_AUTH=required` -- went out under the
+  handshake keys, which a conforming client reads as a bad record MAC
+  rather than the alert; the server writes under its application keys
+  from its Finished on, as §7.1 has it.
+- A KeyUpdate from the peer closed the connection ("not supported");
+  both sides handle it now, and this side can send one (§4.6.3).
+- A connection cut inside a record read as a clean end of stream; it
+  is an error now (a close_notify or a cut between records is the end).
+- The ECDSA verifier accepted a signature integer with its high bit set
+  or a leading zero it did not need (BER, not DER), which is a second
+  encoding of the same signature; refused (Wycheproof tcId 6 caught it).
+- X.509: an extension marked critical that the parser does not read
+  (a name or policy constraint) is refused rather than ignored; key
+  usage is read, an intermediate without keyCertSign does not link a
+  chain, and a leaf's extended key usage must name the purpose -- server
+  authentication for a server, client authentication on the wire. The
+  certificates this crate issues name both purposes now; **a
+  certificate made by an earlier `tls init` names server authentication
+  only and will not serve as a client certificate under
+  `CELASTRO_TLS_CLIENT_AUTH=required` -- make a new set.**
+- The timing test, extended to the field arithmetic, found the scalar
+  reduction (`sc25519::reduce_512`, under every Ed25519 signature)
+  8 % apart between a small and a large scalar: the compiler had turned
+  a masked select back into a branch. The masks in the scalar and field
+  arithmetic, in `ct_eq` and in Poly1305 now go through
+  `std::hint::black_box`; the pair measures 0.1 % apart.
+- The tool refuses core dumps (`prctl(PR_SET_DUMPABLE, 0)` on Linux)
+  from its first line: a dump of a process holding a data key and a
+  TLS key is those keys on disk.
+
+Accepted as they are, with the reasons in docs/design.md: 0-RTT
+refused by never offering `early_data`; the random source read from
+`/dev/urandom` by file; a TLS key that leaks opens two days of
+tickets; the wiping of stack copies not attempted. The README's
+"unaudited" now reads "reviewed in-tree, unaudited outside it".
+
 ## 0.66.0 — 2026-09-21
 
 **HelloRetryRequest.** A client that lists X25519 among its groups but
