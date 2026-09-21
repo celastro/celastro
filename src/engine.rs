@@ -2127,6 +2127,15 @@ impl Db {
                 if tls.client_auth() { "; the wire requires a peer's certificate" } else { "" }
             ));
         }
+        if let Some(c) = &self.cipher {
+            if c.previous_keys() > 0 {
+                out.push_str(&format!(
+                    "data key: {} previous key(s) kept in the ring for the archived tier; `celastro \
+                     key retire` drops them once nothing is under them\n",
+                    c.previous_keys()
+                ));
+            }
+        }
         let mut up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         up.insert(here.clone());
         // Every node this one knows of: the ones it attached, and every

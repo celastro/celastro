@@ -436,3 +436,45 @@ fn a_backup_as_of_an_earlier_instant_holds_what_was_visible_then() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A backup's pin holds the segments it named through a compaction that
+/// retires them: the compaction runs, the backup copies what it pinned
+/// and verifies, and a restore of it answers what was there at the pin.
+#[test]
+fn a_pin_held_through_a_compaction_keeps_the_segments_it_named() {
+    let src = dir("pin-src");
+    let dest = dir("pin-dest");
+    let mut db = open(&src);
+    setup(&mut db, 30);
+    for i in 200..230 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    db.execute("FLUSH items").unwrap();
+    let before = ids(&mut db, "SELECT id FROM items LIMIT 1000");
+    // The pin, not yet copied: the deferred work is held.
+    let pending = match db.execute(&format!("BACKUP TO '{}'", dest.display())).unwrap() {
+        Outcome::Deferred(d) => d,
+        other => panic!("{other:?}"),
+    };
+    // A compaction under the held pin, and more rows after it.
+    let c = ack(&mut db, "COMPACT items");
+    assert!(c.contains("compact"), "{c}");
+    for i in 300..310 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    db.execute("FLUSH items").unwrap();
+    let m = match pending.finish().unwrap() {
+        Outcome::Ack(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let ts: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let v = ack(&mut db, &format!("VERIFY BACKUP '{}' AS OF {ts}", dest.display()));
+    assert!(v.contains("every one as recorded"), "{v}");
+    let d2 = dir("pin-dst");
+    let mut db2 = open(&d2);
+    ack(&mut db2, &format!("RESTORE FROM '{}' AS OF {ts}", dest.display()));
+    assert_eq!(ids(&mut db2, "SELECT id FROM items LIMIT 1000"), before);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&d2);
+}

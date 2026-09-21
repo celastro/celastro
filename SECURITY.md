@@ -94,6 +94,11 @@ holds them; that is the boundary.
 The process refuses core dumps from its first line (`prctl(PR_SET_DUMPABLE,
 0)` on Linux, which also keeps another user's debugger out): a dump of a
 process holding a data key and a TLS key would be those keys on disk.
+Randomness is `getrandom(2)` on Linux, which blocks until the kernel's
+pool is seeded, and `/dev/urandom` elsewhere (0.69.0); the handshake's
+secrets are wiped when the handshake ends. A client's early data, which
+no ticket of this server ever allows, is skipped past rather than
+refused (0.69.0).
 
 ## What is not in scope
 

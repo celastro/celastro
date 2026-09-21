@@ -9,6 +9,7 @@
 //! here; [`TlsStream`] wraps a `TcpStream` and completes the handshake on
 //! first use, so a listener's accept loop never blocks on a peer.
 
+use crate::cipher::Secret;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -59,6 +60,10 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_COOKIE: u16 = 44;
+const EXT_EARLY_DATA: u16 = 42;
+/// How much early data a server skips past for a client that sent some
+/// though no ticket of this server ever allowed it (RFC 8446 §4.2.10).
+const MAX_EARLY_DATA: usize = 16_384 + 256 * 4;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const PSK_DHE_KE: u8 = 1;
 
@@ -309,6 +314,12 @@ impl Drop for TlsStream {
         if let Some(m) = &mut self.res_master {
             crate::cipher::wipe(m);
         }
+        if let Some(s) = &mut self.read_secret {
+            crate::cipher::wipe(s);
+        }
+        if let Some(s) = &mut self.write_secret {
+            crate::cipher::wipe(s);
+        }
     }
 }
 
@@ -379,6 +390,13 @@ pub struct TlsStream {
     /// A test's hook: send the first ClientHello without a key share, so
     /// the server's HelloRetryRequest and this side's answer to it run.
     pub(crate) omit_first_share: bool,
+    /// A test's hook: offer early data and send a record of it after the
+    /// ClientHello, as a misbehaving client would; the server skips it.
+    pub(crate) send_junk_early_data: bool,
+    /// Bytes of early data this server may still skip: records that fail
+    /// to open under the client's handshake key while a client that
+    /// offered early data has not yet been read past it.
+    skip_early: usize,
     /// A client's, after its handshake: the resumption master secret a
     /// NewSessionTicket's PSK derives from, and the store key it goes under.
     res_master: Option<[u8; 32]>,
@@ -424,6 +442,8 @@ impl TlsStream {
             read_secret: None,
             write_secret: None,
             omit_first_share: false,
+            send_junk_early_data: false,
+            skip_early: 0,
             res_master: None,
             store_key: None,
         }
@@ -518,6 +538,16 @@ impl TlsStream {
                 let mut tag_arr = [0u8; 16];
                 tag_arr.copy_from_slice(tag);
                 if !aead::open(&keys.key, &nonce, &header, data, &tag_arr) {
+                    if self.skip_early > 0 {
+                        // Early data this server did not accept: skipped,
+                        // within the bound, and the nonce not consumed.
+                        keys.seq -= 1;
+                        self.skip_early = self.skip_early.saturating_sub(len);
+                        if self.skip_early == 0 {
+                            return Err(err("more early data than the protocol allows"));
+                        }
+                        return self.read_record();
+                    }
                     return Err(err("a record failed authentication"));
                 }
                 // Strip the zero padding and read the inner type.
@@ -724,7 +754,7 @@ impl TlsStream {
         // the certificate flight is skipped. Anything short of that -- no
         // offer, another node's ticket, a stale one -- is a full handshake,
         // for which the client has to accept our signature.
-        let tkey = ticket_key(key, client_anchors.is_some(), ticket_day());
+        let tkey: Secret<32> = (ticket_key(key, client_anchors.is_some(), ticket_day())).into();
         let psk: Option<[u8; 32]> = match &hello.psk {
             Some(offer) if hello.psk_dhe => {
                 match open_ticket(&tkey, &offer.identity).or_else(|| {
@@ -751,10 +781,10 @@ impl TlsStream {
         if self.resumed {
             RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let eph = random::array32().map_err(|e| err(e.to_string()))?;
+        let eph: Secret<32> = (random::array32().map_err(|e| err(e.to_string()))?).into();
         let our_share = x25519::public_key(&eph);
-        let shared = x25519::x25519(&eph, &client_share);
-        if shared == [0u8; 32] {
+        let shared: Secret<32> = (x25519::x25519(&eph, &client_share)).into();
+        if *shared == [0u8; 32] {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
         let server_random = random::array32().map_err(|e| err(e.to_string()))?;
@@ -785,14 +815,21 @@ impl TlsStream {
             self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
         }
         // Keys.
-        let early = hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
+        let early: Secret<32> =
+            (hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]))).into();
         let empty_hash = sha256(&[]);
-        let hs_secret = hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared);
+        let hs_secret: Secret<32> =
+            (hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared[..])).into();
         let th = sha256(&transcript);
-        let c_hs = derive_secret(&hs_secret, "c hs traffic", &th);
-        let s_hs = derive_secret(&hs_secret, "s hs traffic", &th);
+        let c_hs: Secret<32> = (derive_secret(&hs_secret, "c hs traffic", &th)).into();
+        let s_hs: Secret<32> = (derive_secret(&hs_secret, "s hs traffic", &th)).into();
         self.write_keys = Some(Keys::from_secret(&s_hs));
         self.read_keys = Some(Keys::from_secret(&c_hs));
+        // A client that offered early data sent records under a key this
+        // server does not have (no ticket of its ever allowed early data);
+        // they fail to open under the handshake key and are skipped, up to
+        // the protocol's bound, until the client's flight opens.
+        self.skip_early = if hello.early_data { MAX_EARLY_DATA } else { 0 };
         // EncryptedExtensions, Certificate, CertificateVerify, Finished --
         // the middle two only when the client did not resume.
         self.write_handshake(HS_ENCRYPTED_EXTENSIONS, &[0, 0], &mut transcript)?;
@@ -847,11 +884,12 @@ impl TlsStream {
         // record MAC" at Go's client. The client's flight is still read
         // under the handshake keys.
         let th_server_fin = sha256(&transcript);
-        let master = hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32]);
-        let c_ap = derive_secret(&master, "c ap traffic", &th_server_fin);
-        let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
+        let master: Secret<32> =
+            (hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32])).into();
+        let c_ap: Secret<32> = (derive_secret(&master, "c ap traffic", &th_server_fin)).into();
+        let s_ap: Secret<32> = (derive_secret(&master, "s ap traffic", &th_server_fin)).into();
         self.write_keys = Some(Keys::from_secret(&s_ap));
-        self.write_secret = Some(s_ap);
+        self.write_secret = Some(*s_ap);
         // The client's Certificate and CertificateVerify when this side
         // asked for them and the handshake is a full one: its chain
         // reaches an anchor and the signature is its key's over the
@@ -892,15 +930,16 @@ impl TlsStream {
         if !super::ct_eq(&expected, &body) {
             return Err(err("the client's Finished does not verify"));
         }
+        self.skip_early = 0;
         self.read_keys = Some(Keys::from_secret(&c_ap));
-        self.read_secret = Some(c_ap);
+        self.read_secret = Some(*c_ap);
         // A ticket for next time, under the application keys: the PSK it
         // stands for derives from this handshake's resumption master
         // secret, so a resumed connection hands out a fresh ticket too.
         let th_client_fin = sha256(&transcript);
-        let res_master = derive_secret(&master, "res master", &th_client_fin);
+        let res_master: Secret<32> = (derive_secret(&master, "res master", &th_client_fin)).into();
         let nonce = [0u8];
-        let psk_next = resumption_psk(&res_master, &nonce);
+        let psk_next: Secret<32> = (resumption_psk(&res_master, &nonce)).into();
         let age_add = u32::from_be_bytes(
             random::bytes(4).map_err(|e| err(e.to_string()))?.try_into().expect("four bytes"),
         );
@@ -946,7 +985,7 @@ impl TlsStream {
         let ticket: Option<Ticket> = ticket_store(|t| t.get(&store_key).cloned())
             .filter(|t| now < t.received + t.lifetime.min(TICKET_LIFETIME_SECS as u32) as u64);
         self.store_key = Some(store_key);
-        let eph = random::array32().map_err(|e| err(e.to_string()))?;
+        let eph: Secret<32> = (random::array32().map_err(|e| err(e.to_string()))?).into();
         let our_share = x25519::public_key(&eph);
         let client_random = random::array32().map_err(|e| err(e.to_string()))?;
         let session_id = random::array32().map_err(|e| err(e.to_string()))?;
@@ -955,6 +994,7 @@ impl TlsStream {
         // the server asked for, its cookie echoed, and a PSK offer's
         // binder over `prefix` (the transcript so far) and the message cut
         // before the binders.
+        let junk_early = self.send_junk_early_data;
         let build = |share: Option<&[u8; 32]>, cookie: Option<&[u8]>, prefix: &[u8]| -> Vec<u8> {
             let mut ch = Vec::new();
             ch.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
@@ -1006,6 +1046,9 @@ impl TlsStream {
                 body.extend_from_slice(c);
                 extension(&mut exts, EXT_COOKIE, &body);
             }
+            if junk_early {
+                extension(&mut exts, EXT_EARLY_DATA, &[]);
+            }
             if let Some(t) = &ticket {
                 // PSK with (EC)DHE only -- the key share above stays -- and
                 // the offer last, its binder computed over everything
@@ -1046,6 +1089,13 @@ impl TlsStream {
         let first_share = if self.omit_first_share { None } else { Some(&our_share) };
         let ch = build(first_share, None, &[]);
         self.write_handshake(HS_CLIENT_HELLO, &ch, &mut transcript)?;
+        if junk_early {
+            // What a client that believed it could send early data sends:
+            // an application-data record under a key this server lacks.
+            let mut junk = vec![0x17, 0x03, 0x03, 0, 100];
+            junk.extend_from_slice(&[0x5a; 100]);
+            self.sock.write_all(&junk)?;
+        }
         let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         if ty != HS_SERVER_HELLO {
             return Err(err("expected a ServerHello"));
@@ -1105,16 +1155,18 @@ impl TlsStream {
         let Some(server_share) = sh.x25519_share else {
             return Err(err("the server sent no X25519 key share"));
         };
-        let shared = x25519::x25519(&eph, &server_share);
-        if shared == [0u8; 32] {
+        let shared: Secret<32> = (x25519::x25519(&eph, &server_share)).into();
+        if *shared == [0u8; 32] {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
-        let early = hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
+        let early: Secret<32> =
+            (hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]))).into();
         let empty_hash = sha256(&[]);
-        let hs_secret = hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared);
+        let hs_secret: Secret<32> =
+            (hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared[..])).into();
         let th = sha256(&transcript);
-        let c_hs = derive_secret(&hs_secret, "c hs traffic", &th);
-        let s_hs = derive_secret(&hs_secret, "s hs traffic", &th);
+        let c_hs: Secret<32> = (derive_secret(&hs_secret, "c hs traffic", &th)).into();
+        let s_hs: Secret<32> = (derive_secret(&hs_secret, "s hs traffic", &th)).into();
         self.read_keys = Some(Keys::from_secret(&s_hs));
         self.write_keys = Some(Keys::from_secret(&c_hs));
         let (ty, _) = self.read_handshake(&mut hs_buf, &mut transcript)?;
@@ -1189,9 +1241,10 @@ impl TlsStream {
         let mut transcript = transcript.to_vec();
         let empty_hash = sha256(&[]);
         let th_server_fin = sha256(&transcript);
-        let master = hkdf::extract(&derive_secret(hs_secret, "derived", &empty_hash), &[0u8; 32]);
-        let c_ap = derive_secret(&master, "c ap traffic", &th_server_fin);
-        let s_ap = derive_secret(&master, "s ap traffic", &th_server_fin);
+        let master: Secret<32> =
+            (hkdf::extract(&derive_secret(hs_secret, "derived", &empty_hash), &[0u8; 32])).into();
+        let c_ap: Secret<32> = (derive_secret(&master, "c ap traffic", &th_server_fin)).into();
+        let s_ap: Secret<32> = (derive_secret(&master, "s ap traffic", &th_server_fin)).into();
         // Middlebox compatibility: a CCS before our first encrypted record.
         self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
         if let Some(context) = request_context {
@@ -1229,8 +1282,8 @@ impl TlsStream {
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         self.read_keys = Some(Keys::from_secret(&s_ap));
         self.write_keys = Some(Keys::from_secret(&c_ap));
-        self.read_secret = Some(s_ap);
-        self.write_secret = Some(c_ap);
+        self.read_secret = Some(*s_ap);
+        self.write_secret = Some(*c_ap);
         let th_client_fin = sha256(&transcript);
         self.res_master = Some(derive_secret(&master, "res master", &th_client_fin));
         Ok(())
@@ -1393,6 +1446,9 @@ struct ClientHello {
     /// The groups the client supports, for a retry when it sent no X25519
     /// share but lists the group.
     groups: Vec<u16>,
+    /// Whether the client offered early data, which this server never
+    /// accepts: the records it sent under the early key are skipped.
+    early_data: bool,
     /// The first identity of a pre_shared_key offer, if the extension was
     /// the last one as the protocol requires.
     psk: Option<PskOffer>,
@@ -1420,6 +1476,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let mut sig_algs = Vec::new();
     let mut x25519_share = None;
     let mut groups = Vec::new();
+    let mut early_data = false;
     let mut psk = None;
     let mut psk_dhe = false;
     if !r.done() {
@@ -1462,6 +1519,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
                     groups =
                         list.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 }
+                EXT_EARLY_DATA => early_data = true,
                 EXT_KEY_SHARE => {
                     let list = d.vec16()?;
                     let mut l = Reader::new(list);
@@ -1479,7 +1537,17 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
             }
         }
     }
-    Ok(ClientHello { session_id, suites, versions, sig_algs, x25519_share, groups, psk, psk_dhe })
+    Ok(ClientHello {
+        session_id,
+        suites,
+        versions,
+        sig_algs,
+        x25519_share,
+        groups,
+        early_data,
+        psk,
+        psk_dhe,
+    })
 }
 
 struct ServerHello {
@@ -1951,6 +2019,49 @@ mod tests {
         let outcomes = server.join().unwrap();
         assert!(refused > 0, "a flipped byte was never noticed");
         assert!(outcomes.len() == ROUNDS);
+    }
+
+    /// A client that offers early data and sends a record of it, though no
+    /// ticket allowed it, is served: the server skips the record it cannot
+    /// open and reads the client's flight behind it.
+    #[test]
+    fn early_data_this_server_never_accepted_is_skipped_past() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut s = TlsStream::server(
+                sock,
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+            );
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            s.write_all(&buf).unwrap();
+            let _ = s.close_notify();
+            buf
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        let mut c = TlsStream::client(
+            sock,
+            ClientSide {
+                anchors: std::slice::from_ref(&anchor),
+                host: "127.0.0.1",
+                chain_der: None,
+                key: None,
+            },
+        );
+        c.send_junk_early_data = true;
+        c.write_all(b"after the junk").unwrap();
+        c.close_notify().unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"after the junk");
+        assert_eq!(server.join().unwrap(), b"after the junk");
     }
 
     /// A KeyUpdate from either side moves that side's keys to the next

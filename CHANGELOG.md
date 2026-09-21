@@ -6,6 +6,23 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.69.0 — 2026-09-21
+
+**What the reviews had accepted, done.** Randomness comes from
+`getrandom(2)` on Linux (blocking until the pool is seeded, so a key is
+never drawn from an unseeded boot), `/dev/urandom` elsewhere or on a
+kernel without the call. A client that offers early data and sends a
+record of it, though no ticket of this server ever allowed it, is
+served: the server skips the records it cannot open under the
+handshake key, up to the protocol's bound, where it refused the
+connection before (RFC 8446 §4.2.10). The handshake's secrets -- the
+ephemeral key, the shared secret and every traffic secret -- are wiped
+when the handshake ends, and a stream's traffic secrets when it
+closes. `SHOW HEALTH` says when the data key ring keeps previous keys
+for the archived tier, and that `celastro key retire` drops them. A
+test holds a backup's pin through a compaction and restores what was
+pinned.
+
 ## 0.68.1 — 2026-09-21
 
 **A peer that restarted mid-backup is judged by its record.** A cluster

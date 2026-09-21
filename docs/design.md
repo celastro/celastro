@@ -2141,11 +2141,18 @@ name, an intermediate without keyCertSign could have signed, a
 client-only leaf could have served -- fixed and tested with
 openssl-made material (`tests/pki/`); the certificates this crate
 issues name both purposes now, so one certificate serves a node's wire
-both ways. (5) The random source is `/dev/urandom` by file, once per
-draw, which is the kernel's and refuses if it cannot open (a getrandom
-syscall would spare a descriptor; not done); the wiping covers every
-long-lived key (E1) and not stack copies (not attempted: the compiler
-decides those); the process refuses core dumps from its first line.
+both ways. (5) The random source was `/dev/urandom` by file; from 0.69.0 it is
+`getrandom(2)` on Linux, which blocks until the pool is seeded and
+spares the descriptor, with the file as the fallback elsewhere and on
+a kernel without the call; the wiping covers every long-lived key (E1)
+and, from 0.69.0, the handshake's secrets (`Secret<32>` bindings for
+the ephemeral key, the shared secret and every traffic secret, wiped
+when the handshake ends, the stream's traffic secrets when it closes)
+-- what the compiler copies to the stack on its own is still its
+business; the process refuses core dumps from its first line. The 0-RTT
+refusal, which was "never offer it", handles the client that sends
+early data anyway from 0.69.0: the records it cannot open under the
+handshake key are skipped up to the protocol's bound (§4.2.10).
 (6) This list; the README says "reviewed in-tree, unaudited outside
 it".
 
@@ -2185,11 +2192,12 @@ memtable at the instant; peak resident memory went from 11-14 MB to
 16-21 MB a pod for a backup of half a megabyte, the built segment and
 the copy's buffers; and the restore on the box at the instant, node by
 node, added up to 16,239 rows against 16,165 counted before the
-statement and 16,787 after, which is the cut. Not measured: a backup
-long enough for the pin to hold sealed segments through a compaction
-(the handles keep the files; the compaction's output stands beside
-them until the backup drops them), and a destination slow enough for
-the memtable's segment to matter -- both proportional, neither seen.
+statement and 16,787 after, which is the cut. A pin held through a compaction is now a test (`tests/backup.rs`): the
+backup's deferred work is held, `COMPACT` retires the segments it
+named, rows land after, and the copy still verifies and restores what
+was there at the pin -- the handles keep the files until the copy
+drops them. Not measured: a destination slow enough for the memtable's
+segment to matter, which is proportional and was not seen.
 
 ## A worked query
 
