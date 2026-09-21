@@ -157,6 +157,23 @@ pub const CLOCK_REFUSE_MICROS: i64 = 5_000_000;
 /// weeks, the time a rotation takes to notice and do.
 pub const CERTIFICATE_WARN_SECS: i64 = 14 * 86_400;
 
+/// How a detached backup at an instant is going on a node.
+#[derive(Debug, Clone)]
+pub enum BackupState {
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+/// A cluster backup's patience with a peer: to start its copy, between
+/// polls of its status, for one poll, and how many polls unanswered in a
+/// row make it silent (six: about a minute).
+const BACKUP_START_MS: u64 = 15_000;
+const BACKUP_POLL_MS: u64 = 2_000;
+const BACKUP_POLL_DEADLINE_MS: u64 = 8_000;
+const BACKUP_SILENT_POLLS: u32 = 6;
+const BACKUP_LEGACY_MS: u64 = 600_000;
+
 /// What `SHOW HEALTH` and the sweep have seen of a peer's hello.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerSeen {
@@ -1008,6 +1025,9 @@ pub struct Db {
     /// Each known node's region, as its hello said; this node's own
     /// under its address. Not persisted: a hello brings it back.
     regions: BTreeMap<String, String>,
+    /// The detached backups this node has run, by instant: what `BACKUP
+    /// STATUS` answers and a cluster backup polls.
+    backups: Arc<Mutex<BTreeMap<u64, BackupState>>>,
     /// The last counters each holder answered, per collection: what a
     /// statement that does not reach a holder's shards takes for it.
     counters_seen: Mutex<BTreeMap<(String, String), (Timestamp, u64)>>,
@@ -1154,6 +1174,7 @@ impl Db {
                 dir: None,
             })),
             regions: BTreeMap::new(),
+            backups: Arc::new(Mutex::new(BTreeMap::new())),
             counters_seen: Mutex::new(BTreeMap::new()),
             clock: Arc::new(Hlc::new()),
             opts,
@@ -1466,12 +1487,58 @@ impl Db {
         Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls, keep)))
     }
 
+    /// `BACKUP TO ... AS OF <instant> DETACHED`: the copy prepared as
+    /// [`backup`](Self::backup) prepares it, then run on a thread of this
+    /// node's own, the outcome kept for [`backup_status`](Self::backup_status).
+    /// The statement answers at once. What a cluster backup sends its
+    /// peers, so that a peer that falls silent is a poll that fails and
+    /// not a call that never returns.
+    pub fn backup_detached(
+        &mut self,
+        dest: &str,
+        keep: Option<usize>,
+        as_of: Option<Timestamp>,
+    ) -> Result<Outcome> {
+        let ts = as_of.ok_or_else(|| Error::Plan("a detached backup needs AS OF".into()))?;
+        let Outcome::Deferred(job) = self.backup(dest, keep, Some(ts))? else {
+            unreachable!("a backup is deferred work")
+        };
+        let states = self.backups.clone();
+        states.lock().unwrap_or_else(|p| p.into_inner()).insert(ts, BackupState::Running);
+        std::thread::Builder::new()
+            .name("backup".into())
+            .spawn(move || {
+                let state = match job.finish() {
+                    Ok(Outcome::Ack(m)) => BackupState::Done(m),
+                    Ok(other) => BackupState::Done(format!("{other:?}")),
+                    Err(e) => BackupState::Failed(e.to_string()),
+                };
+                states.lock().unwrap_or_else(|p| p.into_inner()).insert(ts, state);
+            })
+            .map_err(|e| Error::Storage(format!("cannot start the backup's thread: {e}")))?;
+        Ok(Outcome::Ack(format!("backup {ts} started; BACKUP STATUS {ts} says how it goes")))
+    }
+
+    /// How a detached backup at `ts` is going on this node.
+    pub fn backup_status(&self, ts: u64) -> String {
+        match self.backups.lock().unwrap_or_else(|p| p.into_inner()).get(&ts) {
+            None => format!("backup {ts}: none started here"),
+            Some(BackupState::Running) => format!("backup {ts}: running"),
+            Some(BackupState::Done(m)) => format!("backup {ts}: done: {m}"),
+            Some(BackupState::Failed(e)) => format!("backup {ts}: failed: {e}"),
+        }
+    }
+
     /// `BACKUP CLUSTER TO '<dest>' [KEEP n]`: this node's backup at an
-    /// instant it chooses, then `LOCAL BACKUP ... AS OF` that instant on
-    /// every other data node, one after another, after this node's copy
-    /// and outside its lock. The set restores to one consistent cut with
-    /// `RESTORE FROM '<dest>' AS OF <instant>` on each node. A node that
-    /// did not take it is named; the others' backups stand.
+    /// instant it chooses, then that instant's backup on every other data
+    /// node -- started detached on each, then polled until each is done,
+    /// after this node's copy and outside its lock. The set restores to
+    /// one consistent cut with `RESTORE FROM '<dest>' AS OF <instant>` on
+    /// each node. A node that did not take it is named -- one that could
+    /// not be reached to start, one whose copy failed, and one that fell
+    /// silent for a minute while copying -- and the others' backups
+    /// stand. Until 0.68.0 a peer was asked with no deadline at all, and a
+    /// peer cut off mid-copy was a cluster backup that never answered.
     pub fn backup_cluster(&mut self, dest: &str, keep: Option<usize>) -> Result<Outcome> {
         let ts = self.clock.now();
         let Outcome::Deferred(local) = self.backup(dest, keep, Some(ts))? else {
@@ -1483,11 +1550,11 @@ impl Db {
                 peers.push((url.clone(), self.node_conn(&url)?));
             }
         }
-        let sql = format!(
-            "LOCAL BACKUP TO '{}'{} AS OF {ts}",
-            dest.replace('\'', "''"),
-            keep.map(|k| format!(" KEEP {k}")).unwrap_or_default()
-        );
+        let escaped = dest.replace('\'', "''");
+        let keep_sql = keep.map(|k| format!(" KEEP {k}")).unwrap_or_default();
+        let start = format!("LOCAL BACKUP TO '{escaped}'{keep_sql} AS OF {ts} DETACHED");
+        let legacy = format!("LOCAL BACKUP TO '{escaped}'{keep_sql} AS OF {ts}");
+        let status = format!("LOCAL BACKUP STATUS {ts}");
         Ok(Outcome::Deferred(Deferred::new(move || {
             let mine = match local.finish()? {
                 Outcome::Ack(m) => m,
@@ -1495,14 +1562,59 @@ impl Db {
             };
             let mut done = Vec::new();
             let mut failed = Vec::new();
+            let mut pending = Vec::new();
             for (url, node) in peers {
-                // A copy takes what it takes; the statement deadline is
-                // not the measure of it.
-                let _no_deadline = crate::deadline::arm(None);
-                match node.statement(&sql, &[]) {
-                    Ok(m) => done.push(format!("{url}: {m}")),
+                // Fifteen seconds to start: a peer that cannot be reached
+                // is named now, not waited for.
+                let _deadline = crate::deadline::arm(Some(BACKUP_START_MS));
+                match node.statement(&start, &[]) {
+                    Ok(_) => pending.push((url, node, 0u32)),
+                    Err(e) if e.to_string().contains("DETACHED") => {
+                        // A peer from before 0.68.0: its copy in one call,
+                        // bounded at ten minutes rather than not at all.
+                        let _deadline = crate::deadline::arm(Some(BACKUP_LEGACY_MS));
+                        match node.statement(&legacy, &[]) {
+                            Ok(m) => done.push(format!("{url}: {m}")),
+                            Err(e) => failed.push(format!("{url}: {e}")),
+                        }
+                    }
                     Err(e) => failed.push(format!("{url}: {e}")),
                 }
+            }
+            // Polled until each is done or failed; a peer whose status
+            // cannot be read for a minute is given up as silent.
+            while !pending.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(BACKUP_POLL_MS));
+                let mut still = Vec::new();
+                for (url, node, missed) in pending {
+                    let _deadline = crate::deadline::arm(Some(BACKUP_POLL_DEADLINE_MS));
+                    match node.statement(&status, &[]) {
+                        Ok(m) => {
+                            if let Some(rest) = m.split_once(": done: ").map(|(_, r)| r) {
+                                done.push(format!("{url}: {rest}"));
+                            } else if let Some(rest) = m.split_once(": failed: ").map(|(_, r)| r) {
+                                failed.push(format!("{url}: {rest}"));
+                            } else if m.contains(": none started") {
+                                failed.push(format!("{url}: the backup it started is not there"));
+                            } else {
+                                still.push((url, node, 0));
+                            }
+                        }
+                        Err(e) => {
+                            if missed + 1 >= BACKUP_SILENT_POLLS {
+                                failed.push(format!(
+                                    "{url}: silent for {} s during its copy ({e})",
+                                    (BACKUP_SILENT_POLLS as u64
+                                        * (BACKUP_POLL_MS + BACKUP_POLL_DEADLINE_MS))
+                                        / 1000
+                                ));
+                            } else {
+                                still.push((url, node, missed + 1));
+                            }
+                        }
+                    }
+                }
+                pending = still;
             }
             Ok(Outcome::Ack(format!(
                 "{mine}; at the same instant {ts}{}{}",
@@ -6345,7 +6457,7 @@ impl Db {
     /// something and takes `&mut self`.
     pub fn is_read(stmt: &Statement) -> bool {
         match stmt {
-            Statement::Select(_) | Statement::ShowHealth => true,
+            Statement::Select(_) | Statement::ShowHealth | Statement::BackupStatus { .. } => true,
             Statement::Explain { inner, .. } | Statement::Local(inner) => Self::is_read(inner),
             _ => false,
         }
@@ -6374,6 +6486,7 @@ impl Db {
             // Dials every peer: under the write lock that held every
             // reader on the node for as long as a peer took to answer.
             Statement::ShowHealth => Ok(Outcome::Ack(self.show_health())),
+            Statement::BackupStatus { ts } => Ok(Outcome::Ack(self.backup_status(ts))),
             Statement::Local(inner) => self.run_read(*inner, sql, params),
             Statement::Explain { analyze, inner } => match *inner {
                 Statement::Select(sel) => {
@@ -6748,13 +6861,16 @@ impl Db {
                 let n = self.flush(&collection)?;
                 Ok(Outcome::Ack(format!("{n} shard(s) flushed")))
             }
-            Statement::Backup { to, keep, as_of, cluster } => {
+            Statement::Backup { to, keep, as_of, cluster, detached } => {
                 if cluster {
                     self.backup_cluster(&to, keep)
+                } else if detached {
+                    self.backup_detached(&to, keep, as_of)
                 } else {
                     self.backup(&to, keep, as_of)
                 }
             }
+            Statement::BackupStatus { ts } => Ok(Outcome::Ack(self.backup_status(ts))),
             Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
             Statement::VerifyBackup { from, node, as_of } => {
                 self.verify_backup(&from, node.as_deref(), as_of)
@@ -9167,6 +9283,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::PromoteShard { .. } => "PROMOTE SHARD",
         Statement::ReplaceCopy { .. } => "REPLACE COPY",
         Statement::VerifyBackup { .. } => "VERIFY BACKUP",
+        Statement::BackupStatus { .. } => "BACKUP STATUS",
         _ => "this statement",
     }
 }

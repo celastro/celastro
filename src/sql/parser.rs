@@ -244,6 +244,15 @@ impl<'a> Parser<'a> {
             return Ok(Statement::MergeShards { collection, a, b });
         }
         if self.eat_kw("BACKUP") {
+            if self.eat_kw("STATUS") {
+                return match self.literal()? {
+                    Value::Int(n) if n >= 0 => Ok(Statement::BackupStatus { ts: n as u64 }),
+                    other => Err(Error::Sql(format!(
+                        "BACKUP STATUS wants an instant, the integer a BACKUP reported, not {}",
+                        crate::json::to_string(&other)
+                    ))),
+                };
+            }
             let cluster = self.eat_kw("CLUSTER");
             self.expect_kw("TO")?;
             let to = self.destination()?;
@@ -279,7 +288,15 @@ impl<'a> Parser<'a> {
                     "BACKUP CLUSTER chooses the instant itself; AS OF is for one node".into(),
                 ));
             }
-            return Ok(Statement::Backup { to, keep, as_of, cluster });
+            let detached = self.eat_kw("DETACHED");
+            if detached && (cluster || as_of.is_none()) {
+                return Err(Error::Sql(
+                    "DETACHED is for one node's backup at an instant given with AS OF, the form \
+                     a cluster backup sends its peers"
+                        .into(),
+                ));
+            }
+            return Ok(Statement::Backup { to, keep, as_of, cluster, detached });
         }
         if self.eat_kw("RESTORE") {
             self.expect_kw("FROM")?;

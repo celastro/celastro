@@ -2746,3 +2746,82 @@ fn a_replica_count_raised_hands_the_collection_to_a_follower_that_never_had_it()
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A cluster backup with a peer that has become a black hole -- its port
+/// accepting and answering nothing -- answers within its patience naming
+/// that peer as NOT backed up, and the others' backups verify at the
+/// instant; before, the coordinator waited on that peer with no deadline.
+#[test]
+fn a_cluster_backup_names_a_silent_peer_and_answers() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("cbs-a");
+    let b = Node::start("cbs-b");
+    let c = Node::start("cbs-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let dest = dir("cbs-dest");
+    // c becomes a black hole: its port held by a listener that never
+    // answers, and a's pooled connection to it gone with the process.
+    let c_url = c.url.clone();
+    let c_port: u16 = c.url.rsplit(':').next().unwrap().parse().unwrap();
+    let c_dir = c.dir.clone();
+    drop(c);
+    settle();
+    let hole = std::net::TcpListener::bind(("127.0.0.1", c_port)).unwrap();
+    hole.set_nonblocking(true).unwrap();
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding = {
+        let plug = plug.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    held.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(held);
+        })
+    };
+    let t0 = std::time::Instant::now();
+    let out = a.exec(&format!("BACKUP CLUSTER TO '{}'", dest.display())).unwrap();
+    let m = match out.finished().unwrap() {
+        Outcome::Ack(m) => m,
+        other => panic!("{other:?}"),
+    };
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(60), "the cluster backup waited {took:?}");
+    let ts: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert!(m.contains(&format!("{}: backup {ts} ", b.url)), "{m}");
+    assert!(m.contains(&format!("NOT on {c_url}")), "{m}");
+    for n in [&a, &b] {
+        let sql = format!("VERIFY BACKUP '{}' NODE '{}' AS OF {ts}", dest.display(), n.url);
+        let v = match a.exec(&sql).unwrap().finished().unwrap() {
+            Outcome::Ack(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(v.starts_with(&format!("verified backup {ts} of node")), "{v}");
+    }
+    // Refused at the statement or in its deferred reading, either way
+    // naming the backup that is not there.
+    let e = match a.exec(&format!("VERIFY BACKUP '{}' NODE '{c_url}' AS OF {ts}", dest.display())) {
+        Err(e) => e.to_string(),
+        Ok(o) => o.finished().unwrap_err().to_string(),
+    };
+    assert!(e.contains("no complete backup"), "{e}");
+    plug.store(false, Ordering::Relaxed);
+    holding.join().unwrap();
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&c_dir);
+    let _ = std::fs::remove_dir_all(&dest);
+}

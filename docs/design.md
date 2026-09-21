@@ -2149,6 +2149,27 @@ decides those); the process refuses core dumps from its first line.
 (6) This list; the README says "reviewed in-tree, unaudited outside
 it".
 
+**B2: the backup under a lost node and under a load (0.68.0).** Two
+drills on kind, `backupnode` and `backupload` (celres-results.md), with
+the pods on a shared claim so a cluster backup lands in one place. The
+first found the defect the entry was written for: `BACKUP CLUSTER`
+asked each peer for its copy in one wire call armed with no deadline --
+"a copy takes what it takes" -- so a peer cut off before or during its
+copy was a call that never returned, and the drill waited 400 seconds
+for nothing. The remedy is not a deadline on the copy, which a large
+shard could exceed, but a copy that can be asked about: a peer is sent
+`BACKUP TO ... AS OF <instant> DETACHED` (fifteen seconds to answer,
+which a peer that cannot be reached does not), runs the copy on a
+thread of its own and keeps the outcome by instant; the coordinator
+polls `BACKUP STATUS <instant>` every two seconds with an eight-second
+deadline, and six polls unanswered in a row -- about a minute -- is a
+peer named `NOT on` as silent, its backup absent (a record is written
+last, so a copy cut short claims nothing and `RESTORE ... AS OF` refuses
+it by name), the others' standing. A peer from before 0.68.0 does not
+know `DETACHED` and is asked the old way, bounded at ten minutes. The
+wire test turns a peer into a black hole and expects the answer within
+a minute; on the box it comes in fourteen seconds. B2_LOAD_NUMBERS
+
 ## A worked query
 
 ```sql

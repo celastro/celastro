@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.68.0 — 2026-09-21
+
+**A cluster backup no longer waits forever for a peer.** `BACKUP
+CLUSTER` asked each peer for its copy in one call with no deadline, so
+a peer cut off before or during its copy was a cluster backup that
+never answered (the drill waited 400 s and gave up). Each peer's copy
+is started detached now (`BACKUP TO ... AS OF <instant> DETACHED`, the
+copy on a thread of the peer's own) and polled with `BACKUP STATUS
+<instant>` every two seconds; a peer that cannot be reached within
+fifteen seconds to start, whose copy fails, or that answers no poll for
+a minute is named `NOT on` and the others' backups stand. A peer from
+before this release is asked the old way, bounded at ten minutes.
+
 ## 0.67.0 — 2026-09-21
 
 **The crypto module reviewed in-tree, and what the review found fixed.**

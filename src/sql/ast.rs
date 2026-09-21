@@ -75,6 +75,17 @@ pub enum Statement {
         keep: Option<usize>,
         as_of: Option<u64>,
         cluster: bool,
+        /// `DETACHED`: the copy runs on a thread of the node's own and the
+        /// statement answers at once; `BACKUP STATUS <instant>` says how
+        /// it went. What a cluster backup sends its peers, so a peer that
+        /// falls silent is noticed by a poll rather than waited for.
+        detached: bool,
+    },
+    /// `BACKUP STATUS <instant>`: how a detached backup at that instant
+    /// is going on this node -- running, done with its answer, failed with
+    /// its error, or none started.
+    BackupStatus {
+        ts: u64,
     },
     /// `RESTORE FROM '<path or s3://bucket/prefix>' [NODE '<address>'] [AS OF
     /// <ts>]` -- into an empty database, this node's newest complete backup

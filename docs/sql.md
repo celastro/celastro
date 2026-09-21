@@ -375,7 +375,14 @@ restored backup 7331102761890652160 of node `local` from /mnt/backups: 1 collect
 A cluster is backed up node by node, each under its own name; `BACKUP
 CLUSTER TO` sent to one node backs every data node up at one instant,
 so the set restores to one cut with `RESTORE FROM ... AS OF <that
-instant>` on each:
+instant>` on each. Each peer's copy is started detached and polled
+until it is done; a peer that cannot be reached within fifteen seconds,
+whose copy fails, or that falls silent for a minute while copying is
+named `NOT on` in the answer, and the others' backups stand -- a set
+with a node missing is not one cut, and the answer says which. `BACKUP
+TO ... AS OF <instant> DETACHED` is the form a peer is sent (its copy on
+a thread of its own, the statement answering at once) and `BACKUP
+STATUS <instant>` says how it went there:
 
 ```sql
 BACKUP CLUSTER TO '/mnt/backups';
