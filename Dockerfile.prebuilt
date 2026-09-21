@@ -1,15 +1,19 @@
 # celastro in a container, from a binary already built: the image stage of
 # Dockerfile with the build stage replaced by a COPY, for an architecture
-# this machine cross-compiles for (scripts/image.sh builds the arm64 image
-# this way). The final stage is Dockerfile's, line for line in effect.
+# this machine cross-compiles for. scripts/image.sh stages the binaries,
+# the licence and the notice in a directory of their own and builds with
+# that as the context (the repository's .dockerignore is an allowlist that
+# does not name target/), so this file copies from the context root.
 #
-#   docker build --platform linux/arm64 -f Dockerfile.prebuilt \
-#     --build-arg BINDIR=target/aarch64-unknown-linux-musl/release -t celastro:arm64 .
+#   docker buildx build --platform linux/arm64 -f Dockerfile.prebuilt -t celastro:arm64 dist/arm64
+#
+# The staging stage runs on the build machine's own platform: it only
+# copies and chmods, and an arm64 alpine could not run here without an
+# emulator. The final stage is Dockerfile's, line for line in effect.
 
-FROM alpine:3.21 AS stage
-ARG BINDIR
-COPY $BINDIR/celastro /celastro
-COPY $BINDIR/celastro-cli /celastro-cli
+FROM --platform=$BUILDPLATFORM alpine:3.21 AS stage
+COPY celastro /celastro
+COPY celastro-cli /celastro-cli
 COPY LICENSE /LICENSE
 COPY COPYRIGHT /COPYRIGHT
 RUN chmod 0755 /celastro /celastro-cli && chmod 0644 /LICENSE /COPYRIGHT \

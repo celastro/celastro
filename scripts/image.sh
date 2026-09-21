@@ -18,19 +18,23 @@ src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$src"
 case $cmd in
   build)
-    docker build -q -t "$img:$v-amd64" .
+    export DOCKER_BUILDKIT=1
+    docker build -q --provenance=false -t "$img:$v-amd64" .
     RUSTFLAGS="-C strip=symbols -C linker=aarch64-linux-gnu-gcc" \
       cargo build -q --release --locked --offline --target aarch64-unknown-linux-musl --bin celastro --bin celastro-cli
-    docker build -q --platform linux/arm64 -f Dockerfile.prebuilt \
-      --build-arg BINDIR=target/aarch64-unknown-linux-musl/release -t "$img:$v-arm64" .
+    # A context of its own: the repository's .dockerignore is an allowlist
+    # that keeps target/ out, and the prebuilt image copies from the root.
+    rm -rf dist/arm64; mkdir -p dist/arm64
+    cp target/aarch64-unknown-linux-musl/release/celastro target/aarch64-unknown-linux-musl/release/celastro-cli LICENSE COPYRIGHT dist/arm64/
+    docker build -q --provenance=false --platform linux/arm64 -f Dockerfile.prebuilt -t "$img:$v-arm64" dist/arm64
     echo "built $img:$v-amd64 and $img:$v-arm64" ;;
   push)
     docker push -q "$img:$v-amd64"; docker push -q "$img:$v-arm64"
-    for tag in "$v" latest; do
-      docker manifest rm "$img:$tag" >/dev/null 2>&1 || true
-      docker manifest create "$img:$tag" "$img:$v-amd64" "$img:$v-arm64" >/dev/null
-      docker manifest push "$img:$tag" >/dev/null
-    done
+    # One index over the two, made in the registry by buildx's imagetools
+    # (`docker manifest create` refuses an image BuildKit stored as an
+    # index of its own).
+    docker buildx imagetools create -t "$img:$v" -t "$img:latest" "$img:$v-amd64" "$img:$v-arm64" >/dev/null
+    docker buildx imagetools inspect "$img:$v" | grep -E "Platform:" | sed 's/^ *//' | sort -u
     echo "pushed $img:$v and $img:latest for amd64 and arm64" ;;
   *) echo "unknown command: $cmd" >&2; exit 1 ;;
 esac
