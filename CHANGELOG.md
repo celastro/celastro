@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.64.1 — 2026-09-21
+
+**The steward's first replacement no longer stops it.** The read lock
+that produced the replacement plan was held through the loop that
+takes the write lock to run it, so the steward stood still at its
+first `REPLACE COPY`, renewed no lease, and every node refused writes
+a lease later. Found by the `replaced` drill on 0.64.0, which is not a
+release to run with `CELASTRO_AUTO_FAILOVER=on` and a follower away
+for longer than `CELASTRO_REPLACE_SECS`.
+
 ## 0.64.0 — 2026-09-21
 
 **A statement whose every shard is on one other node goes there whole,

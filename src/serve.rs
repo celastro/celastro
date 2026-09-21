@@ -2067,7 +2067,12 @@ fn steward_sweep(
     if lost.is_empty() {
         return;
     }
-    for (collection, shard, old, new) in read(db).replacement_plan(&lost, answered) {
+    // The plan in a binding of its own: as the loop's expression the read
+    // guard lived through the body, and the write below waited on it --
+    // the steward stood still at its first replacement, renewed no lease,
+    // and every node refused writes a lease later.
+    let plan = read(db).replacement_plan(&lost, answered);
+    for (collection, shard, old, new) in plan {
         let sql = format!("REPLACE COPY OF SHARD {shard} OF {collection} ON '{old}' WITH '{new}'");
         let out = write(db).execute_with(&sql, &[]);
         let answer = out.and_then(|o| o.finished_with(db)).map(|o| match o {
