@@ -11,7 +11,7 @@ describes them. What differs is who writes that down and starts it.
 |---|---|---|
 | [`celastro install`](#the-binary-and-celastro-install) | the binary writes its own systemd service | a host you can ssh to; the simplest, and what the others call |
 | [cloud-init](cloud-init/celastro.yaml) | the install at a machine's first boot, from user-data | machines made by a cloud or a plan, addresses known up front |
-| [Ansible](ansible/) | a thin role: the binary onto each host, then the install, one host at a time | several hosts whose addresses live in an inventory; rolling upgrades |
+| [over ssh](ssh/celastro-cluster.sh) | a shell script: the binary onto each host, then the install, one host at a time | several hosts, whether or not their addresses were known up front; rolling upgrades |
 | [podman quadlet](quadlet/celastro.container) | the published image, run by systemd through podman | a host that runs images rather than binaries |
 | [Helm chart](chart/celastro/README.md) | a StatefulSet of nodes with Services, Secrets, TLS, backups | Kubernetes |
 
@@ -23,7 +23,7 @@ notice) with a `SHA256SUMS`: the same static binaries the image
 `ghcr.io/celastro/celastro:<version>` runs, taken out of it. On the host:
 
 ```sh
-v=0.71.0
+v=0.72.0
 curl -fsSL "https://github.com/celastro/celastro/releases/download/v$v/celastro-$v-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/').tar.gz" \
   | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN='a-long-random-token' celastro install
@@ -74,33 +74,52 @@ addresses are known before the machines exist -- a static network, a
 plan that assigns them, names your DNS will resolve -- since each
 machine's file needs its own address and the whole list. When they are
 not, install one node per machine with it and attach them afterwards
-from any console (`ATTACH NODE 'tcp://10.0.0.3'`), or use the Ansible
-role, which reads the addresses from its inventory once the machines
-are up. cloud-init runs once: an upgrade is the install command by
-hand, or the role.
+from any console (`ATTACH NODE 'tcp://10.0.0.3'`), or use [the ssh
+script](#several-hosts-over-ssh), which takes the addresses on its
+command line once the machines exist. cloud-init runs once: an upgrade
+is the install command by hand, or the script.
 
-## Ansible
+## Several hosts, over ssh
 
-[ansible/celastro.yml](ansible/celastro.yml) and the role beside it put
-the release (or a binary of your own, `celastro_binary`) on every host
-of the `celastro` group and run the install on each, one host at a
-time, each waited for before the next; a last play asks every node
-whether it has verified every other. [ansible/inventory.example.yml](ansible/inventory.example.yml)
-is the inventory's shape and [ansible/roles/celastro/defaults/main.yml](ansible/roles/celastro/defaults/main.yml)
-every setting. The tokens go in a vault. TLS and the keys are files on
-the machine running the play, copied to each host for the install.
+[ssh/celastro-cluster.sh](ssh/celastro-cluster.sh) is the install above
+run on one host after another: the release binary onto each host
+(checked against the release's `SHA256SUMS`), then `celastro install`
+with that node's own address and the list of every node, then the next
+host. The install returns only once its node answers, so a cluster
+stays up through the run; when every node is installed the script asks
+each one whether it has verified every other, and fails naming the node
+that has not.
 
 ```sh
-cd deploy/ansible && cp inventory.example.yml inventory.yml   # fill it in
-ansible-playbook -i inventory.yml celastro.yml
+CELASTRO_TOKEN='a-long-random-token' CELASTRO_WIRE_TOKEN='another' \
+  deploy/ssh/celastro-cluster.sh 10.0.0.2 10.0.0.3 10.0.0.4
 ```
 
-The same play with a new `celastro_version` is the rolling upgrade;
-with changed settings, the rolling change. Every run installs (there
-is no "already installed, nothing to do"): the binary is replaced, the
-settings rewritten, the service restarted, node by node. Needs
-ansible-core 2.11 or later on the machine running it and Python on the
-hosts; nothing else.
+A host is what you ssh to. When the address the nodes reach each other
+at is not that one -- a private network behind a public one -- give the
+pair, ssh target first: `root@203.0.113.10=10.0.0.2`.
+
+The same command with a newer `CELASTRO_VERSION` is the rolling
+upgrade; with changed settings, the rolling change. Every run installs
+(there is no "already installed, nothing to do"): the binary is
+replaced, the settings rewritten, the service restarted, node by node.
+
+The rest is environment variables, each listed at the top of the
+script: `CELASTRO_TLS_DIR` and `CELASTRO_CLIENT_AUTH`,
+`CELASTRO_MASTER_KEY` and `CELASTRO_DATA_KEY` (files here, copied to
+each host for the install and taken away again),
+`CELASTRO_ROLE=coordinator`, `CELASTRO_ENV` for anything in
+[docs/tuning.md](../docs/tuning.md), `CELASTRO_BINARY` to send a binary
+of your own instead of fetching a release. The tokens are read from the
+environment and reach the hosts on ssh's stdin, so they are in no
+command line, here or there.
+
+Needs ssh here, and curl, tar and systemd there. Nothing else on either
+side: no agent, no interpreter, no inventory, and no state on the hosts
+but the service itself. If you already run a configuration manager,
+what is worth taking from the script is the little it does per host --
+one `celastro install` -- and the address list it builds; a role or a
+manifest around that command will be shorter than this file.
 
 ## podman quadlet
 
@@ -130,22 +149,37 @@ what was verified and how.
 
 ## What was verified
 
-For 0.71.0, on this repository's own test machine (Debian 13, amd64,
-systemd 257, podman 4.9):
+For 0.72.0, on this repository's own test machines:
 
-- `celastro install` as root: one node, then the same host again with
-  a new setting (the service restarted on the rewritten settings with
-  the data kept, the shape of an upgrade), then with `--tls` and
-  `--client-auth` as a cluster of one, then `--no-start`; a backup and
-  `SHOW HEALTH` under the unit's hardening (`ProtectSystem=strict`,
-  the data directory the one writable path); the journal without the
-  token; the refusal when not root.
-- The Ansible role against that host: the release fetched and checked
-  against `SHA256SUMS`, the install, the health wait; the play again
-  with `celastro_binary` as the restart with the data kept; the
-  refusal without a token before anything is touched.
-- The quadlet: the image under podman, a statement through the
-  console, a stop and a start with the data kept on the named volume.
-- Not yet run on fresh machines: the cloud-init file at first boot,
-  and the role forming a cluster over several hosts. Both are the same
-  install with the addresses filled in; they are next.
+- `celastro install` as root (Debian 13, amd64, systemd 257): one node,
+  then the same host again with a new setting (the service restarted on
+  the rewritten settings with the data kept, the shape of an upgrade),
+  then with `--tls` and `--client-auth` as a cluster of one, then
+  `--no-start`; a backup and `SHOW HEALTH` under the unit's hardening
+  (`ProtectSystem=strict`, the data directory the one writable path);
+  the journal without the token; the refusal when not root.
+- **cloud-init on three fresh machines** (Ubuntu 24.04, amd64, one
+  region, a private network between them): each machine fetched the
+  release, checked it against `SHA256SUMS` and was serving 80 to 90
+  seconds after it was created, its journal carrying no token.
+- **[ssh/celastro-cluster.sh](ssh/celastro-cluster.sh) over those same
+  three machines**, reached at their public addresses with their private
+  ones as the wire: the cluster formed in 19 s and every node had
+  verified the other two; a collection split three ways put one shard on
+  each host and a row in each range counted as 3 from another node; the
+  same command again was a rolling change of 15 s, through which a probe
+  at the third node answered correctly every time and never saw an
+  error. Then, over the same cluster: a binary of one's own instead of a
+  release (`CELASTRO_BINARY`, 12 s, replaced under the running service
+  with the data kept), and `CELASTRO_TLS_DIR` with
+  `CELASTRO_CLIENT_AUTH=on` (18 s, the wire re-formed with client
+  certificates, `/etc/celastro/tls` readable by root and the service
+  user alone, the staged copies gone, the data still there over https).
+  Both refusals: no console token, and several hosts with no wire token,
+  each caught before any host is touched.
+- The quadlet: the image under podman, a statement through the console,
+  a stop and a start with the data kept on the named volume.
+- Not covered: more than three machines; a machine added to a cluster
+  that is already running (`ATTACH NODE` does that, the script installs
+  a set); the key files over several machines, though they are staged
+  the way the certificates are; an ssh user that is not root.

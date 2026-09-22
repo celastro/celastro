@@ -290,12 +290,13 @@ CELASTRO_TOKEN=sixteen-bytes-ok! CELASTRO_WIRE_TOKEN=wire celastro install --roo
 ```
 
 ```
-installed celastro 0.71.0 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
+installed celastro 0.72.0 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
 written under the root; nothing started
 ```
 
-[deploy/](../deploy/README.md) has the install as a cloud-init file, an
-Ansible role and a podman quadlet.
+[deploy/](../deploy/README.md) has the install as a cloud-init file, a
+script that runs it over ssh on one host after another, and a podman
+quadlet.
 
 ## The console's HTTP API
 

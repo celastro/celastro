@@ -120,7 +120,7 @@ other nodes; the sections that follow have each option's details.
 |---|---|---|---|---|
 | **one process** | `cargo install celastro` (Rust 1.75 or later, no dependencies outside `std`), then `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; `run <file>` runs a script of statements with no server, `exec "<SQL>"` one statement, `demo` a guided tour in memory |
 | **a container** | `docker run ... ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
-| **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, an Ansible role and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
+| **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, a script that does it over ssh and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
 | **Kubernetes** | `helm install celastro deploy/chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](deploy/chart/celastro/README.md) |
 
 Upgrades roll one node at a time: two releases with one wire version
@@ -295,7 +295,7 @@ Each release carries a static binary for amd64 and arm64
 binary installs itself as a systemd service:
 
 ```sh
-curl -fsSL https://github.com/celastro/celastro/releases/download/v0.71.0/celastro-0.71.0-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
+curl -fsSL https://github.com/celastro/celastro/releases/download/v0.72.0/celastro-0.72.0-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN=... CELASTRO_WIRE_TOKEN=... celastro install --node 10.0.0.2 --attach 10.0.0.2,10.0.0.3,10.0.0.4
 ```
 
@@ -307,8 +307,8 @@ command with the same list on every host is the cluster; `--tls DIR`,
 NAME=VALUE` carry the rest; the same command from a newer binary, one
 host at a time, is the upgrade. The tokens come from the environment,
 never from a flag. [deploy/](deploy/README.md) has the same install as a
-cloud-init file for a machine's first boot, an Ansible role that takes
-the addresses from its inventory, and a podman quadlet that runs the
+cloud-init file for a machine's first boot, a shell script that runs it
+over ssh on one host after another, and a podman quadlet that runs the
 image under systemd instead.
 
 ## Kubernetes and containers

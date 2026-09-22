@@ -6,6 +6,34 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.72.0 — 2026-09-22
+
+**The Ansible role is gone; a shell script over ssh takes its place.**
+`deploy/ansible/` is removed and `deploy/ssh/celastro-cluster.sh` does
+what it did: the release binary onto each host, checked against the
+release's `SHA256SUMS`, then `celastro install` with that node's own
+address and the list of every node, one host at a time and each waited
+for before the next, then every node asked whether it has verified
+every other.
+
+```sh
+CELASTRO_TOKEN='a-long-random-token' CELASTRO_WIRE_TOKEN='another' \
+  deploy/ssh/celastro-cluster.sh 10.0.0.2 10.0.0.3 10.0.0.4
+```
+
+It needs ssh here and curl, tar and systemd there, where the role
+needed ansible-core here and Python on every host -- an interpreter on
+each machine in order to install a binary that has none. Its settings
+are environment variables rather than inventory variables, listed at
+the top of the script, and a host whose ssh address is not the address
+the nodes reach it at is written `root@203.0.113.10=10.0.0.2`. Moving
+off the role is the host list on a command line and the tokens in the
+environment rather than a vault; `celastro install` itself is
+unchanged, so a cluster the role installed is one the script upgrades.
+If you would rather keep Ansible, the role was thin on purpose -- one
+`celastro install` per host -- and wrapping that command in a role of
+your own is shorter than the one that was here.
+
 ## 0.71.0 — 2026-09-21
 
 **The binary installs itself, and the releases carry it.** `celastro

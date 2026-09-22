@@ -12,13 +12,14 @@
 # the addresses have to be known before the machines exist: a static
 # network, a plan that assigns them, or names your DNS will resolve. When
 # they are not, install one node per machine with this file and attach
-# them afterwards with `ATTACH NODE` from any console, or use the Ansible
-# role beside this file, which reads the addresses from its inventory.
+# them afterwards with `ATTACH NODE` from any console, or use
+# ../ssh/celastro-cluster.sh, which takes the addresses on its command
+# line once the machines exist.
 write_files:
   - path: /root/celastro-install.env
     permissions: "0600"
     content: |
-      CELASTRO_VERSION=0.71.0
+      CELASTRO_VERSION=0.72.0
       # The token every client presents: at least sixteen printable bytes,
       # the same on every node of a cluster.
       CELASTRO_TOKEN=change-this-to-a-long-random-token
