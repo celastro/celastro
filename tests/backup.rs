@@ -478,3 +478,90 @@ fn a_pin_held_through_a_compaction_keeps_the_segments_it_named() {
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&d2);
 }
+
+/// B3: a backup does not read a segment it is not copying.
+///
+/// The record carries a SHA-256 beside every size, and until now a segment
+/// already in the destination's pool was read and hashed in full to fill
+/// that column, uploading nothing. On the second backup of a database that
+/// is the whole of it, and on every backup after. The hash now comes from
+/// the record the last backup wrote, which is what a restore already
+/// trusts, and the record it produces is byte for byte the one it produced
+/// before.
+#[test]
+fn a_repeat_backup_takes_its_hashes_from_the_last_record_instead_of_reading_the_pool() {
+    let src = dir("b3-src");
+    let dest = dir("b3-dest");
+    let mut db = open(&src);
+    setup(&mut db, 30);
+
+    let first = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    assert!(first.contains("0 already there"), "{first}");
+    assert!(!first.contains("not read again"), "nothing to recall on a first backup: {first}");
+    let ts1: u64 = first.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let record_of = |ts: u64| -> String {
+        std::fs::read_to_string(
+            dest.join("nodes")
+                .join("local")
+                .join("backups")
+                .join(format!("{ts:020}"))
+                .join("BACKUP"),
+        )
+        .unwrap()
+    };
+    let hashes_of = |ts: u64| -> Vec<(String, String)> {
+        record_of(ts)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                let (k, _len, h) = (f.next()?, f.next()?, f.next()?);
+                k.starts_with("pool/").then(|| (k.to_string(), h.to_string()))
+            })
+            .collect()
+    };
+    let first_hashes = hashes_of(ts1);
+    assert!(!first_hashes.is_empty(), "the first backup recorded no pool objects");
+
+    // Nothing changes, so the second backup copies nothing and every pool
+    // object is one it does not read.
+    let second = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    assert!(second.contains("0 segment(s) copied"), "{second}");
+    assert!(
+        second.contains(&format!("{} of them not read again", first_hashes.len())),
+        "every already-present segment should have come from the last record: {second}"
+    );
+    let ts2: u64 = second.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+    // The hashes are the same ones, which is the whole claim: the record
+    // means exactly what it meant when it was read off the files.
+    assert_eq!(hashes_of(ts2), first_hashes, "a recalled hash differs from the one it replaced");
+
+    // And the record is still a record: verify reads every object back.
+    let v = ack(&mut db, &format!("VERIFY BACKUP '{}'", dest.display()));
+    assert!(v.contains("intact") || v.contains("verified"), "{v}");
+
+    // A new segment is still copied and still hashed from its file, beside
+    // the recalled ones.
+    for i in 200..210 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    db.execute("FLUSH items").unwrap();
+    let third = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    assert!(third.contains("1 segment(s) copied"), "{third}");
+    assert!(third.contains("not read again"), "{third}");
+    let ts3: u64 = third.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let third_hashes = hashes_of(ts3);
+    assert_eq!(third_hashes.len(), first_hashes.len() + 1, "the new segment is in the record");
+    for (k, h) in &first_hashes {
+        assert!(third_hashes.contains(&(k.clone(), h.clone())), "{k} lost its hash");
+    }
+
+    // The restore is the proof that matters: it checks every object against
+    // the record's hash, and the record's hashes were not read off the files
+    // this time.
+    let d2 = dir("b3-dst2");
+    let mut db2 = open(&d2);
+    let r = ack(&mut db2, &format!("RESTORE FROM '{}'", dest.display()));
+    assert!(r.contains(&format!("restored backup {ts3}")), "{r}");
+    assert_eq!(ids(&mut db2, "SELECT id FROM items LIMIT 1000").len(), 44);
+}

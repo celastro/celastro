@@ -150,6 +150,48 @@ pub(crate) fn job(
     Deferred::new(move || run(target, ts, node, catalog, key, colls, keep))
 }
 
+/// What the last backup of this node recorded: object key to its size and
+/// SHA-256, as hex.
+///
+/// A pool object is immutable -- a segment id never recurs within a shard,
+/// and one present at another size is already refused -- so a hash recorded
+/// for a key at a size is the hash of that key at that size for good. That
+/// is what lets a backup fill the record for an object it is not copying
+/// without reading it: today it reads and hashes every segment already in
+/// the pool, which is the whole database on the second backup and every one
+/// after, to upload nothing.
+///
+/// The hash means exactly what it meant before. It described the local file
+/// then and describes the same bytes now, because the object was put from
+/// that file and the file cannot change. Empty for a destination with no
+/// previous backup, a record that cannot be read, or a version 1 record
+/// with no hashes -- each of which falls back to reading the file.
+fn previous_hashes(
+    target: &Target,
+    mine: &str,
+) -> std::collections::HashMap<String, (u64, String)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(latest) = target.store.get(&target.key(&format!("{mine}LATEST"))) else {
+        return out;
+    };
+    let Ok(ts) = String::from_utf8_lossy(&latest).trim().parse::<u64>() else {
+        return out;
+    };
+    let Ok(record) = target.store.get(&target.key(&format!("{mine}backups/{}/BACKUP", ts_key(ts))))
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&record).lines().skip(1) {
+        let Some((key, rest)) = line.split_once('\t') else { continue };
+        let Some((len, hash)) = rest.split_once('\t') else { continue };
+        let Ok(len) = len.parse::<u64>() else { continue };
+        if !hash.is_empty() {
+            out.insert(key.to_string(), (len, hash.to_string()));
+        }
+    }
+    out
+}
+
 fn run(
     target: Target,
     ts: u64,
@@ -163,6 +205,10 @@ fn run(
     let own = format!("{mine}backups/{}/", ts_key(ts));
     let mut files: Vec<(String, u64, String)> = Vec::new();
     let (mut copied, mut present, mut bytes, mut shards) = (0usize, 0usize, 0u64, 0usize);
+    // What the last backup of this node already knows, so a segment that is
+    // in the pool at its size is not read again to fill in its hash.
+    let known = previous_hashes(&target, &mine);
+    let mut recalled = 0usize;
     let put = |key: String, data: &[u8], files: &mut Vec<(String, u64, String)>| -> Result<()> {
         target.store.put(&target.key(&key), data)?;
         files.push((key, data.len() as u64, hex(&sha256(data))));
@@ -185,7 +231,19 @@ fn run(
                         match target.store.size(&target.key(&key))? {
                             Some(n) if n == len => {
                                 present += 1;
-                                crate::objstore::file_sha256(&path)?
+                                // The object is there at its size and is not
+                                // being copied. Its hash is whatever the last
+                                // record said it was, if that record said.
+                                match known.get(&key) {
+                                    Some((l, h)) if *l == len => {
+                                        recalled += 1;
+                                        (len, h.clone())
+                                    }
+                                    _ => {
+                                        let (l, h) = crate::objstore::file_sha256(&path)?;
+                                        (l, hex(&h))
+                                    }
+                                }
                             }
                             Some(n) => {
                                 return Err(Error::Storage(format!(
@@ -199,7 +257,7 @@ fn run(
                                 let out = target.store.put_file(&target.key(&key), &path)?;
                                 copied += 1;
                                 bytes += out.0;
-                                out
+                                (out.0, hex(&out.1))
                             }
                         }
                     }
@@ -222,10 +280,10 @@ fn run(
                                 bytes += data.len() as u64;
                             }
                         }
-                        (data.len() as u64, sha256(&data))
+                        (data.len() as u64, hex(&sha256(&data)))
                     }
                 };
-                files.push((key, len, hex(&hash)));
+                files.push((key, len, hash));
             }
             for (id, log) in &ex.deletes {
                 if let Some(data) = log {
@@ -258,9 +316,17 @@ fn run(
     target.store.put(&target.key(&format!("{mine}LATEST")), format!("{ts}\n").as_bytes())?;
     let mut ack = format!(
         "backup {ts} to {}: {} collection(s), {shards} shard(s), {copied} segment(s) copied \
-         ({bytes} bytes), {present} already there",
+         ({bytes} bytes), {present} already there{}",
         target.display,
-        colls.len()
+        colls.len(),
+        // Worth saying out loud: it is the difference between an
+        // incremental that reads what it copies and one that reads the
+        // whole database to copy nothing.
+        if recalled > 0 {
+            format!(" ({recalled} of them not read again, their hash from the last record)")
+        } else {
+            String::new()
+        }
     );
     if let Some(keep) = keep {
         let held: Vec<String> = colls

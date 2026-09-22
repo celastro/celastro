@@ -80,6 +80,21 @@ is now dropped by the next open and logged, which costs no store
 access. `celastro_data_key_ring_size` is a new gauge: above zero is a
 rotation nobody finished.
 
+**A repeat backup no longer reads the whole database to copy nothing.**
+The record carries a SHA-256 beside every size, and a segment already in
+the destination's pool was read and hashed in full to fill that column
+while uploading nothing -- so the second backup of a database read all
+of it, and so did every backup after. The hash now comes from the
+record the last backup wrote. Three backups of a 36.6 MB corpus with
+nothing changing between them read 35.7 MB each before this; they now
+read 35.7 MB, then nothing, then nothing.
+
+Nothing about the record changed, and `VERIFY BACKUP` still reads every
+object back. A backup falls back to reading the file where it must: no
+previous backup at that destination, a record it cannot read, a version
+1 record with no hashes, or a key the last record does not name at the
+same size. The ack says how many hashes it recalled.
+
 ## 0.71.0 — 2026-09-21
 
 **The binary installs itself, and the releases carry it.** `celastro

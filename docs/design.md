@@ -2306,11 +2306,24 @@ What the pin costs is memory and disk, which is what the paragraph above
 measured correctly: peak resident memory 356 MB with no backup and 487
 MB with one, and the data directory 229 against 281 MB (with compaction
 off, 337 against 553 MB, since nothing retires the pinned segments).
-One thing the isolation found on its way past: a backup to a
-destination whose pool already holds every segment copies nothing and
-still reads and SHA-256s all of them, to fill the record's checksum
-column -- 78 MB in under a second here, but it scales with what the
-database holds rather than with what changed.
+One thing the isolation found on its way past, fixed as B3: a backup to
+a destination whose pool already held every segment copied nothing and
+still read and SHA-256'd all of them, to fill the record's checksum
+column -- work proportional to what the database holds rather than to
+what changed, on the second backup and every one after. A pool object
+is immutable (a segment id never recurs within a shard, and one present
+at another size is refused rather than trusted), so the hash recorded
+for a key at a size is that key's hash for good: a backup now takes it
+from the record the last one wrote, which is already what a restore
+trusts, and reads the file only when there is no previous record, the
+record cannot be read, it is a version 1 record with no hashes, or it
+does not name the key at that size. Measured with `rchar` from
+`/proc/<pid>/io` over three backups of a 36.6 MB corpus with nothing
+changing: 35.7 MB read on each of the three before, and 35.7 then 0.0
+then 0.0 after. The value means what it meant -- it described the local
+file then and the same bytes now -- and `VERIFY BACKUP` still reads
+every object back, which is the thing to run when a destination is in
+doubt.
 
 The store client's read timeout starts after the last write is
 accepted and scales with the object from 0.70.0 (a second per 100 KB
