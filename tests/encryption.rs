@@ -482,3 +482,48 @@ fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&p);
 }
+
+/// A ring with nothing behind it retires itself at the next open.
+///
+/// The ring exists so an archived object sealed under an older data key
+/// still opens. With no index at the archived tier there is no such object,
+/// so keeping the old keys only widens what a stolen KEY and master open.
+/// The catalog answers that, so the check costs no store access.
+#[test]
+fn a_key_ring_with_no_archived_index_retires_itself_at_the_next_open() {
+    let d = dir("ring-self-retire");
+    let m = master(11);
+    {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        db.execute("CREATE COLLECTION docs (id TEXT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO docs VALUES ('{\"id\":\"a\",\"n\":1}')").unwrap();
+    }
+    // A rotation would only keep a ring with an archived index, so the ring
+    // is put there by hand: this is about what the next open does with one.
+    let wrapped = std::fs::read(d.join("KEY")).unwrap();
+    let current = celastro::cipher::Cipher::unwrap(&wrapped, &m).unwrap();
+    let mut with_ring = current.without_previous();
+    with_ring.keep_previous(&celastro::cipher::Cipher::generate().unwrap());
+    std::fs::write(d.join("KEY"), with_ring.wrap(&m).unwrap()).unwrap();
+    assert_eq!(
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m)
+            .unwrap()
+            .previous_keys(),
+        1,
+        "the ring is there before the open"
+    );
+
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert_eq!(db.data_key_ring_size(), 0, "the open retired a ring nothing needs");
+    // And it wrote that through, so the next open does not do it again.
+    assert_eq!(
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m)
+            .unwrap()
+            .previous_keys(),
+        0,
+        "KEY on disk no longer keeps the ring"
+    );
+    // The data is still there, which is the thing a wrong retirement breaks.
+    let out = db.execute("SELECT count(*) FROM docs").unwrap();
+    assert!(format!("{out:?}").contains('1'), "{out:?}");
+}

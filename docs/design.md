@@ -2079,7 +2079,28 @@ what CREATE hands a node. The data-key ring: `KEY` in its `CELK2` form
 holds the current key and the previous ones; `open_file`,
 `open_records` and `read_range` try each in turn on failure, so a
 rotation under an archived tier keeps the old key rather than refusing,
-and `key retire` drops the ring. The fuzz remainders found what the
+and `key retire` drops the ring. From 0.72.0 the ring is answerable
+rather than a standing reminder (K1). `key retire` walks the archived
+tier before it drops anything -- one ranged read of a frame per object,
+since a frame authenticates on its own, so the walk costs a `HEAD` and
+a few kilobytes an object rather than the objects -- and refuses while
+any of them still opens only under a previous key, naming the
+collections; `--check` reports and writes nothing, `--force` is the old
+behaviour. A store it cannot reach is a refusal, because the failure
+this command can cause is unreadable data. `key reseal` finishes the
+rotation the other way: the objects still under an old key are fetched,
+opened, sealed under the current one and written back through
+`put_file` so the upload streams, then the ring retires itself; it
+skips what it has already moved, so a failure part way is finished by
+running it again. The seal identity is read off the object key
+(`<prefix><collection>/<shard>/<id>.seg` against `Shard::file_id`'s
+`<shard>/<id>.seg`), so neither command needs a manifest to know what
+an object was sealed as. Both are offline, like the rotation they
+belong to -- a statement would need the node running, which is the
+opposite of when a rotation happens. And a ring nothing *can* need --
+no index at the archived tier at all -- is dropped by the next open,
+which the catalog answers with no store access. `celastro_data_key_ring_size`
+is the gauge to alert on: above zero is a rotation nobody finished. The fuzz remainders found what the
 first sweeps found elsewhere: a capacity from a count the bytes gave
 (the dictionary's index, the cursor's block count) and a sum that
 overflowed, each an end of the process a file could cause; bounded.

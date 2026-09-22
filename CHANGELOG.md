@@ -55,6 +55,31 @@ a field leaves the local it was moved out of, and Rust never drops a
 moved-from value, so nothing wipes it. The README says so in those
 terms. No wire format, no API and no behaviour changed.
 
+**The data-key ring can be asked about, and finished.** A rotation with
+an index at the archived tier keeps the old data key in a ring, because
+the objects in the store are where the rotation does not reach. Until
+now the only thing that knew whether the ring was still needed was
+`SHOW HEALTH`, and `key retire` dropped it on trust.
+
+`celastro key retire <DIR>` now walks the archived tier first and
+**refuses** while any object still opens only under a previous key,
+naming the collections; `--check` reports and writes nothing, `--force`
+is the old behaviour. The walk reads one frame per object rather than
+the object, since a frame authenticates on its own. A store it cannot
+reach is a refusal, not a retirement.
+
+`celastro key reseal <DIR>` finishes the rotation instead of undoing
+it: the objects still under an old key are fetched, sealed again under
+the current one, written back, and the ring retired. It skips what it
+has already moved, so running it again after a failure finishes the
+rest. Both read the tier through the same `CELASTRO_ARCHIVE_*` settings
+a node uses.
+
+A ring that nothing can need -- no index at the archived tier at all --
+is now dropped by the next open and logged, which costs no store
+access. `celastro_data_key_ring_size` is a new gauge: above zero is a
+rotation nobody finished.
+
 ## 0.71.0 — 2026-09-21
 
 **The binary installs itself, and the releases carry it.** `celastro

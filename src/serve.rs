@@ -172,6 +172,15 @@ fn metrics_text(db: &Db) -> String {
         c.statements.load(Relaxed).to_string(),
     );
     line(
+        "celastro_data_key_ring_size",
+        "gauge",
+        "Previous data keys kept so archived objects sealed under them still open. Above zero \
+         after a rotation until `celastro key reseal` and `key retire`; an alert on it catches a \
+         rotation nobody finished.",
+        "",
+        db.data_key_ring_size().to_string(),
+    );
+    line(
         "celastro_statements_failed_total",
         "counter",
         "Statements that were refused or failed.",

@@ -256,8 +256,17 @@ enum Cmd {
     KeyRotate {
         dir: PathBuf,
     },
-    /// `key retire <DIR>`: the previous data keys a rotation kept, dropped.
+    /// `key retire <DIR> [--check] [--force]`: the previous data keys a
+    /// rotation kept, dropped once nothing at the archived tier still
+    /// needs them.
     KeyRetire {
+        dir: PathBuf,
+        check: bool,
+        force: bool,
+    },
+    /// `key reseal <DIR>`: every archived object still under a previous
+    /// data key, sealed again under the current one.
+    KeyReseal {
         dir: PathBuf,
     },
     Check {
@@ -295,6 +304,8 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut json = false;
     let mut port: Option<u16> = None;
     let mut open = false;
+    let mut check = false;
+    let mut force = false;
     let mut shard_bind: Option<String> = None;
     let mut bind: Option<IpAddr> = None;
     let mut attached: Option<u64> = None;
@@ -355,6 +366,18 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                     return Cli::Usage("`--open` takes no value".to_string());
                 }
                 open = true;
+            }
+            "--check" => {
+                if inline.is_some() {
+                    return Cli::Usage("`--check` takes no value".to_string());
+                }
+                check = true;
+            }
+            "--force" => {
+                if inline.is_some() {
+                    return Cli::Usage("`--force` takes no value".to_string());
+                }
+                force = true;
             }
             "--shard-bind" => match value_for(inline.as_deref(), &args, &mut i) {
                 Some(v) => shard_bind = Some(v),
@@ -487,7 +510,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
             (Some("master"), 2) => Cmd::KeyMaster { file: PathBuf::from(&rest[1]) },
             (Some("init"), 2) => Cmd::KeyInit { file: PathBuf::from(&rest[1]) },
             (Some("rotate"), 2) => Cmd::KeyRotate { dir: PathBuf::from(&rest[1]) },
-            (Some("retire"), 2) => Cmd::KeyRetire { dir: PathBuf::from(&rest[1]) },
+            (Some("retire"), 2) => {
+                Cmd::KeyRetire { dir: PathBuf::from(&rest[1]), check, force }
+            }
+            (Some("reseal"), 2) => Cmd::KeyReseal { dir: PathBuf::from(&rest[1]) },
             (Some("rekey"), 3) => {
                 Cmd::KeyRekey { key: PathBuf::from(&rest[1]), master: PathBuf::from(&rest[2]) }
             }
@@ -550,6 +576,18 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     }
     if attached.is_some() && !matches!(cmd, Cmd::Health { .. }) {
         return Cli::Usage("`--attached` only means something to `health`".to_string());
+    }
+    if (check || force) && !matches!(cmd, Cmd::KeyRetire { .. }) {
+        return Cli::Usage(
+            "`--check` and `--force` only mean something to `key retire`".to_string(),
+        );
+    }
+    if check && force {
+        return Cli::Usage(
+            "`key retire --check` writes nothing and `--force` writes without looking; they are \
+             not both"
+                .to_string(),
+        );
     }
     // The demo builds its own database, with build options no persistent
     // database should inherit. Accepting `--dir` alongside it would run the
@@ -710,8 +748,11 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::KeyRotate { dir } = cmd {
         return key_rotate(&dir, json);
     }
-    if let Cmd::KeyRetire { dir } = cmd {
-        return key_retire(&dir, json);
+    if let Cmd::KeyRetire { dir, check, force } = cmd {
+        return key_retire(&dir, check, force, json);
+    }
+    if let Cmd::KeyReseal { dir } = cmd {
+        return key_reseal(&dir, json);
     }
     if let Cmd::Check { dir } = cmd {
         return check_dir(&dir, json);
@@ -755,6 +796,7 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         | Cmd::KeyRekey { .. }
         | Cmd::KeyRotate { .. }
         | Cmd::KeyRetire { .. }
+        | Cmd::KeyReseal { .. }
         | Cmd::Check { .. }
         | Cmd::Install(_) => {
             unreachable!("answered before the database was opened")
@@ -843,6 +885,13 @@ fn failure_report(json: bool, msg: &str) -> (bool, String) {
 // --------------------------------------------------------------------------
 // serve
 // --------------------------------------------------------------------------
+
+/// One acknowledgement line and a success status, for a command whose
+/// whole answer is that line.
+fn ack_ok(json: bool, message: &str) -> i32 {
+    ack(json, message);
+    EXIT_OK
+}
 
 /// One acknowledgement line, in whichever shape the run asked for.
 fn ack(json: bool, message: &str) {
@@ -1562,31 +1611,256 @@ fn key_rotate(dir: &Path, json: bool) -> i32 {
 
 /// `key retire <DIR>`: the previous data keys a rotation kept for the
 /// archived tier dropped from KEY; what is still under them stops opening.
-fn key_retire(dir: &Path, json: bool) -> i32 {
+/// The archived tier's store as the environment configures it, for the
+/// offline key commands. `Ok(None)` means the tier is the local `archive/`
+/// directory, which a rotation's own walk already reaches.
+fn archive_store(
+    json: bool,
+) -> std::result::Result<Option<celastro::objstore::ArchiveHandle>, i32> {
+    let opts = match db_opts() {
+        Ok(o) => o,
+        Err(e) => return Err(fail(json, &e)),
+    };
+    match celastro::objstore::ArchiveHandle::from_opts(&opts.archive) {
+        Ok(h) => Ok(h),
+        Err(e) => Err(fail(json, &format!("the archived tier's store: {e}"))),
+    }
+}
+
+/// What the archived tier says about the ring, or `None` when there is no
+/// store to ask (the tier is local, and a rotation already re-sealed it).
+fn walk_or_report(
+    dir: &Path,
+    cipher: &celastro::cipher::Cipher,
+    json: bool,
+) -> std::result::Result<Option<celastro::cipher::ArchiveWalk>, i32> {
+    let Some(h) = archive_store(json)? else { return Ok(None) };
+    match celastro::cipher::walk_archive(cipher, h.store.as_ref(), &h.prefix) {
+        Ok(w) => Ok(Some(w)),
+        Err(e) => Err(fail(
+            json,
+            &format!(
+                "{}: the archived tier could not be walked: {e}; nothing was changed",
+                dir.display()
+            ),
+        )),
+    }
+}
+
+fn open_ring(dir: &Path, json: bool) -> std::result::Result<celastro::cipher::Cipher, i32> {
+    let master = master_or_fail(json, "key")?;
+    let key_path = dir.join("KEY");
+    let wrapped = match std::fs::read(&key_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(fail(
+                json,
+                &format!("{}: {e} (not an encrypted database?)", key_path.display()),
+            ))
+        }
+    };
+    match celastro::cipher::Cipher::unwrap(&wrapped, &master) {
+        Ok(c) => Ok(c),
+        Err(e) => Err(fail(json, &format!("{}: {e}", key_path.display()))),
+    }
+}
+
+fn key_retire(dir: &Path, check: bool, force: bool, json: bool) -> i32 {
     let master = match master_or_fail(json, "key retire") {
         Ok(m) => m,
         Err(code) => return code,
     };
-    match celastro::cipher::retire_keys(dir, &master) {
-        Ok(0) => {
-            ack(
-                json,
-                &format!("{}: KEY keeps no previous data key; nothing to retire", dir.display()),
-            );
-            EXIT_OK
+    let cipher = match open_ring(dir, json) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    if cipher.previous_keys() == 0 {
+        return ack_ok(
+            json,
+            &format!("{}: KEY keeps no previous data key; nothing to retire", dir.display()),
+        );
+    }
+    // What the archived tier still needs, before anything is dropped. A
+    // store that cannot be reached is a refusal, not a silent retirement:
+    // this command makes archived objects unreadable if it is wrong.
+    let walk = if force {
+        None
+    } else {
+        match walk_or_report(dir, &cipher, json) {
+            Ok(w) => w,
+            Err(code) => return code,
         }
-        Ok(n) => {
-            ack(
+    };
+    if let Some(w) = &walk {
+        if check {
+            let names: Vec<&str> = w.collections.iter().map(String::as_str).collect();
+            let line = if w.under_previous > 0 {
+                format!(
+                    "{}: {} previous data key(s) in the ring, and {} of {} archived object(s) \
+                     still need them, in {}; `celastro key reseal {}` seals those under the \
+                     current key. Nothing was changed",
+                    dir.display(),
+                    cipher.previous_keys(),
+                    w.under_previous,
+                    w.objects,
+                    names.join(", "),
+                    dir.display()
+                )
+            } else {
+                format!(
+                    "{}: {} previous data key(s) in the ring, and none of {} archived object(s) \
+                     needs them; `celastro key retire {}` drops the ring. Nothing was changed",
+                    dir.display(),
+                    cipher.previous_keys(),
+                    w.objects,
+                    dir.display()
+                )
+            };
+            ack(json, &line);
+            // Non-zero while the ring is still needed, so a script can ask
+            // this without reading the line.
+            return if w.under_previous > 0 || !w.unopenable.is_empty() {
+                EXIT_FAIL
+            } else {
+                EXIT_OK
+            };
+        }
+        if !w.unopenable.is_empty() {
+            return fail(
                 json,
                 &format!(
-                    "{}: {n} previous data key(s) dropped from KEY; an archived object still \
-                     sealed under one of them no longer opens",
+                    "{}: {} archived object(s) open under no key this KEY holds, the first {}; \
+                     retiring would not make that worse but would hide it, so it is refused. \
+                     `--force` retires anyway",
+                    dir.display(),
+                    w.unopenable.len(),
+                    w.unopenable.first().map(String::as_str).unwrap_or("?")
+                ),
+            );
+        }
+        if w.under_previous > 0 {
+            let names: Vec<&str> = w.collections.iter().map(String::as_str).collect();
+            return fail(
+                json,
+                &format!(
+                    "{}: {} of {} archived object(s) are still sealed under a previous data key, \
+                     in {}; retiring now would make them unreadable. `celastro key reseal {}` \
+                     seals them under the current key, and this then retires the ring; \
+                     `--force` retires without re-sealing",
+                    dir.display(),
+                    w.under_previous,
+                    w.objects,
+                    names.join(", "),
                     dir.display()
                 ),
             );
-            EXIT_OK
         }
+    }
+    let scope = match &walk {
+        Some(w) => format!("{} archived object(s) checked, all under the current key", w.objects),
+        None if force => "not checked (--force)".to_string(),
+        None => "the archived tier is a local directory, which a rotation re-seals".to_string(),
+    };
+    if check {
+        return ack_ok(
+            json,
+            &format!(
+                "{}: {} previous data key(s) in the ring; {scope}; nothing was changed",
+                dir.display(),
+                cipher.previous_keys()
+            ),
+        );
+    }
+    match celastro::cipher::retire_keys(dir, &master) {
+        Ok(n) => ack_ok(
+            json,
+            &format!("{}: {n} previous data key(s) dropped from KEY; {scope}", dir.display()),
+        ),
         Err(e) => fail(json, &format!("could not retire {}'s keys: {e}", dir.display())),
+    }
+}
+
+/// `key reseal <DIR>`: the archived objects still under a previous data key,
+/// sealed again under the current one, and the ring retired once none is.
+fn key_reseal(dir: &Path, json: bool) -> i32 {
+    let master = match master_or_fail(json, "key reseal") {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let cipher = match open_ring(dir, json) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    if cipher.previous_keys() == 0 {
+        return ack_ok(
+            json,
+            &format!(
+                "{}: KEY keeps no previous data key; every archived object is already under the \
+                 current one",
+                dir.display()
+            ),
+        );
+    }
+    let Some(h) = (match archive_store(json) {
+        Ok(h) => h,
+        Err(code) => return code,
+    }) else {
+        return fail(
+            json,
+            &format!(
+                "{}: no archived tier is configured, so there is nothing in a store to re-seal; \
+                 a rotation re-seals a local `archive/` directory itself",
+                dir.display()
+            ),
+        );
+    };
+    let n = match celastro::cipher::reseal_archive(&cipher, h.store.as_ref(), &h.prefix, dir) {
+        Ok(n) => n,
+        Err(e) => {
+            return fail(
+                json,
+                &format!(
+                    "{}: re-sealing stopped: {e}; the objects done before it are under the \
+                     current key and running this again finishes the rest",
+                    dir.display()
+                ),
+            )
+        }
+    };
+    // Nothing is under a previous key now, so the ring has no purpose. It
+    // is walked again rather than assumed: the re-seal may have raced a
+    // node that archived something under an older key.
+    let left = match walk_or_report(dir, &cipher, json) {
+        Ok(w) => w,
+        Err(code) => return code,
+    };
+    let still = left.as_ref().map(|w| w.under_previous).unwrap_or(0);
+    if still > 0 {
+        return ack_ok(
+            json,
+            &format!(
+                "{}: {n} archived object(s) re-sealed under the current data key; {still} still \
+                 are not -- run it again",
+                dir.display()
+            ),
+        );
+    }
+    match celastro::cipher::retire_keys(dir, &master) {
+        Ok(dropped) => ack_ok(
+            json,
+            &format!(
+                "{}: {n} archived object(s) re-sealed under the current data key; {dropped} \
+                 previous key(s) dropped from KEY",
+                dir.display()
+            ),
+        ),
+        Err(e) => fail(
+            json,
+            &format!(
+                "{}: {n} object(s) re-sealed, but the ring could not be retired: {e}",
+                dir.display()
+            ),
+        ),
     }
 }
 

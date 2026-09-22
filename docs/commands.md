@@ -156,22 +156,40 @@ no longer need to share one data key once they hold their own copies).
 The new key goes to `KEY.next` first, so a rotation cut short is
 finished by running it again, and a node refuses to open a directory
 with a `KEY.next` until then. Backups and exports made before carry
-their own `KEY` and open as they did. An index at the archived tier has
-objects the rotation does not reach: the old key is kept in a ring
-behind the new one in `KEY`, those objects open as before, and **`key
-retire <DIR>`** drops the ring once nothing is under it (the index
-moved back and out again, or dropped) -- an object still under a
-retired key no longer opens.
+their own `KEY` and open as they did.
+
+An index at the archived tier has objects in a store the rotation does
+not reach, so the old key stays in a ring behind the new one in `KEY`
+and those objects open as before. **`key reseal <DIR>`** finishes the
+rotation: it reads one frame of each archived object to see which key
+seals it, fetches only the ones still under an old key, seals them
+again under the current one, puts them back, and then drops the ring.
+It is resumable -- an object it has already moved is skipped, so
+running it again after a failure finishes the rest.
+
+**`key retire <DIR>`** drops the ring on its own, and **refuses** while
+any archived object still needs it, naming the collections; `--check`
+reports without changing anything and `--force` retires regardless, at
+the cost of every object still under an old key. Both read the archived
+tier through the same `CELASTRO_ARCHIVE_*` settings a node uses, and a
+store they cannot reach is a refusal rather than a retirement. A ring
+that nothing can need -- no index is at the archived tier at all -- is
+dropped by the next open without being asked, and logged.
+
 **`check <DIR>`** opens every frame of every file and names what does
 not open, with nothing written: what to run on a volume you doubt.
 
 ```sh
 CELASTRO_MASTER_KEY_FILE=./master.key celastro key rotate ./data
+CELASTRO_MASTER_KEY_FILE=./master.key celastro key retire ./data --check
+CELASTRO_MASTER_KEY_FILE=./master.key celastro key reseal ./data
 CELASTRO_MASTER_KEY_FILE=./master.key celastro check ./data
 ```
 
 ```
 ./data: 14 file(s) and 120 log record(s) sealed under a new data key; KEY rewrapped
+./data: 1 previous data key(s) in the ring; 9 archived object(s) checked, all under the current key; nothing was changed
+./data: 3 archived object(s) re-sealed under the current data key; 1 previous key(s) dropped from KEY
 ./data: 14 file(s) and 120 log record(s) open under the data key; nothing is damaged
 ```
 
@@ -328,12 +346,15 @@ database lock was held when it was asked (alive, not ready). It says
 `ok:false` when the data directory is gone. `/api/metrics` is the text
 format a Prometheus scraper reads: statements and their time, refusals,
 compactions, connections, reconciliations, backpressure, TLS
-resumptions, the certificate's expiry, and per collection the shards,
+resumptions, the certificate's expiry, the data-key ring's size (above
+zero is a rotation nobody finished -- see `key reseal`), and per
+collection the shards,
 segments and documents held here and each shard's reads and writes:
 
 ```
 celastro_statements_total 5
 celastro_statement_seconds_max 0.000318
+celastro_data_key_ring_size 0
 celastro_compactions_total 1
 celastro_attached_nodes 0
 celastro_shards{collection="notes"} 1

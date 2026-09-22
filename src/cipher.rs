@@ -89,6 +89,14 @@ impl Cipher {
         self.previous = ring;
     }
 
+    /// The same data key with no ring behind it: what a retirement leaves.
+    /// There is no `Clone` on `Cipher` on purpose -- a cipher copied by
+    /// accident is a second copy of a key -- so this is the one way to make
+    /// another, and it says in its name what it is for.
+    pub fn without_previous(&self) -> Cipher {
+        Cipher { data_key: self.data_key, previous: Vec::new() }
+    }
+
     /// Forget the previous keys: `key retire`, once nothing is under them.
     pub fn retire_previous(&mut self) {
         for k in self.previous.iter_mut() {
@@ -907,6 +915,129 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
 /// nothing is under them any more (an archived index moved back and out
 /// again after the rotation, or dropped). Objects still under them stop
 /// opening. How many were dropped.
+/// How many bytes of a framed file are enough to tell which key sealed it:
+/// one whole frame, which authenticates on its own.
+pub const HEAD_BYTES: usize = FRAME;
+
+/// What an archived object's key says about it: the collection it belongs
+/// to, the shard, and the identity it was sealed under.
+///
+/// The object key is `<prefix><collection>/<shard>/<id>.seg` and the seal
+/// identity is `<shard>/<id>.seg` (`Shard::file_id`), so one is read off
+/// the other and neither has to be guessed from a manifest.
+pub fn archived_seal_id(object_key: &str) -> Option<(String, String, String)> {
+    let mut parts = object_key.rsplitn(3, '/');
+    let file = parts.next()?.to_string();
+    let shard = parts.next()?.to_string();
+    let coll = parts.next()?.rsplit('/').next()?.to_string();
+    if !file.ends_with(".seg") {
+        return None;
+    }
+    Some((coll, shard.clone(), format!("{shard}/{file}")))
+}
+
+impl Cipher {
+    /// Which key of the ring opens `id`'s first frame: `Some(0)` for the
+    /// current key, `Some(n)` for the nth previous one, `None` for a frame
+    /// no key in the ring opens.
+    ///
+    /// `head` is the first [`HEAD_BYTES`] of the file, or the whole of it
+    /// when it is shorter -- a frame authenticates on its own, so nothing
+    /// more needs fetching to answer this.
+    pub fn opening_key(&self, id: &str, head: &[u8]) -> Option<usize> {
+        let keys = self.file_keys(id);
+        for (n, key) in keys.iter().enumerate() {
+            if self.open_file_under(key, id, head).is_ok() {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// `framed` opened under whichever key of the ring seals it and sealed
+    /// again under the current one. An error names the file when no key
+    /// opens it.
+    pub fn reseal_file(&self, id: &str, framed: &[u8]) -> Result<Vec<u8>> {
+        let plain = self.open_file(id, framed)?;
+        self.seal_file(id, &plain)
+    }
+}
+
+/// What a walk of the archived tier found: the objects still sealed under a
+/// previous data key, by collection.
+#[derive(Debug, Default)]
+pub struct ArchiveWalk {
+    pub objects: usize,
+    /// Objects that open only under a previous key, and the collections
+    /// they belong to.
+    pub under_previous: usize,
+    pub collections: std::collections::BTreeSet<String>,
+    /// Objects no key in the ring opens: neither retiring nor re-sealing
+    /// helps these, and a walk says so rather than passing over them.
+    pub unopenable: Vec<String>,
+}
+
+/// Every archived object under `prefix`, and which key of the ring opens
+/// it. One ranged read of a frame per object; nothing is downloaded whole.
+pub fn walk_archive(
+    cipher: &Cipher,
+    store: &dyn crate::objstore::ObjectStore,
+    prefix: &str,
+) -> Result<ArchiveWalk> {
+    let mut w = ArchiveWalk::default();
+    for key in store.list(prefix)? {
+        let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
+        let Some(size) = store.size(&key)? else { continue };
+        let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+        w.objects += 1;
+        match cipher.opening_key(&id, &head) {
+            Some(0) => {}
+            Some(_) => {
+                w.under_previous += 1;
+                w.collections.insert(coll);
+            }
+            None => w.unopenable.push(key),
+        }
+    }
+    Ok(w)
+}
+
+/// Re-seal every archived object that is not already under the current data
+/// key, so a rotation can be finished without moving the tier back.
+///
+/// Object by object: a ranged read says which key seals it, an object that
+/// needs it is fetched, opened, sealed again under the current key, written
+/// to a temporary beside nothing and `put_file`d back, so the upload
+/// streams rather than holding a second copy of the object in the request.
+/// A failure part way leaves what it has already done -- every object is
+/// independent, and running it again finishes the rest.
+pub fn reseal_archive(
+    cipher: &Cipher,
+    store: &dyn crate::objstore::ObjectStore,
+    prefix: &str,
+    tmp_dir: &std::path::Path,
+) -> Result<usize> {
+    let mut done = 0usize;
+    for key in store.list(prefix)? {
+        let Some((_coll, _shard, id)) = archived_seal_id(&key) else { continue };
+        let Some(size) = store.size(&key)? else { continue };
+        let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+        match cipher.opening_key(&id, &head) {
+            Some(0) | None => continue,
+            Some(_) => {}
+        }
+        let framed = store.get(&key)?;
+        let resealed = cipher.reseal_file(&id, &framed)?;
+        let tmp = tmp_dir.join(format!("reseal-{:016x}.part", done as u64));
+        crate::shard::atomic_write(&tmp, &resealed)?;
+        let put = store.put_file(&key, &tmp);
+        let _ = std::fs::remove_file(&tmp);
+        put?;
+        done += 1;
+    }
+    Ok(done)
+}
+
 pub fn retire_keys(dir: &std::path::Path, master: &[u8; 32]) -> Result<usize> {
     let key_path = dir.join("KEY");
     let wrapped = std::fs::read(&key_path).map_err(|e| {
@@ -1173,5 +1304,145 @@ pub(crate) mod core_dump {
         let n = occurrences(&masked);
         eprintln!("hkdf block, returned by value: {n} copy(ies) left in memory");
         assert!(n <= 1, "a returned secret left {n} copies, which is more than the one recorded");
+    }
+}
+
+#[cfg(test)]
+mod archive_ring_tests {
+    use super::*;
+    use crate::objstore::{DirStore, ObjectStore};
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "celastro-ring-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The seal identity is read off the object key, so a walk needs no
+    /// manifest to know what a segment was sealed as.
+    #[test]
+    fn an_object_key_names_the_collection_and_the_seal_identity() {
+        let (coll, shard, id) =
+            archived_seal_id("docs/shard-0000/0000000000000007.seg").expect("a segment key");
+        assert_eq!((coll.as_str(), shard.as_str()), ("docs", "shard-0000"));
+        assert_eq!(id, "shard-0000/0000000000000007.seg");
+        // A prefix in front of it changes only the collection's position.
+        let (coll, _, id) =
+            archived_seal_id("celastro/archive/docs/shard-0002/0000000000000001.seg").unwrap();
+        assert_eq!((coll.as_str(), id.as_str()), ("docs", "shard-0002/0000000000000001.seg"));
+        // Anything that is not a segment is not one.
+        assert!(archived_seal_id("docs/shard-0000/MANIFEST").is_none());
+        assert!(archived_seal_id("lonely.seg").is_none());
+    }
+
+    /// The walk tells an object under the current key from one under a
+    /// previous key, reading a frame of each rather than the whole object,
+    /// and names the collection a stale one belongs to.
+    #[test]
+    fn the_walk_finds_what_is_still_under_a_previous_key() {
+        let root = temp("walk");
+        let store = DirStore::new(&root).unwrap();
+        let old = Cipher::generate().unwrap();
+        let mut new = Cipher::generate().unwrap();
+        new.keep_previous(&old);
+
+        // Big enough that a whole-object read would be a different thing
+        // from the ranged read the walk does.
+        let plain = vec![7u8; CHUNK * 3 + 11];
+        let stale_id = "shard-0000/0000000000000001.seg";
+        store.put(&format!("docs/{stale_id}"), &old.seal_file(stale_id, &plain).unwrap()).unwrap();
+        let fresh_id = "shard-0001/0000000000000002.seg";
+        store.put(&format!("docs/{fresh_id}"), &new.seal_file(fresh_id, &plain).unwrap()).unwrap();
+        let other_id = "shard-0000/0000000000000003.seg";
+        store.put(&format!("logs/{other_id}"), &old.seal_file(other_id, &plain).unwrap()).unwrap();
+
+        let w = walk_archive(&new, &store, "").unwrap();
+        assert_eq!(w.objects, 3);
+        assert_eq!(w.under_previous, 2, "two were sealed under the old key");
+        assert_eq!(
+            w.collections.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["docs", "logs"],
+            "the walk names every collection with a stale object"
+        );
+        assert!(w.unopenable.is_empty());
+    }
+
+    /// An object no key in the ring opens is reported rather than passed
+    /// over: retiring would hide it, and it is not the ring's fault.
+    #[test]
+    fn an_object_under_no_key_at_all_is_named() {
+        let root = temp("stranger");
+        let store = DirStore::new(&root).unwrap();
+        let stranger = Cipher::generate().unwrap();
+        let mine = Cipher::generate().unwrap();
+        let id = "shard-0000/0000000000000001.seg";
+        store.put(&format!("docs/{id}"), &stranger.seal_file(id, b"not mine").unwrap()).unwrap();
+        let w = walk_archive(&mine, &store, "").unwrap();
+        assert_eq!(w.under_previous, 0);
+        assert_eq!(w.unopenable, vec!["docs/shard-0000/0000000000000001.seg".to_string()]);
+    }
+
+    /// Re-sealing moves every stale object onto the current key, leaves the
+    /// ones already there alone, and keeps the bytes.
+    #[test]
+    fn re_sealing_puts_every_object_under_the_current_key() {
+        let root = temp("reseal");
+        let store = DirStore::new(&root).unwrap();
+        let old = Cipher::generate().unwrap();
+        let mut new = Cipher::generate().unwrap();
+        new.keep_previous(&old);
+
+        let plain = vec![3u8; CHUNK + 5];
+        let stale_id = "shard-0000/0000000000000001.seg";
+        store.put(&format!("docs/{stale_id}"), &old.seal_file(stale_id, &plain).unwrap()).unwrap();
+        let fresh_id = "shard-0000/0000000000000002.seg";
+        let fresh_bytes = new.seal_file(fresh_id, &plain).unwrap();
+        store.put(&format!("docs/{fresh_id}"), &fresh_bytes).unwrap();
+
+        let tmp = temp("reseal-tmp");
+        let n = reseal_archive(&new, &store, "", &tmp).unwrap();
+        assert_eq!(n, 1, "only the stale object is rewritten");
+        assert_eq!(
+            store.get(&format!("docs/{fresh_id}")).unwrap(),
+            fresh_bytes,
+            "an object already under the current key is not touched"
+        );
+
+        let after = walk_archive(&new, &store, "").unwrap();
+        assert_eq!(after.under_previous, 0, "nothing is under a previous key now");
+        assert_eq!(after.objects, 2);
+
+        // The point of all of it: the rows survive, and they survive the
+        // ring being retired, which is what would have destroyed them.
+        let mut retired = new.without_previous();
+        retired.retire_previous();
+        assert_eq!(
+            retired.open_file(stale_id, &store.get(&format!("docs/{stale_id}")).unwrap()).unwrap(),
+            plain
+        );
+        // And no temporary is left behind in the directory it used.
+        let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(left.is_empty(), "a re-seal left {} file(s) behind", left.len());
+    }
+
+    /// Re-sealing is resumable: it only ever moves an object forward, so
+    /// running it twice is running it once.
+    #[test]
+    fn re_sealing_twice_is_re_sealing_once() {
+        let root = temp("again");
+        let store = DirStore::new(&root).unwrap();
+        let old = Cipher::generate().unwrap();
+        let mut new = Cipher::generate().unwrap();
+        new.keep_previous(&old);
+        let id = "shard-0000/0000000000000001.seg";
+        store.put(&format!("docs/{id}"), &old.seal_file(id, b"rows").unwrap()).unwrap();
+        let tmp = temp("again-tmp");
+        assert_eq!(reseal_archive(&new, &store, "", &tmp).unwrap(), 1);
+        assert_eq!(reseal_archive(&new, &store, "", &tmp).unwrap(), 0, "nothing left to do");
     }
 }

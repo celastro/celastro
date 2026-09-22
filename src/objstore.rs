@@ -101,6 +101,30 @@ pub struct ArchiveHandle {
     pub prefix: String,
 }
 
+impl ArchiveHandle {
+    /// The handle the `archived` tier's configuration asks for, or `None`
+    /// when the tier is the local `archive/` directory. Offline commands
+    /// (`key retire`, `key reseal`) reach the same store the node would.
+    pub fn from_opts(opts: &ArchiveOpts) -> Result<Option<ArchiveHandle>> {
+        match (&opts.endpoint, &opts.dir) {
+            (Some(_), Some(_)) => Err(Error::Storage(
+                "archive: an endpoint and a directory are both configured; the tier lives in one \
+                 place"
+                    .into(),
+            )),
+            (Some(_), None) => Ok(Some(ArchiveHandle {
+                store: std::sync::Arc::new(S3Store::from_env(opts)?),
+                prefix: opts.prefix.clone(),
+            })),
+            (None, Some(d)) => Ok(Some(ArchiveHandle {
+                store: std::sync::Arc::new(DirStore::new(d)?),
+                prefix: opts.prefix.clone(),
+            })),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 /// An S3-compatible store over plain HTTP.
 pub struct S3Store {
     /// `host:port`, dialled.

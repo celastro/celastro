@@ -1210,27 +1210,17 @@ impl Db {
         }
     }
 
+    /// How many previous data keys the ring keeps: zero unless a rotation
+    /// left an archived tier behind it. The metric reads this.
+    pub fn data_key_ring_size(&self) -> usize {
+        self.cipher.as_ref().map(|c| c.previous_keys()).unwrap_or(0)
+    }
+
     /// Open a database rooted at `dir`, installing the catalog and every
     /// shard's manifest, then replaying each WAL.
     pub fn open(dir: &Path, opts: DbOpts) -> Result<Db> {
         opts.placement.validate()?;
-        let archive = match (&opts.archive.endpoint, &opts.archive.dir) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Storage(
-                    "archive: an endpoint and a directory are both configured; the tier lives in one place"
-                        .into(),
-                ))
-            }
-            (Some(_), None) => Some(crate::objstore::ArchiveHandle {
-                store: Arc::new(crate::objstore::S3Store::from_env(&opts.archive)?),
-                prefix: opts.archive.prefix.clone(),
-            }),
-            (None, Some(d)) => Some(crate::objstore::ArchiveHandle {
-                store: Arc::new(crate::objstore::DirStore::new(d)?),
-                prefix: opts.archive.prefix.clone(),
-            }),
-            (None, None) => None,
-        };
+        let archive = crate::objstore::ArchiveHandle::from_opts(&opts.archive)?;
         let mut db = Db::with_opts(opts);
         db.archive = archive;
         fs::create_dir_all(dir)?;
@@ -1248,6 +1238,32 @@ impl Db {
             // against: a collection older than this directory that names
             // this node is data this directory never had.
             db.catalog.born_micros = lifecycle::now_micros(&db.clock);
+        }
+        // A ring with nothing behind it retires itself. The ring exists so
+        // an archived object sealed under an older key still opens; with no
+        // index at the archived tier there is no such object, and keeping
+        // the old keys only widens what a stolen KEY and master open. This
+        // costs no store access -- the catalog answers it -- so the walk
+        // that `key retire` does is not needed for the easy case.
+        if let (Some(c), Some(master)) = (&db.cipher, &db.opts.master_key) {
+            let archived = db
+                .catalog
+                .collections
+                .values()
+                .any(|c| c.indexes.iter().any(|i| i.tier == crate::residency::Tier::Archived));
+            if c.previous_keys() > 0 && !archived {
+                let dropped = c.previous_keys();
+                let fresh = c.without_previous();
+                crate::shard::atomic_write(&dir.join("KEY"), &fresh.wrap(master)?)?;
+                db.cipher = Some(std::sync::Arc::new(fresh));
+                crate::log::info(
+                    "data_key_ring_retired",
+                    &[
+                        ("dropped", dropped.to_string()),
+                        ("why", "no index is at the archived tier".to_string()),
+                    ],
+                );
+            }
         }
         // A drop is complete once the collection's directory has been renamed
         // aside; the catalog catches up here if the process ended between
@@ -2137,8 +2153,10 @@ impl Db {
         if let Some(c) = &self.cipher {
             if c.previous_keys() > 0 {
                 out.push_str(&format!(
-                    "data key: {} previous key(s) kept in the ring for the archived tier; `celastro \
-                     key retire` drops them once nothing is under them\n",
+                    "data key: {} previous key(s) kept in the ring so archived objects sealed \
+                     under them still open; `celastro key retire <DIR> --check` says whether any \
+                     still needs them, `celastro key reseal <DIR>` seals them under the current \
+                     key and retires the ring\n",
                     c.previous_keys()
                 ));
             }
