@@ -447,8 +447,8 @@ switch, a read of the shard there is refused naming the move, as a write
 has been since the pin -- the window in which the two copies could
 disagree answers nothing.
 
-The drills' side of the suite runs on kind, from the private tooling that
-drives the box, one scenario per script with its outcome asserted: the
+The drills' side of the suite runs on kind, one scenario per script with
+its outcome asserted: the
 split, the mixed versions, a slow link. The mixed scenario's first run as
 an assertion found two things a reader of the drill's log had passed over.
 The console of the last pod rolled answered nothing for 45 s: a node
@@ -2045,7 +2045,7 @@ opening everything and writing nothing.
 **Measured, not proven: the constant-time claim and the build.** The
 crate's timing test (`crypto::timing`, ignored, run by hand in release)
 samples pairs of inputs that differ only in the secret, in alternation,
-and compares medians: on the box on 2026-09-21, `ct_eq` over 64 bytes
+and compares medians: on 2026-09-21, `ct_eq` over 64 bytes
 equal and differing in the first byte 38 ns and 38 ns; X25519 with a
 scalar of one set bit and of every bit 108.1 µs and 107.2 µs (0.9 %
 apart); Ed25519 signing under two seeds 12.75 ms and 12.77 ms (0.1 %);
@@ -2107,8 +2107,8 @@ masked swap), `chacha20poly1305` (the tag compared by `ct_eq` before
 anything is decrypted; the final reduction of Poly1305 by masks) and
 the ticket open (one AEAD either way) -- nothing found; the timing test
 extended to `fe25519::mul` and `invert`, `sc25519::reduce_512` and the
-ticket open. That test found the one thing the reading did not: on
-the box, `sc25519::reduce_512` over a scalar of one set bit against
+ticket open. That test found the one thing the reading did not:
+`sc25519::reduce_512` over a scalar of one set bit against
 one of every bit came out 4.5 % and then 8.4 % apart, every other pair
 under 1 % -- the compiler had turned the masked select in
 `reduce_once` (a mask that is 0 or all ones) back into the branch it
@@ -2175,8 +2175,8 @@ last, so a copy cut short claims nothing and `RESTORE ... AS OF` refuses
 it by name), the others' standing. A peer from before 0.68.0 does not
 know `DETACHED` and is asked the old way, bounded at ten minutes. The
 wire test turns a peer into a black hole and expects the answer within
-a minute; on the box it comes in fourteen seconds, on kind in
-eighteen with a peer cut off by iptables. The drill's second case, a
+a minute; on this repository's own test machine it comes in fourteen
+seconds, on kind in eighteen with a peer cut off by iptables. The drill's second case, a
 pod deleted a second after the cluster backup started, found the
 poll's other gap: the pod came back with no memory of the copy and
 said "none started", and the coordinator named it `NOT on` though the
@@ -2190,13 +2190,13 @@ on four shared cores -- since the copy runs with the lock let go and
 holds only handles to sealed segments and one segment built from the
 memtable at the instant; peak resident memory went from 11-14 MB to
 16-21 MB a pod for a backup of half a megabyte, the built segment and
-the copy's buffers; and the restore on the box at the instant, node by
+the copy's buffers; and the restore at the instant, node by
 node, added up to 16,239 rows against 16,165 counted before the
 statement and 16,787 after, which is the cut. A pin held through a compaction is now a test (`tests/backup.rs`): the
 backup's deferred work is held, `COMPACT` retires the segments it
 named, rows land after, and the copy still verifies and restores what
 was there at the pin -- the handles keep the files until the copy
-drops them. A slow destination was then measured on the box (`do/slowbk/`): an
+drops them. A slow destination was then measured: an
 S3-compatible store in a container behind a link shaped to 4 Mbit/s
 with 50 ms of latency, a node holding 40,000 documents with a text and
 a vector index (103 MB in eight segments, the largest 30 MB), a
@@ -2214,11 +2214,37 @@ a writer 618 MB, the rest the writer's own memtables. The data
 directory grew from 103 to 162 MB over the quiet shaped copy and 206
 MB under the writer -- the pinned segments standing beside what
 fourteen compactions wrote meanwhile -- and shrank once the copy
-dropped them. The writer, 305 a second alone, made 146 a second over a
-run that held the copy for three quarters of it: about half its rate
-during the copy, which is the copy's reading, hashing and sending on
-the same cores and the compactions the pin makes larger, not the pin
-itself, which holds nothing a writer waits for; not isolated further.
+dropped them.
+
+**W1: what a writer actually loses during a backup copy (measured
+2026-09-22).** The first reading of this -- a writer at about half its
+rate through the copy -- was an artefact, and isolating it says the
+opposite. Four runs from one
+byte-identical seeded directory on one machine, each rate taken over
+whole five-second windows lying *inside* the copy rather than averaged
+over a run the copy only partly covers: a writer alone made 247 rows a
+second with compaction on and 243 with it off, and the same writer
+during a shaped copy of 78 MB made 253 and 251. **A writer keeps its
+whole rate during a backup copy**, and neither candidate cause takes
+anything measurable from it. The copy's own work is one second -- that
+is how long the same corpus takes to a local directory, read, hashed and
+written -- against 171 seconds of waiting on a 4 Mbit/s link, so the copy
+is idle for almost all of a slow backup and competes for nothing.
+Compaction on or off moves the writer by under 2% whether or not a
+backup is running. The earlier number compared a 60-second baseline
+against a 150-second window taken at another time on another machine,
+with a baseline that ranged 144 to 311 a second across machines and
+disks -- a spread wide enough to make a factor of two out of nothing.
+What the pin costs is memory and disk, which is what the paragraph above
+measured correctly: peak resident memory 356 MB with no backup and 487
+MB with one, and the data directory 229 against 281 MB (with compaction
+off, 337 against 553 MB, since nothing retires the pinned segments).
+One thing the isolation found on its way past: a backup to a
+destination whose pool already holds every segment copies nothing and
+still reads and SHA-256s all of them, to fill the record's checksum
+column -- 78 MB in under a second here, but it scales with what the
+database holds rather than with what changed.
+
 The store client's read timeout starts after the last write is
 accepted and scales with the object from 0.70.0 (a second per 100 KB
 on top of thirty), so a destination slower than about 100 KB/s takes
