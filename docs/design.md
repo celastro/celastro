@@ -2147,14 +2147,60 @@ spares the descriptor, with the file as the fallback elsewhere and on
 a kernel without the call; the wiping covers every long-lived key (E1)
 and, from 0.69.0, the handshake's secrets (`Secret<32>` bindings for
 the ephemeral key, the shared secret and every traffic secret, wiped
-when the handshake ends, the stream's traffic secrets when it closes)
--- what the compiler copies to the stack on its own is still its
-business; the process refuses core dumps from its first line. The 0-RTT
+when the handshake ends, the stream's traffic secrets when it closes);
+the process refuses core dumps from its first line. What the compiler
+copies on its own was measured in H5, below. The 0-RTT
 refusal, which was "never offer it", handles the client that sends
 early data anyway from 0.69.0: the records it cannot open under the
 handshake key are skipped up to the protocol's bound (§4.2.10).
 (6) This list; the README says "reviewed in-tree, unaudited outside
 it".
+
+**H5: what a search of a running process actually finds (measured
+2026-09-22).** The claim before this was that secrets are wiped "except
+what the compiler copies on its own", which is true and says nothing.
+`cipher::core_dump` makes it a number: it masks a known key as it is
+produced -- XORed on the way in, compared a byte at a time against
+`masked[j] ^ MASK[j]`, so the 32 plaintext bytes exist nowhere
+contiguously and the needle cannot find itself -- then reads this
+process's own writable private mappings through `/proc/self/maps` and
+`/proc/self/mem`. A core dump is a copy of exactly those regions, so
+this is the search `gcore` would allow, as a test rather than a
+procedure, and without having to turn the dump refusal off.
+
+What it found before the change, per operation: **two copies of every
+HKDF block**, one in `Sha256::finish`'s output and one in
+`hmac_sha256`'s return slot, and -- not searched for but read out of the
+code on the way -- HMAC's padded key, both pads and its two `Vec`
+message buffers went to the allocator unwiped on every call, which put
+key material in freed heap rather than merely on a stack. HKDF's
+expander was worse: it replaced its `T(i-1)` buffer each round and
+returned its output as a `Vec` for callers to drop, so a key schedule
+left derived bytes in three freed allocations per round.
+
+What it finds after: **zero** for a file key, zero for the X25519 scalar
+(the ladder's clamped copy of the private key is now wiped; the field
+elements it carries are not, and cannot be named), and zero for an HKDF
+block expanded into a `Secret` the caller owns. `hmac_sha256_into`,
+`sha256_into` and `Sha256::finish_into` write into the caller's buffer
+and erase every intermediate; `wipe` is `#[inline(never)]` with a
+compiler fence and a `black_box`, so it cannot be reasoned away as a
+dead store.
+
+**One copy survives, and it is Rust's move semantics, not an oversight.**
+A value that has been moved out of is never dropped, so `self.read_secret
+= Some(c_ap)` leaves `c_ap`'s bytes on the frame it was built in. The
+search finds one such copy of a traffic secret after a handshake, and
+one of an HKDF block returned by value; `#[inline(always)]` on the
+returning function does not remove it (tried, the count did not move),
+and neither does anything else available from Rust. Deriving in place
+removes that one and re-creates it a step down, where `Keys` is built
+from the secret and moved into its own field. Removing it everywhere
+means constructing the handshake in place throughout, which was judged
+not worth the rewrite: the copies are on a stack that later calls
+reuse, where the ones that were fixed were in freed heap that any later
+allocation could have been handed. The README says as much, in those
+terms, rather than claiming the stronger property.
 
 **B2: the backup under a lost node and under a load (0.68.0).** Two
 drills on kind, `backupnode` and `backupload` (celres-results.md), with

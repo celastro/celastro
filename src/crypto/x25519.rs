@@ -2,9 +2,21 @@
 //! step the same work, the swap a mask of the scalar bit.
 
 use super::fe25519::Fe;
+use crate::cipher::{wipe, Secret};
 
-/// `scalar * u`, both 32 bytes as the RFC lays them out.
-pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
+/// `scalar * u`, both 32 bytes as the RFC lays them out. The result is a
+/// shared secret and leaves as one.
+///
+/// What is erased here and what is not: `k`, the clamped copy of the
+/// private scalar, is wiped before this returns -- it is the private key
+/// itself, sitting on the stack for the length of the ladder. The field
+/// elements the ladder carries (`x2`, `z2`, `x3`, `z3` and the per-step
+/// temporaries) are not: they are `Copy` limb arrays the compiler spills
+/// where it likes, and wiping the named ones would erase the copies that
+/// can be named while leaving the spills that cannot. They are secret, and
+/// they are one of the things the core-dump test measures rather than
+/// something this function can honestly claim to have cleared.
+pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> Secret<32> {
     let mut k = *scalar;
     k[0] &= 248;
     k[31] &= 127;
@@ -38,14 +50,17 @@ pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
     }
     Fe::cswap(&mut x2, &mut x3, swap);
     Fe::cswap(&mut z2, &mut z3, swap);
-    x2.mul(z2.invert()).to_bytes()
+    let out = x2.mul(z2.invert()).to_bytes();
+    wipe(&mut k);
+    out.into()
 }
 
 /// The public key of `secret`: the scalar times the base point u = 9.
+/// Public, so it comes back as bare bytes.
 pub fn public_key(secret: &[u8; 32]) -> [u8; 32] {
     let mut base = [0u8; 32];
     base[0] = 9;
-    x25519(secret, &base)
+    *x25519(secret, &base)
 }
 
 #[cfg(test)]
@@ -80,17 +95,17 @@ mod tests {
             ),
             (
                 "shared, alice",
-                hex(&x25519(&alice, &bob_pub)),
+                hex(&x25519(&alice, &bob_pub)[..]),
                 "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
             ),
             (
                 "shared, bob",
-                hex(&x25519(&bob, &alice_pub)),
+                hex(&x25519(&bob, &alice_pub)[..]),
                 "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
             ),
             (
                 "one iteration from 9",
-                hex(&x25519(&nine, &nine)),
+                hex(&x25519(&nine, &nine)[..]),
                 "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079",
             ),
         ];

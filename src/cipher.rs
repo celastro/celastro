@@ -168,21 +168,18 @@ impl Cipher {
     }
 
     /// The key of one file, from its identity, under the current data key.
-    fn file_key(&self, id: &str) -> [u8; 32] {
+    fn file_key(&self, id: &str) -> Secret<32> {
         Self::file_key_under(&self.data_key, id)
     }
 
-    fn file_key_under(data_key: &[u8; 32], id: &str) -> [u8; 32] {
+    fn file_key_under(data_key: &[u8; 32], id: &str) -> Secret<32> {
         let prk = hkdf::extract(b"celastro file key v1", data_key);
-        let okm = hkdf::expand(&prk, id.as_bytes(), 32);
-        let mut k = [0u8; 32];
-        k.copy_from_slice(&okm);
-        k
+        hkdf::expand::<32>(&prk, id.as_bytes())
     }
 
     /// The file's key under the current data key, then under each previous
     /// one: what a reader tries in turn.
-    fn file_keys(&self, id: &str) -> Vec<[u8; 32]> {
+    fn file_keys(&self, id: &str) -> Vec<Secret<32>> {
         let mut v = Vec::with_capacity(1 + self.previous.len());
         v.push(self.file_key(id));
         for k in &self.previous {
@@ -425,15 +422,25 @@ fn aad(id: &str, index: u64) -> Vec<u8> {
 pub type Shared = Option<Arc<Cipher>>;
 
 /// Overwrite `bytes` with zeros in a way the optimiser does not remove: a
-/// volatile write per byte and a fence after. What every secret does to
-/// itself when it is dropped, so a key does not outlive its use in freed
-/// memory a later allocation, a core dump or a swap file could show.
+/// volatile write per byte, a fence after, and the slice handed to
+/// `black_box` so the writes cannot be proved unread. What every secret
+/// does to itself when it is dropped, so a key does not outlive its use in
+/// freed memory a later allocation, a core dump or a swap file could show.
+///
+/// `#[inline(never)]` is part of the contract, not a hint about code size:
+/// inlined into a caller that drops the buffer immediately afterwards, the
+/// whole loop is a dead store, and a volatile write is only guaranteed
+/// against *elision of the write itself* -- the fence and the black_box are
+/// what stop the surrounding reasoning, and they are cheaper to trust when
+/// the optimiser cannot see both sides of the call at once.
+#[inline(never)]
 pub fn wipe(bytes: &mut [u8]) {
     for b in bytes.iter_mut() {
         // SAFETY: `b` is a valid, exclusive reference into `bytes`.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    std::hint::black_box(bytes);
 }
 
 /// Wipe a string's bytes before it is dropped.
@@ -449,8 +456,31 @@ pub fn wipe_string(s: &mut String) {
 pub struct Secret<const N: usize>([u8; N]);
 
 impl<const N: usize> From<[u8; N]> for Secret<N> {
-    fn from(b: [u8; N]) -> Self {
-        Secret(b)
+    fn from(mut b: [u8; N]) -> Self {
+        let s = Secret(b);
+        // `[u8; N]` is Copy, so this took a copy and the caller still holds
+        // its own. Erase the copy that landed here: it is one of the stack
+        // copies this type exists to bound, and the only one this function
+        // is in a position to reach. The caller's is the caller's problem,
+        // which is why the paths that matter hand out `Secret` rather than
+        // arrays in the first place.
+        wipe(&mut b);
+        s
+    }
+}
+
+impl<const N: usize> Secret<N> {
+    /// `N` zero bytes, to be written into and dropped like any other
+    /// secret: what a derivation expands into.
+    pub fn zero() -> Self {
+        Secret([0u8; N])
+    }
+
+    /// The bytes, to write into. There is no `into_inner`: a secret that
+    /// could be moved out as a bare array would leave an unwiped copy
+    /// behind, which is the whole point of the type.
+    pub fn bytes_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
     }
 }
 
@@ -938,5 +968,210 @@ mod ring_tests {
         retired.retire_previous();
         assert!(retired.open_file("shard-0000/a.seg", &sealed).is_err());
         assert_eq!(&retired.wrap(&master).unwrap()[..5], b"CELK1");
+    }
+}
+
+/// H5's proof, as far as a byte search can prove anything: what is left of
+/// a secret in this process's own memory once the code that used it has
+/// dropped it.
+///
+/// A core dump is a copy of exactly these regions, so searching them from
+/// inside is the search `gcore` would allow, without the tool, without a
+/// second process, and as a test rather than a procedure:
+/// `/proc/self/maps` names the writable private mappings (the heap and the
+/// stacks) and `/proc/self/mem` reads them.
+///
+/// **The needle is never held in the clear.** It is XORed into `masked` as
+/// it is produced, and the scan compares each candidate byte against
+/// `masked[j] ^ MASK[j]`, computed one byte at a time. The 32 plaintext
+/// bytes therefore exist nowhere contiguously, so every contiguous run the
+/// scan finds is a copy some code path left behind -- not the needle
+/// looking at itself, which is the trap that makes this kind of test lie.
+///
+/// Ignored: it reads its own address space and takes a second or two. Run
+/// it in release, where the optimiser has actually had its way with the
+/// wipes -- a debug build proves nothing about what release code leaves.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod core_dump {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const MASK: [u8; 32] = [0x5c; 32];
+
+    pub(crate) fn mask(s: &[u8; 32]) -> [u8; 32] {
+        std::array::from_fn(|i| s[i] ^ MASK[i])
+    }
+
+    /// The writable private mappings, which is what a core dump keeps.
+    fn regions() -> Vec<(u64, u64)> {
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
+        let mut out = Vec::new();
+        for line in maps.lines() {
+            let mut f = line.split_whitespace();
+            let (range, perms) = (f.next().unwrap_or(""), f.next().unwrap_or(""));
+            let path = f.nth(3).unwrap_or("");
+            // Writable and private. File-backed mappings of our own binary
+            // are skipped: constants live there and are not what a wipe is
+            // about. `[vvar]` and friends cannot be read at all.
+            if !perms.starts_with("rw") || !perms.contains('p') {
+                continue;
+            }
+            if !(path.is_empty() || path == "[heap]" || path == "[stack]") {
+                continue;
+            }
+            let Some((a, b)) = range.split_once('-') else { continue };
+            let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16)) else {
+                continue;
+            };
+            out.push((a, b));
+        }
+        out
+    }
+
+    /// Which mapping an address falls in, for a hit worth explaining.
+    fn where_is(addr: u64) -> String {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        for line in maps.lines() {
+            let mut f = line.split_whitespace();
+            let range = f.next().unwrap_or("");
+            let path = f.nth(4).unwrap_or("");
+            if let Some((a, b)) = range.split_once('-') {
+                let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))
+                else {
+                    continue;
+                };
+                if addr >= a && addr < b {
+                    return if path.is_empty() { "anonymous".into() } else { path.into() };
+                }
+            }
+        }
+        "gone".into()
+    }
+
+    /// How many times the unmasked needle appears in this process's memory,
+    /// and where.
+    pub(crate) fn occurrences(masked: &[u8; 32]) -> usize {
+        let mut mem = std::fs::File::open("/proc/self/mem").expect("/proc/self/mem");
+        let mut buf = vec![0u8; 1 << 20];
+        let mut hits = 0usize;
+        let mut found: Vec<u64> = Vec::new();
+        for (start, end) in regions() {
+            let mut at = start;
+            while at < end {
+                let want = ((end - at) as usize).min(buf.len());
+                if mem.seek(SeekFrom::Start(at)).is_err() {
+                    break;
+                }
+                let n = match mem.read(&mut buf[..want]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                for (off, w) in buf[..n].windows(32).enumerate() {
+                    if (0..32).all(|j| w[j] == masked[j] ^ MASK[j]) {
+                        hits += 1;
+                        found.push(at + off as u64);
+                    }
+                }
+                at += n as u64;
+            }
+            // The buffer now holds a copy of the region just read. Left
+            // alone, it would be counted a second time when the scan
+            // reaches the buffer's own pages.
+            wipe(&mut buf);
+        }
+        for a in found.iter().take(4) {
+            eprintln!("  a copy at {a:#x} in {}", where_is(*a));
+        }
+        hits
+    }
+
+    /// Derive a file key, use it, drop it -- then look for it.
+    #[test]
+    #[ignore]
+    fn a_file_key_is_not_left_in_memory() {
+        let data_key = [0xa7u8; 32];
+        let masked = {
+            let k = Cipher::file_key_under(&data_key, "shard-0000/a.seg");
+            mask(&k)
+        };
+        // The same derivation as the real path, used and dropped.
+        {
+            let c = Cipher { data_key, previous: Vec::new() };
+            let _ = c.seal_file("shard-0000/a.seg", b"a segment's bytes");
+        }
+        let n = occurrences(&masked);
+        eprintln!("file key: {n} copy(ies) left in memory");
+        assert_eq!(n, 0, "a file key is still in memory {n} time(s) after its last use");
+    }
+
+    /// The private scalar X25519 clamps onto its stack.
+    #[test]
+    #[ignore]
+    fn the_x25519_scalar_is_not_left_in_memory() {
+        let scalar = [0x9du8; 32];
+        let mut clamped = scalar;
+        clamped[0] &= 248;
+        clamped[31] &= 127;
+        clamped[31] |= 64;
+        let masked = mask(&clamped);
+        {
+            let mut base = [0u8; 32];
+            base[0] = 9;
+            let _shared = crate::crypto::x25519::x25519(&scalar, &base);
+        }
+        let n = occurrences(&masked);
+        eprintln!("x25519 clamped scalar: {n} copy(ies) left in memory");
+        // `scalar` itself is the caller's and is deliberately still alive;
+        // the clamped form is the copy the ladder made, and it is wiped.
+        assert_eq!(n, 0, "the clamped scalar is still in memory {n} time(s)");
+    }
+
+    /// An HKDF block: the expansion's own buffers.
+    #[test]
+    #[ignore]
+    fn an_hkdf_block_is_not_left_in_memory() {
+        let prk = [0x31u8; 32];
+        let masked = {
+            let out = crate::crypto::hkdf::expand::<32>(&prk, b"celastro h5");
+            mask(&out)
+        };
+        for _ in 0..4 {
+            let mut s = Secret::<32>::zero();
+            crate::crypto::hkdf::expand_into(&prk, b"celastro h5", s.bytes_mut());
+        }
+        let n = occurrences(&masked);
+        eprintln!("hkdf block, expanded into a caller's Secret: {n} copy(ies) left in memory");
+        assert_eq!(n, 0, "a derived block is still in memory {n} time(s)");
+    }
+
+    /// The residue this whole entry is about, measured rather than argued.
+    ///
+    /// Returning a `Secret` by value can leave the callee's copy behind:
+    /// the move memcpies the bytes to the caller and the moved-from source
+    /// is never dropped, so `Drop` never runs on it and it is never wiped.
+    /// It sits in a frame that has returned until that stack is reused.
+    /// `#[inline(always)]` on the returning function does not remove it --
+    /// tried, and the count did not move -- and neither does anything else
+    /// available from Rust: this is the part of the claim that the language
+    /// cannot make, which is why the number is recorded instead of hidden.
+    ///
+    /// Whether it happens at all depends on where the compiler chose to
+    /// build the value: the file key above is also returned by value and
+    /// leaves nothing, because that return is in tail position and is built
+    /// in the caller's slot. So this asserts a bound, not an equality.
+    #[test]
+    #[ignore]
+    fn a_secret_returned_by_value_can_leave_one_copy() {
+        let prk = [0x53u8; 32];
+        let masked = {
+            let out = crate::crypto::hkdf::expand::<32>(&prk, b"by value");
+            mask(&out)
+        };
+        for _ in 0..4 {
+            let _ = crate::crypto::hkdf::expand::<32>(&prk, b"by value");
+        }
+        let n = occurrences(&masked);
+        eprintln!("hkdf block, returned by value: {n} copy(ies) left in memory");
+        assert!(n <= 1, "a returned secret left {n} copies, which is more than the one recorded");
     }
 }

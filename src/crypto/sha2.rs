@@ -2,10 +2,18 @@
 //! TLS key schedule's hash, Ed25519's, and the S3 signer's.
 
 /// HMAC-SHA-256, RFC 2104.
-pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+/// HMAC-SHA-256 into `out`, with everything that touched the key erased
+/// before it returns: the padded key, both pads, and the two message
+/// buffers, all of which are key material and all of which used to be
+/// dropped as they were. A key schedule calls this; a MAC over public
+/// bytes can call `hmac_sha256` and not care.
+pub(crate) fn hmac_sha256_into(key: &[u8], msg: &[u8], out: &mut [u8; 32]) {
     let mut k = [0u8; 64];
     if key.len() > 64 {
-        k[..32].copy_from_slice(&sha256(key));
+        let mut kh = [0u8; 32];
+        sha256_into(key, &mut kh);
+        k[..32].copy_from_slice(&kh);
+        crate::cipher::wipe(&mut kh);
     } else {
         k[..key.len()].copy_from_slice(key);
     }
@@ -18,11 +26,22 @@ pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut inner = Vec::with_capacity(64 + msg.len());
     inner.extend_from_slice(&ipad);
     inner.extend_from_slice(msg);
-    let ih = sha256(&inner);
+    let mut ih = [0u8; 32];
+    sha256_into(&inner, &mut ih);
     let mut outer = Vec::with_capacity(96);
     outer.extend_from_slice(&opad);
     outer.extend_from_slice(&ih);
-    sha256(&outer)
+    sha256_into(&outer, out);
+    for b in [&mut k[..], &mut ipad[..], &mut opad[..], &mut ih[..], &mut inner[..], &mut outer[..]]
+    {
+        crate::cipher::wipe(b);
+    }
+}
+
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hmac_sha256_into(key, msg, &mut out);
+    out
 }
 
 const K256: [u32; 64] = [
@@ -76,7 +95,10 @@ impl Sha256 {
         self.buf.extend_from_slice(chunks.remainder());
     }
 
-    pub(crate) fn finish(mut self) -> [u8; 32] {
+    /// The digest into `out`. The state words *are* the digest, and the
+    /// tail block is the last of the message, so both are erased here:
+    /// over a secret they are two more copies of it on the stack.
+    pub(crate) fn finish_into(mut self, out: &mut [u8; 32]) {
         let bit_len = self.len.wrapping_mul(8);
         let mut tail = std::mem::take(&mut self.buf);
         tail.push(0x80);
@@ -87,10 +109,17 @@ impl Sha256 {
         for block in tail.chunks(64) {
             compress(&mut self.h, block);
         }
-        let mut out = [0u8; 32];
         for (i, v) in self.h.iter().enumerate() {
             out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
         }
+        self.h = [0u32; 8];
+        std::hint::black_box(&self.h);
+        crate::cipher::wipe(&mut tail);
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.finish_into(&mut out);
         out
     }
 }
@@ -134,10 +163,16 @@ fn compress(h: &mut [u32; 8], block: &[u8]) {
     }
 }
 
-pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256_into(msg: &[u8], out: &mut [u8; 32]) {
     let mut s = Sha256::new();
     s.update(msg);
-    s.finish()
+    s.finish_into(out);
+}
+
+pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    sha256_into(msg, &mut out);
+    out
 }
 
 const K512: [u64; 80] = [

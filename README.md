@@ -195,6 +195,27 @@ data key (`celastro key init`, `CELASTRO_KEY_FILE`, the chart's
 reviewed in-tree and unaudited outside it; [SECURITY.md](SECURITY.md) says what each protects and what it
 does not.
 
+**What is erased, and what the compiler keeps.** Every key this code
+names erases itself: the long-lived keys, the file keys, the ticket key,
+the X25519 scalar, the handshake's secrets and a stream's traffic
+secrets are held in a type that overwrites its bytes when it is dropped,
+and the key schedule's working buffers -- HKDF's and HMAC's padded key,
+pads and message buffers -- are overwritten before they are freed, so no
+derived byte reaches freed heap. The process also refuses core dumps
+from its first line.
+
+What is *not* erased is what the compiler puts somewhere this code
+cannot name. Rust never drops a value that has been moved out of, so a
+secret moved from a local into a field leaves the local's bytes where
+they were; a search of a running process finds one such copy of a
+traffic secret after a handshake, on a stack frame that has returned,
+until that stack is reused. Register spills are the same. Those copies
+are measured rather than claimed away -- `cargo test --release --
+--ignored core_dump` searches this process's own memory for known keys
+and prints what it finds -- and removing them would mean building the
+whole handshake in place. If your threat model includes reading the
+memory of a live process, this is not the property protecting you.
+
 ## Two or more nodes
 
 Each node is its own process and directory, started with an address and the

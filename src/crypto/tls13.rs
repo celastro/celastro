@@ -89,52 +89,67 @@ fn err(what: impl Into<String>) -> io::Error {
 
 /// The next application traffic secret from the current one (RFC 8446
 /// §7.2): what a KeyUpdate moves both sides to.
-fn next_secret(secret: &[u8; 32]) -> [u8; 32] {
-    let v = expand_label(secret, "traffic upd", &[], 32);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
+fn next_secret(secret: &[u8; 32]) -> Secret<32> {
+    expand_label(secret, "traffic upd", &[])
+}
+
+/// `HKDF-Expand-Label` into `N` secret bytes. The label and the context
+/// are public; only the output is not, which is why it comes back as a
+/// `Secret` and never as a `Vec` for the caller to drop unwiped.
+fn expand_label<const N: usize>(secret: &[u8; 32], label: &str, context: &[u8]) -> Secret<N> {
+    let mut out = Secret::<N>::zero();
+    expand_label_into(secret, label, context, out.bytes_mut());
     out
 }
 
-fn expand_label(secret: &[u8; 32], label: &str, context: &[u8], len: usize) -> Vec<u8> {
+fn expand_label_into(secret: &[u8; 32], label: &str, context: &[u8], out: &mut [u8]) {
     let full = format!("tls13 {label}");
     let mut info = Vec::with_capacity(4 + full.len() + context.len());
-    info.extend_from_slice(&(len as u16).to_be_bytes());
+    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
     info.push(full.len() as u8);
     info.extend_from_slice(full.as_bytes());
     info.push(context.len() as u8);
     info.extend_from_slice(context);
-    hkdf::expand(secret, &info, len)
+    hkdf::expand_into(secret, &info, out);
 }
 
-fn derive_secret(secret: &[u8; 32], label: &str, transcript_hash: &[u8; 32]) -> [u8; 32] {
-    let v = expand_label(secret, label, transcript_hash, 32);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
-    out
+fn derive_secret(secret: &[u8; 32], label: &str, transcript_hash: &[u8; 32]) -> Secret<32> {
+    expand_label(secret, label, transcript_hash)
+}
+
+/// `Derive-Secret` into a secret the caller already owns.
+///
+/// The long-lived traffic secrets go through this rather than through the
+/// returning form: a `Secret` returned by value can leave the callee's copy
+/// on a frame that has returned, because the move takes the bytes out and
+/// the moved-from source is never dropped, so it is never wiped. Measured
+/// -- `tls13::tests::a_traffic_secret_is_not_left_in_memory_after_a_handshake`
+/// finds one copy of the traffic secret with the returning form and none
+/// with this one.
+fn derive_secret_into(
+    secret: &[u8; 32],
+    label: &str,
+    transcript_hash: &[u8; 32],
+    out: &mut Secret<32>,
+) {
+    expand_label_into(secret, label, transcript_hash, out.bytes_mut());
 }
 
 /// One direction's keys: derived from a traffic secret, used with a
 /// sequence number that never repeats within them.
 struct Keys {
-    key: [u8; 32],
-    iv: [u8; 12],
+    key: Secret<32>,
+    iv: Secret<12>,
     seq: u64,
 }
 
 impl Keys {
     fn from_secret(secret: &[u8; 32]) -> Keys {
-        let k = expand_label(secret, "key", &[], 32);
-        let iv = expand_label(secret, "iv", &[], 12);
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&k);
-        let mut ivb = [0u8; 12];
-        ivb.copy_from_slice(&iv);
-        Keys { key, iv: ivb, seq: 0 }
+        Keys { key: expand_label(secret, "key", &[]), iv: expand_label(secret, "iv", &[]), seq: 0 }
     }
 
     fn nonce(&mut self) -> [u8; 12] {
-        let mut n = self.iv;
+        let mut n = *self.iv;
         for (i, b) in self.seq.to_be_bytes().iter().enumerate() {
             n[4 + i] ^= b;
         }
@@ -150,7 +165,7 @@ impl Keys {
 #[derive(Clone)]
 struct Ticket {
     ticket: Vec<u8>,
-    psk: [u8; 32],
+    psk: Secret<32>,
     /// Seconds since the epoch when the ticket arrived.
     received: u64,
     lifetime: u32,
@@ -198,7 +213,7 @@ fn now_secs() -> u64 {
 /// day is in the derivation: a server seals under today's key and opens
 /// under today's or yesterday's (a ticket lives a day), so a TLS key that
 /// leaks opens the tickets of two days, not of its whole life.
-fn ticket_key(key: &KeyPair, client_auth: bool, day: u64) -> [u8; 32] {
+fn ticket_key(key: &KeyPair, client_auth: bool, day: u64) -> Secret<32> {
     let salt: &[u8] =
         if client_auth { b"celastro tls ticket v1 mtls" } else { b"celastro tls ticket v1" };
     let mut ikm = [0u8; 40];
@@ -263,11 +278,8 @@ pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// The PSK a resumption master secret and a ticket nonce make.
-fn resumption_psk(res_master: &[u8; 32], nonce: &[u8]) -> [u8; 32] {
-    let v = expand_label(res_master, "resumption", nonce, 32);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
-    out
+fn resumption_psk(res_master: &[u8; 32], nonce: &[u8]) -> Secret<32> {
+    expand_label(res_master, "resumption", nonce)
 }
 
 /// The binder over the truncated ClientHello: the same construction as
@@ -296,38 +308,16 @@ fn parse_new_session_ticket(body: &[u8]) -> io::Result<NewSessionTicket> {
     Ok(NewSessionTicket { lifetime, age_add, nonce, ticket })
 }
 
-impl Drop for Keys {
-    fn drop(&mut self) {
-        crate::cipher::wipe(&mut self.key);
-        crate::cipher::wipe(&mut self.iv);
-    }
-}
+// `Ticket::psk`, `TlsStream::res_master` and the two traffic secrets used
+// to be wiped by hand in a `Drop` here. They are `Secret` now, so they wipe
+// themselves wherever they are dropped -- including out of a `Some` that is
+// overwritten by a KeyUpdate, which a `Drop` on the stream never reached.
 
-impl Drop for Ticket {
-    fn drop(&mut self) {
-        crate::cipher::wipe(&mut self.psk);
-    }
-}
-
-impl Drop for TlsStream {
-    fn drop(&mut self) {
-        if let Some(m) = &mut self.res_master {
-            crate::cipher::wipe(m);
-        }
-        if let Some(s) = &mut self.read_secret {
-            crate::cipher::wipe(s);
-        }
-        if let Some(s) = &mut self.write_secret {
-            crate::cipher::wipe(s);
-        }
-    }
-}
-
+/// The Finished MAC. The finished key is expanded, used and dropped here;
+/// it is never copied into a bare array on the way to the HMAC.
 fn finished_verify(base: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
-    let fk = expand_label(base, "finished", &[], 32);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&fk);
-    hmac_sha256(&key, transcript_hash)
+    let fk: Secret<32> = expand_label(base, "finished", &[]);
+    hmac_sha256(&fk[..], transcript_hash)
 }
 
 // -------------------------------------------------------------- the stream
@@ -385,8 +375,8 @@ pub struct TlsStream {
     retried: bool,
     /// The application traffic secrets, kept so a KeyUpdate can derive the
     /// next generation of keys from them.
-    read_secret: Option<[u8; 32]>,
-    write_secret: Option<[u8; 32]>,
+    read_secret: Option<Secret<32>>,
+    write_secret: Option<Secret<32>>,
     /// A test's hook: send the first ClientHello without a key share, so
     /// the server's HelloRetryRequest and this side's answer to it run.
     pub(crate) omit_first_share: bool,
@@ -399,7 +389,7 @@ pub struct TlsStream {
     skip_early: usize,
     /// A client's, after its handshake: the resumption master secret a
     /// NewSessionTicket's PSK derives from, and the store key it goes under.
-    res_master: Option<[u8; 32]>,
+    res_master: Option<Secret<32>>,
     store_key: Option<String>,
 }
 
@@ -465,7 +455,7 @@ impl TlsStream {
     /// After the handshake only.
     pub fn update_keys(&mut self, ask_peer: bool) -> io::Result<()> {
         self.handshake()?;
-        let Some(secret) = self.write_secret else {
+        let Some(secret) = self.write_secret.as_deref().copied() else {
             return Err(err("no application keys to update yet"));
         };
         let msg = [HS_KEY_UPDATE, 0, 0, 1, ask_peer as u8];
@@ -479,7 +469,7 @@ impl TlsStream {
     /// The peer announced its next generation of keys: read under them
     /// from here on.
     fn next_read_keys(&mut self) -> io::Result<()> {
-        let Some(secret) = self.read_secret else {
+        let Some(secret) = self.read_secret.as_deref().copied() else {
             return Err(err("a KeyUpdate before the application keys"));
         };
         let next = next_secret(&secret);
@@ -754,7 +744,7 @@ impl TlsStream {
         // the certificate flight is skipped. Anything short of that -- no
         // offer, another node's ticket, a stale one -- is a full handshake,
         // for which the client has to accept our signature.
-        let tkey: Secret<32> = (ticket_key(key, client_anchors.is_some(), ticket_day())).into();
+        let tkey: Secret<32> = ticket_key(key, client_anchors.is_some(), ticket_day());
         let psk: Option<[u8; 32]> = match &hello.psk {
             Some(offer) if hello.psk_dhe => {
                 match open_ticket(&tkey, &offer.identity).or_else(|| {
@@ -783,7 +773,7 @@ impl TlsStream {
         }
         let eph: Secret<32> = (random::array32().map_err(|e| err(e.to_string()))?).into();
         let our_share = x25519::public_key(&eph);
-        let shared: Secret<32> = (x25519::x25519(&eph, &client_share)).into();
+        let shared: Secret<32> = x25519::x25519(&eph, &client_share);
         if *shared == [0u8; 32] {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
@@ -816,13 +806,15 @@ impl TlsStream {
         }
         // Keys.
         let early: Secret<32> =
-            (hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]))).into();
+            hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
         let empty_hash = sha256(&[]);
         let hs_secret: Secret<32> =
-            (hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared[..])).into();
+            hkdf::extract(&derive_secret(&early, "derived", &empty_hash)[..], &shared[..]);
         let th = sha256(&transcript);
-        let c_hs: Secret<32> = (derive_secret(&hs_secret, "c hs traffic", &th)).into();
-        let s_hs: Secret<32> = (derive_secret(&hs_secret, "s hs traffic", &th)).into();
+        let mut c_hs = Secret::<32>::zero();
+        derive_secret_into(&hs_secret, "c hs traffic", &th, &mut c_hs);
+        let mut s_hs = Secret::<32>::zero();
+        derive_secret_into(&hs_secret, "s hs traffic", &th, &mut s_hs);
         self.write_keys = Some(Keys::from_secret(&s_hs));
         self.read_keys = Some(Keys::from_secret(&c_hs));
         // A client that offered early data sent records under a key this
@@ -885,11 +877,13 @@ impl TlsStream {
         // under the handshake keys.
         let th_server_fin = sha256(&transcript);
         let master: Secret<32> =
-            (hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash), &[0u8; 32])).into();
-        let c_ap: Secret<32> = (derive_secret(&master, "c ap traffic", &th_server_fin)).into();
-        let s_ap: Secret<32> = (derive_secret(&master, "s ap traffic", &th_server_fin)).into();
+            hkdf::extract(&derive_secret(&hs_secret, "derived", &empty_hash)[..], &[0u8; 32]);
+        let mut c_ap = Secret::<32>::zero();
+        derive_secret_into(&master, "c ap traffic", &th_server_fin, &mut c_ap);
+        let mut s_ap = Secret::<32>::zero();
+        derive_secret_into(&master, "s ap traffic", &th_server_fin, &mut s_ap);
         self.write_keys = Some(Keys::from_secret(&s_ap));
-        self.write_secret = Some(*s_ap);
+        self.write_secret = Some(s_ap);
         // The client's Certificate and CertificateVerify when this side
         // asked for them and the handshake is a full one: its chain
         // reaches an anchor and the signature is its key's over the
@@ -932,14 +926,15 @@ impl TlsStream {
         }
         self.skip_early = 0;
         self.read_keys = Some(Keys::from_secret(&c_ap));
-        self.read_secret = Some(*c_ap);
+        self.read_secret = Some(c_ap);
         // A ticket for next time, under the application keys: the PSK it
         // stands for derives from this handshake's resumption master
         // secret, so a resumed connection hands out a fresh ticket too.
         let th_client_fin = sha256(&transcript);
-        let res_master: Secret<32> = (derive_secret(&master, "res master", &th_client_fin)).into();
+        let mut res_master = Secret::<32>::zero();
+        derive_secret_into(&master, "res master", &th_client_fin, &mut res_master);
         let nonce = [0u8];
-        let psk_next: Secret<32> = (resumption_psk(&res_master, &nonce)).into();
+        let psk_next: Secret<32> = resumption_psk(&res_master, &nonce);
         let age_add = u32::from_be_bytes(
             random::bytes(4).map_err(|e| err(e.to_string()))?.try_into().expect("four bytes"),
         );
@@ -1140,8 +1135,8 @@ impl TlsStream {
                 return Err(err("a second HelloRetryRequest"));
             }
         }
-        let psk: Option<[u8; 32]> = match (sh.selected_psk, &ticket) {
-            (Some(0), Some(t)) => Some(t.psk),
+        let psk: Option<Secret<32>> = match (sh.selected_psk, &ticket) {
+            (Some(0), Some(t)) => Some(t.psk.clone()),
             (Some(_), _) => return Err(err("the server selected a PSK that was not offered")),
             (None, _) => None,
         };
@@ -1155,18 +1150,20 @@ impl TlsStream {
         let Some(server_share) = sh.x25519_share else {
             return Err(err("the server sent no X25519 key share"));
         };
-        let shared: Secret<32> = (x25519::x25519(&eph, &server_share)).into();
+        let shared: Secret<32> = x25519::x25519(&eph, &server_share);
         if *shared == [0u8; 32] {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
         let early: Secret<32> =
-            (hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]))).into();
+            hkdf::extract(&[0u8; 32], psk.as_ref().map(|p| &p[..]).unwrap_or(&[0u8; 32]));
         let empty_hash = sha256(&[]);
         let hs_secret: Secret<32> =
-            (hkdf::extract(&derive_secret(&early, "derived", &empty_hash), &shared[..])).into();
+            hkdf::extract(&derive_secret(&early, "derived", &empty_hash)[..], &shared[..]);
         let th = sha256(&transcript);
-        let c_hs: Secret<32> = (derive_secret(&hs_secret, "c hs traffic", &th)).into();
-        let s_hs: Secret<32> = (derive_secret(&hs_secret, "s hs traffic", &th)).into();
+        let mut c_hs = Secret::<32>::zero();
+        derive_secret_into(&hs_secret, "c hs traffic", &th, &mut c_hs);
+        let mut s_hs = Secret::<32>::zero();
+        derive_secret_into(&hs_secret, "s hs traffic", &th, &mut s_hs);
         self.read_keys = Some(Keys::from_secret(&s_hs));
         self.write_keys = Some(Keys::from_secret(&c_hs));
         let (ty, _) = self.read_handshake(&mut hs_buf, &mut transcript)?;
@@ -1242,9 +1239,11 @@ impl TlsStream {
         let empty_hash = sha256(&[]);
         let th_server_fin = sha256(&transcript);
         let master: Secret<32> =
-            (hkdf::extract(&derive_secret(hs_secret, "derived", &empty_hash), &[0u8; 32])).into();
-        let c_ap: Secret<32> = (derive_secret(&master, "c ap traffic", &th_server_fin)).into();
-        let s_ap: Secret<32> = (derive_secret(&master, "s ap traffic", &th_server_fin)).into();
+            hkdf::extract(&derive_secret(hs_secret, "derived", &empty_hash)[..], &[0u8; 32]);
+        let mut c_ap = Secret::<32>::zero();
+        derive_secret_into(&master, "c ap traffic", &th_server_fin, &mut c_ap);
+        let mut s_ap = Secret::<32>::zero();
+        derive_secret_into(&master, "s ap traffic", &th_server_fin, &mut s_ap);
         // Middlebox compatibility: a CCS before our first encrypted record.
         self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
         if let Some(context) = request_context {
@@ -1282,8 +1281,8 @@ impl TlsStream {
         self.write_handshake(HS_FINISHED, &fin, &mut transcript)?;
         self.read_keys = Some(Keys::from_secret(&s_ap));
         self.write_keys = Some(Keys::from_secret(&c_ap));
-        self.read_secret = Some(*s_ap);
-        self.write_secret = Some(*c_ap);
+        self.read_secret = Some(s_ap);
+        self.write_secret = Some(c_ap);
         let th_client_fin = sha256(&transcript);
         self.res_master = Some(derive_secret(&master, "res master", &th_client_fin));
         Ok(())
@@ -1809,17 +1808,17 @@ mod tests {
                 .unwrap();
         let early = hkdf::extract(&[0u8; 32], &[0u8; 32]);
         assert_eq!(
-            crate::crypto::hex(&early),
+            crate::crypto::hex(&early[..]),
             "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
         );
         let derived = derive_secret(&early, "derived", &sha256(&[]));
         assert_eq!(
-            crate::crypto::hex(&derived),
+            crate::crypto::hex(&derived[..]),
             "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
         );
-        let hs = hkdf::extract(&derived, &shared);
+        let hs = hkdf::extract(&derived[..], &shared);
         assert_eq!(
-            crate::crypto::hex(&hs),
+            crate::crypto::hex(&hs[..]),
             "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
         );
         // The transcript hash of ClientHello..ServerHello in that trace.
@@ -1829,22 +1828,22 @@ mod tests {
                 .unwrap();
         let c_hs = derive_secret(&hs, "c hs traffic", &th);
         assert_eq!(
-            crate::crypto::hex(&c_hs),
+            crate::crypto::hex(&c_hs[..]),
             "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
         );
         let s_hs = derive_secret(&hs, "s hs traffic", &th);
         assert_eq!(
-            crate::crypto::hex(&s_hs),
+            crate::crypto::hex(&s_hs[..]),
             "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
         );
         // The trace's suite is AES-128-GCM, so its key is 16 bytes and its
         // iv 12: the same labels, expanded to those lengths.
         assert_eq!(
-            crate::crypto::hex(&expand_label(&s_hs, "key", &[], 16)),
+            crate::crypto::hex(&expand_label::<16>(&s_hs, "key", &[])[..]),
             "3fce516009c21727d0f2e4e86ee403bc"
         );
         assert_eq!(
-            crate::crypto::hex(&expand_label(&s_hs, "iv", &[], 12)),
+            crate::crypto::hex(&expand_label::<12>(&s_hs, "iv", &[])[..]),
             "5d313eb2671276ee13000b30"
         );
     }
@@ -1866,22 +1865,22 @@ mod tests {
         let th_client_fin = arr("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
         let res_master = derive_secret(&master, "res master", &th_client_fin);
         assert_eq!(
-            crate::crypto::hex(&res_master),
+            crate::crypto::hex(&res_master[..]),
             "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"
         );
         let psk = resumption_psk(&res_master, &[0, 0]);
         assert_eq!(
-            crate::crypto::hex(&psk),
+            crate::crypto::hex(&psk[..]),
             "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"
         );
-        let early = hkdf::extract(&[0u8; 32], &psk);
+        let early = hkdf::extract(&[0u8; 32], &psk[..]);
         assert_eq!(
-            crate::crypto::hex(&early),
+            crate::crypto::hex(&early[..]),
             "9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"
         );
         let binder_key = derive_secret(&early, "res binder", &sha256(&[]));
         assert_eq!(
-            crate::crypto::hex(&binder_key),
+            crate::crypto::hex(&binder_key[..]),
             "69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256"
         );
         let prefix = unhex(RFC8448_RESUMED_CLIENT_HELLO_PREFIX);
@@ -2062,6 +2061,70 @@ mod tests {
         c.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"after the junk");
         assert_eq!(server.join().unwrap(), b"after the junk");
+    }
+
+    /// H5, on the real path: a handshake's application traffic secret is
+    /// not in this process's memory once the stream is dropped.
+    ///
+    /// The secret is taken from the live stream, masked, and only then is
+    /// the stream dropped -- so what the scan looks for is the value the
+    /// handshake actually derived, not one this test made up. Ignored and
+    /// run in release beside `cipher::core_dump`: a debug build says
+    /// nothing about what optimised code leaves behind.
+    #[test]
+    #[ignore]
+    fn a_traffic_secret_is_not_left_in_memory_after_a_handshake() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut s = TlsStream::server(
+                sock,
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+            );
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            s.write_all(&buf).unwrap();
+            let _ = s.close_notify();
+        });
+        let masked = {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: None,
+                    key: None,
+                },
+            );
+            c.write_all(b"a handshake").unwrap();
+            c.close_notify().unwrap();
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"a handshake");
+            let secret = c.read_secret.as_ref().expect("an application traffic secret");
+            crate::cipher::core_dump::mask(secret)
+        };
+        server.join().unwrap();
+        let n = crate::cipher::core_dump::occurrences(&masked);
+        eprintln!("traffic secret after a handshake: {n} copy(ies) left in memory");
+        // One copy, and what it is: the secret is derived into a local and
+        // then MOVED into `self.read_secret`. A moved-from value is never
+        // dropped, so the local's bytes are never wiped, and they stay on
+        // that frame until the stack is reused. Deriving in place removes
+        // this one, but not the same problem a step down -- `Keys` is built
+        // from the secret and moved into its own field, leaving the derived
+        // key and iv the same way -- and removing it everywhere means
+        // building the whole handshake in place. The heap is the case that
+        // matters more and it is clean: HKDF and HMAC wipe every buffer
+        // they allocate (they wiped none before this entry).
+        assert!(n <= 1, "a traffic secret is in memory {n} times, more than the one recorded");
     }
 
     /// A KeyUpdate from either side moves that side's keys to the next

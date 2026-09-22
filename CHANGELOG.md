@@ -34,6 +34,27 @@ If you would rather keep Ansible, the role was thin on purpose -- one
 `celastro install` per host -- and wrapping that command in a role of
 your own is shorter than the one that was here.
 
+**Keys erase their working buffers, and what is left is measured.** The
+key schedule used to hand its intermediates to the allocator as they
+were: HMAC's padded key, its two pads and its two message buffers, and
+HKDF's `T(i-1)` buffer and its output `Vec`, all of them key material
+and none of them overwritten, so a derivation left derived bytes in
+freed heap that any later allocation could have been given. They are
+wiped now, and the expansion writes into the caller's buffer rather than
+returning one. `wipe` is `#[inline(never)]` with a compiler fence and a
+`black_box`, so it cannot be reasoned away as a dead store; the file
+keys, the ticket key, the X25519 scalar and a stream's traffic secrets
+are held in a type that erases itself when dropped.
+
+What remains is stated rather than implied. `cargo test --release --
+--ignored core_dump` searches the process's own memory for known keys
+and reports what it finds: none for a file key, none for the X25519
+scalar, none for a derived block expanded into a caller's buffer, and
+**one copy of a traffic secret after a handshake** -- a value moved into
+a field leaves the local it was moved out of, and Rust never drops a
+moved-from value, so nothing wipes it. The README says so in those
+terms. No wire format, no API and no behaviour changed.
+
 ## 0.71.0 — 2026-09-21
 
 **The binary installs itself, and the releases carry it.** `celastro

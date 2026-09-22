@@ -52,7 +52,7 @@ fn x25519_agrees_with_wycheproof_on_every_vector() {
         // "acceptable" is a low-order or non-canonical public key: the
         // computation is still the RFC's, and the caller (the TLS) refuses
         // the zero it yields.
-        assert_eq!(got.to_vec(), shared, "{}", name(&t));
+        assert_eq!(got[..].to_vec(), shared, "{}", name(&t));
         checked += 1;
     }
     assert!(checked >= 500, "{checked} vectors");
@@ -125,7 +125,9 @@ fn hkdf_sha256_agrees_with_wycheproof_on_every_vector() {
             continue;
         }
         let prk = hkdf::extract(&salt, &ikm);
-        assert_eq!(hkdf::expand(&prk, &info, size), okm, "{}", name(&t));
+        let mut got = vec![0u8; size];
+        hkdf::expand_into(&prk, &info, &mut got);
+        assert_eq!(got, okm, "{}", name(&t));
         checked += 1;
     }
     assert!(checked >= 80, "{checked} vectors");
