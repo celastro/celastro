@@ -251,6 +251,14 @@ base64 -d`, sent as `X-Celastro-Token` (or `?t=`) with every request to
 `http://celastro-console:8787` from inside the cluster; the notes `helm`
 prints say the same with the release's names filled in.
 
+**That token is not in the pod's log.** A console using `CELASTRO_TOKEN`
+prints its URL without the query, because the line reaches stdout before
+the first request and a token that outlives the pod -- and that every
+replica answers -- should not be readable by anything that can read
+logs. The `Secret` is where it lives, and the command above is how to
+read it. The per-run token above, which a pod without `console.expose`
+draws for itself, is still printed: nothing else knows it.
+
 ## Probes
 
 Both probes run `/celastro --port 8787 health` inside the pod: the image

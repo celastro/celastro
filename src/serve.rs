@@ -118,6 +118,10 @@ pub struct Server {
     /// Whether the maintenance thread compacts on its own
     /// (`CELASTRO_AUTO_COMPACT`); on unless told otherwise.
     auto_compact: bool,
+    /// Whether `token` is the operator's, from `CELASTRO_TOKEN`, rather
+    /// than one drawn for this run. It decides whether the token may be
+    /// printed: see [`Server::url`].
+    operator_token: bool,
 }
 
 /// What this process has done since it started, for `/api/metrics`: the
@@ -419,6 +423,7 @@ impl Server {
             tls: None,
             max_connections: MAX_CONNECTIONS,
             auto_compact: true,
+            operator_token: false,
         })
     }
 
@@ -458,6 +463,9 @@ impl Server {
             tls: None,
             max_connections: MAX_CONNECTIONS,
             auto_compact: true,
+            // Every token this constructor takes is the operator's: that
+            // is the whole reason it exists.
+            operator_token: true,
         })
     }
 
@@ -501,15 +509,35 @@ impl Server {
         &self.token
     }
 
-    /// The URL to open, token included.
+    /// Whether the token is the operator's, from `CELASTRO_TOKEN`, rather
+    /// than drawn for this run.
+    pub fn operator_token(&self) -> bool {
+        self.operator_token
+    }
+
+    /// The URL to open.
+    ///
+    /// A per-run token is in the query, because the process drawing it is
+    /// the only thing that knows it and it dies with the process. **The
+    /// operator's token is not.** This line reaches stdout before the first
+    /// request is served, which is a pod's log under the chart and the
+    /// journal under the quadlet, and a token that outlives the process --
+    /// and that every node behind the same Service answers -- does not
+    /// belong in either. A client that needs it already has it: whoever set
+    /// `CELASTRO_TOKEN` chose it.
+    ///
+    /// The cost is `--open` against a console whose token came from the
+    /// environment: the browser is handed a URL it cannot authenticate with
+    /// and the token has to be pasted. That is the right way round -- the
+    /// alternative writes it to a log for everyone who can read logs.
     pub fn url(&self) -> String {
-        format!(
-            "{}://{}:{}/?t={}",
-            if self.tls.is_some() { "https" } else { "http" },
-            self.addr.ip(),
-            self.addr.port(),
-            self.token
-        )
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        let (ip, port) = (self.addr.ip(), self.addr.port());
+        if self.operator_token {
+            format!("{scheme}://{ip}:{port}/")
+        } else {
+            format!("{scheme}://{ip}:{port}/?t={}", self.token)
+        }
     }
 
     /// Serve until a shutdown is requested. Returns `Ok(())` on clean shutdown.
@@ -3134,11 +3162,28 @@ mod tests {
         assert_eq!(s.token(), good);
         assert_eq!(s.reach(), Reach::Loopback, "a loopback address keeps the loopback guards");
         assert!(s.url().starts_with("http://127.0.0.1:"));
-        assert!(s.url().ends_with(&format!("/?t={good}")));
+        // T1: the operator's token is not in the URL, because that line is
+        // printed to stdout before the first request -- a pod's log under
+        // the chart, the journal under the quadlet.
+        assert!(s.operator_token(), "a token given to bind_network is the operator's");
+        assert!(!s.url().contains("?t="), "the operator's token is in the URL: {}", s.url());
+        assert!(!s.url().contains(good), "the operator's token is in the URL: {}", s.url());
+        assert!(s.url().ends_with('/'), "{}", s.url());
         let any =
             Server::bind_network(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, good.to_string()).unwrap();
         assert_eq!(any.reach(), Reach::Network);
         assert!(any.url().starts_with("http://0.0.0.0:"));
+        assert!(!any.url().contains(good), "{}", any.url());
+    }
+
+    /// The per-run token a loopback console draws is still printed: the
+    /// process that drew it is the only thing that knows it, and it dies
+    /// with the process. Removing that would make `serve` unusable.
+    #[test]
+    fn a_per_run_token_stays_in_the_url_it_is_the_only_way_to_learn_it() {
+        let s = Server::bind(0).unwrap();
+        assert!(!s.operator_token());
+        assert!(s.url().contains(&format!("?t={}", s.token())), "{}", s.url());
     }
 
     #[test]

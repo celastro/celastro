@@ -226,11 +226,25 @@ celastro --dir ./data serve --bind 127.0.0.1 --port 18787 &
 ```
 
 ```
-http://127.0.0.1:18787/?t=examples-token-0123456789abcdef
+http://127.0.0.1:18787/
 ```
 
-`--port 0` asks for a free port, `--open` opens a browser, and under
-`--json` the first line is `{"url":...,"addr":...,"token":...}`.
+**The token is not in that line when it came from `CELASTRO_TOKEN`**, and
+`--json`'s first line leaves the `token` field out for the same reason:
+the URL is printed to stdout before the first request is served, which
+under the chart is the pod's log and under the quadlet the journal, and
+a token that outlives the process and that every node behind one Service
+answers does not belong there. Whoever set `CELASTRO_TOKEN` has it
+already. A console on loopback with no `CELASTRO_TOKEN` draws a token
+for the run and *does* print it, because nothing else knows it and it
+dies with the process; that is the line `--open` opens and the one
+below can be pasted.
+
+`--port 0` asks for a free port, `--open` opens a browser (which a
+console using `CELASTRO_TOKEN` cannot authenticate for you -- paste the
+token), and under `--json` the first line is
+`{"url":...,"addr":...}`, with `token` beside them only for a per-run
+token.
 `CELASTRO_LOG=json` makes the log lines JSON. A server saves after every
 statement that changed something and again when it stops.
 
@@ -260,8 +274,8 @@ celastro send http://127.0.0.1:18787 "SELECT id FROM notes ORDER BY id LIMIT 1"
 
 **`--url <URL>`** makes `exec`, `run`, `repl` and `catalog` clients of
 that console, rendered as they would be locally; the token is
-`CELASTRO_TOKEN` or the `?t=` of the URL `serve` printed, so that line
-can be pasted as it is:
+`CELASTRO_TOKEN` or the `?t=` of a per-run URL `serve` printed, so that
+line can be pasted as it is:
 
 ```sh
 celastro --url http://127.0.0.1:18787 exec "SELECT id FROM notes ORDER BY id LIMIT 1"

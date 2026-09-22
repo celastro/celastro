@@ -95,6 +95,21 @@ previous backup at that destination, a record it cannot read, a version
 1 record with no hashes, or a key the last record does not name at the
 same size. The ack says how many hashes it recalled.
 
+**The operator's token no longer reaches the log.** `serve` printed its
+URL with `?t=<token>` on stdout before serving, so a `CELASTRO_TOKEN`
+set by whoever runs the database landed in the pod's log under the chart
+and in the journal under the quadlet -- a token that outlives the
+process, and that every node behind one Service answers, readable by
+anything that can read logs. That URL is now printed without the query,
+and `--json`'s first line leaves the `token` field out, whenever the
+token came from the environment.
+
+Nothing changes for a console on loopback with no `CELASTRO_TOKEN`: it
+draws a token for the run, prints it, and it dies with the process,
+which is the only way anyone learns it. The one cost is `--open`
+against a console using `CELASTRO_TOKEN` -- the browser gets a URL it
+cannot authenticate with, and the token has to be pasted.
+
 ## 0.71.0 — 2026-09-21
 
 **The binary installs itself, and the releases carry it.** `celastro

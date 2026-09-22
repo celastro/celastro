@@ -1969,12 +1969,19 @@ fn write_private(path: &Path, text: &str, private: bool) -> std::io::Result<()> 
 }
 
 fn serve_json(server: &Server) -> Value {
-    Value::obj(vec![
+    let mut fields = vec![
         ("ok".to_string(), Value::Bool(true)),
         ("url".to_string(), Value::Str(server.url())),
         ("addr".to_string(), Value::Str(server.local_addr().to_string())),
-        ("token".to_string(), Value::Str(server.token().to_string())),
-    ])
+    ];
+    // The per-run token is here because nothing else knows it. The
+    // operator's is not: this goes to stdout, which is a pod's log under
+    // the chart and the journal under the quadlet, and whoever set
+    // `CELASTRO_TOKEN` already has it.
+    if !server.operator_token() {
+        fields.push(("token".to_string(), Value::Str(server.token().to_string())));
+    }
+    Value::obj(fields)
 }
 
 /// Hand the URL to whatever this desktop uses to open one.

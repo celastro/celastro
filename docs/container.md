@@ -289,3 +289,10 @@ is the unit, with the host's network, a named volume and an environment
 file, and systemd starts, stops and restarts it. The binary installed
 directly (`celastro install`) is the lighter choice on a host with no
 container runtime; [deploy/](../deploy/README.md) has both.
+
+The token in that environment file does not reach the journal: a console
+using `CELASTRO_TOKEN` prints its URL without the query, since the line
+goes to stdout before the first request is served and `journalctl -u
+celastro` is readable by more people than the environment file is. The
+per-run token a loopback console draws with no `CELASTRO_TOKEN` set is
+still printed, because nothing else knows it.
