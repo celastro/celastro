@@ -1073,8 +1073,9 @@ pub fn walk_archive(
             if &coll != name {
                 continue;
             }
-            let Some(size) = store.size(&key)? else { continue };
-            let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+            // One request per object: whether it is there and what its
+            // first frame says are the same question.
+            let Some(head) = store.head(&key, HEAD_BYTES as u64)? else { continue };
             w.objects += 1;
             match cipher.opening_key(&id, &head) {
                 Some(0) => {}
@@ -1121,8 +1122,7 @@ pub fn reseal_archive(
                 if &coll != name {
                     continue;
                 }
-                let Some(size) = store.size(&key)? else { continue };
-                let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+                let Some(head) = store.head(&key, HEAD_BYTES as u64)? else { continue };
                 match cipher.opening_key(&id, &head) {
                     Some(0) | None => continue,
                     Some(_) => {}

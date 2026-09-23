@@ -62,6 +62,21 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     }
     /// `len` bytes from `off`. Short reads are errors, not partial answers.
     fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>>;
+    /// *Up to* `len` bytes from the start, or `None` when there is no such
+    /// object.
+    ///
+    /// The one call that answers "is it there, and what do its first bytes
+    /// say", which is the whole of what a walk of the archived tier needs
+    /// per object: a frame authenticates on its own, so its first frame
+    /// says which key seals it. `size` then `get_range` answers the same
+    /// question in two round trips and cannot ask for a frame without
+    /// knowing the length first, since a short read there is an error.
+    ///
+    /// The default is those two calls, for a store that cannot do better.
+    fn head(&self, key: &str, len: u64) -> Result<Option<Vec<u8>>> {
+        let Some(size) = self.size(key)? else { return Ok(None) };
+        Ok(Some(self.get_range(key, 0, size.min(len))?))
+    }
     fn get(&self, key: &str) -> Result<Vec<u8>>;
     /// The object's size, or `None` when there is no such object.
     fn size(&self, key: &str) -> Result<Option<u64>>;
@@ -445,6 +460,22 @@ impl ObjectStore for S3Store {
         Ok(r.body)
     }
 
+    /// A ranged GET that, unlike [`get_range`](ObjectStore::get_range),
+    /// takes the short answer: a range reaching past the end is answered
+    /// with what there is, which is what makes this one request rather
+    /// than a HEAD and a GET.
+    fn head(&self, key: &str, len: u64) -> Result<Option<Vec<u8>>> {
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let r = self.request("GET", key, "", Some((0, len)), &[])?;
+        match r.status {
+            200 | 206 => Ok(Some(r.body)),
+            404 => Ok(None),
+            _ => Err(self.fail("GET", key, &r)),
+        }
+    }
+
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         let r = self.request("GET", key, "", None, &[])?;
         if r.status == 200 {
@@ -689,6 +720,20 @@ impl ObjectStore for DirStore {
         f.read_exact(&mut out)
             .map_err(|e| Error::Storage(format!("archive: GET {key} bytes {off}+{len}: {e}")))?;
         Ok(out)
+    }
+
+    fn head(&self, key: &str, len: u64) -> Result<Option<Vec<u8>>> {
+        let p = self.path(key)?;
+        let f = match std::fs::File::open(&p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Storage(format!("archive: GET {key}: {e}"))),
+        };
+        let mut out = Vec::new();
+        f.take(len)
+            .read_to_end(&mut out)
+            .map_err(|e| Error::Storage(format!("archive: GET {key} bytes 0+{len}: {e}")))?;
+        Ok(Some(out))
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
@@ -978,6 +1023,29 @@ mod tests {
     /// under the root, published whole, read whole or by range, sized,
     /// deleted, listed by prefix with `.tmp` leftovers skipped -- and a
     /// key cannot climb out of the root.
+    /// `head` takes the short answer where `get_range` refuses it, which
+    /// is what lets a walk ask one question per object instead of two.
+    #[test]
+    fn a_head_reads_up_to_what_was_asked_and_says_when_there_is_nothing() {
+        let root = temp("head");
+        let s = DirStore::new(&root).unwrap();
+        s.put("a/one", b"0123456789").unwrap();
+
+        // Shorter than the object: exactly what was asked for.
+        assert_eq!(s.head("a/one", 4).unwrap().as_deref(), Some(&b"0123"[..]));
+        // Exactly the object.
+        assert_eq!(s.head("a/one", 10).unwrap().as_deref(), Some(&b"0123456789"[..]));
+        // Past the end: the whole object, not an error -- this is the
+        // difference from `get_range`, which refuses a short read.
+        assert_eq!(s.head("a/one", 1 << 20).unwrap().as_deref(), Some(&b"0123456789"[..]));
+        assert!(s.get_range("a/one", 0, 1 << 20).is_err(), "get_range must still refuse");
+        // Absent is None, not an error: a walk skips it.
+        assert!(s.head("a/missing", 16).unwrap().is_none());
+        // An empty object is Some(empty), which is not the same answer.
+        s.put("a/empty", b"").unwrap();
+        assert_eq!(s.head("a/empty", 16).unwrap().as_deref(), Some(&b""[..]));
+    }
+
     #[test]
     fn a_directory_store_holds_objects_as_published_files() {
         let root = temp("ops");

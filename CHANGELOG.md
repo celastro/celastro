@@ -37,6 +37,12 @@ The `BACKUP` record had two parsers in one file, one strict and one
 silently skipping; there is one now, so a restore and the hash recall
 cannot drift apart over what a line means.
 
+A walk of the archived tier asks one question per object rather than
+two. `ObjectStore::head` reads *up to* a given number of bytes and says
+`None` when there is no such object, where `get_range` refuses a short
+read and so needs the length known first; `key retire` and `key reseal`
+took a `HEAD` and a `GET` per object and now take one `GET`.
+
 ## 0.72.0 — 2026-09-22
 
 **The Ansible role is gone; a shell script over ssh takes its place.**
