@@ -77,7 +77,11 @@ COMMANDS:
   key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER
   key rotate <DIR>           a new data key for the database at DIR: every file sealed again,
                              KEY rewrapped; with no process serving DIR; resumable if interrupted
-  key retire <DIR>           drop the previous data keys a rotation kept for the archived tier
+  key retire <DIR>           drop the previous data keys a rotation kept for the archived tier;
+        [--check]                refuses while an archived object still needs them (--check only
+        [--force]                reports, --force drops without looking)
+  key reseal <DIR>           seal every archived object still under a previous data key under the
+                             current one, then retire the ring: finishes a rotation
   check <DIR>                open every frame of every file under DIR and name what does not open
   tls init <DIR> <NAME> [<NAMES>] [<DAYS>]
                              write a CA and a certificate for NAME (and NAMES, comma-separated
@@ -522,7 +526,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                     "`key master <FILE>`: write a new master key to FILE. `key init <FILE>`: write \
                      a new data key to FILE, wrapped under the master key in CELASTRO_MASTER_KEY_FILE \
                      or CELASTRO_MASTER_KEY. `key rekey <KEY> <MASTER>`: rewrap the data key in KEY \
-                     under the master key in the file MASTER"
+                     under the master key in the file MASTER. `key rotate <DIR>`: a new data key for \
+                     the database at DIR. `key retire <DIR> [--check] [--force]`: drop the ring a \
+                     rotation kept. `key reseal <DIR>`: seal the archived objects under the current \
+                     key and retire the ring"
                         .to_string(),
                 )
             }

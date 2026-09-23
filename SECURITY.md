@@ -82,14 +82,45 @@ can carry nothing else. Tokens compare in constant time, and a source
 address that was refused waits a hundred milliseconds more per refusal in
 the last minute, two seconds at most, before it is answered again.
 
+From 0.72.0 a token that came from `CELASTRO_TOKEN` is also kept out of
+the process's own output: `serve` prints its URL without the `?t=`
+query and `--json` leaves the `token` field out, because that line
+reaches stdout before the first request -- a pod's log under the chart,
+the journal under the quadlet -- and an operator's token outlives the
+process and is answered by every node behind one Service. The per-run
+token a loopback console draws for itself is still printed, since
+nothing else knows it and it dies with the process.
+
 ### Secrets in memory
 
 The data key, the master key, TLS traffic keys, session tickets, the
 node's private key, S3 credentials and the tokens overwrite themselves
-with zeros when they are dropped (`cipher::wipe`, a volatile write per
-byte), so a key does not outlive its use in freed memory that a later
-allocation, a core dump or a swap file could show. A running process
-holds them; that is the boundary.
+with zeros when they are dropped (`cipher::wipe`: a volatile write per
+byte, a compiler fence, and the slice handed to `black_box`, in a
+function marked `#[inline(never)]` so the loop cannot be reasoned away
+as a dead store). From 0.72.0 the key schedule's working buffers go the
+same way -- HMAC's padded key, its two pads and its two message buffers,
+and HKDF's intermediate and output -- which before then were handed to
+the allocator as they were, putting derived key material in freed heap
+on every derivation.
+
+**What is not covered, measured rather than asserted.** Rust never drops
+a value that has been moved out of, so a secret moved from a local into
+a field leaves the local's bytes where they were, and nothing wipes
+them. A byte search of a running process (`cargo test --release --
+--ignored core_dump`, which reads this process's own writable mappings
+-- the regions a core dump copies) finds **one copy of a traffic secret
+after a handshake**, on a frame that has returned, until that stack is
+reused. It finds none of a file key, none of the X25519 private scalar,
+and none of a derived block. Register spills are the same class and are
+not searchable at all. Removing the remainder would mean constructing
+the whole handshake in place; it was judged not worth the rewrite once
+the freed-heap copies were gone, since a stack is reused by later calls
+and freed heap is handed to whatever allocates next.
+
+A running process holds these keys; that is the boundary. **If your
+threat model includes reading the memory of a live process, this is not
+the property protecting you.**
 
 The process refuses core dumps from its first line (`prctl(PR_SET_DUMPABLE,
 0)` on Linux, which also keeps another user's debugger out): a dump of a

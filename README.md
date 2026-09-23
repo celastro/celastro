@@ -12,7 +12,7 @@ token is what every client presents:
 ```sh
 docker run -d --name celastro -p 8787:8787 -v celastro-data:/data \
   -e CELASTRO_TOKEN=0123456789abcdef0123456789abcdef \
-  ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0
+  ghcr.io/celastro/celastro:latest --dir /data serve --bind 0.0.0.0
 ```
 
 ```sh
@@ -34,7 +34,7 @@ q "SELECT id, topic FROM notes ORDER BY hybrid(text_match(body, 'documents'), em
 The last query is text and vector in one plan, fused by reciprocal rank
 fusion; `WHERE` takes structured predicates, `text_match`, and a distance
 threshold. The same image is a client: `docker run --rm --network host
--e CELASTRO_TOKEN ghcr.io/celastro/celastro:0.55.0 send
+-e CELASTRO_TOKEN ghcr.io/celastro/celastro:latest send
 http://127.0.0.1:8787 "SELECT id FROM notes WHERE text_match(body,
 'segments')"`, or `repl` for a prompt. The volume is written in the
 clear and the console is plain HTTP: encryption at rest and TLS are
@@ -119,7 +119,7 @@ other nodes; the sections that follow have each option's details.
 | option | how | data | clients | notes |
 |---|---|---|---|---|
 | **one process** | `cargo install celastro` (Rust 1.75 or later, no dependencies outside `std`), then `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; `run <file>` runs a script of statements with no server, `exec "<SQL>"` one statement, `demo` a guided tour in memory |
-| **a container** | `docker run ... ghcr.io/celastro/celastro:0.55.0 --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
+| **a container** | `docker run ... ghcr.io/celastro/celastro:latest --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
 | **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, a script that does it over ssh and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
 | **Kubernetes** | `helm install celastro deploy/chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](deploy/chart/celastro/README.md) |
 
@@ -346,12 +346,16 @@ how.
 helm install celastro deploy/chart/celastro --set replicas=3 --set console.expose=true --set tls.enabled=true
 ```
 
-Each release publishes `ghcr.io/celastro/celastro:<version>`: a static
-`celastro` in an image `FROM scratch`, nothing running as root.
+Each release publishes `ghcr.io/celastro/celastro:<version>`, with
+`latest` following the newest: a static `celastro` in an image `FROM
+scratch`, nothing running as root. The examples here use `latest`
+because they are for trying it; **a deployment pins a version** -- the
+quadlet, the cloud-init file and the chart in [deploy/](deploy/README.md)
+all do, and are moved forward by each release.
 
 ```
-docker run --rm ghcr.io/celastro/celastro:0.55.0 demo
-docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:0.55.0 --dir /data serve
+docker run --rm ghcr.io/celastro/celastro:latest demo
+docker run --rm --network host -v celastro-data:/data ghcr.io/celastro/celastro:latest --dir /data serve
 ```
 
 `serve` needs `--network host` (a published port cannot reach a loopback

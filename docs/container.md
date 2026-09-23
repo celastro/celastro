@@ -10,7 +10,7 @@ with `latest` following the newest release, built from the tagged tree by the
 same `Dockerfile`; pull that, or build it:
 
 ```
-docker pull ghcr.io/celastro/celastro:0.53.0
+docker pull ghcr.io/celastro/celastro:latest
 docker build -t celastro .
 docker run --rm celastro version       # the version the image was built from
 docker run --rm celastro demo          # the guided tour, in memory, no volume

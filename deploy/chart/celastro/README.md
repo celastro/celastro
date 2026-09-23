@@ -223,10 +223,16 @@ For an image of your own, build it, put it where the cluster can pull it (or
 load it into a local cluster), and point the chart at it:
 
 ```
-docker build -t celastro:0.53.0 .
-kind load docker-image celastro:0.53.0        # for a kind cluster
-helm install celastro deploy/chart/celastro --set image.repository=celastro
+docker build -t celastro:dev .
+kind load docker-image celastro:dev           # for a kind cluster
+helm install celastro deploy/chart/celastro \
+  --set image.repository=celastro --set image.tag=dev
 ```
+
+`image.tag` is not optional here. Left empty it is the chart's
+`appVersion`, which is the released version, so setting only
+`image.repository` asks the cluster for `celastro:<appVersion>` -- a tag
+your build did not make.
 
 `image.repository` and `image.tag` take a registry of your own the same way.
 
