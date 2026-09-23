@@ -332,7 +332,7 @@ CELASTRO_TOKEN=sixteen-bytes-ok! CELASTRO_WIRE_TOKEN=wire celastro install --roo
 ```
 
 ```
-installed celastro 0.72.0 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
+installed celastro 0.72.1 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
 written under the root; nothing started
 ```
 
