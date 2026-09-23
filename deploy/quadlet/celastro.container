@@ -27,7 +27,9 @@ Volume=celastro-data:/data
 EnvironmentFile=/etc/celastro/celastro.env
 # For one node drop `--shard-bind 0.0.0.0:2352`; the wire is a cluster's.
 Exec=--dir /data serve --bind 0.0.0.0 --shard-bind 0.0.0.0:2352
-# `serve` prints its URL, token included, on stdout; the log is on stderr.
+# `serve` prints its URL on stdout -- without the token, since the token
+# came from the environment file and this line lands in the journal --
+# and the log on stderr.
 LogDriver=journald
 
 [Service]

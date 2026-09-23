@@ -177,8 +177,18 @@ For 0.72.0, on this repository's own test machines:
   user alone, the staged copies gone, the data still there over https).
   Both refusals: no console token, and several hosts with no wire token,
   each caught before any host is touched.
-- The quadlet: the image under podman, a statement through the console,
-  a stop and a start with the data kept on the named volume.
+- The quadlet, by a drill rather than by hand, 0.72.0 then 0.72.1 on
+  podman 4.9.3: serving 4 s after `systemctl start`; the named volume
+  seeded from the image and owned by 65532; the journal carrying the
+  served URL and not the token; a row written, `systemctl stop` exiting 0
+  in 1 s (SIGTERM handled, not `TimeoutStopSec` waited out), the row
+  there after `start`; the container SIGKILLed and back serving the row
+  4 s later by `Restart=on-failure`; and **the upgrade as the unit
+  describes it** -- the `Image=` line moved from 0.72.0 to 0.72.1,
+  `daemon-reload`, `restart` -- serving in 5 s with the binary reporting
+  0.72.1 and the row written on 0.72.0 reading. The same drill against a
+  release that does not exist fails its first leg and still removes
+  everything it put in place.
 - Not covered: more than three machines; a machine added to a cluster
   that is already running (`ATTACH NODE` does that, the script installs
   a set); the key files over several machines, though they are staged
