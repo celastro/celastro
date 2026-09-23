@@ -6,6 +6,37 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`key reseal` will not touch a backup.** A backup keeps its segments at
+`pool/<collection>/<shard>/<id>.seg` and the archived tier keeps its own
+at `<prefix><collection>/<shard>/<id>.seg` -- the same shape, and the
+identity a file was sealed under is the same string read off either. If
+the tier and a backup destination shared a bucket and prefix, 0.72.0's
+`key reseal` would have re-sealed the backup's objects under the new
+data key, leaving every record that named them with a hash that no
+longer matched: `VERIFY BACKUP` would have called the backup damaged and
+a restore would have refused it. Now `key retire` and `key reseal` look
+only at the collections the catalog says are at the archived tier, and
+both refuse outright when a backup has been written under the same
+prefix, naming the setting to change. Nobody could have hit this without
+pointing both at one place; nothing else changed for anyone who did not.
+
+**A re-seal no longer holds an object three times over.** It read the
+object, its plaintext and its re-sealed copy all at once -- about ninety
+megabytes for a thirty-megabyte segment. Frames are independent, so it
+now re-seals one frame at a time into a scratch file, which is also
+removed when the command ends rather than left beside the database.
+
+`Secret` no longer derives `PartialEq`: `==` on secret bytes stops at the
+first difference, and the derive invited a timing oracle with no
+warning. `Secret::ct_eq` is the comparison the type offers. Nothing in
+the tree compared two of them.
+
+The `BACKUP` record had two parsers in one file, one strict and one
+silently skipping; there is one now, so a restore and the hash recall
+cannot drift apart over what a line means.
+
 ## 0.72.0 — 2026-09-22
 
 **The Ansible role is gone; a shell script over ssh takes its place.**

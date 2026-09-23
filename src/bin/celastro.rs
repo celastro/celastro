@@ -1636,13 +1636,71 @@ fn archive_store(
 
 /// What the archived tier says about the ring, or `None` when there is no
 /// store to ask (the tier is local, and a rotation already re-sealed it).
+/// The collections with an index at the archived tier, read from the
+/// catalog in DIR. These and no others are what the key commands touch in
+/// the store: see `cipher::backups_share_this_prefix` for what else can be
+/// under the same prefix and why listing it whole would be wrong.
+fn archived_collections(
+    dir: &Path,
+    cipher: &celastro::cipher::Cipher,
+    json: bool,
+) -> std::result::Result<Vec<String>, i32> {
+    let bytes = match std::fs::read(dir.join("CATALOG")) {
+        Ok(b) => b,
+        // No catalog is a database with no collections, so no tier.
+        Err(_) => return Ok(Vec::new()),
+    };
+    let plain = match cipher.open_file("CATALOG", &bytes) {
+        Ok(p) => p,
+        Err(e) => return Err(fail(json, &format!("{}/CATALOG: {e}", dir.display()))),
+    };
+    let catalog = match celastro::catalog::Catalog::decode(&plain) {
+        Ok(c) => c,
+        Err(e) => return Err(fail(json, &format!("{}/CATALOG: {e}", dir.display()))),
+    };
+    Ok(catalog
+        .collections
+        .iter()
+        .filter(|(_, c)| c.indexes.iter().any(|i| i.tier == celastro::residency::Tier::Archived))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+/// The store, refused when a backup has been written under the same
+/// prefix: the two layouts are the same shape, and re-sealing a backup's
+/// pool object would leave every record that names it with a hash that no
+/// longer matches.
+fn archive_store_for_keys(
+    dir: &Path,
+    json: bool,
+) -> std::result::Result<Option<celastro::objstore::ArchiveHandle>, i32> {
+    let Some(h) = archive_store(json)? else { return Ok(None) };
+    match celastro::cipher::backups_share_this_prefix(h.store.as_ref(), &h.prefix) {
+        Ok(false) => Ok(Some(h)),
+        Ok(true) => Err(fail(
+            json,
+            &format!(
+                "{}: the archived tier's prefix also holds backups, whose objects are laid out \
+                 the same way; re-sealing or judging them as the tier's would break the records \
+                 that name them. Point CELASTRO_ARCHIVE_PREFIX or the bucket somewhere the \
+                 backups are not, and nothing here will touch them",
+                dir.display()
+            ),
+        )),
+        Err(e) => {
+            Err(fail(json, &format!("{}: the archived tier could not be read: {e}", dir.display())))
+        }
+    }
+}
+
 fn walk_or_report(
     dir: &Path,
     cipher: &celastro::cipher::Cipher,
     json: bool,
 ) -> std::result::Result<Option<celastro::cipher::ArchiveWalk>, i32> {
-    let Some(h) = archive_store(json)? else { return Ok(None) };
-    match celastro::cipher::walk_archive(cipher, h.store.as_ref(), &h.prefix) {
+    let Some(h) = archive_store_for_keys(dir, json)? else { return Ok(None) };
+    let colls = archived_collections(dir, cipher, json)?;
+    match celastro::cipher::walk_archive(cipher, h.store.as_ref(), &h.prefix, &colls) {
         Ok(w) => Ok(Some(w)),
         Err(e) => Err(fail(
             json,
@@ -1808,7 +1866,7 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
             ),
         );
     }
-    let Some(h) = (match archive_store(json) {
+    let Some(h) = (match archive_store_for_keys(dir, json) {
         Ok(h) => h,
         Err(code) => return code,
     }) else {
@@ -1821,7 +1879,18 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
             ),
         );
     };
-    let n = match celastro::cipher::reseal_archive(&cipher, h.store.as_ref(), &h.prefix, dir) {
+    let colls = match archived_collections(dir, &cipher, json) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let scratch = dir.join("reseal.scratch");
+    let n = match celastro::cipher::reseal_archive(
+        &cipher,
+        h.store.as_ref(),
+        &h.prefix,
+        &colls,
+        &scratch,
+    ) {
         Ok(n) => n,
         Err(e) => {
             return fail(

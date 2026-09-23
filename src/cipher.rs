@@ -460,7 +460,11 @@ pub fn wipe_string(s: &mut String) {
 
 /// `N` secret bytes that wipe themselves when dropped and print as
 /// nothing: the master key as the options hold it.
-#[derive(Clone, PartialEq, Eq)]
+/// Equality is deliberately not derived. `==` on `[u8; N]` compares byte
+/// by byte and stops at the first difference, which over a secret is a
+/// timing oracle, and a derive would let any future caller write it with
+/// no warning. [`Secret::ct_eq`] is the comparison this type offers.
+#[derive(Clone)]
 pub struct Secret<const N: usize>([u8; N]);
 
 impl<const N: usize> From<[u8; N]> for Secret<N> {
@@ -489,6 +493,12 @@ impl<const N: usize> Secret<N> {
     /// behind, which is the whole point of the type.
     pub fn bytes_mut(&mut self) -> &mut [u8; N] {
         &mut self.0
+    }
+
+    /// Whether two secrets are the same, in time that does not depend on
+    /// where they first differ.
+    pub fn ct_eq(&self, other: &Secret<N>) -> bool {
+        crate::crypto::ct_eq(&self.0, &other.0)
     }
 }
 
@@ -955,11 +965,56 @@ impl Cipher {
     }
 
     /// `framed` opened under whichever key of the ring seals it and sealed
-    /// again under the current one. An error names the file when no key
-    /// opens it.
+    /// again under the current one, a frame at a time into `out`.
+    ///
+    /// Frames are independent -- a nonce, the ciphertext and a tag, with
+    /// the file's identity and the frame's index as associated data -- so
+    /// a re-seal does not need the file in one piece. Holding one frame
+    /// rather than the object, its plaintext and its re-sealed copy all at
+    /// once is the same economy that made a backup stream a segment from
+    /// its file instead of reading it whole (0.70.0); an archived segment
+    /// is the same size as that one.
+    ///
+    /// Which key opens it is decided from the first frame, so the object is
+    /// not decrypted once per candidate key to find out.
+    pub fn reseal_into(&self, id: &str, sealed: &[u8], out: &mut dyn std::io::Write) -> Result<()> {
+        let head = &sealed[..sealed.len().min(HEAD_BYTES)];
+        let Some(which) = self.opening_key(id, head) else {
+            return Err(Error::Storage(format!(
+                "{id}: no data key this KEY holds opens it; it is damaged, or was sealed under a \
+                 key that has been retired"
+            )));
+        };
+        let keys = self.file_keys(id);
+        let from = &keys[which];
+        let to = self.file_key(id);
+        let (mut index, mut rest) = (0u64, sealed);
+        loop {
+            let take = rest.len().min(FRAME);
+            if take < NONCE + TAG {
+                return Err(Error::Storage(format!("{id}: an encrypted frame is torn")));
+            }
+            let (frame, after) = rest.split_at(take);
+            let mut plain = self.open_frame(from, id, index, frame)?;
+            let mut one = Vec::with_capacity(framed(plain.len()));
+            self.push_frame(&to, id, index, &plain, &mut one)?;
+            wipe(&mut plain);
+            out.write_all(&one)
+                .map_err(|e| Error::Storage(format!("{id}: writing a re-sealed frame: {e}")))?;
+            rest = after;
+            index += 1;
+            if rest.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// [`Cipher::reseal_into`] into a buffer, for a caller that wants the
+    /// bytes rather than a writer.
     pub fn reseal_file(&self, id: &str, framed: &[u8]) -> Result<Vec<u8>> {
-        let plain = self.open_file(id, framed)?;
-        self.seal_file(id, &plain)
+        let mut out = Vec::with_capacity(framed.len());
+        self.reseal_into(id, framed, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -977,65 +1032,118 @@ pub struct ArchiveWalk {
     pub unopenable: Vec<String>,
 }
 
-/// Every archived object under `prefix`, and which key of the ring opens
-/// it. One ranged read of a frame per object; nothing is downloaded whole.
+/// Whether a backup has been written under this prefix as well.
+///
+/// **A backup's layout and the archived tier's are the same shape.** A
+/// backup keeps its segments at `pool/<collection>/<shard>/<id>.seg` and
+/// the tier keeps its own at `<prefix><collection>/<shard>/<id>.seg`, and
+/// the seal identity read off either is the same string -- so a tier and a
+/// backup destination sharing a bucket and a prefix cannot be told apart
+/// by the shape of a key. Re-sealing a backup's pool object under the
+/// current data key would leave every record that names it with a hash
+/// that no longer matches: `VERIFY BACKUP` would call the backup damaged
+/// and a restore would refuse it.
+///
+/// `nodes/<slug>/LATEST` is written by every completed backup and by
+/// nothing the tier writes, so its presence is the overlap, and the
+/// commands refuse rather than guess.
+pub fn backups_share_this_prefix(
+    store: &dyn crate::objstore::ObjectStore,
+    prefix: &str,
+) -> Result<bool> {
+    Ok(store.list(&format!("{prefix}nodes/"))?.iter().any(|k| k.ends_with("/LATEST")))
+}
+
+/// The archived objects of `colls`, and which key of the ring opens each.
+/// One ranged read of a frame per object; nothing is downloaded whole.
+///
+/// It lists each collection's own prefix rather than the whole of
+/// `prefix`, so that nothing outside the tier is ever considered -- see
+/// [`backups_share_this_prefix`] for what else can be under there.
 pub fn walk_archive(
     cipher: &Cipher,
     store: &dyn crate::objstore::ObjectStore,
     prefix: &str,
+    colls: &[String],
 ) -> Result<ArchiveWalk> {
     let mut w = ArchiveWalk::default();
-    for key in store.list(prefix)? {
-        let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
-        let Some(size) = store.size(&key)? else { continue };
-        let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
-        w.objects += 1;
-        match cipher.opening_key(&id, &head) {
-            Some(0) => {}
-            Some(_) => {
-                w.under_previous += 1;
-                w.collections.insert(coll);
+    for name in colls {
+        for key in store.list(&format!("{prefix}{name}/"))? {
+            let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
+            if &coll != name {
+                continue;
             }
-            None => w.unopenable.push(key),
+            let Some(size) = store.size(&key)? else { continue };
+            let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+            w.objects += 1;
+            match cipher.opening_key(&id, &head) {
+                Some(0) => {}
+                Some(_) => {
+                    w.under_previous += 1;
+                    w.collections.insert(coll);
+                }
+                None => w.unopenable.push(key),
+            }
         }
     }
     Ok(w)
 }
 
-/// Re-seal every archived object that is not already under the current data
-/// key, so a rotation can be finished without moving the tier back.
+/// Re-seal every archived object of `colls` that is not already under the
+/// current data key, so a rotation can be finished without moving the tier
+/// back.
 ///
 /// Object by object: a ranged read says which key seals it, an object that
-/// needs it is fetched, opened, sealed again under the current key, written
-/// to a temporary beside nothing and `put_file`d back, so the upload
-/// streams rather than holding a second copy of the object in the request.
-/// A failure part way leaves what it has already done -- every object is
-/// independent, and running it again finishes the rest.
+/// needs it is fetched, re-sealed a frame at a time into a scratch file and
+/// `put_file`d back, so neither the upload nor the re-seal holds the object
+/// more than once over. A failure part way leaves what it has already done
+/// -- every object is independent, and running it again finishes the rest.
+///
+/// `scratch` is a directory this makes and removes; it is not the data
+/// directory, so a run cut short leaves nothing beside the database.
 pub fn reseal_archive(
     cipher: &Cipher,
     store: &dyn crate::objstore::ObjectStore,
     prefix: &str,
-    tmp_dir: &std::path::Path,
+    colls: &[String],
+    scratch: &std::path::Path,
 ) -> Result<usize> {
+    // A previous run cut short is the normal reason to be here.
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch)
+        .map_err(|e| Error::Storage(format!("{}: {e}", scratch.display())))?;
+    let tmp = scratch.join("object.part");
     let mut done = 0usize;
-    for key in store.list(prefix)? {
-        let Some((_coll, _shard, id)) = archived_seal_id(&key) else { continue };
-        let Some(size) = store.size(&key)? else { continue };
-        let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
-        match cipher.opening_key(&id, &head) {
-            Some(0) | None => continue,
-            Some(_) => {}
+    let out = (|| -> Result<usize> {
+        for name in colls {
+            for key in store.list(&format!("{prefix}{name}/"))? {
+                let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
+                if &coll != name {
+                    continue;
+                }
+                let Some(size) = store.size(&key)? else { continue };
+                let head = store.get_range(&key, 0, size.min(HEAD_BYTES as u64))?;
+                match cipher.opening_key(&id, &head) {
+                    Some(0) | None => continue,
+                    Some(_) => {}
+                }
+                let sealed = store.get(&key)?;
+                let mut f = std::fs::File::create(&tmp)
+                    .map_err(|e| Error::Storage(format!("{}: {e}", tmp.display())))?;
+                cipher.reseal_into(&id, &sealed, &mut f)?;
+                drop(sealed);
+                use std::io::Write;
+                f.flush().map_err(|e| Error::Storage(format!("{}: {e}", tmp.display())))?;
+                f.sync_all().map_err(|e| Error::Storage(format!("{}: {e}", tmp.display())))?;
+                drop(f);
+                store.put_file(&key, &tmp)?;
+                done += 1;
+            }
         }
-        let framed = store.get(&key)?;
-        let resealed = cipher.reseal_file(&id, &framed)?;
-        let tmp = tmp_dir.join(format!("reseal-{:016x}.part", done as u64));
-        crate::shard::atomic_write(&tmp, &resealed)?;
-        let put = store.put_file(&key, &tmp);
-        let _ = std::fs::remove_file(&tmp);
-        put?;
-        done += 1;
-    }
-    Ok(done)
+        Ok(done)
+    })();
+    let _ = std::fs::remove_dir_all(scratch);
+    out
 }
 
 pub fn retire_keys(dir: &std::path::Path, master: &[u8; 32]) -> Result<usize> {
@@ -1312,6 +1420,10 @@ mod archive_ring_tests {
     use super::*;
     use crate::objstore::{DirStore, ObjectStore};
 
+    fn colls(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     fn temp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "celastro-ring-{tag}-{}-{:?}",
@@ -1361,7 +1473,7 @@ mod archive_ring_tests {
         let other_id = "shard-0000/0000000000000003.seg";
         store.put(&format!("logs/{other_id}"), &old.seal_file(other_id, &plain).unwrap()).unwrap();
 
-        let w = walk_archive(&new, &store, "").unwrap();
+        let w = walk_archive(&new, &store, "", &colls(&["docs", "logs"])).unwrap();
         assert_eq!(w.objects, 3);
         assert_eq!(w.under_previous, 2, "two were sealed under the old key");
         assert_eq!(
@@ -1382,7 +1494,7 @@ mod archive_ring_tests {
         let mine = Cipher::generate().unwrap();
         let id = "shard-0000/0000000000000001.seg";
         store.put(&format!("docs/{id}"), &stranger.seal_file(id, b"not mine").unwrap()).unwrap();
-        let w = walk_archive(&mine, &store, "").unwrap();
+        let w = walk_archive(&mine, &store, "", &colls(&["docs"])).unwrap();
         assert_eq!(w.under_previous, 0);
         assert_eq!(w.unopenable, vec!["docs/shard-0000/0000000000000001.seg".to_string()]);
     }
@@ -1405,7 +1517,7 @@ mod archive_ring_tests {
         store.put(&format!("docs/{fresh_id}"), &fresh_bytes).unwrap();
 
         let tmp = temp("reseal-tmp");
-        let n = reseal_archive(&new, &store, "", &tmp).unwrap();
+        let n = reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap();
         assert_eq!(n, 1, "only the stale object is rewritten");
         assert_eq!(
             store.get(&format!("docs/{fresh_id}")).unwrap(),
@@ -1413,7 +1525,7 @@ mod archive_ring_tests {
             "an object already under the current key is not touched"
         );
 
-        let after = walk_archive(&new, &store, "").unwrap();
+        let after = walk_archive(&new, &store, "", &colls(&["docs"])).unwrap();
         assert_eq!(after.under_previous, 0, "nothing is under a previous key now");
         assert_eq!(after.objects, 2);
 
@@ -1425,9 +1537,57 @@ mod archive_ring_tests {
             retired.open_file(stale_id, &store.get(&format!("docs/{stale_id}")).unwrap()).unwrap(),
             plain
         );
-        // And no temporary is left behind in the directory it used.
-        let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().filter_map(|e| e.ok()).collect();
-        assert!(left.is_empty(), "a re-seal left {} file(s) behind", left.len());
+        // Not merely emptied: the scratch directory is taken away, so a run
+        // leaves nothing beside the database at all.
+        assert!(!tmp.exists(), "a re-seal left its scratch directory behind");
+    }
+
+    /// A backup's objects are not the archived tier's, however alike they
+    /// look.
+    ///
+    /// `pool/<collection>/<shard>/<id>.seg` and the tier's
+    /// `<collection>/<shard>/<id>.seg` yield the same seal identity, so a
+    /// walk that listed the prefix whole would judge a backup's segments as
+    /// the tier's and a re-seal would rewrite them -- leaving every record
+    /// that names them with a hash that no longer matches. Two guards: the
+    /// walk lists each collection's own prefix, and a prefix that holds
+    /// backups is refused outright.
+    #[test]
+    fn a_backup_under_the_same_prefix_is_neither_walked_nor_re_sealed() {
+        let root = temp("shared");
+        let store = DirStore::new(&root).unwrap();
+        let old = Cipher::generate().unwrap();
+        let mut new = Cipher::generate().unwrap();
+        new.keep_previous(&old);
+
+        // A backup, as `backup::run` lays one out: a pool segment under the
+        // old key, and the LATEST that says a backup was written here.
+        let pooled = "shard-0000/0000000000000001.seg";
+        let pool_key = format!("pool/docs/{pooled}");
+        let pool_bytes = old.seal_file(pooled, b"a backup's segment").unwrap();
+        store.put(&pool_key, &pool_bytes).unwrap();
+        store.put("nodes/local/LATEST", b"123\n").unwrap();
+        // And one real archived object of the tier, also under the old key.
+        let mine = "shard-0000/0000000000000002.seg";
+        store.put(&format!("docs/{mine}"), &old.seal_file(mine, b"the tier's").unwrap()).unwrap();
+
+        // The overlap is detectable, and the commands refuse on it.
+        assert!(backups_share_this_prefix(&store, "").unwrap());
+        assert!(!backups_share_this_prefix(&store, "elsewhere/").unwrap());
+
+        // Even if it were not refused, scoping to the collection keeps the
+        // walk off `pool/`: one object seen, not two.
+        let w = walk_archive(&new, &store, "", &colls(&["docs"])).unwrap();
+        assert_eq!(w.objects, 1, "the backup's pool segment was walked as the tier's");
+        assert_eq!(w.under_previous, 1);
+
+        let tmp = temp("shared-tmp");
+        assert_eq!(reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(), 1);
+        assert_eq!(
+            store.get(&pool_key).unwrap(),
+            pool_bytes,
+            "a re-seal rewrote a backup's pool object; every record naming it is now wrong"
+        );
     }
 
     /// Re-sealing is resumable: it only ever moves an object forward, so
@@ -1442,7 +1602,11 @@ mod archive_ring_tests {
         let id = "shard-0000/0000000000000001.seg";
         store.put(&format!("docs/{id}"), &old.seal_file(id, b"rows").unwrap()).unwrap();
         let tmp = temp("again-tmp");
-        assert_eq!(reseal_archive(&new, &store, "", &tmp).unwrap(), 1);
-        assert_eq!(reseal_archive(&new, &store, "", &tmp).unwrap(), 0, "nothing left to do");
+        assert_eq!(reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(), 1);
+        assert_eq!(
+            reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(),
+            0,
+            "nothing left to do"
+        );
     }
 }

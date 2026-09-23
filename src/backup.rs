@@ -166,6 +166,32 @@ pub(crate) fn job(
 /// that file and the file cannot change. Empty for a destination with no
 /// previous backup, a record that cannot be read, or a version 1 record
 /// with no hashes -- each of which falls back to reading the file.
+/// The entries of a `BACKUP` record: each object's key, its size, and its
+/// SHA-256 as hex -- empty in a version 1 record, which carried no hashes.
+///
+/// One parser, because there are two readers of this format and they used
+/// to have one each: a restore, which must refuse a record it cannot
+/// understand, and the hash recall below, which must not care. They can no
+/// longer drift apart over what a line means.
+fn record_entries(record: &[u8], whose: &str) -> Result<Vec<(String, u64, String)>> {
+    let record = String::from_utf8_lossy(record).to_string();
+    let mut lines = record.lines();
+    if lines.next() != Some("celastro backup") {
+        return Err(Error::Storage(format!("{whose} is not a backup record")));
+    }
+    let mut files = Vec::new();
+    for line in lines {
+        // A header line (`version 2`, `ts ...`, `node ...`) has no tab.
+        let Some((key, rest)) = line.split_once('\t') else { continue };
+        let (len, hash) = rest.split_once('\t').unwrap_or((rest, ""));
+        let len = len
+            .parse::<u64>()
+            .map_err(|_| Error::Storage(format!("{whose}: `{line}` is not a file entry")))?;
+        files.push((key.to_string(), len, hash.to_string()));
+    }
+    Ok(files)
+}
+
 fn previous_hashes(
     target: &Target,
     mine: &str,
@@ -181,12 +207,12 @@ fn previous_hashes(
     else {
         return out;
     };
-    for line in String::from_utf8_lossy(&record).lines().skip(1) {
-        let Some((key, rest)) = line.split_once('\t') else { continue };
-        let Some((len, hash)) = rest.split_once('\t') else { continue };
-        let Ok(len) = len.parse::<u64>() else { continue };
+    // A record that cannot be read is a record whose hashes are not used;
+    // every key then falls back to being read off its file, as before.
+    for (key, len, hash) in record_entries(&record, "the last backup's record").unwrap_or_default()
+    {
         if !hash.is_empty() {
-            out.insert(key.to_string(), (len, hash.to_string()));
+            out.insert(key, (len, hash));
         }
     }
     out
@@ -491,24 +517,7 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
             )));
         }
     };
-    let record = String::from_utf8_lossy(&record).to_string();
-    let mut lines = record.lines();
-    if lines.next() != Some("celastro backup") {
-        return Err(Error::Storage(format!(
-            "{own}BACKUP at {} is not a backup record",
-            target.display
-        )));
-    }
-    let mut files: Vec<(String, u64, String)> = Vec::new();
-    for line in lines {
-        if let Some((key, rest)) = line.split_once('\t') {
-            let (len, hash) = rest.split_once('\t').unwrap_or((rest, ""));
-            let len = len.parse::<u64>().map_err(|_| {
-                Error::Storage(format!("{own}BACKUP: `{line}` is not a file entry"))
-            })?;
-            files.push((key.to_string(), len, hash.to_string()));
-        }
-    }
+    let files = record_entries(&record, &format!("{own}BACKUP at {}", target.display))?;
     // Every object at its recorded size, before anything is written.
     for (key, len, _) in &files {
         match target.store.size(&target.key(key))? {

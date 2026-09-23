@@ -2089,10 +2089,25 @@ collections; `--check` reports and writes nothing, `--force` is the old
 behaviour. A store it cannot reach is a refusal, because the failure
 this command can cause is unreadable data. `key reseal` finishes the
 rotation the other way: the objects still under an old key are fetched,
-opened, sealed under the current one and written back through
-`put_file` so the upload streams, then the ring retires itself; it
+re-sealed a frame at a time into a scratch file and written back through
+`put_file`, so neither the re-seal nor the upload holds an object more
+than once over -- frames are independent, which is what lets a re-seal
+stream the way a backup's copy does -- then the ring retires itself; it
 skips what it has already moved, so a failure part way is finished by
-running it again. The seal identity is read off the object key
+running it again, and the scratch directory is taken away either way.
+
+**A backup's layout is the archived tier's layout.** A backup's segments
+sit at `pool/<collection>/<shard>/<id>.seg` and the tier's at
+`<prefix><collection>/<shard>/<id>.seg`, and `Shard::file_id` gives the
+same seal identity for both, so a walk that listed the prefix whole
+could not tell them apart -- and a re-seal that rewrote a backup's pool
+object would leave every record naming it with a hash that no longer
+matches, which `VERIFY BACKUP` would call damage and a restore would
+refuse. Two guards, since one of them is a heuristic: the walk lists
+each archived collection's own prefix, taken from the catalog, rather
+than the prefix whole; and a prefix under which any `nodes/<slug>/LATEST`
+exists -- written by every completed backup and by nothing the tier
+writes -- is refused outright, naming the setting to change. The seal identity is read off the object key
 (`<prefix><collection>/<shard>/<id>.seg` against `Shard::file_id`'s
 `<shard>/<id>.seg`), so neither command needs a manifest to know what
 an object was sealed as. Both are offline, like the rotation they

@@ -172,7 +172,17 @@ any archived object still needs it, naming the collections; `--check`
 reports without changing anything and `--force` retires regardless, at
 the cost of every object still under an old key. Both read the archived
 tier through the same `CELASTRO_ARCHIVE_*` settings a node uses, and a
-store they cannot reach is a refusal rather than a retirement. A ring
+store they cannot reach is a refusal rather than a retirement.
+
+Both also look only at the collections the catalog says are at the
+archived tier, and both **refuse outright if a backup has been written
+under the same prefix**. A backup keeps its segments at
+`pool/<collection>/<shard>/<id>.seg` and the tier keeps its own at
+`<prefix><collection>/<shard>/<id>.seg`: the same shape, and the
+identity a file was sealed under is the same string read off either. A
+re-seal that mistook one for the other would leave every record naming
+it with a hash that no longer matches, so the archived tier and a backup
+destination want different prefixes, or different buckets. A ring
 that nothing can need -- no index is at the archived tier at all -- is
 dropped by the next open without being asked, and logged.
 
