@@ -81,3 +81,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-archive" (include "celastro.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Whether the console listens on the pod's network rather than on
+     127.0.0.1 inside it. `console.expose` asks for that so clients can
+     reach it through the console Service; `monitoring.enabled` needs the
+     same thing for a different reason -- a scrape comes from another pod --
+     and both then want the token, since a network console never runs
+     without one. */}}
+{{- define "celastro.consoleNetworked" -}}
+{{- if or .Values.console.expose .Values.monitoring.enabled -}}true{{- end -}}
+{{- end -}}

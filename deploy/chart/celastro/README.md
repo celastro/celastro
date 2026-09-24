@@ -277,6 +277,53 @@ which needs the headless Service to publish a pod's address before it is
 ready, or no pod could reach another. Liveness stays the plain `health`, so a
 peer that is down does not get every pod restarted.
 
+## Monitoring
+
+`--set monitoring.enabled=true` emits a `PodMonitor` that scrapes
+every pod's `/api/metrics` and a `PrometheusRule` with four alerts: a
+data-key ring nobody retired, a certificate inside thirty days, a node
+short of its peers, and a data directory that has gone. Both need the
+prometheus-operator CRDs in the cluster; without them the install fails
+naming the missing kind rather than quietly monitoring nothing. The
+dashboard that draws the rest is
+[deploy/grafana/celastro.json](../../grafana/celastro.json), imported as
+it is.
+
+Three things about it are worth knowing before turning it on:
+
+- **It makes the console listen on the pod's network**, because a scrape
+  comes from another pod, and so it generates the console token if there
+  is not one already -- the same thing `console.expose` does. It does not
+  create the console Service: with `console.expose` still `false`, the
+  scraper is the only thing that can reach the console.
+- **The scrape sends the console token** as `Authorization: Bearer`, read
+  from the console Secret. A PodMonitor can send that header and cannot
+  send an arbitrary one, which is why the console takes a bearer token as
+  well as `X-Celastro-Token` (0.74.0). Prometheus therefore holds what a
+  client holds; if that is not wanted, give the scraper its own release
+  with its own token.
+- **It selects pods, not Services.** A release can have three Services
+  carrying the same labels -- headless, console, coordinators -- and a
+  ServiceMonitor over them scrapes each pod once per Service, which
+  doubles every sum over the fleet. This was the first version of it, and
+  the drill below is what caught it.
+- **`instance` is the pod's name**, relabelled from the pod's IP, so a
+  graph survives a restart and matches the addresses `SHOW HEALTH` prints.
+
+Which Prometheus picks the PodMonitor up is the cluster's business, not
+the chart's, and it usually takes one value: kube-prometheus-stack, at
+its defaults, selects only PodMonitors and PrometheusRules labelled with
+its own release, so `--set monitoring.labels.release=<the stack's
+release>` is what makes it look at these. Without it the objects exist,
+the install succeeds and nothing is scraped, which is what the drill
+below found the first time it was run that way. A Prometheus configured
+to select everything needs nothing here.
+
+Verified on kind against kube-prometheus-stack, at the chart's own
+version: the targets came up, every panel's query answered, and the
+numbers were the ones `SHOW HEALTH` and `SHOW CATALOG` gave at the same
+moment -- see the drill in "What was verified" below.
+
 ## Upgrading
 
 `helm upgrade` with a new `image.tag` rolls the pods one by one; a pod
@@ -313,6 +360,10 @@ later and has been restarted together.
 | `port` | `8787` | the console's port inside the pod |
 | `console.expose` | `false` | serve the console on every interface, one token at every pod, behind the Service `<release>-console` |
 | `console.service.type` | `ClusterIP` | that Service's type |
+| `monitoring.enabled` | `false` | a `PodMonitor` over every pod's `/api/metrics` and a `PrometheusRule`; also puts the console on the pod's network, since a scrape comes from another pod |
+| `monitoring.namespace`, `monitoring.labels` | empty | where the two objects go, and the labels the Prometheus instance selects on |
+| `monitoring.interval`, `monitoring.scrapeTimeout` | `30s`, `10s` | the scrape |
+| `monitoring.rules.enabled` | `true` | the four alerts; `rules.ringFor`, `rules.certDays` and `rules.attachedFor` are their thresholds |
 | `console.token`, `console.existingSecret` | empty | the console token (at least sixteen characters), or a `Secret` with the key `CELASTRO_TOKEN`; both empty generates one, kept across upgrades |
 | `persistence.size`, `persistence.storageClass` | `10Gi`, the cluster default | the data volume |
 | `archive.endpoint` | empty | `http://host:port` or `https://host` of an S3-compatible store; empty keeps the `archived` tier in the data volume |
@@ -340,6 +391,24 @@ store in the cluster. Without it the endpoint has to be `http://`.
 
 All against a `kind` cluster (kind v0.24, Helm v3.16), each with an image
 built from the tree at the time:
+
+- **Monitoring** (0.74.0): three pods with `monitoring.enabled=true`
+  beside a kube-prometheus-stack, and every claim on this page checked
+  rather than looked at. The three targets came up, one per pod, each
+  labelled by its pod name; the four alert rules loaded; every one of the
+  twenty-three queries in
+  [deploy/grafana/celastro.json](../../grafana/celastro.json) was read out
+  of the file and run, and all answered. The numbers were the database's
+  at the same moment: 90 documents from `sum(celastro_documents)` against
+  90 from `SELECT count(*)`, 3 shards, 2 peers attached per node against
+  `SHOW HEALTH`'s "3 of 3 node(s) answer", and a latency histogram that
+  gave p50 2.1 ms, p95 8.8 ms and a 146 ms worst statement -- which is
+  also the proof that Prometheus took the buckets as a histogram.
+  Two things failed first and are fixed: a `ServiceMonitor` scraped every
+  pod once per Service that matched it, so 3 pods were 6 targets and
+  every sum over the fleet doubled (hence the PodMonitor), and the same
+  drill without `monitoring.labels` found no targets at all (hence the
+  paragraph about the stack's selector above).
 
 - **One pod** (the chart's first release): `helm lint` clean; `helm install
   --wait` ready in 9 seconds on a 1 GiB claim; a collection and a row through

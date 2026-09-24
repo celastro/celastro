@@ -1,0 +1,71 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.rules.enabled }}
+{{- /* Four rules, and no more: each one is a state an operator has to act
+       on and cannot see any other way. Everything else the dashboard in
+       deploy/grafana/ draws is for looking at, not for waking someone. */}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "celastro.fullname" . }}
+  {{- if .Values.monitoring.namespace }}
+  namespace: {{ .Values.monitoring.namespace }}
+  {{- end }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: celastro
+      rules:
+        - alert: CelastroDataKeyRingKept
+          expr: celastro_data_key_ring_size > 0
+          for: {{ .Values.monitoring.rules.ringFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }} is still keeping {{ `{{ $value }}` }} previous data key(s)"
+            description: >-
+              A data-key rotation was started and never finished, so objects
+              sealed under the old keys still need them. Run `celastro key
+              reseal` and then `key retire` on this node. It is not urgent
+              and it does not go away on its own.
+        - alert: CelastroCertificateExpiring
+          expr: (celastro_tls_certificate_expiry_seconds - time()) < {{ mul .Values.monitoring.rules.certDays 86400 }}
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }}'s certificate expires in {{ `{{ $value | humanizeDuration }}` }}"
+            description: >-
+              The wire and the console both stop when it expires, and every
+              pod verifies every other against one CA, so this is the whole
+              cluster and not one pod. Replace the material in the Secret;
+              cert-manager does it by itself where it issued the
+              certificate.
+        {{- if gt (int .Values.replicas) 1 }}
+        - alert: CelastroNodeNotAttached
+          expr: celastro_attached_nodes < {{ sub (add (int .Values.replicas) (int .Values.coordinators.replicas)) 1 }}
+          for: {{ .Values.monitoring.rules.attachedFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }} has reached {{ `{{ $value }}` }} of {{ sub (add (int .Values.replicas) (int .Values.coordinators.replicas)) 1 }} peers"
+            description: >-
+              A node that cannot reach a peer cannot read the shards that
+              peer holds, so statements coordinated here answer short or
+              refuse. Expected briefly while a pod restarts; sustained, it
+              is the wire, the token or the peer itself.
+        {{- end }}
+        - alert: CelastroDataDirectoryGone
+          expr: celastro_directory_present == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }} cannot see its data directory"
+            description: >-
+              The volume this node opened is no longer where it was. It can
+              still answer from memory, which is why nothing else notices.
+              Its writes are going nowhere durable.
+{{- end }}

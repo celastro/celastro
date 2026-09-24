@@ -6,6 +6,72 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.74.0 — 2026-09-24
+
+**A dashboard, an alert set, and a Monitoring section in the console.**
+`/api/metrics` has spoken the Prometheus text format since the console
+did, and nothing drew it, nothing scraped it, and the page an operator
+already has open said nothing about whether the node was well. Three
+things change that, and one of them changes the metrics themselves.
+
+**Statement latency is a histogram.** `celastro_statement_seconds` now
+carries `_bucket{le="..."}` at eleven bounds from a millisecond to ten
+seconds, and `_count` beside them, so `histogram_quantile` answers and a
+dashboard can draw a p95 instead of a mean. The old
+`celastro_statement_seconds_sum` keeps its name, its value and its
+meaning; what changed is the family's `# TYPE` line, from `counter` to
+`histogram`. A scraper that
+recorded the sum goes on recording it. A p95 sitting exactly at 10 means
+the statement was slower than the widest bucket, not that it took ten
+seconds.
+
+**The console accepts `Authorization: Bearer <token>`** wherever it
+accepts `X-Celastro-Token`: the same secret, compared the same way,
+under the name scrapers speak. Prometheus, and the `PodMonitor` the
+chart emits for it, can send an `Authorization` header from a Secret and
+cannot send an arbitrary one, so without this an authenticated
+`/api/metrics` could not be scraped over a network without putting the
+token in a URL, where every proxy on the way logs it. It costs no CSRF
+protection: both headers are non-simple, so a cross-origin page still
+cannot attach either without a preflight this console never answers.
+
+**[deploy/grafana/celastro.json](deploy/grafana/celastro.json)** imports
+as it is -- the only thing it asks for is a Prometheus datasource -- and
+draws four rows: statements, the cluster, storage, and the states that
+page someone. Every panel's description says what its query is and what
+a bad value means, including the traps: a p95 pinned at the widest
+bucket, a document count that drops because a node stopped being
+scraped, a "failed" line that is mostly people mistyping SQL.
+
+**The chart scrapes it.** `--set monitoring.enabled=true` emits a
+`PodMonitor` over every pod's `/api/metrics` and a `PrometheusRule`
+with four alerts -- a data-key ring nobody retired, a certificate inside
+thirty days, a node short of its peers, a data directory that has gone.
+Both need the prometheus-operator CRDs; without them the install fails
+naming the missing kind rather than monitoring nothing. Turning it on
+also puts the console on the pod's network and generates the console
+token if there is none, because a scrape comes from another pod; it does
+not create the console Service, so with `console.expose` still false the
+scraper is the only thing that can reach the console. On hosts,
+[deploy/README.md](deploy/README.md#watching-it) has the `scrape_config`.
+
+**The console has a Monitoring section.** `SHOW HEALTH` rendered as it
+prints -- this node, every node it knows and whether each answers, every
+shard and where it is, the certificate, the data-key ring -- with the
+lines the report already marks in capitals (`DOWN`, `UNREACHABLE`,
+`CLOCK OFF`, `EXPIRES SOON`, `GONE`, `NOT ADOPTED`) coloured rather than
+left to be noticed; and beside it statements a second, refusals,
+failures, connections, compactions and a p95, each a number and a
+sparkline. It refreshes with the sidebar's Refresh and on a ten-second
+timer that can be turned off, and it asks for nothing but `/api/query`
+and `/api/metrics` on this node. The rates are the page's own arithmetic
+and live in the tab: the node keeps no history, so they start when the
+page opens and a reload starts them again, which the panel says in as
+many words.
+
+Nothing was renamed. The metric names are the contract, and a release
+that changes one will say so here.
+
 ## 0.73.0 — 2026-09-24
 
 **The wire's default port is 7876, and an address written without one

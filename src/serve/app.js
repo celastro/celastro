@@ -80,6 +80,15 @@ function api(path, init) {
   });
 }
 
+// The metrics page is text, not JSON, and it is the only thing on this
+// console that is.
+function apiText(path) {
+  return fetch(path, { headers: { 'X-Celastro-Token': TOKEN } }).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' from ' + path);
+    return res.text();
+  });
+}
+
 function runQuery() {
   var sql = editor.value.trim();
   if (busy) return;
@@ -319,8 +328,210 @@ function remember(sql) {
   });
 }
 
+// ---------------------------------------------------------------- monitoring
+//
+// Two answers, side by side: what SHOW HEALTH says about this node and the
+// ones it knows, and the handful of rates from /api/metrics that tell you
+// whether it is working. Both go through paths this console already serves
+// and nothing here reaches anywhere else.
+//
+// The health report marks what needs doing in capitals -- DOWN, UNREACHABLE,
+// CLOCK OFF, EXPIRES SOON, GONE, NOT ADOPTED, AN OLDER PROCESS -- so this
+// panel colours the lines carrying those rather than inventing a second
+// opinion about what is wrong. If the server grows another marker, the line
+// still shows; it is just not coloured, which is the safe direction.
+var MON_DOWN = ['DOWN', 'UNREACHABLE', 'GONE', 'EXPIRED', 'NOT ADOPTED'];
+var MON_ACT = ['EXPIRES SOON', 'CLOCK OFF', 'AN OLDER PROCESS', 'previous key(s) kept',
+  'seal failure', 'restarted since last seen', 'none elected yet'];
+var MON_EVERY_MS = 10000;
+var MON_SAMPLES = 60; // ten minutes at ten seconds, and the sparkline's width
+
+var monHealth = document.getElementById('mon-health');
+var monNumbers = document.getElementById('mon-numbers');
+var monAuto = document.getElementById('mon-auto');
+var monTimer = null;
+var monLast = null;   // the previous sample, for the deltas
+var monSeries = {};   // name -> the last MON_SAMPLES rates, oldest first
+
+// The rates this panel draws, in the order they are shown. `of` names the
+// counter in the metrics page; a rate is its delta over the seconds between
+// two samples, which is what the page can know without any history.
+var MON_RATES = [
+  { key: 'statements', of: 'celastro_statements_total', name: 'statements/s' },
+  { key: 'refused', of: 'celastro_requests_refused_total', name: 'refused/s' },
+  { key: 'failed', of: 'celastro_statements_failed_total', name: 'failed/s' },
+  { key: 'connections', of: 'celastro_connections_total', name: 'connections/s' },
+  { key: 'compactions', of: 'celastro_compactions_total', name: 'compactions/s' }
+];
+
+// The Prometheus text format, as much of it as this page needs: `name 1.5`
+// and `name{labels} 1.5`, with the # lines skipped. Returns a map of the
+// plain counters and, separately, the histogram's cumulative buckets.
+function parseMetrics(text) {
+  var values = {};
+  var buckets = [];
+  text.split('\n').forEach(function (raw) {
+    var line = raw.trim();
+    if (!line || line.charAt(0) === '#') return;
+    var cut = line.lastIndexOf(' ');
+    if (cut < 1) return;
+    var name = line.slice(0, cut);
+    var value = parseFloat(line.slice(cut + 1));
+    if (!isFinite(value)) return;
+    var le = /^celastro_statement_seconds_bucket\{le="([^"]+)"\}$/.exec(name);
+    if (le) {
+      buckets.push({ le: le[1] === '+Inf' ? Infinity : parseFloat(le[1]), count: value });
+      return;
+    }
+    if (name.indexOf('{') === -1) values[name] = value;
+  });
+  buckets.sort(function (a, b) { return a.le - b.le; });
+  return { values: values, buckets: buckets };
+}
+
+// The 95th percentile of the statements in THIS window: the difference
+// between two cumulative bucket sets, interpolated inside the bucket the
+// rank falls in, which is what histogram_quantile does. The widest finite
+// bound is the last thing this can say -- beyond it the answer is "slower
+// than that", and the panel says so rather than drawing a number.
+function windowP95(before, after) {
+  if (!before || before.length !== after.length || !after.length) return null;
+  var deltas = after.map(function (b, i) { return Math.max(0, b.count - before[i].count); });
+  var total = deltas[deltas.length - 1];
+  if (!total) return null;
+  var rank = 0.95 * total;
+  for (var i = 0; i < deltas.length; i++) {
+    if (deltas[i] < rank) continue;
+    var lo = i === 0 ? 0 : after[i - 1].le;
+    var below = i === 0 ? 0 : deltas[i - 1];
+    if (!isFinite(after[i].le)) return { over: lo };
+    var span = deltas[i] - below;
+    var within = span ? (rank - below) / span : 0;
+    return { at: lo + (after[i].le - lo) * within };
+  }
+  return null;
+}
+
+// A name, not an address: createElementNS identifies the SVG dialect with
+// it and fetches nothing. It is the only absolute URL in this file, and the
+// test in serve.rs holds it to that.
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+function sparkline(points) {
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'mon-spark');
+  svg.setAttribute('viewBox', '0 0 ' + MON_SAMPLES + ' 10');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('aria-hidden', 'true'); // the number beside it is the content
+  var top = Math.max.apply(null, points.concat([0])) || 1;
+  var line = document.createElementNS(SVG_NS, 'polyline');
+  // Right-aligned, so a fresh page draws the newest samples where the older
+  // ones will be rather than stretching two points across the whole box.
+  var start = MON_SAMPLES - points.length;
+  line.setAttribute('points', points.map(function (v, i) {
+    return (start + i) + ',' + (10 - (v / top) * 9.5).toFixed(2);
+  }).join(' '));
+  svg.appendChild(line);
+  return svg;
+}
+
+function monStat(name, value, points) {
+  var box = el('div', 'mon-stat');
+  box.appendChild(el('span', 'mon-name', name));
+  box.appendChild(el('span', 'mon-value', value));
+  if (points && points.length > 1) box.appendChild(sparkline(points));
+  return box;
+}
+
+function renderHealth(message) {
+  clear(monHealth);
+  var lines = String(message || '').split('\n').filter(function (l) { return l.trim(); });
+  if (!lines.length) {
+    monHealth.appendChild(el('p', 'muted', 'The node answered with nothing to report.'));
+    return;
+  }
+  var flagged = 0;
+  lines.forEach(function (text) {
+    var kind = '';
+    if (MON_DOWN.some(function (m) { return text.indexOf(m) !== -1; })) kind = ' down';
+    else if (MON_ACT.some(function (m) { return text.indexOf(m) !== -1; })) kind = ' act';
+    if (kind) flagged++;
+    monHealth.appendChild(el('p', 'mon-line' + kind, text));
+  });
+  // The live region would otherwise read the whole report aloud on every
+  // tick; a count of what is marked is the part worth hearing.
+  monHealth.setAttribute('aria-label', flagged
+    ? 'Health: ' + flagged + ' line(s) need attention'
+    : 'Health: nothing marked');
+}
+
+function renderRates(sample) {
+  clear(monNumbers);
+  var seconds = monLast ? (sample.at - monLast.at) / 1000 : 0;
+  MON_RATES.forEach(function (r) {
+    var now = sample.values[r.of];
+    var text = '—';
+    if (typeof now === 'number') {
+      if (monLast && seconds > 0 && typeof monLast.values[r.of] === 'number') {
+        // A counter that went backwards is a process that restarted, not a
+        // negative rate.
+        var delta = now - monLast.values[r.of];
+        var rate = delta < 0 ? 0 : delta / seconds;
+        monSeries[r.key] = (monSeries[r.key] || []).concat([rate]).slice(-MON_SAMPLES);
+        text = rate < 10 ? rate.toFixed(2) : Math.round(rate).toString();
+      } else {
+        text = '…';
+      }
+    }
+    monNumbers.appendChild(monStat(r.name, text, monSeries[r.key]));
+  });
+  var p95 = monLast ? windowP95(monLast.buckets, sample.buckets) : null;
+  var p95text = '—';
+  if (p95 && p95.over !== undefined) p95text = '> ' + p95.over + ' s';
+  else if (p95) {
+    p95text = p95.at < 1 ? Math.round(p95.at * 1000) + ' ms' : p95.at.toFixed(2) + ' s';
+    monSeries.p95 = (monSeries.p95 || []).concat([p95.at]).slice(-MON_SAMPLES);
+  } else if (monLast) p95text = 'no statements';
+  monNumbers.appendChild(monStat('p95 statement', p95text, monSeries.p95));
+  monLast = sample;
+}
+
+function loadMonitoring() {
+  // A statement is running: SHOW HEALTH would queue behind it and the timer
+  // would pile up more. The next tick will do.
+  if (busy) return;
+  api('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql: 'SHOW HEALTH' })
+  }).then(function (res) {
+    if (res && res.ok) renderHealth(res.message);
+    else renderHealth('SHOW HEALTH: ' + ((res && res.error) || 'no answer'));
+  }).catch(function (err) {
+    clear(monHealth);
+    monHealth.appendChild(el('p', 'mon-line down', 'Health unavailable: ' + err.message));
+  });
+  apiText('/api/metrics').then(function (text) {
+    var parsed = parseMetrics(text);
+    renderRates({ at: Date.now(), values: parsed.values, buckets: parsed.buckets });
+  }).catch(function (err) {
+    clear(monNumbers);
+    monNumbers.appendChild(el('p', 'muted', 'Metrics unavailable: ' + err.message));
+  });
+}
+
+function monitoringTimer(on) {
+  if (monTimer) { clearInterval(monTimer); monTimer = null; }
+  if (on) monTimer = setInterval(loadMonitoring, MON_EVERY_MS);
+}
+
 runBtn.addEventListener('click', runQuery);
-document.getElementById('refresh').addEventListener('click', loadCatalog);
+document.getElementById('refresh').addEventListener('click', function () {
+  loadCatalog();
+  loadMonitoring();
+});
+document.getElementById('mon-refresh').addEventListener('click', loadMonitoring);
+monAuto.addEventListener('change', function () { monitoringTimer(monAuto.checked); });
 editor.addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
@@ -335,4 +546,6 @@ api('/api/health').then(function (res) {
   if (res && res.version) document.getElementById('version').textContent = 'v' + res.version;
 }).catch(function () { /* the status line already reports anything that matters */ });
 loadCatalog();
+loadMonitoring();
+monitoringTimer(monAuto.checked);
 editor.focus();

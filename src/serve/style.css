@@ -170,3 +170,32 @@ td.doc pre { max-height: 9rem; overflow: auto; }
   .layout { grid-template-columns: 1fr; }
   .side { position: static; max-height: none; min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
 }
+
+/* Monitoring. Two columns on a wide screen -- the health report reads as
+   lines, the rates as a row of small numbers -- and one column under the
+   same breakpoint as the rest of the page. */
+.monitoring {
+  padding: .75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  min-width: 0;
+}
+.mon-controls { display: flex; align-items: baseline; gap: .75rem; }
+.mon-controls label { display: inline-flex; align-items: center; gap: .3rem; font-weight: 400; margin: 0; }
+.mon-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: .75rem; margin: .5rem 0; }
+.mon-health { min-width: 0; max-height: 18rem; overflow: auto; font-size: 13px; }
+.mon-line { margin: 0; padding: .15rem .35rem; font-family: var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A line the report itself marked: it shouts in capitals, and this is the
+   same claim in colour for anyone reading the panel rather than the text. */
+.mon-line.act { background: var(--warn-bg); border-left: 3px solid var(--warn-line); font-weight: 600; }
+.mon-line.down { background: var(--err-bg); border-left: 3px solid var(--err-line); font-weight: 600; }
+.mon-numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .5rem; align-content: start; }
+.mon-stat { padding: .35rem .5rem; border: 1px solid var(--line); border-radius: 4px; min-width: 0; }
+.mon-stat .mon-name { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.mon-stat .mon-value { font-family: var(--mono); font-size: 15px; }
+.mon-spark { display: block; width: 100%; height: 1.6rem; margin-top: .15rem; }
+.mon-spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+@media (max-width: 44rem) {
+  .mon-grid { grid-template-columns: 1fr; }
+}

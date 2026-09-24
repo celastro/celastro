@@ -147,6 +147,54 @@ what each flag costs -- are in [docs/container.md](../docs/container.md).
 deploy/chart/celastro --set replicas=3`. The chart's README records
 what was verified and how.
 
+## Watching it
+
+`/api/metrics` is the Prometheus text format, on the console's port and
+behind the console's token: statements and their latency as a histogram,
+refusals, the nodes this one has attached, reconciliations, backpressure,
+compactions and seal failures, the data-key ring, the certificate's
+expiry, and per collection the shards, segments and documents held here
+with each shard's reads and writes. Two things read it.
+
+**The dashboard.** [grafana/celastro.json](grafana/celastro.json) imports
+as it is -- the only thing it asks for is a Prometheus datasource -- and
+draws four rows: statements, the cluster, storage, and the handful of
+states that page someone. Every panel's description says what its query
+is and what a bad value looks like, which is also where the traps are
+written down (a p95 pinned at the widest bucket, a document count that
+drops because a node stopped being scraped).
+
+**The scrape.** Under Kubernetes the chart does it: `--set
+monitoring.enabled=true` emits a PodMonitor for every pod and a
+PrometheusRule with four alerts -- with `--set
+monitoring.labels.release=<your kube-prometheus-stack release>` beside
+it, since that stack takes only the objects labelled with its own
+release and otherwise creates nothing and scrapes nothing. On hosts, this is the scrape config --
+the token goes in a header, because a `?t=` in the URL is written into
+every proxy's access log on the way:
+
+```yaml
+scrape_configs:
+  - job_name: celastro
+    metrics_path: /api/metrics
+    # `celastro install` writes CELASTRO_TOKEN into
+    # /etc/celastro/celastro.env; this file holds the same value, readable
+    # only by Prometheus. The console also accepts the token as
+    # `X-Celastro-Token`, which `http_headers` can send instead.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/celastro-token
+    # With TLS on the console (CELASTRO_TLS_CERT), add:
+    # scheme: https
+    # tls_config: { ca_file: /etc/prometheus/celastro-ca.crt }
+    static_configs:
+      - targets: ['10.0.0.2:8787', '10.0.0.3:8787', '10.0.0.4:8787']
+```
+
+Each node answers for itself: the collection totals on the dashboard are
+a sum over the nodes, so a node missing from this list is a collection
+that looks smaller than it is rather than a gap that announces itself.
+
 ## What was verified
 
 For 0.72.0, on this repository's own test machines:

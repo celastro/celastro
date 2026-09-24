@@ -1,0 +1,69 @@
+{{- if .Values.monitoring.enabled }}
+{{- /* A PodMonitor and not a ServiceMonitor, which is what this started as:
+       a ServiceMonitor selects SERVICES, and this chart can have three that
+       carry the same labels -- the headless one, the console one, the
+       coordinators' one -- so every pod was scraped once per service it
+       appears in and every sum over the fleet came out doubled. A drill on
+       kind caught it: six targets for three pods, 180 documents where the
+       cluster held 90. A PodMonitor selects pods, so a pod is one target
+       however many Services route to it, and the coordinator pods are
+       included without another object.
+
+       /api/metrics takes the token like every other endpoint, and on a
+       network bind it takes it in a header. A PodMonitor can send an
+       Authorization header from a Secret and cannot send an arbitrary one,
+       which is why the console accepts `Authorization: Bearer <token>` as
+       well as `X-Celastro-Token` (0.74.0). The Secret named here is the
+       console's own, so the scraper holds what a client holds. */}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "celastro.fullname" . }}
+  {{- if .Values.monitoring.namespace }}
+  namespace: {{ .Values.monitoring.namespace }}
+  {{- end }}
+  labels:
+    {{- include "celastro.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "celastro.selectorLabels" . | nindent 6 }}
+  {{- if .Values.monitoring.namespace }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  {{- end }}
+  podMetricsEndpoints:
+    - port: console
+      path: /api/metrics
+      interval: {{ .Values.monitoring.interval }}
+      scrapeTimeout: {{ .Values.monitoring.scrapeTimeout }}
+      {{- if .Values.tls.enabled }}
+      scheme: https
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ include "celastro.tlsSecretName" . }}
+            key: ca.crt
+        # A pod is scraped at its IP, which no certificate names; the pod's
+        # own DNS name is what its certificate carries, so that is the name
+        # the handshake is verified against.
+        serverName: {{ printf "%s.%s.svc" (include "celastro.fullname" .) .Release.Namespace }}
+      {{- end }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ include "celastro.consoleSecretName" . }}
+          key: CELASTRO_TOKEN
+      {{- /* Without this every series is labelled by the pod's IP, which
+             changes on every restart and makes a week-long graph a mess of
+             short lines. `instance` becomes the pod's name, which is also
+             the node's address in the placement map. */}}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
+          action: replace
+{{- end }}

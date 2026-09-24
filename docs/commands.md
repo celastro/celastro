@@ -258,6 +258,27 @@ token.
 `CELASTRO_LOG=json` makes the log lines JSON. A server saves after every
 statement that changed something and again when it stops.
 
+**The page** is a statement box with its results, a sidebar of
+collections and this tab's history, and a Monitoring section. Monitoring
+is `SHOW HEALTH` rendered as it prints -- this node, every node it knows
+and whether each answers, every shard and where it is, the certificate
+and the data-key ring -- with the lines the report marks (`DOWN`,
+`UNREACHABLE`, `CLOCK OFF`, `EXPIRES SOON`, `GONE`, `NOT ADOPTED`)
+coloured rather than left to be spotted; beside it are statements a
+second, refusals, failures, connections, compactions and a p95, each a
+number and a sparkline. It refreshes on the sidebar's Refresh and every
+ten seconds unless that is turned off, and it asks for nothing but
+`/api/query` and `/api/metrics`, both on this node. `SHOW HEALTH` dials
+every peer, so a tab left open on a large cluster is a small steady load
+on it; that is what the timer's checkbox is for.
+
+The rates are the page's own arithmetic over `/api/metrics`, sampled
+while the tab is open: the node keeps no history to serve, so they begin
+when the page did and a reload starts them again, and the p95 is the
+window's, from the latency histogram, reading `> 10 s` when the answer
+is past the widest bucket. [deploy/](../deploy/README.md#watching-it) is
+where a fleet and last week are drawn instead.
+
 **`health [--port N] [--attached N]`** exits 0 when a console is serving
 on loopback -- and, with `--attached N`, has verified `N` other nodes
 since it started. A container's liveness and readiness probes run it.
@@ -343,10 +364,20 @@ quadlet.
 ## The console's HTTP API
 
 Every request but `/api/health` carries the token in the
-`X-Celastro-Token` header (on loopback, `?t=` in the URL is accepted
-too). `POST /api/query` takes `{"sql": "..."}` and answers the same JSON
-`send` prints; an error is `{"ok":false,"error":"..."}` with status 200,
-so a client reads `ok`.
+`X-Celastro-Token` header, or in `Authorization: Bearer <token>`, which
+is the same secret by the name scrapers and API clients already speak
+(on loopback, `?t=` in the URL is accepted too; on a network bind the
+API takes a header only, because a URL is what proxies log). `POST
+/api/query` takes `{"sql": "..."}` and answers the same JSON `send`
+prints; an error is `{"ok":false,"error":"..."}` with status 200, so a
+client reads `ok`.
+
+`GET /api/metrics` is the Prometheus text format, behind the same token:
+statement, refusal and compaction counters, a latency histogram
+(`celastro_statement_seconds_bucket`), the nodes attached, the data-key
+ring, the certificate's expiry, and per collection what this node holds.
+[deploy/](../deploy/README.md#watching-it) has the scrape config, the
+chart's `monitoring.enabled`, and a dashboard that draws it.
 
 ```sh
 T="X-Celastro-Token: $CELASTRO_TOKEN"

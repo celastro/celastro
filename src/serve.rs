@@ -139,7 +139,21 @@ struct Counters {
     compaction_millis: AtomicU64,
     connections: AtomicU64,
     reconciled: AtomicU64,
+    /// One cumulative counter per bound in [`STATEMENT_BUCKETS`], plus the
+    /// last for `+Inf`: what makes `celastro_statement_seconds` a
+    /// histogram a scraper can take a quantile of. The sum and the count
+    /// are `statement_micros` and `statements` above, which is why they
+    /// are not repeated here.
+    statement_buckets: [AtomicU64; STATEMENT_BUCKETS.len() + 1],
 }
+
+/// The upper bounds of the statement-latency histogram, in seconds. A
+/// console statement is anything from a point lookup to a compaction-bound
+/// scan, so the bounds run from a millisecond to ten seconds, doubling
+/// roughly: enough resolution for a p95 to move where an operator would
+/// notice, few enough series that a scrape of a hundred nodes is cheap.
+const STATEMENT_BUCKETS: [f64; 11] =
+    [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 10.0];
 
 static COUNTERS: Counters = Counters {
     statements: AtomicU64::new(0),
@@ -151,6 +165,21 @@ static COUNTERS: Counters = Counters {
     compaction_millis: AtomicU64::new(0),
     connections: AtomicU64::new(0),
     reconciled: AtomicU64::new(0),
+    // `[AtomicU64::new(0); N]` needs Copy, which AtomicU64 is not.
+    statement_buckets: [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
 };
 
 /// The metrics page: the process's counters, then what the database holds
@@ -191,13 +220,44 @@ fn metrics_text(db: &Db) -> String {
         "",
         c.statements_failed.load(Relaxed).to_string(),
     );
+    // The latency histogram. It goes through `line` like everything else,
+    // with the suffix in the label slot, so the family gets ONE HELP and
+    // TYPE line and the series come out `celastro_statement_seconds_bucket
+    // {le="..."}`, `_sum`, `_count`. `_sum` keeps the name and the meaning
+    // it had when it was a counter of its own; the buckets and `_count`
+    // are what `histogram_quantile` needs, and without them a dashboard
+    // can only draw the mean.
+    let hist_help = "How long statements took, in buckets.";
+    let mut counted = 0u64;
+    for (i, bound) in STATEMENT_BUCKETS.iter().enumerate() {
+        counted = c.statement_buckets[i].load(Relaxed);
+        line(
+            "celastro_statement_seconds",
+            "histogram",
+            hist_help,
+            &format!("_bucket{{le=\"{bound}\"}}"),
+            counted.to_string(),
+        );
+    }
+    // A bucket read after the one below it can be the lower of the two when
+    // a statement lands between the loads; +Inf is the count, so it may not
+    // come out smaller than a bound under it.
+    let total = c.statement_buckets[STATEMENT_BUCKETS.len()].load(Relaxed).max(counted);
     line(
-        "celastro_statement_seconds_sum",
-        "counter",
-        "Time spent running statements.",
-        "",
+        "celastro_statement_seconds",
+        "histogram",
+        hist_help,
+        "_bucket{le=\"+Inf\"}",
+        total.to_string(),
+    );
+    line(
+        "celastro_statement_seconds",
+        "histogram",
+        hist_help,
+        "_sum",
         format!("{:.6}", c.statement_micros.load(Relaxed) as f64 / 1e6),
     );
+    line("celastro_statement_seconds", "histogram", hist_help, "_count", total.to_string());
     line(
         "celastro_statement_seconds_max",
         "gauge",
@@ -1346,14 +1406,36 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// The token a request presented in a header: `X-Celastro-Token`, or
+/// `Authorization: Bearer <token>`.
+///
+/// The second is there for the scrapers. Prometheus, and the
+/// `ServiceMonitor` the chart emits for it, can send an `Authorization`
+/// header from a Secret and cannot send an arbitrary one, so without this
+/// `/api/metrics` -- which takes the token like everything else -- could
+/// not be scraped over a network at all without putting the token in the
+/// URL, where every proxy on the way logs it. It is the same secret
+/// compared the same way; nothing is exempt.
+///
+/// It costs no CSRF protection either. Both of these are non-simple
+/// headers, so a cross-origin page cannot attach one without a preflight
+/// this console never answers: the browser refuses the request before it
+/// is sent, exactly as it does today for `X-Celastro-Token`.
+fn header_token(head: &Head) -> Option<&str> {
+    if let Some(t) = head.header("x-celastro-token") {
+        return Some(t);
+    }
+    let (scheme, rest) = head.header("authorization")?.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+}
+
 /// The token the request presented, if it presented one.
 ///
 /// No percent-decoding: the token alphabet is `[0-9a-f]`, so a real token never
 /// needs escaping, and a decoder here would only add ways for two different
 /// strings to compare equal.
 fn presented_token(head: &Head) -> Option<&str> {
-    let from_header = head.header("x-celastro-token");
-    from_header.or_else(|| query_param(&head.query, "t"))
+    header_token(head).or_else(|| query_param(&head.query, "t"))
 }
 
 /// What to do with a request, once everything decidable without the database
@@ -1528,10 +1610,7 @@ fn dispatch_for(
     // still take it, because a `<link>` and a `<script>` can carry nothing
     // else; on loopback nothing is logged between the browser and the
     // console, and the URL `serve` prints stays the way in.
-    if reach == Reach::Network
-        && head.header("x-celastro-token").is_none()
-        && head.path.starts_with("/api/")
-    {
+    if reach == Reach::Network && header_token(head).is_none() && head.path.starts_with("/api/") {
         return Err(Reject::Unauthorized);
     }
     match (head.method.as_str(), head.path.as_str()) {
@@ -2719,6 +2798,16 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     }
     COUNTERS.statement_micros.fetch_add(micros, AtomicOrdering::Relaxed);
     COUNTERS.statement_micros_max.fetch_max(micros, AtomicOrdering::Relaxed);
+    // Cumulative, as the text format wants: a statement counts in its own
+    // bucket and in every wider one, so the series read left to right is
+    // already "at most this long".
+    let secs = micros as f64 / 1e6;
+    for (i, bound) in STATEMENT_BUCKETS.iter().enumerate() {
+        if secs <= *bound {
+            COUNTERS.statement_buckets[i].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+    COUNTERS.statement_buckets[STATEMENT_BUCKETS.len()].fetch_add(1, AtomicOrdering::Relaxed);
     response
 }
 
@@ -2833,6 +2922,39 @@ mod tests {
         );
         assert!(text.contains("celastro_documents{collection=\"notes\"} 1"), "{text}");
         assert!(text.contains("celastro_statement_seconds_sum "), "{text}");
+        // The histogram is one family: one TYPE line, a bucket per bound and
+        // one for +Inf, and a count that no bucket under it exceeds -- which
+        // is what a scraper rejects a histogram for.
+        assert_eq!(
+            text.matches("# TYPE celastro_statement_seconds ").count(),
+            1,
+            "one TYPE line for the family: {text}"
+        );
+        assert!(text.contains("# TYPE celastro_statement_seconds histogram"), "{text}");
+        for bound in STATEMENT_BUCKETS {
+            assert!(
+                text.contains(&format!("celastro_statement_seconds_bucket{{le=\"{bound}\"}} ")),
+                "no bucket for {bound}: {text}"
+            );
+        }
+        let series = |name: &str| -> u64 {
+            text.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {text}"))
+        };
+        let count = series("celastro_statement_seconds_count");
+        let inf = series("celastro_statement_seconds_bucket{le=\"+Inf\"}");
+        assert_eq!(count, inf, "+Inf is the count: {text}");
+        assert!(count >= 3, "three statements ran: {text}");
+        let mut last = 0;
+        for bound in STATEMENT_BUCKETS {
+            let v = series(&format!("celastro_statement_seconds_bucket{{le=\"{bound}\"}}"));
+            assert!(v >= last, "the buckets are cumulative: {text}");
+            assert!(v <= inf, "no bucket exceeds +Inf: {text}");
+            last = v;
+        }
         assert!(COUNTERS.statements.load(AtomicOrdering::Relaxed) >= before + 3);
         assert!(COUNTERS.statements_failed.load(AtomicOrdering::Relaxed) >= 1);
         assert_eq!(text.matches("# TYPE celastro_shards ").count(), 1, "one TYPE line per name");
@@ -2844,6 +2966,52 @@ mod tests {
             dispatch_for(&head, "0123456789abcdef", 8787, Reach::Network),
             Ok(Action::Metrics)
         ));
+    }
+
+    /// The Monitoring section is in the page, and the console still talks
+    /// to nothing but itself.
+    ///
+    /// The second half is the claim worth a test: a panel that watches a
+    /// node is exactly the kind of thing that grows a fetch of a chart
+    /// library, an icon font or somebody's metrics service, and this
+    /// console has to work on a machine with no route to the internet. So
+    /// every path `app.js` asks for must be one this process serves, and
+    /// the only absolute URL allowed in it is the SVG namespace -- which is
+    /// a name, not an address: `createElementNS` never fetches it.
+    #[test]
+    fn the_page_has_monitoring_and_app_js_calls_nothing_but_this_console() {
+        assert!(INDEX_HTML.contains(r#"id="monitoring""#), "no Monitoring section in the page");
+        assert!(INDEX_HTML.contains(">Monitoring<"), "the section has no heading");
+        assert!(
+            INDEX_HTML.contains(r#"id="mon-health""#) && INDEX_HTML.contains(r#"id="mon-numbers""#)
+        );
+
+        // Every single-quoted string in app.js that starts with a slash: the
+        // paths it fetches, and nothing else in this file looks like one.
+        let mut paths: Vec<&str> = Vec::new();
+        for (at, _) in APP_JS.match_indices("'/") {
+            let rest = &APP_JS[at + 1..];
+            let end = rest.find('\'').expect("an unterminated string in app.js");
+            paths.push(&rest[..end]);
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        assert!(!paths.is_empty(), "the paths are not being found at all");
+        for p in &paths {
+            assert!(
+                allowed_methods(p).is_some(),
+                "app.js asks for {p}, which this console does not serve"
+            );
+        }
+        for wanted in ["/api/query", "/api/metrics"] {
+            assert!(paths.contains(&wanted), "Monitoring stopped calling {wanted}: {paths:?}");
+        }
+        assert_eq!(
+            APP_JS.matches("://").count(),
+            1,
+            "the only absolute URL in app.js is the SVG namespace"
+        );
+        assert!(APP_JS.contains("http://www.w3.org/2000/svg"), "and that one is the namespace");
     }
 
     /// On a network bind the API takes the token in the header only, while
@@ -2858,9 +3026,21 @@ mod tests {
         let by_query = |path: &str| head(&format!("GET {path}?t={token}"), "");
         let by_header =
             |path: &str| head(&format!("GET {path}"), &format!("X-Celastro-Token: {token}\r\n"));
+        // What a Prometheus scrape sends, and what it must not get away with.
+        let by_bearer = |path: &str| {
+            head(&format!("GET {path}"), &format!("Authorization: Bearer {token}\r\n"))
+        };
+        let wrong_scheme =
+            |path: &str| head(&format!("GET {path}"), &format!("Authorization: Basic {token}\r\n"));
+        let wrong_bearer =
+            |path: &str| head(&format!("GET {path}"), "Authorization: Bearer 0123456789abcdef\r\n");
         for (h, want_ok) in [
             (by_query("/api/catalog"), false),
             (by_header("/api/catalog"), true),
+            (by_bearer("/api/metrics"), true),
+            (by_bearer("/api/catalog"), true),
+            (wrong_scheme("/api/metrics"), false),
+            (wrong_bearer("/api/metrics"), false),
             (by_query("/"), true),
             (by_query("/app.js"), true),
             (by_query("/style.css"), true),

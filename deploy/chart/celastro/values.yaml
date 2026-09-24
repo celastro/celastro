@@ -116,6 +116,45 @@ console:
   token: ""
   existingSecret: ""
 
+# Prometheus. On, the chart emits a PodMonitor that scrapes every pod's
+# /api/metrics and a PrometheusRule with the four alerts worth waking
+# someone for; the dashboard that draws the rest is
+# deploy/grafana/celastro.json, importable as it is. Both need the
+# prometheus-operator CRDs in the cluster (kube-prometheus-stack installs
+# them); without them `helm install` fails naming the missing kind, which
+# is better than a release that silently monitors nothing.
+#
+# Turning this on also makes the console listen on the pod's network rather
+# than on 127.0.0.1 inside it -- a scrape comes from another pod -- and so
+# generates the console token if there is not one already, exactly as
+# `console.expose` does. It does NOT create the console Service: nothing but
+# the scraper can reach the console unless `console.expose` is on too.
+monitoring:
+  enabled: false
+  # Where the PodMonitor and PrometheusRule go, if not the release's own
+  # namespace; with a namespace here, the PodMonitor is given a
+  # namespaceSelector for the release's.
+  namespace: ""
+  # What the Prometheus instance selects on, and usually not optional:
+  # kube-prometheus-stack at its defaults takes only the PodMonitors and
+  # PrometheusRules labelled with its own release, so `release: <the
+  # stack's release>` goes here. Without it both objects are created and
+  # nothing scrapes them.
+  labels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+  rules:
+    enabled: true
+    # How long a kept data-key ring is tolerated before it is worth saying
+    # so: a reseal of a large archived tier can take a while, and the point
+    # is to catch a rotation nobody finished, not one in progress.
+    ringFor: 1h
+    # Days of certificate left at which to warn.
+    certDays: 30
+    # A pod that restarts is briefly short of its peers; this is how long
+    # that is allowed to last.
+    attachedFor: 10m
+
 persistence:
   size: 10Gi
   # Empty means the cluster's default StorageClass.

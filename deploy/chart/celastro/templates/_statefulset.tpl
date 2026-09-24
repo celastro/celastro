@@ -56,7 +56,10 @@ spec:
         - name: celastro
           image: "{{ $r.Values.image.repository }}:{{ $r.Values.image.tag | default $r.Chart.AppVersion }}"
           imagePullPolicy: {{ $r.Values.image.pullPolicy }}
-          {{- $bind := ternary (list "--bind" "0.0.0.0") (list) $r.Values.console.expose }}
+          {{- $networked := eq (include "celastro.consoleNetworked" $r) "true" }}
+          {{- /* Reachable from outside the pod for a client, for a scrape, or
+                 both; the token is what stands in front of it either way. */}}
+          {{- $bind := ternary (list "--bind" "0.0.0.0") (list) $networked }}
           {{- if gt $total 1 }}
           args: {{ concat (list "--dir" "/data" "--port" ($r.Values.port | toString) "serve") $bind (list "--shard-bind" (printf "0.0.0.0:%d" (int $r.Values.wire.port))) | toJson }}
           {{- else }}
@@ -85,7 +88,7 @@ spec:
             - name: CELASTRO_KEY_FILE
               value: /keys/KEY
             {{- end }}
-            {{- if $r.Values.console.expose }}
+            {{- if $networked }}
             - name: CELASTRO_TOKEN
               valueFrom:
                 secretKeyRef:

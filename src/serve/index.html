@@ -65,6 +65,38 @@
       </div>
     </div>
     <section id="results" class="results" aria-label="Results"></section>
+
+    <!-- Monitoring. The health lines come from SHOW HEALTH over /api/query,
+         the same authenticated path the editor uses; the numbers beside them
+         from /api/metrics. Nothing here is fetched from anywhere but this
+         node, and nothing is kept: the node has no history to give, so the
+         sparklines are what this tab has seen since it was opened. -->
+    <section id="monitoring" class="monitoring" aria-labelledby="mon-h">
+      <div class="side-head">
+        <h2 id="mon-h">Monitoring</h2>
+        <span class="mon-controls">
+          <label class="hint" for="mon-auto">
+            <input type="checkbox" id="mon-auto" checked> every 10s
+          </label>
+          <button id="mon-refresh" type="button" class="link small">Refresh</button>
+        </span>
+      </div>
+      <div class="mon-grid">
+        <!-- The one place a screen reader hears that something needs doing:
+             the lines the report marked are announced, the rest are not. -->
+        <div id="mon-health" class="mon-health" role="status" aria-live="polite"
+          aria-label="Health">
+          <p class="muted">Loading&hellip;</p>
+        </div>
+        <div id="mon-numbers" class="mon-numbers" aria-label="Rates"></div>
+      </div>
+      <p class="muted foot">The rates and the sparklines are this tab's own,
+        sampled from <code>/api/metrics</code> while the page is open: the node
+        keeps no history, so they begin when this page did and a reload starts
+        them again. The counters they are computed from do go back to the
+        process's start &mdash; <code>deploy/grafana/</code> has the dashboard
+        for a fleet and for last week.</p>
+    </section>
   </main>
 </div>
 </body>
