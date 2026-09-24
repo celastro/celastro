@@ -1699,8 +1699,8 @@ mod tests {
             "INSERT INTO notes VALUES ('{\"id\":\"n1\",\"body\":\"x''y\"}'), ('{\"id\":\"n2\"}')",
             "DELETE FROM notes WHERE text_match(body, 'comp*') COLLAPSE BY parent",
             "CREATE LIFECYCLE POLICY p ON notes MOVE INDEX i TO 'archived' AFTER 30 days",
-            "BACKUP TO 's3://b/p'; RESTORE FROM 'x' AS OF 12345 NODE 'tcp://a:2352'",
-            "MOVE SHARD 1 OF notes TO 'tcp://h:2352'; ALTER INDEX i ON notes SET TIER 'active'",
+            "BACKUP TO 's3://b/p'; RESTORE FROM 'x' AS OF 12345 NODE 'tcp://a:7876'",
+            "MOVE SHARD 1 OF notes TO 'tcp://h:7876'; ALTER INDEX i ON notes SET TIER 'active'",
         ];
         crate::fuzz::sweep_text(111, &samples, 6000, |t| {
             let _ = parse(t, &[Value::Int(1), Value::Str("p".into())]);

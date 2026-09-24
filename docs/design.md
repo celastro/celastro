@@ -94,7 +94,7 @@ SHOW RESIDENCY;           -- what is decoded right now, and what it cost
 SHOW LIFECYCLE;           -- every policy, with each index's idle time and age
 DROP INDEX items_emb ON items;   -- withdraw the declaration; sealed regions wait for compaction
 DROP COLLECTION items;           -- files, store objects, statistics, clocks: all of it
-ATTACH NODE 'tcp://db-b:2352';   -- a node this one may place shards on
+ATTACH NODE 'tcp://db-b:7876';   -- a node this one may place shards on
 LOCAL FLUSH items;               -- this node's shards only, never forwarded
 ```
 

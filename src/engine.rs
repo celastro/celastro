@@ -9442,7 +9442,7 @@ mod tests {
     /// started at the node doing the planning.
     #[test]
     fn a_replan_names_the_same_followers_on_every_node() {
-        let nodes: Vec<String> = (0..5).map(|i| format!("tcp://10.0.0.{i}:2352")).collect();
+        let nodes: Vec<String> = (0..5).map(|i| format!("tcp://10.0.0.{i}:7876")).collect();
         let regions = ["sgp", "sgp", "sgp", "fra", "fra"];
         let plan_on = |me: usize| {
             let mut opts = DbOpts::default();

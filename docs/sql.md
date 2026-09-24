@@ -363,7 +363,7 @@ takes another node's.
 BACKUP TO '/mnt/backups' KEEP 7;
 VERIFY BACKUP '/mnt/backups';
 RESTORE FROM '/mnt/backups';
-RESTORE FROM '/mnt/backups' AS OF 7331102761890652160 NODE 'tcp://10.0.0.2:2352';
+RESTORE FROM '/mnt/backups' AS OF 7331102761890652160 NODE 'tcp://10.0.0.2:7876';
 ```
 
 ```
@@ -389,7 +389,7 @@ BACKUP CLUSTER TO '/mnt/backups';
 ```
 
 ```
-backup 7331102771519565824 to /mnt/backups: 1 collection(s), 1 shard(s), ...; at the same instant 7331102771519565824 on tcp://127.0.0.1:23522: backup ..., on tcp://127.0.0.1:23523: backup ...
+backup 7331102771519565824 to /mnt/backups: 1 collection(s), 1 shard(s), ...; at the same instant 7331102771519565824 on tcp://127.0.0.1:7878: backup ..., on tcp://127.0.0.1:7879: backup ...
 ```
 
 `CELASTRO_BACKUP_DIR` makes a bare name resolve under it and refuses a
@@ -406,7 +406,7 @@ before the client hears of it. Every holder and follower carries the
 definition and the placement, so any node coordinates any statement.
 
 ```sql
-ATTACH NODE 'tcp://127.0.0.1:23522';
+ATTACH NODE 'tcp://127.0.0.1:7878';
 CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
   PARTITION BY (tenant) WITH (splits = ['m', 't']);
 CREATE INDEX notes_body ON notes USING fulltext (body);
@@ -414,17 +414,17 @@ SHOW HEALTH;
 ```
 
 ```
-node tcp://127.0.0.1:23522 attached
-collection `notes` created with 3 shard(s) on tcp://127.0.0.1:23521, tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
-index `notes_body` created on the active tier; and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
-this node: tcp://127.0.0.1:23521, data, celastro 0.72.1, 1 collection(s), 1 shard(s) held, directory present
-node tcp://127.0.0.1:23522: up, data, celastro 0.72.1, 0 ms, clock -0.0 s
-node tcp://127.0.0.1:23523: up, data, celastro 0.72.1, 0 ms, clock -0.0 s
-shard 0 of `notes`: on tcp://127.0.0.1:23521, reachable
-shard 1 of `notes`: on tcp://127.0.0.1:23522, reachable
-shard 2 of `notes`: on tcp://127.0.0.1:23523, reachable
-steward: tcp://127.0.0.1:23521 (this node); automatic failover off
-shard 0 of `notes`: follower tcp://127.0.0.1:23522 live, confirmed to ts 7331216705097039872, 0 behind
+node tcp://127.0.0.1:7878 attached
+collection `notes` created with 3 shard(s) on tcp://127.0.0.1:7877, tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
+index `notes_body` created on the active tier; and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
+this node: tcp://127.0.0.1:7877, data, celastro 0.72.1, 1 collection(s), 1 shard(s) held, directory present
+node tcp://127.0.0.1:7878: up, data, celastro 0.72.1, 0 ms, clock -0.0 s
+node tcp://127.0.0.1:7879: up, data, celastro 0.72.1, 0 ms, clock -0.0 s
+shard 0 of `notes`: on tcp://127.0.0.1:7877, reachable
+shard 1 of `notes`: on tcp://127.0.0.1:7878, reachable
+shard 2 of `notes`: on tcp://127.0.0.1:7879, reachable
+steward: tcp://127.0.0.1:7877 (this node); automatic failover off
+shard 0 of `notes`: follower tcp://127.0.0.1:7878 live, confirmed to ts 7331216705097039872, 0 behind
 follows shard 2 of `notes` at term 0: caught up to ts 7331216705237512192
 3 of 3 node(s) answer; 0 shard(s) unreachable
 ```
@@ -443,11 +443,11 @@ demotes its copy and follows. With `CELASTRO_AUTO_FAILOVER=on` the
 steward does it once a holder has missed two sweeps.
 
 ```sql
-PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:23523';
+PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:7879';
 ```
 
 ```
-shard 1 of `notes` promoted here at term 1 (was on tcp://127.0.0.1:23522); tcp://127.0.0.1:23522 follow it; map switched here and on tcp://127.0.0.1:23521; not on tcp://127.0.0.1:23522: ...
+shard 1 of `notes` promoted here at term 1 (was on tcp://127.0.0.1:7878); tcp://127.0.0.1:7878 follow it; map switched here and on tcp://127.0.0.1:7877; not on tcp://127.0.0.1:7878: ...
 ```
 
 `REPLACE COPY OF SHARD i OF c ON 'lost' WITH 'node'` is for a follower
@@ -461,11 +461,11 @@ been away for `CELASTRO_REPLACE_SECS` (ten minutes), placing the copy
 where the collection's `regions` ask, else in the holder's region.
 
 ```sql
-REPLACE COPY OF SHARD 1 OF notes ON 'tcp://127.0.0.1:23522' WITH 'tcp://127.0.0.1:23521';
+REPLACE COPY OF SHARD 1 OF notes ON 'tcp://127.0.0.1:7878' WITH 'tcp://127.0.0.1:7877';
 ```
 
 ```
-shard 1 of `notes`: the copy on tcp://127.0.0.1:23522 is replaced by one on tcp://127.0.0.1:23521 at term 2; the holder ships it from nothing; map switched here and on tcp://127.0.0.1:23521; not on tcp://127.0.0.1:23522: ...
+shard 1 of `notes`: the copy on tcp://127.0.0.1:7878 is replaced by one on tcp://127.0.0.1:7877 at term 2; the holder ships it from nothing; map switched here and on tcp://127.0.0.1:7877; not on tcp://127.0.0.1:7878: ...
 ```
 
 `MOVE SHARD` carries a shard to another node without stopping the
@@ -488,27 +488,27 @@ or a placement statement applies it to the node it reaches and carries
 it nowhere (a query always reads every shard, wherever it is).
 
 ```sql
-MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521';
+MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:7877';
 REBALANCE notes;
 SPLIT SHARD 1 OF notes AT 'p';
-MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23521';
+MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7877';
 MERGE SHARDS 1 AND 3 OF notes;
-MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23522';
+MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7878';
 MERGE SHARDS 1 AND 3 OF notes;
-LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:23521';
-DETACH NODE 'tcp://127.0.0.1:23523';
+LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:7877';
+DETACH NODE 'tcp://127.0.0.1:7879';
 ```
 
 ```
-shard 2 of `notes` moved from tcp://127.0.0.1:23523 to tcp://127.0.0.1:23521; 3 file(s), map switched here and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23523
-shard 2 of `notes` moved from tcp://127.0.0.1:23521 to tcp://127.0.0.1:23523; 3 file(s), map switched here and on tcp://127.0.0.1:23522, tcp://127.0.0.1:23521
-shard 1 of `notes` split at 'p': shard 3 is [p, t) on this node, 3 file(s); map switched here and on tcp://127.0.0.1:23521, tcp://127.0.0.1:23523
-shard 3 of `notes` moved from tcp://127.0.0.1:23522 to tcp://127.0.0.1:23521; 3 file(s), map switched here and on tcp://127.0.0.1:23523, tcp://127.0.0.1:23522
-shards 1 and 3 of `notes` are on different nodes (tcp://127.0.0.1:23522 and tcp://127.0.0.1:23521); bring them together first: MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23522'
-shard 3 of `notes` moved from tcp://127.0.0.1:23521 to tcp://127.0.0.1:23522; 3 file(s), map switched here and on tcp://127.0.0.1:23523, tcp://127.0.0.1:23521
-shards 1 and 3 of `notes` merged: shard 1 is [m, t) on this node, 0 row(s) of shard 3 rebuilt into it, shard 3 owns no key; map switched here and on tcp://127.0.0.1:23521, tcp://127.0.0.1:23523
-shard 0 of `notes` placed on tcp://127.0.0.1:23521
-node tcp://127.0.0.1:23523 holds 1 shard(s); move them first: MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'
+shard 2 of `notes` moved from tcp://127.0.0.1:7879 to tcp://127.0.0.1:7877; 3 file(s), map switched here and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
+shard 2 of `notes` moved from tcp://127.0.0.1:7877 to tcp://127.0.0.1:7879; 3 file(s), map switched here and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7877
+shard 1 of `notes` split at 'p': shard 3 is [p, t) on this node, 3 file(s); map switched here and on tcp://127.0.0.1:7877, tcp://127.0.0.1:7879
+shard 3 of `notes` moved from tcp://127.0.0.1:7878 to tcp://127.0.0.1:7877; 3 file(s), map switched here and on tcp://127.0.0.1:7879, tcp://127.0.0.1:7878
+shards 1 and 3 of `notes` are on different nodes (tcp://127.0.0.1:7878 and tcp://127.0.0.1:7877); bring them together first: MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7878'
+shard 3 of `notes` moved from tcp://127.0.0.1:7877 to tcp://127.0.0.1:7878; 3 file(s), map switched here and on tcp://127.0.0.1:7879, tcp://127.0.0.1:7877
+shards 1 and 3 of `notes` merged: shard 1 is [m, t) on this node, 0 row(s) of shard 3 rebuilt into it, shard 3 owns no key; map switched here and on tcp://127.0.0.1:7877, tcp://127.0.0.1:7879
+shard 0 of `notes` placed on tcp://127.0.0.1:7877
+node tcp://127.0.0.1:7879 holds 1 shard(s); move them first: MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:7877'
 ```
 
 A split and a merge work on one node as well: `SPLIT SHARD 0 OF notes

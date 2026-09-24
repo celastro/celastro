@@ -2,7 +2,7 @@
 
 One static binary, one shape of data directory, and these ways to put
 it on machines. Every one of them ends in the same process: `celastro
---dir DIR --port 8787 serve --bind 0.0.0.0 [--shard-bind 0.0.0.0:2352]`
+--dir DIR --port 8787 serve --bind 0.0.0.0 [--shard-bind 0.0.0.0:7876]`
 with `CELASTRO_TOKEN`, and for a cluster `CELASTRO_NODE`,
 `CELASTRO_ATTACH` and `CELASTRO_WIRE_TOKEN`, as the [README](../README.md#two-or-more-nodes)
 describes them. What differs is who writes that down and starts it.
@@ -59,7 +59,7 @@ the log, `journalctl -u celastro`; the URL `serve` prints with the
 token in it is discarded rather than written there.
 
 The firewall: 8787 to the clients (or to a balancer with `/api/health`
-as its check), 2352 between the nodes and to nobody else. The token is
+as its check), 7876 between the nodes and to nobody else. The token is
 what protects the console, the wire token and TLS the wire.
 
 ## cloud-init
@@ -125,7 +125,7 @@ manifest around that command will be shorter than this file.
 
 [quadlet/celastro.container](quadlet/celastro.container) runs the
 published image under systemd through podman: the host's network (so
-8787 and 2352 are the machine's own ports and `CELASTRO_NODE` is its
+8787 and 7876 are the machine's own ports and `CELASTRO_NODE` is its
 address), a named volume for the data (seeded from the image with its
 ownership, so nothing is prepared by hand), the settings from
 [quadlet/celastro.env](quadlet/celastro.env) at

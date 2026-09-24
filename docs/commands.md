@@ -332,7 +332,7 @@ CELASTRO_TOKEN=sixteen-bytes-ok! CELASTRO_WIRE_TOKEN=wire celastro install --roo
 ```
 
 ```
-installed celastro 0.72.1 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:2352 as tcp://10.0.0.2:2352, attaching tcp://10.0.0.2:2352, tcp://10.0.0.3:2352
+installed celastro 0.72.1 as the service `celastro`: binary ./root/usr/local/bin/celastro, settings ./root/etc/celastro/celastro.env, data ./root/var/lib/celastro; the console on http://0.0.0.0:8787, the wire on 0.0.0.0:7876 as tcp://10.0.0.2:7876, attaching tcp://10.0.0.2:7876, tcp://10.0.0.3:7876
 written under the root; nothing started
 ```
 
@@ -398,17 +398,17 @@ shards served to the others; three on one machine, for the examples:
 export CELASTRO_TOKEN=examples-token-0123456789abcdef
 export CELASTRO_WIRE_TOKEN=examples-wire-token-0123456789
 for i in 1 2 3; do
-  CELASTRO_NODE=tcp://127.0.0.1:2352$i celastro --dir ./node$i serve \
-    --bind 127.0.0.1 --port $((18788 + i)) --shard-bind 127.0.0.1:2352$i &
+  CELASTRO_NODE=tcp://127.0.0.1:$((7876 + i)) celastro --dir ./node$i serve \
+    --bind 127.0.0.1 --port $((18788 + i)) --shard-bind 127.0.0.1:$((7876 + i)) &
 done
-celastro send http://127.0.0.1:18789 "ATTACH NODE 'tcp://127.0.0.1:23522'"
-celastro send http://127.0.0.1:18789 "ATTACH NODE 'tcp://127.0.0.1:23523'"
+celastro send http://127.0.0.1:18789 "ATTACH NODE 'tcp://127.0.0.1:7878'"
+celastro send http://127.0.0.1:18789 "ATTACH NODE 'tcp://127.0.0.1:7879'"
 celastro health --port 18789 --attached 2
 ```
 
 ```
-{"ok":true,"kind":"ack","message":"node tcp://127.0.0.1:23522 attached"}
-{"ok":true,"kind":"ack","message":"node tcp://127.0.0.1:23523 attached"}
+{"ok":true,"kind":"ack","message":"node tcp://127.0.0.1:7878 attached"}
+{"ok":true,"kind":"ack","message":"node tcp://127.0.0.1:7879 attached"}
 serving on 127.0.0.1:18789
 ```
 
@@ -424,6 +424,21 @@ statement over every node's shards, so a client needs one URL: any
 node's, or a load balancer's with `/api/health` as its check. The
 cluster statements -- placement, moves, `LOCAL`, `SHOW HEALTH`,
 `partial_results` -- are in [docs/sql.md](sql.md#two-or-more-nodes).
+
+An address without a port means the wire's default, 7876, and the
+address is kept as it was written: the placement map holds the string
+and each node resolves it when it dials. So a cluster whose addresses
+are bare cannot be upgraded across a release that changes that default
+one node at a time -- the upgraded node would bind and dial 7876 while
+its peers were on the old port. 0.73.0 moved it from 2352 to 7876:
+either stop the whole cluster and upgrade every node, or write `:2352`
+into `CELASTRO_NODE`, `CELASTRO_ATTACH` and `--shard-bind` first, which
+is a change of address rather than of settings: one node at a time, move
+its shards away, `DETACH NODE`, restart it on the explicit address,
+`ATTACH NODE 'tcp://host:2352'`, move the shards back. Writing the port
+in is what the installer, the chart and
+[deploy/ssh](../deploy/ssh/celastro-cluster.sh) do already, and a cluster
+whose addresses carry it is untouched by any change of the default.
 
 ## The image
 

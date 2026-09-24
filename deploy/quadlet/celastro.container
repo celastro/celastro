@@ -16,7 +16,7 @@ Wants=network-online.target
 [Container]
 Image=ghcr.io/celastro/celastro:0.72.1
 ContainerName=celastro
-# The host's network: the console on 8787 and the wire on 2352 are the
+# The host's network: the console on 8787 and the wire on 7876 are the
 # machine's own ports, as they would be for the binary installed directly,
 # and CELASTRO_NODE can name the machine's address.
 Network=host
@@ -25,8 +25,8 @@ Network=host
 # celastro-data` says where it is on the host.
 Volume=celastro-data:/data
 EnvironmentFile=/etc/celastro/celastro.env
-# For one node drop `--shard-bind 0.0.0.0:2352`; the wire is a cluster's.
-Exec=--dir /data serve --bind 0.0.0.0 --shard-bind 0.0.0.0:2352
+# For one node drop `--shard-bind 0.0.0.0:7876`; the wire is a cluster's.
+Exec=--dir /data serve --bind 0.0.0.0 --shard-bind 0.0.0.0:7876
 # `serve` prints its URL on stdout -- without the token, since the token
 # came from the environment file and this line lands in the journal --
 # and the log on stderr.

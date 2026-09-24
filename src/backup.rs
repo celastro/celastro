@@ -13,7 +13,7 @@
 //! the backup needs with its size. A backup with no record did not finish
 //! and is not one; `nodes/<node>/LATEST` names the newest that did. The
 //! node is `CELASTRO_NODE` with its scheme and punctuation folded
-//! (`celastro-0.celastro_2352`), or `local` for a node with no address, so
+//! (`celastro-0.celastro_7876`), or `local` for a node with no address, so
 //! the pods of a cluster back up side by side into one destination and
 //! each restores its own by default. A restore reads the record, checks
 //! every object is there at its size, and only then writes.
@@ -122,8 +122,8 @@ fn ts_key(ts: u64) -> String {
     format!("{ts:020}")
 }
 
-/// The key component a node's address becomes: `tcp://celastro-0.celastro:2352`
-/// is `celastro-0.celastro_2352`, and no address is `local`.
+/// The key component a node's address becomes: `tcp://celastro-0.celastro:7876`
+/// is `celastro-0.celastro_7876`, and no address is `local`.
 pub(crate) fn node_slug(node: &str) -> String {
     let bare = node.split_once("://").map(|(_, r)| r).unwrap_or(node);
     let slug: String = bare

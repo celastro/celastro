@@ -29,7 +29,7 @@ coordinators:
 # one, give one here, or leave both empty and the chart generates one and
 # keeps it across upgrades.
 wire:
-  port: 2352
+  port: 7876
   token: ""
   existingSecret: ""
   # A second token every pod accepts, for a rotation: a rotation by one

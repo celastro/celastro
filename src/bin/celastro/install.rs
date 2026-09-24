@@ -18,7 +18,7 @@ use std::process::Command;
 
 /// The wire's port when an address names none, as `serve --shard-bind`
 /// reads it.
-const WIRE_PORT: u16 = 2352;
+const WIRE_PORT: u16 = 7876;
 /// How long the start is given to answer the health probe.
 const START_WAIT_SECS: u64 = 30;
 
@@ -48,7 +48,7 @@ pub struct Opts {
     pub user: String,
     pub port: u16,
     pub bind: IpAddr,
-    /// `--shard-bind`, `0.0.0.0:2352` unless given.
+    /// `--shard-bind`, `0.0.0.0:7876` unless given.
     pub shard_bind: String,
     pub dir: PathBuf,
 }
@@ -224,7 +224,7 @@ fn wire_address(s: &str) -> Result<String, String> {
     if rest.is_empty() || rest.contains('/') || rest.contains(char::is_whitespace) {
         return Err(format!("`{s}` is not a node address (tcp://host:port)"));
     }
-    // An IPv6 literal carries colons of its own and is written [::1]:2352.
+    // An IPv6 literal carries colons of its own and is written [::1]:7876.
     let has_port = if rest.starts_with('[') {
         rest.rsplit_once(']').map(|(_, p)| p.starts_with(':')).unwrap_or(false)
     } else {
@@ -787,20 +787,28 @@ mod tests {
         Secrets { token: Some("sixteen-bytes-ok!".into()), wire_token: Some("wire-secret".into()) }
     }
 
+    // The installer carries its own copy of the wire's port: it writes the
+    // unit's `--shard-bind` and fills a bare `--node` before any of the
+    // library's address code runs. The two must name one port.
+    #[test]
+    fn the_installer_s_wire_port_is_the_library_s_default() {
+        assert_eq!(WIRE_PORT, celastro::wire::DEFAULT_WIRE_PORT);
+    }
+
     #[test]
     fn a_bare_host_becomes_a_wire_address_on_the_default_port() {
         let o = parse_ok(&[
             "--node",
             "10.0.0.2",
             "--attach",
-            "10.0.0.2,tcp://10.0.0.3:2352, 10.0.0.4:2353",
+            "10.0.0.2,tcp://10.0.0.3:7876, 10.0.0.4:7877",
         ]);
-        assert_eq!(o.node.as_deref(), Some("tcp://10.0.0.2:2352"));
+        assert_eq!(o.node.as_deref(), Some("tcp://10.0.0.2:7876"));
         assert_eq!(
             o.attach,
-            vec!["tcp://10.0.0.2:2352", "tcp://10.0.0.3:2352", "tcp://10.0.0.4:2353"]
+            vec!["tcp://10.0.0.2:7876", "tcp://10.0.0.3:7876", "tcp://10.0.0.4:7877"]
         );
-        assert_eq!(o.shard_bind, "0.0.0.0:2352");
+        assert_eq!(o.shard_bind, "0.0.0.0:7876");
     }
 
     #[test]
@@ -809,8 +817,8 @@ mod tests {
         assert!(parse_err(&["--node", "fe80::1"]).contains("[addr]:port"));
         assert!(parse_err(&["--node", "tcp://a b"]).contains("not a node address"));
         assert_eq!(
-            parse_ok(&["--node", "[fe80::1]:2352"]).node.as_deref(),
-            Some("tcp://[fe80::1]:2352")
+            parse_ok(&["--node", "[fe80::1]:7876"]).node.as_deref(),
+            Some("tcp://[fe80::1]:7876")
         );
     }
 
@@ -903,9 +911,9 @@ mod tests {
         assert_eq!(report.started, None);
         let env = std::fs::read_to_string(root.join("etc/celastro/celastro.env")).unwrap();
         assert!(env.contains("CELASTRO_TOKEN=\"sixteen-bytes-ok!\"\n"), "{env}");
-        assert!(env.contains("CELASTRO_NODE=\"tcp://10.0.0.2:2352\"\n"), "{env}");
+        assert!(env.contains("CELASTRO_NODE=\"tcp://10.0.0.2:7876\"\n"), "{env}");
         assert!(
-            env.contains("CELASTRO_ATTACH=\"tcp://10.0.0.2:2352,tcp://10.0.0.3:2352\"\n"),
+            env.contains("CELASTRO_ATTACH=\"tcp://10.0.0.2:7876,tcp://10.0.0.3:7876\"\n"),
             "{env}"
         );
         assert!(env.contains("CELASTRO_WIRE_TOKEN=\"wire-secret\"\n"), "{env}");
@@ -924,7 +932,7 @@ mod tests {
         );
         let unit =
             std::fs::read_to_string(root.join("etc/systemd/system/celastro.service")).unwrap();
-        assert!(unit.contains("ExecStart=/usr/local/bin/celastro --dir /var/lib/celastro --port 8787 serve --bind 0.0.0.0 --shard-bind 0.0.0.0:2352\n"), "{unit}");
+        assert!(unit.contains("ExecStart=/usr/local/bin/celastro --dir /var/lib/celastro --port 8787 serve --bind 0.0.0.0 --shard-bind 0.0.0.0:7876\n"), "{unit}");
         assert!(unit.contains("EnvironmentFile=/etc/celastro/celastro.env\n"), "{unit}");
         assert!(unit.contains("ReadWritePaths=/var/lib/celastro\n"), "{unit}");
         assert!(
@@ -946,7 +954,7 @@ mod tests {
         // Text output names the essentials.
         let text = report.text();
         assert!(
-            text.contains("tcp://10.0.0.2:2352") && text.contains("https://0.0.0.0:8787"),
+            text.contains("tcp://10.0.0.2:7876") && text.contains("https://0.0.0.0:8787"),
             "{text}"
         );
         assert!(report.json().contains("\"kind\":\"install\""));

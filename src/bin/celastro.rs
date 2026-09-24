@@ -61,7 +61,7 @@ USAGE:
 COMMANDS:
   serve [--port N] [--open]  serve the browser UI on 127.0.0.1
         [--bind ADDR]            or on ADDR, answering the token in CELASTRO_TOKEN
-        [--shard-bind ADDR[:PORT]] and this node's shards to other nodes (port 2352)
+        [--shard-bind ADDR[:PORT]] and this node's shards to other nodes (port 7876)
   exec <SQL>                 run one statement and print the result
   run <FILE>                 run a script of statements
   repl                       interactive session on stdin
@@ -99,7 +99,7 @@ COMMANDS:
                              second install. CELASTRO_TOKEN from the environment (never a flag);
                              --bind and --port as for serve (0.0.0.0, 8787)
         --node ADDR              a node of a cluster: its wire address, tcp://host:port,
-                                 served on --shard-bind (0.0.0.0:2352); CELASTRO_WIRE_TOKEN
+                                 served on --shard-bind (0.0.0.0:7876); CELASTRO_WIRE_TOKEN
                                  from the environment
         --attach A,B,C           every node of the cluster, the same list on every node
         --role coordinator       a node that holds no shards
@@ -146,8 +146,8 @@ terminal does not cost committed writes.
 
 A node in a cluster is started with CELASTRO_NODE=tcp://host:port, its address
 in every placement map, and CELASTRO_WIRE_TOKEN, the secret every node shares;
-`serve --shard-bind ADDR[:PORT]` then serves its shards to the others (2352 when
-no port is given, in addresses too), and CELASTRO_ATTACH=tcp://a,tcp://b:2352
+`serve --shard-bind ADDR[:PORT]` then serves its shards to the others (7876 when
+no port is given, in addresses too), and CELASTRO_ATTACH=tcp://a,tcp://b:7876
 names the peers it attaches as they
 come up, its own address skipped, so every node of a cluster can be given the
 same list. CELASTRO_ROLE=coordinator makes a node hold no shards -- a
@@ -3111,7 +3111,7 @@ mod tests {
             "CELASTRO_AUTO_FAILOVER=on",
         ]) {
             Cli::Run { cmd: Cmd::Install(o), .. } => {
-                assert_eq!(o.node.as_deref(), Some("tcp://10.0.0.2:2352"));
+                assert_eq!(o.node.as_deref(), Some("tcp://10.0.0.2:7876"));
                 assert_eq!(o.attach.len(), 2);
                 assert_eq!(o.port, 9000);
                 assert_eq!(o.dir, PathBuf::from("/srv/celastro"));

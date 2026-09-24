@@ -6,6 +6,55 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.73.0 — 2026-09-24
+
+**The wire's default port is 7876, and an address written without one
+changes meaning.** `tcp://host` meant `tcp://host:2352` through 0.72.1;
+here it means `tcp://host:7876`, and `serve --shard-bind ADDR` binds
+`ADDR:7876`. An address is kept as it was written -- the placement map
+holds the string and each node resolves it when it dials -- so what an
+upgrade does depends on whether the port is in it:
+
+- **Every address names its port**, which is what `celastro install`,
+  the Helm chart and [deploy/ssh](deploy/ssh/celastro-cluster.sh) all
+  write: nothing changes. The cluster goes on serving 2352, and the new
+  default reaches only clusters started after the upgrade and any
+  address or `--shard-bind` written bare.
+- **An address is bare**: a rolling upgrade breaks at the first node.
+  That node binds 7876 and dials its peers on 7876; they are listening
+  on 2352 and dialing 2352, and a holder that cannot be reached is a
+  shard that cannot be read. Either upgrade the whole cluster at once --
+  stop every node, replace the binary, start them again, and the bare
+  addresses resolve to 7876 on all of them with nothing in the map to
+  change -- or write `:2352` into `CELASTRO_NODE`, `CELASTRO_ATTACH`,
+  `--shard-bind` and every attached address *before* upgrading anything.
+  The second is a change of each node's address rather than of its
+  settings, so it goes one node at a time: move its shards away,
+  `DETACH NODE`, restart it on the explicit address, `ATTACH NODE
+  'tcp://host:2352'`, move the shards back. Either way the ports can be
+  dropped again once every node is on this release.
+
+The chart is the same question in one line: `wire.port` defaults to
+`7876`, a pod's address is `tcp://<pod>.<release>:<wire.port>`, and
+`helm upgrade` rolls the pods one at a time -- so an existing release
+takes `--set wire.port=2352` (or that value in its own file) to keep
+the addresses its map holds. A new release needs nothing.
+
+A node's backups are keyed by its address as written
+(`nodes/<host>_7876/`), so an address that gains, loses or changes its
+port starts a new lineage under the destination: its `LATEST` is
+elsewhere, the next backup is a full one rather than a repeat, and
+restoring what the old address wrote means naming it --
+`RESTORE FROM '/mnt/backups' NODE 'tcp://host:2352'`.
+
+The firewall between the nodes wants 7876 where it wanted 2352. The
+console's 8787 is unchanged; every client names it explicitly, so it
+was never the port with a default to get wrong.
+
+Nothing else changed: this release is the port, the documents and the
+deployment files that carry it, and a test pinning the installer's copy
+of it to the library's.
+
 ## 0.72.1 — 2026-09-23
 
 **`key reseal` will not touch a backup.** A backup keeps its segments at

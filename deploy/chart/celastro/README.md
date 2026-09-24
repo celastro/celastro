@@ -23,7 +23,7 @@ CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL)
 ```
 
 Raising `replicas` adds attached nodes; `REBALANCE notes` moves shards onto
-them, `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:2352'` moves one
+them, `MOVE SHARD i OF notes TO 'tcp://celastro-3.celastro:7876'` moves one
 by hand. Lowering `replicas` strands the shards on the removed pods' volumes:
 move them off first. The wire is plain TCP with the shared token inside the
 cluster network, encrypted with `tls.enabled` (below).
@@ -206,7 +206,7 @@ restore, start an empty release (a new name, or the same one with its
 volumes gone), mount the same claim, and run on each pod — `celastro
 send` from a pod with the token, or the console UI — `RESTORE FROM
 'nightly'`: every pod backs up under its own address, so a pod restores
-what its namesake wrote (`NODE 'tcp://<pod>.<release>:2352'` for another
+what its namesake wrote (`NODE 'tcp://<pod>.<release>:7876'` for another
 one's), and a pod that held shards `0` and `2` restores those. The pods
 have no NFS client of their own: the claim is the cluster's.
 
@@ -287,6 +287,16 @@ versions speak. A release that bumps the wire version says so in the
 changelog; those need every pod restarted together
 (`updateStrategy: OnDelete`, delete them all).
 
+**A release that changes `wire.port`'s default changes every pod's
+address.** A pod's address is `tcp://<pod>.<release>:<wire.port>`, and
+the placement map holds those strings, so a rolling upgrade that moves
+the port leaves the pods that have not rolled yet dialing the old one
+and the map naming it. 0.73.0 moved the default from `2352` to `7876`:
+an existing release upgrades with `--set wire.port=2352` (or that value
+in its own file) and keeps the addresses it has; a new release needs
+nothing, and the port can be dropped once every pod is on 0.73.0 or
+later and has been restarted together.
+
 ## Stopping
 
 `serve` handles SIGTERM: it stops accepting, saves, and exits 0 inside the
@@ -298,7 +308,7 @@ changelog; those need every pod restarted together
 |---|---|---|
 | `image.repository`, `image.tag` | `ghcr.io/celastro/celastro`, the chart's `appVersion` | the image; `pullPolicy` is `IfNotPresent` |
 | `replicas` | `1` | pods; more than one is a cluster of nodes |
-| `wire.port` | `2352` | the port pods serve their shards on to each other |
+| `wire.port` | `7876` | the port pods serve their shards on to each other |
 | `wire.token`, `wire.existingSecret` | empty | the shared token, or a `Secret` with the key `CELASTRO_WIRE_TOKEN`; both empty generates one, kept across upgrades |
 | `port` | `8787` | the console's port inside the pod |
 | `console.expose` | `false` | serve the console on every interface, one token at every pod, behind the Service `<release>-console` |

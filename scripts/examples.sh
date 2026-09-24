@@ -10,7 +10,7 @@
 #
 # Needs: bash, curl, jq (for the console examples); docker for the image
 # examples, which are skipped without it. Ports 18787-18790 and
-# 23521-23523 on loopback.
+# 7877-7879 on loopback.
 
 set -u
 CEL=${CELASTRO:-$(cd "$(dirname "$0")/.." && pwd)/target/release/celastro}
@@ -158,12 +158,12 @@ echo "== three nodes on loopback"
 export CELASTRO_WIRE_TOKEN=examples-wire-token-0123456789
 NODE_PIDS=()
 for i in 1 2 3; do
-  CELASTRO_NODE=tcp://127.0.0.1:2352$i "$CEL" --dir "$W/node$i" serve --bind 127.0.0.1 --port $((18788 + i)) --shard-bind 127.0.0.1:2352$i >/dev/null 2>"$W/node$i.err" & PIDS+=($!); NODE_PIDS+=($!)
+  CELASTRO_NODE=tcp://127.0.0.1:$((7876 + i)) "$CEL" --dir "$W/node$i" serve --bind 127.0.0.1 --port $((18788 + i)) --shard-bind 127.0.0.1:$((7876 + i)) >/dev/null 2>"$W/node$i.err" & PIDS+=($!); NODE_PIDS+=($!)
 done
 for i in 1 2 3; do wait_console $((18788 + i)) || cat "$W/node$i.err"; done
 A=http://127.0.0.1:18789; B=http://127.0.0.1:18790; C=http://127.0.0.1:18791
-run "attach node" 'attached' "$CEL" send $A "ATTACH NODE 'tcp://127.0.0.1:23522'"
-run "attach node, the third" 'attached' "$CEL" send $A "ATTACH NODE 'tcp://127.0.0.1:23523'"
+run "attach node" 'attached' "$CEL" send $A "ATTACH NODE 'tcp://127.0.0.1:7878'"
+run "attach node, the third" 'attached' "$CEL" send $A "ATTACH NODE 'tcp://127.0.0.1:7879'"
 run "health --attached" 'serving' "$CEL" health --port 18789 --attached 2
 run "create a collection over three shards" '3 shard' "$CEL" send $A "CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL) PARTITION BY (tenant) WITH (splits = ['m', 't'])"
 run "an index on every holder" 'created' "$CEL" send $A "CREATE INDEX notes_body ON notes USING fulltext (body)"
@@ -172,32 +172,32 @@ run "a query from any node" '3' "$CEL" send $C "SELECT count(*) FROM notes"
 run "group by tenant" 'acme' "$CEL" send $C "SELECT tenant, count(*) AS n FROM notes GROUP BY tenant ORDER BY tenant"
 run "show health" '3 of 3 node' "$CEL" send $A "SHOW HEALTH"
 run "show catalog with placement" 'shard 0' "$CEL" send $A "SHOW CATALOG notes"
-run "move a shard" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'"
+run "move a shard" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:7877'"
 run "the map switched everywhere" '3' "$CEL" send $C "SELECT count(*) FROM notes"
 run "rebalance" 'rebalance|moved|already' "$CEL" send $A "REBALANCE notes"
 run "split a shard" 'shard 3 is \[p, t\)' "$CEL" send $A "SPLIT SHARD 1 OF notes AT 'p'"
-run "the new shard moves" 'moved from' "$CEL" send $A "MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23521'"
+run "the new shard moves" 'moved from' "$CEL" send $A "MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7877'"
 run "merge refused across nodes" 'different nodes' "$CEL" send $A "MERGE SHARDS 1 AND 3 OF notes"
-run "the new shard moves back" 'moved from' "$CEL" send $A "MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:23522'"
+run "the new shard moves back" 'moved from' "$CEL" send $A "MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7878'"
 run "merge the shards" 'shard 1 is \[m, t\).*shard 3 owns no key' "$CEL" send $A "MERGE SHARDS 1 AND 3 OF notes"
 run "the count is whole after the split" '"count\(\*\)":3' "$CEL" send $C "SELECT count(*) FROM notes"
-run "place shard (repair, here a no-op)" 'placed' "$CEL" send $A "LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:23521'"
+run "place shard (repair, here a no-op)" 'placed' "$CEL" send $A "LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:7877'"
 run "a cluster backup at one instant" 'backed up|instant|AS OF' "$CEL" send $A "BACKUP CLUSTER TO '$W/cluster-backups'"
-run "every shard has a follower" 'followed by tcp://127.0.0.1:2352' "$CEL" send $A "SHOW CATALOG notes"
+run "every shard has a follower" 'followed by tcp://127.0.0.1:787[789]' "$CEL" send $A "SHOW CATALOG notes"
 # Shard 1's follower in particular: the merge above reset its copy and
 # a catch-up refills it, and a copy promoted before that is done answers
 # what it has. (Matched on any live follower, this raced one run in four.)
-for _ in $(seq 1 100); do "$CEL" send $B "SHOW HEALTH" 2>/dev/null | grep -q 'shard 1 of `notes`: follower tcp://127.0.0.1:23523 live' && break; sleep 0.2; done
-run "a write is confirmed on the follower" 'shard 1 of `notes`: follower tcp://127.0.0.1:23523 live' "$CEL" send $B "SHOW HEALTH"
+for _ in $(seq 1 100); do "$CEL" send $B "SHOW HEALTH" 2>/dev/null | grep -q 'shard 1 of `notes`: follower tcp://127.0.0.1:7879 live' && break; sleep 0.2; done
+run "a write is confirmed on the follower" 'shard 1 of `notes`: follower tcp://127.0.0.1:7879 live' "$CEL" send $B "SHOW HEALTH"
 kill "${NODE_PIDS[1]}"; sleep 0.5
 run "partial results when a node is gone" 'missing":\["shard 1"\]' "$CEL" send $A "SELECT count(*) FROM notes WITH (partial_results, deadline_ms = 3000)"
 run "without partial results, refused naming the node" 'did not answer|deadline' "$CEL" send $A "SELECT count(*) FROM notes WITH (deadline_ms = 2000)"
-run "promote its follower" 'promoted here at term 1' "$CEL" send $A "PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:23523'"
+run "promote its follower" 'promoted here at term 1' "$CEL" send $A "PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:7879'"
 run "the count is whole again" '"count\(\*\)":3' "$CEL" send $A "SELECT count(*) FROM notes"
-run "detach refused while the node holds a shard" 'holds [0-9]+ shard' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
-run "move its shards away first" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:23521'"
-run "and the promoted one" 'moved from' "$CEL" send $A "MOVE SHARD 1 OF notes TO 'tcp://127.0.0.1:23521'"
-run "detach node" 'detached' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:23523'"
+run "detach refused while the node holds a shard" 'holds [0-9]+ shard' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:7879'"
+run "move its shards away first" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF notes TO 'tcp://127.0.0.1:7877'"
+run "and the promoted one" 'moved from' "$CEL" send $A "MOVE SHARD 1 OF notes TO 'tcp://127.0.0.1:7877'"
+run "detach node" 'detached' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:7879'"
 
 if command -v docker >/dev/null 2>&1 && docker image inspect ghcr.io/celastro/celastro:0.55.0 >/dev/null 2>&1; then
   echo "== the image"

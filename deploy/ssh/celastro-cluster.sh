@@ -33,7 +33,7 @@
 #   CELASTRO_SSH_OPTS      further ssh options                        (none)
 #   CELASTRO_PORT          the console's port                         (8787)
 #   CELASTRO_BIND          the console's interfaces                   (0.0.0.0)
-#   CELASTRO_WIRE_PORT     the wire's port                            (2352)
+#   CELASTRO_WIRE_PORT     the wire's port                            (7876)
 #   CELASTRO_DIR           the data directory on each host            (/var/lib/celastro)
 #   CELASTRO_CLUSTER       `on` for one node others will join later   (on when given several hosts)
 #   CELASTRO_ROLE          `coordinator` for nodes that hold no shards (none)
@@ -54,7 +54,7 @@ SSH_USER=${CELASTRO_SSH_USER:-root}
 SSH_OPTS=${CELASTRO_SSH_OPTS:-}
 PORT=${CELASTRO_PORT:-8787}
 BIND=${CELASTRO_BIND:-0.0.0.0}
-WIRE_PORT=${CELASTRO_WIRE_PORT:-2352}
+WIRE_PORT=${CELASTRO_WIRE_PORT:-7876}
 DATA_DIR=${CELASTRO_DIR:-/var/lib/celastro}
 ROLE=${CELASTRO_ROLE:-}
 TLS_DIR=${CELASTRO_TLS_DIR:-}
