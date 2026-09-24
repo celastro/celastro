@@ -118,6 +118,9 @@ pub struct Server {
     /// Whether the maintenance thread compacts on its own
     /// (`CELASTRO_AUTO_COMPACT`); on unless told otherwise.
     auto_compact: bool,
+    /// Whether write statements sync their logs as a group after the lock
+    /// (`CELASTRO_GROUP_COMMIT`); on unless told otherwise.
+    group_commit: bool,
     /// Whether `token` is the operator's, from `CELASTRO_TOKEN`, rather
     /// than one drawn for this run. It decides whether the token may be
     /// printed: see [`Server::url`].
@@ -360,6 +363,30 @@ fn metrics_text(db: &Db) -> String {
         "",
         seal_failures.to_string(),
     );
+    let (syncs, settled, failed) = db.log_syncs();
+    line(
+        "celastro_wal_syncs_total",
+        "counter",
+        "Write-ahead log syncs made for writers that settled theirs after the lock (group \
+         commit).",
+        "",
+        syncs.to_string(),
+    );
+    line(
+        "celastro_wal_sync_writers_total",
+        "counter",
+        "Writes those syncs settled: over celastro_wal_syncs_total, the writers per sync.",
+        "",
+        settled.to_string(),
+    );
+    line(
+        "celastro_wal_sync_failed",
+        "gauge",
+        "1 once a write-ahead log's sync failed: the node takes no writes on that shard and \
+         needs a restart.",
+        "",
+        if failed.is_some() { "1" } else { "0" }.to_string(),
+    );
     line(
         "celastro_directory_present",
         "gauge",
@@ -493,6 +520,7 @@ impl Server {
             tls: None,
             max_connections: MAX_CONNECTIONS,
             auto_compact: true,
+            group_commit: true,
             operator_token: false,
         })
     }
@@ -533,6 +561,7 @@ impl Server {
             tls: None,
             max_connections: MAX_CONNECTIONS,
             auto_compact: true,
+            group_commit: true,
             // Every token this constructor takes is the operator's: that
             // is the whole reason it exists.
             operator_token: true,
@@ -550,6 +579,13 @@ impl Server {
     /// Compact in the background, or not (`CELASTRO_AUTO_COMPACT=off`).
     pub fn with_auto_compact(mut self, on: bool) -> Server {
         self.auto_compact = on;
+        self
+    }
+
+    /// Group commit, or a sync under the lock per statement
+    /// (`CELASTRO_GROUP_COMMIT=off`).
+    pub fn with_group_commit(mut self, on: bool) -> Server {
+        self.group_commit = on;
         self
     }
 
@@ -653,6 +689,7 @@ impl Server {
         let (tx, rx) = std::sync::mpsc::sync_channel::<TcpStream>(self.max_connections);
         let rx = Mutex::new(rx);
         let grants = Grants::new();
+        write(db).set_group_commit(server.group_commit);
         std::thread::scope(|scope| {
             if server.auto_compact {
                 // The thread that builds seals off the lock exists, so a
@@ -2584,6 +2621,13 @@ fn health_json(db: &Db) -> String {
             r#"{{"ok":false,"error":"the data directory is gone","name":"celastro","version":{version},"node":{node}}}"#
         );
     }
+    // Likewise a log whose sync failed: its shard takes no writes, and the
+    // reads here are held before the write that failed until a restart.
+    if db.log_syncs().2.is_some() {
+        return format!(
+            r#"{{"ok":false,"error":"a write-ahead log failed to sync; restart the node","name":"celastro","version":{version},"node":{node}}}"#
+        );
+    }
     format!(
         r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections},"node":{node},"attached":{attached}}}"#
     )
@@ -4470,18 +4514,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What a slow disk costs a reader. A write holds the exclusive lock
-    /// for the whole statement, the log's fdatasync included, so a point
-    /// read that arrives during a write waits out that sync. Measured, not
-    /// asserted: the log's sync on the writing thread is made 50 ms slower,
-    /// a reader on another thread times its lookups through the same path
-    /// the console takes, and the same run without the delay is printed
-    /// beside it.
+    /// What a slow disk costs a reader, and what it costs writers. Measured,
+    /// not asserted: the log's sync is made 50 ms slower on every writing
+    /// thread, a reader on another thread times its lookups through the same
+    /// path the console takes, and eighty writes are made by one writer and
+    /// then by eight -- with the sync under the lock, and with group commit,
+    /// where a write syncs after the lock with every writer that appended
+    /// meanwhile. The same run without the delay is printed first.
     #[test]
     #[ignore]
     fn what_a_slow_log_sync_costs_a_reader() {
         use crate::shard::durability_probe::{self, Op};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let tag = format!("celastro-serve-slow-disk-{}", std::process::id());
         let dir = std::env::temp_dir().join(tag);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4492,12 +4536,15 @@ mod tests {
         assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
 
         let mut report = Vec::new();
-        for delay_ms in [0u64, 50] {
-            durability_probe::slow(
-                (delay_ms > 0).then(|| (Op::WalSync, Duration::from_millis(delay_ms))),
-            );
+        let next = AtomicUsize::new(1);
+        for (delay_ms, group, writers) in
+            [(0u64, false, 1usize), (50, false, 1), (50, false, 8), (50, true, 1), (50, true, 8)]
+        {
+            write(&db).set_group_commit(group);
+            let slow = (delay_ms > 0).then(|| (Op::WalSync, Duration::from_millis(delay_ms)));
+            let (syncs_before, settled_before, _) = read(&db).log_syncs();
             let stop = AtomicBool::new(false);
-            let (mut reads, writes) = std::thread::scope(|scope| {
+            let (mut reads, took) = std::thread::scope(|scope| {
                 let reader = scope.spawn(|| {
                     let mut took = Vec::new();
                     while !stop.load(Ordering::Relaxed) {
@@ -4510,29 +4557,50 @@ mod tests {
                     took
                 });
                 let started = Instant::now();
-                for i in 1..=40 {
-                    let r = run_sql(
-                        &db,
-                        &format!(r#"INSERT INTO items VALUES ('{{"id":"w{i}","n":{i}}}')"#),
-                    );
-                    assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
+                let handles: Vec<_> = (0..writers)
+                    .map(|_| {
+                        let next = &next;
+                        let db = &db;
+                        scope.spawn(move || {
+                            durability_probe::slow(slow);
+                            for _ in 0..80 / writers {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let r = run_sql(
+                                    db,
+                                    &format!(
+                                        r#"INSERT INTO items VALUES ('{{"id":"w{i}","n":{i}}}')"#
+                                    ),
+                                );
+                                assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
+                            }
+                            durability_probe::slow(None);
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
                 }
-                let writes = started.elapsed();
+                let took = started.elapsed();
                 stop.store(true, Ordering::Relaxed);
-                (reader.join().unwrap(), writes)
+                (reader.join().unwrap(), took)
             });
+            let (syncs, settled, _) = read(&db).log_syncs();
             reads.sort();
             let at = |q: f64| reads[((reads.len() - 1) as f64 * q) as usize];
             report.push(format!(
-                "log sync +{delay_ms} ms: 40 writes in {writes:.0?}; {} reads, p50 {:.1?}, p99 \
-                 {:.1?}, max {:.1?}",
+                "log sync +{delay_ms} ms, {}, {writers} writer(s): 80 writes in {took:.0?} \
+                 ({:.0}/s, {} group sync(s) for {} write(s)); {} reads, p50 {:.1?}, p99 {:.1?}, \
+                 max {:.1?}",
+                if group { "group commit" } else { "sync under the lock" },
+                80.0 / took.as_secs_f64(),
+                syncs - syncs_before,
+                settled - settled_before,
                 reads.len(),
                 at(0.5),
                 at(0.99),
                 reads[reads.len() - 1]
             ));
         }
-        durability_probe::slow(None);
         for line in report {
             eprintln!("slow disk: {line}");
         }

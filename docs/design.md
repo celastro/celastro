@@ -1615,9 +1615,29 @@ both). The turn closes no cycle: the writer waits for reads that were
 already waiting, as it waits for the ones holding the lock, and a read
 waits across the network only on served reads. A read through the
 console also takes the lock once rather than three times; its
-bookkeeping each cost a turn of its own. What remains is the sync
-itself under the exclusive lock -- a write still holds it across its
-fdatasync, so a slow disk costs every read one sync.
+bookkeeping each cost a turn of its own. The sync itself left the
+lock in 0.76.0 as a group commit: a write statement appends its records
+and applies them under the exclusive lock, lets it go, and then waits
+for its log's `fdatasync` with every writer that appended meanwhile
+(`shard::LogSync`) -- one of them makes the sync, the rest wait for it.
+What a reader may see did not change: every read snapshot is held below
+the oldest write still waiting (`Hlc::visible`), so a row, a delete or a
+replacement is seen only once it is durable, as when the sync was under
+the lock, and a write is acknowledged only once a read would see it, so
+a client reads its own write. A seal that runs with a write in flight
+keeps the version that write replaces, as a pinned backup horizon makes
+it, and compaction collects below the same bound. A sync that fails is
+not retried -- a page cache that failed one cannot be trusted with a
+second -- so the log is cut back to what its last good sync covered, the
+shard takes no more writes, reads stay below the failed write, and the
+health says to restart, which replays the log. At a sync made 50 ms
+slower a point read went from one sync (p99 61-67 ms) to 0.5-0.9 ms,
+and eight writers made 74 writes a second where they had made 18, four
+to a sync; one writer is still one sync a write
+(`what_a_slow_log_sync_costs_a_reader` prints every case). The embedded
+API keeps the sync under the caller's hands: only `serve` turns it on
+(`CELASTRO_GROUP_COMMIT`), since only a caller that lets the lock go
+gains from it, and the crash sweep runs both ways.
 A two-node test runs the mixed load in-process and asserts no
 statement waits over two seconds; with the plain read on the wire it
 deadlocks both nodes until the deadline, every time. The replication

@@ -33,7 +33,7 @@ use crate::plan::walk::{self, WalkSpec};
 use crate::residency::{Placement, ResidencyManager, ResidencyOpts, Tier};
 use crate::segment::BuildOpts;
 use crate::segment::{PendingDoc, SegmentBuilder, SegmentSource};
-use crate::shard::{sort_key, Searchable, SegmentHandle, Shard, ShardOpts};
+use crate::shard::{sort_key, PendingSync, Searchable, SegmentHandle, Shard, ShardOpts};
 use crate::sql::{self, ast::*};
 use crate::text::scorer::{Expansion, GlobalStats};
 use crate::time::{Hlc, Timestamp};
@@ -254,6 +254,13 @@ pub struct DbOpts {
     /// builds inline under the write lock. The console turns it on when it
     /// runs its maintenance thread ([`Db::set_background_seal`]).
     pub background_seal: bool,
+    /// Group commit: a write statement syncs its log after the lock is let
+    /// go, together with every other writer that appended meanwhile, and is
+    /// acknowledged after that sync; reads are held below any write not yet
+    /// synced (`shard::LogSync`). Off, a statement syncs under the lock. The
+    /// console turns it on (`CELASTRO_GROUP_COMMIT`, on unless told
+    /// otherwise), since only a caller that lets the lock go gains from it.
+    pub group_commit: bool,
     /// Encryption at rest: the master key that wraps the database's data
     /// key (`CELASTRO_MASTER_KEY_FILE`, 32 bytes, or `CELASTRO_MASTER_KEY`
     /// as hex). With it, `<dir>/KEY` is made at the first open of an empty
@@ -327,6 +334,7 @@ impl Default for DbOpts {
             backup_dir: None,
             insert_batch: 1000,
             background_seal: false,
+            group_commit: false,
             master_key: None,
             key_file: None,
             role: Role::Data,
@@ -1034,6 +1042,10 @@ pub struct Db {
     /// What the last write statement wrote here, shard by shard: what its
     /// acknowledgement waits on the followers for.
     recent_writes: Vec<(String, usize, Timestamp)>,
+    /// Whether the writes made now leave their log syncs for the statement's
+    /// confirmation ([`deferring`](Self::deferring)), and those syncs.
+    defer_syncs: bool,
+    pending_syncs: Vec<PendingSync>,
     /// The lease the steward renews, shared with the wire so a renewal
     /// takes no lock: when it was last renewed, and by which node it may
     /// be.
@@ -1166,6 +1178,8 @@ impl Db {
             shards: BTreeMap::new(),
             followed: Arc::new(Mutex::new(BTreeMap::new())),
             recent_writes: Vec::new(),
+            defer_syncs: false,
+            pending_syncs: Vec::new(),
             lease: Arc::new(Mutex::new(LeaseState {
                 at: None,
                 steward: None,
@@ -1434,7 +1448,7 @@ impl Db {
             )));
         }
         self.absorb_shard_catalogs(name)?;
-        let ts = self.clock.peek().max(self.last_commit);
+        let ts = self.read_ts();
         let coll = self.catalog.get(name)?.clone();
         let mut catalog = Catalog::default();
         catalog.collections.insert(name.to_string(), coll.clone());
@@ -1466,7 +1480,7 @@ impl Db {
         let target =
             crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), dest)?;
         let ts = match as_of {
-            None => self.clock.peek().max(self.last_commit),
+            None => self.read_ts(),
             Some(t) => {
                 // An instant another node chose: within this node's clock
                 // and the skew ATTACH allows, or it is not an instant of
@@ -2065,7 +2079,14 @@ impl Db {
 
     /// The instant a statement started now would read at.
     pub fn now_ts(&self) -> Timestamp {
-        self.clock.peek().max(self.last_commit)
+        self.read_ts()
+    }
+
+    /// A read's snapshot: the clock, raised to the last commit here, and held
+    /// below every write whose log is not yet synced (group commit, see
+    /// `shard::LogSync`), so a read never sees a row a crash could take back.
+    pub(crate) fn read_ts(&self) -> Timestamp {
+        self.clock.visible(self.clock.peek().max(self.last_commit))
     }
 
     /// A collection's definition.
@@ -2111,6 +2132,12 @@ impl Db {
                 String::new()
             }
         ));
+        if let (_, _, Some(e)) = self.log_syncs() {
+            out.push_str(&format!(
+                "write-ahead log: a sync FAILED ({e}); its shard takes no writes and reads here \
+                 are held at the instant before it -- restart the node to replay the log\n"
+            ));
+        }
         let lead = self.hlc_lead_micros();
         if lead > 1_000_000 {
             out.push_str(&format!(
@@ -2336,6 +2363,23 @@ impl Db {
 
     /// Seals that failed and were left for a later write to retry, over
     /// every shard held here, with the last reason seen.
+    /// The write-ahead logs' syncs since the process started, summed over
+    /// the shards held: syncs made, the writes they settled, and why a log
+    /// takes no more writes, if one does not (`shard::LogSync`).
+    pub fn log_syncs(&self) -> (u64, u64, Option<String>) {
+        let (mut syncs, mut settled, mut failed) = (0, 0, None);
+        for s in self.shards.values().flatten() {
+            if let Some(log) = s.log_sync() {
+                let st = log.lock();
+                syncs += st.syncs;
+                settled += st.settled;
+                drop(st);
+                failed = failed.or_else(|| log.failure());
+            }
+        }
+        (syncs, settled, failed)
+    }
+
     pub fn seal_failures(&self) -> (u64, Option<String>) {
         let mut n = 0;
         let mut last = None;
@@ -3503,7 +3547,7 @@ impl Db {
         }
         let coll = self.catalog.get(collection)?.clone();
         self.absorb_shard_catalogs(collection)?;
-        let ts = self.clock.peek().max(self.last_commit);
+        let ts = self.read_ts();
         let s = self
             .shards
             .get(collection)
@@ -3930,7 +3974,7 @@ impl Db {
         let at: String = match at {
             Some(k) => k.to_string(),
             None => {
-                let ts = self.clock.peek().max(self.last_commit);
+                let ts = self.read_ts();
                 self.shards
                     .get(collection)
                     .and_then(|v| v.iter().find(|s| s.index == shard))
@@ -3960,7 +4004,7 @@ impl Db {
             )));
         }
         self.absorb_shard_catalogs(collection)?;
-        let ts = self.clock.peek().max(self.last_commit);
+        let ts = self.read_ts();
         let cdir = dir.join("collections").join(collection);
         let incoming = cdir.join(format!("shard-{next:04}.incoming"));
         let new_id = format!("shard-{next:04}");
@@ -4184,7 +4228,7 @@ impl Db {
             }
         }
         self.absorb_shard_catalogs(collection)?;
-        let now = self.clock.peek().max(self.last_commit);
+        let now = self.read_ts();
         let copts = self.opts.compaction;
         let shards = self.shards.get_mut(collection).expect("checked above");
         // Every row of `b`, sealed first so one path -- the segments' --
@@ -4331,7 +4375,8 @@ impl Db {
                 }
             }
         }
-        Confirmation { waits, budget }
+        let syncs = Mutex::new(std::mem::take(&mut self.pending_syncs));
+        Confirmation { waits, budget, syncs, clock: self.clock.clone() }
     }
 
     /// The instant of the last commit here.
@@ -4413,7 +4458,7 @@ impl Db {
     /// waited for their confirmation until the deadline, and the
     /// statements behind those writes with it.
     pub fn replication_step(&self) -> usize {
-        let now = self.clock.peek().max(self.last_commit);
+        let now = self.read_ts();
         let mut cut = 0;
         let mut jobs: Vec<(
             String,
@@ -5584,7 +5629,10 @@ impl Db {
                 let tail = batch.split_off(batch.len().min(chunk));
                 let (stamps, index) = {
                     let shards = self.shards.get_mut(collection).expect("checked above");
-                    (shards[idx].insert_many(batch)?, shards[idx].index)
+                    let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
+                    let stamps =
+                        Db::on_shard(defer, pending, &mut shards[idx], |s| s.insert_many(batch))?;
+                    (stamps, shards[idx].index)
                 };
                 let mut chunk_last = 0;
                 for ts in stamps {
@@ -5689,7 +5737,8 @@ impl Db {
             .iter()
             .position(|s| s.owns(&key))
             .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
-        let ts = shards[idx].insert(doc)?;
+        let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
+        let ts = Db::on_shard(defer, pending, &mut shards[idx], |s| s.insert(doc))?;
         let index = shards[idx].index;
         self.note_write(collection, ts);
         self.recent_writes.push((collection.to_string(), index, ts));
@@ -5747,9 +5796,10 @@ impl Db {
             .shards
             .get_mut(collection)
             .ok_or_else(|| Error::Plan(format!("no shard of `{collection}` is on this node")))?;
+        let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
         for s in shards.iter_mut() {
             if s.owns(key) {
-                if let Some(ts) = s.delete(key)? {
+                if let Some(ts) = Db::on_shard(defer, pending, s, |s| s.delete(key))? {
                     let idx = s.index;
                     self.note_write(collection, ts);
                     self.recent_writes.push((collection.to_string(), idx, ts));
@@ -5805,8 +5855,48 @@ impl Db {
         compaction::build(&ticket.reserved)
     }
 
-    /// Install a built compaction on the shard it was reserved on. `false`
-    /// when the shard moved on meanwhile and the build is dropped.
+    /// Whether write statements sync their logs as a group after the lock
+    /// is let go ([`DbOpts::group_commit`]).
+    pub fn set_group_commit(&mut self, on: bool) {
+        self.opts.group_commit = on;
+    }
+
+    /// Run `f`, a write statement's work under the lock, with the log syncs
+    /// of the writes it makes left for its [`confirmation`](Self::confirmation)
+    /// when group commit is on. A statement that fails has the syncs of what
+    /// it did write settled here, under the lock, as they were before: the
+    /// part of it that landed is durable and seen, and nothing waits on it.
+    pub(crate) fn deferring<T>(&mut self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+        self.defer_syncs = self.opts.group_commit;
+        let r = f(self);
+        self.defer_syncs = false;
+        if r.is_err() {
+            let syncs = Mutex::new(std::mem::take(&mut self.pending_syncs));
+            drop(Confirmation {
+                waits: Vec::new(),
+                budget: None,
+                syncs,
+                clock: self.clock.clone(),
+            });
+        }
+        r
+    }
+
+    /// A write on `shard`, with its log sync left for the confirmation when
+    /// this statement defers it.
+    fn on_shard<T>(
+        defer: bool,
+        pending: &mut Vec<PendingSync>,
+        shard: &mut Shard,
+        f: impl FnOnce(&mut Shard) -> Result<T>,
+    ) -> Result<T> {
+        shard.defer_sync = defer;
+        let r = f(shard);
+        shard.defer_sync = false;
+        pending.extend(shard.take_pending());
+        r
+    }
+
     /// Whether a due seal freezes for the maintenance thread or builds
     /// inline; set on every shard held and every one built from here on.
     pub fn set_background_seal(&mut self, on: bool) {
@@ -5908,6 +5998,8 @@ impl Db {
         }
     }
 
+    /// Install a built compaction on the shard it was reserved on. `false`
+    /// when the shard moved on meanwhile and the build is dropped.
     pub fn compaction_install(
         &mut self,
         ticket: CompactionTicket,
@@ -6069,9 +6161,9 @@ impl Db {
                 // The rule on the doc comment, as a test failure rather than
                 // a sentence: this arm writes what it gathers into state the
                 // whole epoch reads, so the timestamp has to be one this query
-                // pinned. `run_select` passes `clock.peek().max(last_commit)`.
+                // pinned. `run_select` passes `read_ts()`.
                 debug_assert!(
-                    ts >= self.last_commit,
+                    ts >= self.clock.visible(self.last_commit),
                     "a historical `as_of` must be read with `exact: true`: it would poison the \
                      cache for every later query in the epoch"
                 );
@@ -6088,7 +6180,7 @@ impl Db {
                 //
                 // Below the `debug_assert!`, not above it: shadowing `ts` first
                 // would delete both the debug panic and the test that pins it.
-                let ts = ts.max(self.last_commit);
+                let ts = ts.max(self.clock.visible(self.last_commit));
                 // Reset first, then fill: a refresh point starts a new epoch
                 // by emptying the entry, and filling into an entry that is
                 // about to be emptied would pay for a masked walk and discard
@@ -6250,9 +6342,10 @@ impl Db {
     ///
     /// THE RULE, and it is the one plausible-looking optimisation that
     /// silently undoes everything above: `ts` must be a timestamp pinned by
-    /// the CURRENT query — `run_select` computes it as
-    /// `clock.peek().max(last_commit)`. Never store the timestamp a refresh
-    /// used and re-read at it later. `Shard::term_stats` is a pure function
+    /// the CURRENT query — `run_select` computes it as `read_ts()`, the
+    /// clock raised to the last commit and held below any write not yet
+    /// synced. Never store the timestamp a refresh used and re-read at it
+    /// later. `Shard::term_stats` is a pure function
     /// of the live corpus only at or above `Shard::retain_floor`, and
     /// `retain_from` returns `now` when no `gc_horizon` is pinned, so a seal
     /// or a compaction walks the floor up past any stored timestamp and the
@@ -6866,7 +6959,8 @@ impl Db {
                 let (here, away) = self.split_by_holder(&i.collection, i.docs)?;
                 let mut last = self.last_commit;
                 if !here.is_empty() {
-                    last = last.max(self.insert_many_local(&i.collection, here)?);
+                    let c = &i.collection;
+                    last = last.max(self.deferring(|db| db.insert_many_local(c, here))?);
                 }
                 let confirm = self.confirmation();
                 if away.is_empty() && confirm.is_empty() {
@@ -6893,7 +6987,7 @@ impl Db {
                 // the two steps is waited for under the lock, as before.
                 let holders = self.holders(&d.collection);
                 if d.predicate.is_none() || holders.is_empty() || crate::wire::serving() {
-                    return self.delete_where(d, sql, params);
+                    return self.deferring(|db| db.delete_where(d, sql, params));
                 }
                 let mut conns = Vec::new();
                 for url in holders {
@@ -6916,7 +7010,7 @@ impl Db {
                     let left = crate::deadline::remaining_ms();
                     Ok(Resume::new(move |db: &mut Db| {
                         let _deadline = crate::deadline::arm(left);
-                        db.delete_where(d, &sql, &params)
+                        db.deferring(|db| db.delete_where(d, &sql, &params))
                     }))
                 })))
             }
@@ -6946,7 +7040,7 @@ impl Db {
                 Ok(Outcome::Ack(format!("{n} compaction job(s) run")))
             }
             Statement::ShowSegments { collection } => {
-                let ts = self.clock.peek();
+                let ts = self.read_ts();
                 let mut out = String::from("shard  segment  level  docs      vectors   dead\n");
                 for (i, s) in self.shards(&collection)?.iter().enumerate() {
                     for (id, level, docs, vecs, dead) in s.segment_summary(ts) {
@@ -7885,7 +7979,7 @@ impl Db {
         self.note_touches(&sel.collection, &index_uses(sel));
         // Read-your-writes: pin at least the last commit timestamp this client
         // observed (§6).
-        let ts = self.clock.peek().max(self.last_commit).max(floor);
+        let ts = self.clock.visible(self.read_ts().max(floor));
         let coll = self.planning_collection(&sel.collection)?;
         if let Some(path) = exec::undeclared_text_path(&coll, sel) {
             return Err(Error::Plan(format!(
@@ -8961,19 +9055,68 @@ pub fn follower_status(
 pub struct Confirmation {
     waits: Vec<(Arc<crate::replication::Shipper>, Timestamp)>,
     budget: Option<u64>,
+    /// The statement's log syncs, left for after the lock (group commit),
+    /// and the clock whose readers are held below them until they settle.
+    /// Settled by [`wait`](Self::wait), or on drop by a caller that never
+    /// waits: a write is never left unsynced, nor its readers held for good.
+    syncs: Mutex<Vec<PendingSync>>,
+    clock: Arc<Hlc>,
 }
 
 impl Confirmation {
     pub fn is_empty(&self) -> bool {
-        self.waits.is_empty()
+        self.waits.is_empty() && guard(&self.syncs).is_empty()
     }
 
-    /// Wait for every confirmation, within the statement's budget.
+    /// Wait for every confirmation, within the statement's budget: this
+    /// node's log syncs, then the followers, then until a read here sees
+    /// the statement -- every write that began before it settled too, so
+    /// the client reads its own write the moment it is told of it.
     pub fn wait(&self) -> Result<()> {
+        let visible = self.settle()?;
         for (sh, ts) in &self.waits {
             sh.wait(*ts, self.budget)?;
         }
+        if let Some(t) = visible {
+            let budget = std::time::Duration::from_millis(self.budget.unwrap_or(30_000));
+            // A write before it whose sync failed holds reads back for good,
+            // and this one is durable: it is answered, not held.
+            let _ = self.clock.wait_visible(t, std::time::Instant::now() + budget);
+        }
         Ok(())
+    }
+
+    /// Settle the log syncs: each log's group sync, then the reads let
+    /// through to what they cover. A sync that failed leaves its writes
+    /// hidden -- they are applied in memory and not on the disk -- and the
+    /// log refuses writes until a restart replays it. The newest write's
+    /// first timestamp, for the wait on visibility.
+    fn settle(&self) -> Result<Option<Timestamp>> {
+        let syncs = std::mem::take(&mut *guard(&self.syncs));
+        let mut failed = None;
+        let mut newest = None;
+        for p in syncs {
+            match p.log.settle(p.seq) {
+                Ok(()) => {
+                    self.clock.end(p.first);
+                    newest = newest.max(Some(p.first));
+                }
+                Err(e) => {
+                    self.clock.fail();
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(newest),
+        }
+    }
+}
+
+impl Drop for Confirmation {
+    fn drop(&mut self) {
+        let _ = self.settle();
     }
 }
 
@@ -12472,6 +12615,18 @@ mod tests {
     #[test]
     fn a_crash_at_every_durability_point_leaves_a_directory_that_opens_with_what_was_acknowledged()
     {
+        crash_sweep(false);
+    }
+
+    /// The same sweep with group commit: each statement's log sync is made
+    /// after its work, by the confirmation, and a seal that runs with a write
+    /// in flight keeps the versions that write supersedes.
+    #[test]
+    fn a_crash_at_every_durability_point_under_group_commit_opens_with_what_was_acknowledged() {
+        crash_sweep(true);
+    }
+
+    fn crash_sweep(group_commit: bool) {
         use std::cell::RefCell;
         use std::collections::BTreeMap;
         use std::rc::Rc;
@@ -12491,12 +12646,13 @@ mod tests {
             }
         }
 
-        let dir = tmp("crashsweep");
-        let crashes = tmp("crashsweep-copies");
+        let dir = tmp(&format!("crashsweep-{group_commit}"));
+        let crashes = tmp(&format!("crashsweep-copies-{group_commit}"));
         fs::create_dir_all(&crashes).unwrap();
         let mut opts = DbOpts::default();
         // Small enough that the inserts seal on their own, inline.
         opts.thresholds.max_bytes = 4096;
+        opts.group_commit = group_commit;
         let mut db = Db::open(&dir, opts.clone()).unwrap();
 
         // Each copy is taken while statement `done` is in flight, after
@@ -12642,14 +12798,145 @@ mod tests {
             }
         }
         eprintln!(
-            "crash sweep: {} crash points ({} torn records), every one opened with what was \
-             acknowledged; {partial} left the statement in flight in part",
+            "crash sweep (group commit {group_commit}): {} crash points ({} torn records), every \
+             one opened with what was acknowledged; {partial} left the statement in flight in part",
             copies.len(),
             seen("torn")
         );
         drop(copies);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&crashes);
+    }
+
+    fn group_commit_db(tag: &str) -> (PathBuf, Db) {
+        let dir = tmp(tag);
+        let mut opts = DbOpts::default();
+        opts.group_commit = true;
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        db.execute(r#"INSERT INTO items VALUES ('{"id":"k0","n":0}')"#)
+            .unwrap()
+            .finished()
+            .unwrap();
+        (dir, db)
+    }
+
+    fn ids(db: &mut Db) -> Vec<String> {
+        let r = db.query("SELECT id FROM items LIMIT 100").unwrap();
+        let mut ids: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Group commit's promise to a reader: a write is applied under the lock
+    /// and synced after it, and between the two no read sees it -- neither the
+    /// row, nor the removal of the version it replaced, nor a delete. The
+    /// statement's outcome is held unsettled here, which is the instant a
+    /// reader on another thread would find while the writer waits on the
+    /// disk.
+    #[test]
+    fn under_group_commit_a_write_is_seen_only_once_its_log_is_synced() {
+        let (dir, mut db) = group_commit_db("gc-visible");
+        let log = dir.join("collections/items/shard-0000/wal.log");
+
+        durability_probe::start();
+        let pending = db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":1}')"#).unwrap();
+        assert!(
+            durability_probe::take().paths(Op::WalSync).is_empty(),
+            "the statement synced under the lock"
+        );
+        assert!(matches!(pending, Outcome::Deferred(_)), "the sync was not left for after");
+        assert_eq!(ids(&mut db), ["k0"], "a row not yet synced was read");
+        // Every snapshot, not only a SELECT's: a backup, a move's copy and the
+        // clock a coordinator asks a holder for all start from this one.
+        assert!(
+            db.now_ts() < db.last_commit_ts(),
+            "the instant a statement reads at is past a write not yet synced"
+        );
+        durability_probe::start();
+        pending.finished().unwrap();
+        assert_eq!(durability_probe::take().count(Op::WalSync, &log), 1);
+        assert_eq!(ids(&mut db), ["k0", "k1"], "the synced row is not read");
+
+        // One document, as the wire's forwarded insert writes it.
+        let doc = crate::json::parse(r#"{"id":"k2","n":2}"#).unwrap();
+        durability_probe::start();
+        db.deferring(|db| db.insert_here("items", doc)).unwrap();
+        assert!(
+            durability_probe::take().paths(Op::WalSync).is_empty(),
+            "a forwarded insert synced under the lock"
+        );
+        assert_eq!(ids(&mut db), ["k0", "k1"], "a forwarded row not yet synced was read");
+        db.confirmation().wait().unwrap();
+        assert_eq!(ids(&mut db), ["k0", "k1", "k2"]);
+
+        let pending = db.execute("DELETE FROM items WHERE id = 'k0'").unwrap();
+        assert_eq!(ids(&mut db), ["k0", "k1", "k2"], "a delete not yet synced was read");
+        pending.finished().unwrap();
+        assert_eq!(ids(&mut db), ["k1", "k2"]);
+
+        let pending = db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":2}')"#).unwrap();
+        let r = db.query("SELECT n FROM items WHERE id = 'k1'").unwrap();
+        assert_eq!(r.rows.len(), 1, "a replacement not yet synced hid the version it replaces");
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
+        // Dropped, not waited on: a caller that never looks still gets a
+        // durable write and lets the readers through.
+        drop(pending);
+        let r = db.query("SELECT n FROM items WHERE id = 'k1'").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seal that runs while a write is in flight keeps the version that
+    /// write replaces, since a reader is still held below the write and
+    /// reads it; the seal must not leave the key with no version a reader
+    /// can see.
+    #[test]
+    fn a_seal_with_a_write_in_flight_keeps_the_version_the_write_replaces() {
+        let (dir, mut db) = group_commit_db("gc-seal");
+        let pending = db.execute(r#"INSERT INTO items VALUES ('{"id":"k0","n":1}')"#).unwrap();
+        db.execute("FLUSH items").unwrap();
+        let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
+        assert_eq!(r.rows.len(), 1, "the seal dropped the version a reader still sees");
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(0));
+        pending.finished().unwrap();
+        let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A group sync that fails is not retried: the statement is refused, its
+    /// row is never read, the log is cut back so a reopen does not bring it
+    /// back, the shard takes no more writes, and the health says so.
+    #[test]
+    fn a_failed_group_sync_refuses_the_write_hides_it_and_stops_the_log() {
+        let (dir, mut db) = group_commit_db("gc-failed");
+        let log = dir.join("collections/items/shard-0000/wal.log");
+        let pending = db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":1}')"#).unwrap();
+        durability_probe::fail_next(Op::WalSync, &log);
+        let e = pending.finished().unwrap_err();
+        assert!(e.to_string().contains("injected"), "{e}");
+        assert_eq!(ids(&mut db), ["k0"], "a write whose sync failed is read");
+        let e = db
+            .execute(r#"INSERT INTO items VALUES ('{"id":"k2","n":2}')"#)
+            .and_then(|o| o.finished())
+            .unwrap_err();
+        assert!(e.to_string().contains("takes no more writes"), "{e}");
+        assert!(db.show_health().contains("sync FAILED"), "{}", db.show_health());
+        assert_eq!(ids(&mut db), ["k0"]);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(ids(&mut db), ["k0"], "the refused write came back on the reopen");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// CATALOG and MANIFEST are published by a rename, and a rename is a change

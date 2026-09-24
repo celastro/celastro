@@ -170,7 +170,10 @@ at least sixteen printable bytes, the same at every node), accepts whatever
 takes the API's token in the header only, never in the URL.
 Connections are served at once, up to sixty-four, and reads run side by
 side on every core; a statement that changes something runs alone, since
-the engine is single-writer. `/api/health` names the node that answered.
+the engine is single-writer, and waits for its log's sync after it has let
+the others go, sharing that sync with every writer that came meanwhile
+(`CELASTRO_GROUP_COMMIT=off` keeps it under the lock). A read never sees a
+write before it is on disk. `/api/health` names the node that answered.
 A `serve` also compacts on its own — one job at a time, built outside the
 lock, `CELASTRO_AUTO_COMPACT=off` to leave it to `COMPACT`.
 

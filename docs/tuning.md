@@ -56,6 +56,7 @@ process itself and the page cache the kernel reclaims under pressure.
 
 | variable | default | what it does |
 |---|---|---|
+| `CELASTRO_GROUP_COMMIT` | `on` | `serve` syncs a write statement's log after the lock is let go, together with every writer that appended meanwhile, and acknowledges it after that sync; a read never sees a write before it is durable. At a disk 50 ms slow to sync, a point read beside a writer took one sync (p99 61-67 ms) under the lock and 0.5-0.9 ms with it, and eight writers made 74 writes a second rather than 18. `off` syncs under the lock, one statement at a time. `celastro_wal_syncs_total` and `celastro_wal_sync_writers_total` show the grouping. |
 | `CELASTRO_AUTO_COMPACT` | `on` | `serve` runs a maintenance thread that compacts on its own: every second it asks whether a shard has a job, builds it with no lock held, and installs it under the lock; one job at a time, logged. `off` leaves it to `COMPACT`. Scripts and `exec` compact only on `COMPACT`. |
 | `CELASTRO_COMPACTION_TIER_FANOUT` | `4` | Segments of one size class merged into the next when this many have gathered. Lower merges sooner (fewer segments to search, more rewriting); higher the reverse. |
 | `CELASTRO_COMPACTION_SEGMENT_CAP` | `5000000` | The largest segment compaction makes, in documents. |

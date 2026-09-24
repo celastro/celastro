@@ -18,7 +18,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::bitmap::Bitmap;
 use crate::catalog::{Collection, PathTally};
@@ -1323,6 +1323,9 @@ pub(crate) struct WalMark {
 pub(crate) struct Wal {
     file: fs::File,
     path: PathBuf,
+    /// The log's syncs, shared with the writers that settle theirs after
+    /// the database's lock is let go: see [`LogSync`].
+    group: Arc<LogSync>,
     /// Encryption at rest: each appended record is a length-prefixed frame
     /// under the log's key with its ordinal in the AAD; `records` counts
     /// the frames in the file, so the next one continues the sequence.
@@ -1352,6 +1355,160 @@ fn truncate_file(path: &Path) -> Result<fs::File> {
     Ok(f)
 }
 
+/// A write's log sync, left for its caller to settle outside the lock:
+/// the log, the record count to reach, and the write's first timestamp,
+/// which reads are held below until it is settled.
+pub(crate) struct PendingSync {
+    pub(crate) log: Arc<LogSync>,
+    pub(crate) seq: u64,
+    pub(crate) first: Timestamp,
+}
+
+/// Group commit on one write-ahead log (§6).
+///
+/// A write statement appends its records and applies them under the
+/// database's exclusive lock, lets the lock go, and only then waits for the
+/// log's sync -- here, with every other writer that appended meanwhile. One
+/// of them makes the `fdatasync` for all, the rest wait for it, so on a slow
+/// disk the writes cost one sync per group rather than one each, and a
+/// reader never waits one out behind a writer. What a reader may see is
+/// held below every write still waiting (`Hlc::visible`), so a row is seen
+/// only once it is durable, exactly as when the sync was under the lock.
+///
+/// A sync that fails is not retried. What the page cache holds after a
+/// failed `fdatasync` cannot be trusted to reach the disk on a second try,
+/// so the log is cut back to what the last good sync covered -- a refused
+/// write does not come back on a reopen -- and every write to it is
+/// refused from then on: the shard needs the node restarted, and its health
+/// says so.
+pub(crate) struct LogSync {
+    path: PathBuf,
+    state: Mutex<SyncState>,
+    done: Condvar,
+}
+
+pub(crate) struct SyncState {
+    file: Arc<fs::File>,
+    /// Bumped when the log is rotated or emptied: a sync of the file before
+    /// it has nothing to say about the length of the one after.
+    generation: u64,
+    /// Records appended, and how many of them a sync has covered.
+    appended: u64,
+    synced: u64,
+    syncing: bool,
+    /// The log's length at the last good sync: where a failed one cuts to.
+    synced_len: u64,
+    /// The shortest the log was cut to by a refused statement while a sync
+    /// was in the air, so that sync does not claim bytes it may not have.
+    low_water: u64,
+    failed: Option<String>,
+    /// Syncs made, and writers they settled: the grouping, for the metrics.
+    pub(crate) syncs: u64,
+    pub(crate) settled: u64,
+}
+
+impl LogSync {
+    fn new(path: &Path, file: fs::File, len: u64) -> LogSync {
+        LogSync {
+            path: path.to_path_buf(),
+            state: Mutex::new(SyncState {
+                file: Arc::new(file),
+                generation: 0,
+                appended: 0,
+                synced: 0,
+                syncing: false,
+                synced_len: len,
+                low_water: u64::MAX,
+                failed: None,
+                syncs: 0,
+                settled: 0,
+            }),
+            done: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, SyncState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn appended(&self) -> u64 {
+        self.lock().appended
+    }
+
+    fn refused(path: &Path, e: &str) -> Error {
+        Error::Io(std::io::Error::other(format!(
+            "the write-ahead log {} failed to sync ({e}) and takes no more writes; restart \
+             the node to replay it",
+            path.display()
+        )))
+    }
+
+    /// Why this log takes no writes, if it does not.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.lock().failed.clone()
+    }
+
+    /// The log's file was replaced under the database's lock, after a sync
+    /// or a publication made everything before it durable.
+    fn replace(&self, file: fs::File) {
+        let mut st = self.lock();
+        st.file = Arc::new(file);
+        st.generation += 1;
+        st.synced = st.appended;
+        st.synced_len = 0;
+        st.low_water = u64::MAX;
+        drop(st);
+        self.done.notify_all();
+    }
+
+    /// Return once the first `seq` records appended to this log are on the
+    /// disk: by making the sync, or by waiting for the one in the air and
+    /// then, if it did not cover them, making the next. Called with no
+    /// database lock held.
+    pub(crate) fn settle(&self, seq: u64) -> Result<()> {
+        let mut st = self.lock();
+        loop {
+            if st.synced >= seq {
+                st.settled += 1;
+                return Ok(());
+            }
+            if let Some(e) = &st.failed {
+                return Err(LogSync::refused(&self.path, e));
+            }
+            if st.syncing {
+                st = self.done.wait(st).unwrap_or_else(|p| p.into_inner());
+                continue;
+            }
+            st.syncing = true;
+            st.low_water = u64::MAX;
+            let (target, file, generation) = (st.appended, st.file.clone(), st.generation);
+            let len = file.metadata().map(|m| m.len());
+            drop(st);
+            let r = len
+                .map_err(Error::from)
+                .and_then(|len| durable::sync_data(&file, &self.path).map(|_| len));
+            st = self.lock();
+            st.syncing = false;
+            match r {
+                Ok(len) => {
+                    st.synced = st.synced.max(target);
+                    st.syncs += 1;
+                    if st.generation == generation {
+                        st.synced_len = len.min(st.low_water);
+                    }
+                }
+                Err(e) => {
+                    st.failed = Some(e.to_string());
+                    if st.generation == generation {
+                        let _ = st.file.set_len(st.synced_len);
+                    }
+                }
+            }
+            self.done.notify_all();
+        }
+    }
+}
+
 impl Wal {
     /// Open the log, creating it if this is a fresh shard directory.
     ///
@@ -1373,7 +1530,14 @@ impl Wal {
             },
             None => 0,
         };
-        Ok(Wal { file, path: path.to_path_buf(), cipher, id, records })
+        let group = Arc::new(LogSync::new(path, file.try_clone()?, file.metadata()?.len()));
+        Ok(Wal { file, path: path.to_path_buf(), group, cipher, id, records })
+    }
+
+    /// The sync a writer that appended just now settles outside the lock:
+    /// this log's group, and the record count it has to reach.
+    pub(crate) fn pending(&self) -> (Arc<LogSync>, u64) {
+        (self.group.clone(), self.group.appended())
     }
 
     /// Where the log ends now: what a statement takes before its records,
@@ -1392,6 +1556,8 @@ impl Wal {
     /// effort on a disk that is full -- shrinking a file needs no space --
     /// and on one that is gone, where the failure is the caller's anyway.
     pub(crate) fn rollback(&mut self, mark: WalMark) -> Result<()> {
+        let mut st = self.group.lock();
+        st.low_water = st.low_water.min(mark.len);
         self.file.set_len(mark.len)?;
         self.records = mark.records;
         Ok(())
@@ -1421,7 +1587,16 @@ impl Wal {
             out = c.seal_record(&self.id, self.records, &out)?;
             self.records += 1;
         }
+        // Under the group's lock, so a sync that failed -- and cut the log
+        // back to what it last made durable -- is never followed by a record
+        // written past the cut.
+        let mut st = self.group.lock();
+        if let Some(e) = &st.failed {
+            return Err(LogSync::refused(&self.path, e));
+        }
         self.file.write_all(&out)?;
+        st.appended += 1;
+        drop(st);
         // Recorded so that a test can assert the sync below happens AFTER this.
         // Syncing before the append is not a missing sync -- the count is the
         // same and every call still makes a syscall -- it is record N reaching
@@ -1445,7 +1620,15 @@ impl Wal {
     /// say an fsync happened has to be the code that makes it -- see that
     /// module.
     pub(crate) fn sync(&mut self) -> Result<()> {
-        durable::sync_data(&self.file, &self.path)
+        let mut st = self.group.lock();
+        if let Some(e) = &st.failed {
+            return Err(LogSync::refused(&self.path, e));
+        }
+        let (target, len) = (st.appended, self.file.metadata()?.len());
+        durable::sync_data(&self.file, &self.path)?;
+        st.synced = st.synced.max(target);
+        st.synced_len = len;
+        Ok(())
     }
 
     /// Replay. A torn tail — a record whose length or checksum does not check
@@ -1527,6 +1710,7 @@ impl Wal {
         sync_dir_of(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
         self.records = 0;
+        self.group.replace(self.file.try_clone()?);
         Ok(rotated)
     }
 
@@ -1537,6 +1721,10 @@ impl Wal {
         self.file = truncate_file(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
         self.records = 0;
+        // The records it held are in segments a published manifest names,
+        // which is the only way a caller may get here, so every writer still
+        // waiting on them is durable.
+        self.group.replace(self.file.try_clone()?);
         Ok(())
     }
 }
@@ -1704,6 +1892,12 @@ pub struct Shard {
     /// the last one's reason: a disk that is full or gone, seen here first.
     pub(crate) seal_failures: u64,
     pub(crate) last_seal_error: Option<String>,
+    /// Group commit: a write appends and applies, and leaves its log's sync
+    /// in `pending` for the caller to settle with the database's lock let go
+    /// ([`LogSync`]). Off, the write syncs before it returns, as the embedded
+    /// API promises.
+    pub(crate) defer_sync: bool,
+    pending: Vec<PendingSync>,
     pub(crate) compactions: u64,
     /// The horizon the last version-collecting operation actually ran at,
     /// maxed over every flush and compaction since this shard was opened. At
@@ -1788,6 +1982,8 @@ impl Shard {
             flushes: 0,
             seal_failures: 0,
             last_seal_error: None,
+            defer_sync: false,
+            pending: Vec::new(),
             compactions: 0,
             retain_floor: 0,
             catchup_floor: 0,
@@ -1941,7 +2137,7 @@ impl Shard {
     }
 
     pub fn snapshot(&self) -> Snapshot<'_> {
-        self.snapshot_at(self.clock.peek())
+        self.snapshot_at(self.clock.visible(self.clock.peek()))
     }
 
     pub fn snapshot_at(&self, ts: Timestamp) -> Snapshot<'_> {
@@ -2153,9 +2349,15 @@ impl Shard {
             // back on the next reopen as if it had been acknowledged. This
             // is what a full disk showed: the appends that fit were replayed
             // for a statement the client was told had failed.
-            if let Err(e) = w.append(&record).and_then(|_| w.sync()) {
+            let defer = self.defer_sync;
+            if let Err(e) = w.append(&record).and_then(|_| if defer { Ok(()) } else { w.sync() }) {
                 let _ = w.rollback(mark);
                 return Err(e);
+            }
+            if defer {
+                let (log, seq) = w.pending();
+                self.clock.begin(ts);
+                self.pending.push(PendingSync { log, seq, first: ts });
             }
             if let Some(sh) = &self.shipper {
                 sh.push(ship_item(&record));
@@ -2232,6 +2434,7 @@ impl Shard {
             }
             return Ok(out);
         }
+        let defer = self.defer_sync;
         if let Some(w) = self.wal.as_mut() {
             let mark = w.mark()?;
             let written: Result<()> = 'log: {
@@ -2249,7 +2452,12 @@ impl Shard {
                 }
                 // Above the mutations, as in `insert`: a sync that fails
                 // leaves the shard's memory as it was for every document.
-                w.sync()
+                // Deferred, it is the caller's, after the lock.
+                if defer {
+                    Ok(())
+                } else {
+                    w.sync()
+                }
             };
             // All or nothing on the log too: the records that fit before the
             // disk filled are taken back, so the statement the client was
@@ -2257,6 +2465,12 @@ impl Shard {
             if let Err(e) = written {
                 let _ = w.rollback(mark);
                 return Err(e);
+            }
+            if defer {
+                let (log, seq) = w.pending();
+                let first = prepared.iter().map(|p| p.1).min().unwrap_or(0);
+                self.clock.begin(first);
+                self.pending.push(PendingSync { log, seq, first });
             }
             if let Some(sh) = &self.shipper {
                 for (key, ts, doc, _) in &prepared {
@@ -2339,9 +2553,15 @@ impl Shard {
             // would otherwise drop the old version for a delete the log never
             // recorded, and a reopen would resurrect the document. A record
             // that did not make it is taken back off the log.
-            if let Err(e) = w.append(&record).and_then(|_| w.sync()) {
+            let defer = self.defer_sync;
+            if let Err(e) = w.append(&record).and_then(|_| if defer { Ok(()) } else { w.sync() }) {
                 let _ = w.rollback(mark);
                 return Err(e);
+            }
+            if defer {
+                let (log, seq) = w.pending();
+                self.clock.begin(ts);
+                self.pending.push(PendingSync { log, seq, first: ts });
             }
             if let Some(sh) = &self.shipper {
                 sh.push(ship_item(&record));
@@ -2625,6 +2845,24 @@ impl Shard {
         }
     }
 
+    /// Whether a seal must keep versions a newer one supersedes: a backup
+    /// holds the horizon back, or a write is on a log and not yet synced, so
+    /// readers are held below it and still read the version it replaced.
+    fn keeps_history(&self) -> bool {
+        self.opts.gc_horizon > 0 || self.clock.writes_in_flight()
+    }
+
+    /// The log syncs this shard's writes left for their caller since the
+    /// last call: see [`Shard::defer_sync`].
+    pub(crate) fn take_pending(&mut self) -> Vec<PendingSync> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// This shard's log, for its sync statistics and its failure.
+    pub(crate) fn log_sync(&self) -> Option<Arc<LogSync>> {
+        self.wal.as_ref().map(|w| w.group.clone())
+    }
+
     pub(crate) fn maybe_flush(&mut self) -> Result<bool> {
         let pinned = self.opts.gc_horizon > 0;
         if self.memtable.should_flush_pinned(&self.opts.thresholds, pinned) {
@@ -2651,10 +2889,11 @@ impl Shard {
         if self.memtable.is_empty() {
             return Ok(false);
         }
-        let retain_from = self.retain_from(self.clock.peek());
-        let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
+        let history = self.keeps_history();
+        let retain_from = self.retain_from(self.clock.visible(self.clock.peek()));
+        let drain_at = if history { retain_from } else { 0 };
         let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
-        if self.opts.gc_horizon == 0 {
+        if !history {
             layers.truncate(1);
         }
         let first_id = self.next_segment_id;
@@ -2892,10 +3131,11 @@ impl Shard {
         // for the statement, and `Shard::prefix_terms` enumerates the LIVE
         // dictionary at the query's own `t`, so neither which terms a prefix
         // names nor what they weigh depends on what this seal drops or keeps.
-        let retain_from = self.retain_from(self.clock.peek());
-        let drain_at = if self.opts.gc_horizon > 0 { retain_from } else { 0 };
+        let history = self.keeps_history();
+        let retain_from = self.retain_from(self.clock.visible(self.clock.peek()));
+        let drain_at = if history { retain_from } else { 0 };
         let mut layers = crate::segment::layer_by_version(self.memtable.drain_into(drain_at));
-        if self.opts.gc_horizon == 0 {
+        if !history {
             // Exactly the old dedup: layer 0 holds the newest version of every
             // key, which is the one `SegmentBuilder::build` used to keep.
             layers.truncate(1);

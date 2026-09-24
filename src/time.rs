@@ -7,8 +7,10 @@
 //! the causality half is only exercised by `observe`, but the type is the one
 //! the distributed layer needs, so it exists from the start.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Microseconds since the Unix epoch in the high bits, a logical counter in the
 /// low 12. Packing both into one u64 keeps timestamps comparable with a plain
@@ -38,6 +40,16 @@ pub const MAX_TS: Timestamp = u64::MAX;
 #[derive(Debug)]
 pub struct Hlc {
     packed: AtomicU64,
+    /// The writes whose log records are appended and not yet synced, by
+    /// their first timestamp: group commit (§6). A read is held below the
+    /// oldest of them, so nothing a crash could still take back is ever
+    /// seen, and `horizon` is that bound, `MAX_TS` when nothing is in flight.
+    in_flight: Mutex<BTreeMap<Timestamp, usize>>,
+    horizon: AtomicU64,
+    settled: Condvar,
+    /// A write's log failed to sync: its rows stay applied and hidden, the
+    /// horizon stays below them until a restart, and nothing waits on it.
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Hlc {
@@ -48,7 +60,13 @@ impl Default for Hlc {
 
 impl Hlc {
     pub fn new() -> Self {
-        Hlc { packed: AtomicU64::new(0) }
+        Hlc {
+            packed: AtomicU64::new(0),
+            in_flight: Mutex::new(BTreeMap::new()),
+            horizon: AtomicU64::new(MAX_TS),
+            settled: Condvar::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn wall() -> u64 {
@@ -116,6 +134,83 @@ impl Hlc {
                 return wall;
             }
         }
+    }
+}
+
+impl Hlc {
+    /// `t`, held below every write still waiting for its log's sync: the
+    /// timestamp a read may use. A write is appended and applied under the
+    /// database's lock and synced after it is let go, so between the two a
+    /// reader could otherwise see a row a crash would take back. Every read
+    /// snapshot passes through here; a write in flight has a timestamp above
+    /// the value returned, so it is invisible until it is durable.
+    pub fn visible(&self, t: Timestamp) -> Timestamp {
+        t.min(self.horizon.load(Ordering::Acquire))
+    }
+
+    /// Whether any write is appended and not yet synced.
+    pub fn writes_in_flight(&self) -> bool {
+        self.horizon.load(Ordering::Acquire) != MAX_TS
+    }
+
+    /// A write whose timestamps begin at `first` is on the log and not yet
+    /// synced. Called under the database's write lock, so no reader can pin a
+    /// snapshot between the timestamp's issue and this.
+    pub fn begin(&self, first: Timestamp) {
+        let mut f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        *f.entry(first).or_insert(0) += 1;
+        self.horizon.store(Self::bound(&f), Ordering::Release);
+    }
+
+    /// The write begun at `first` is durable, or was refused and taken back.
+    pub fn end(&self, first: Timestamp) {
+        let mut f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = f.get_mut(&first) {
+            *n -= 1;
+            if *n == 0 {
+                f.remove(&first);
+            }
+        }
+        self.horizon.store(Self::bound(&f), Ordering::Release);
+        self.settled.notify_all();
+    }
+
+    /// Wait until a read would see `t`: every write that began before it has
+    /// settled. What an acknowledgement waits for, so a client reads its own
+    /// write the moment it is told of it. `false` at `until`.
+    pub fn wait_visible(&self, t: Timestamp, until: Instant) -> bool {
+        let mut f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if Self::bound(&f) >= t {
+                return true;
+            }
+            if self.failed.load(Ordering::Acquire) {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return false;
+            }
+            let wait = (until - now).min(Duration::from_millis(100));
+            f = self.settled.wait_timeout(f, wait).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// A write in flight will never settle: its log failed to sync. Reads
+    /// stay below it; waiters stop waiting.
+    pub fn fail(&self) {
+        let _f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        self.failed.store(true, Ordering::Release);
+        self.settled.notify_all();
+    }
+
+    /// Whether a write's log failed to sync since this node started.
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn bound(f: &BTreeMap<Timestamp, usize>) -> Timestamp {
+        f.keys().next().map_or(MAX_TS, |first| first - 1)
     }
 }
 

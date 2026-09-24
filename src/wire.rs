@@ -2167,7 +2167,7 @@ fn handle(
             // the shipper's, and nothing under the lock waits for a peer.
             let (ts, confirm) = {
                 let d = db.exclusive();
-                let ts = d.insert_here(&collection, doc)?;
+                let ts = d.deferring(|d| d.insert_here(&collection, doc))?;
                 (ts, d.confirmation())
             };
             drop(db);
@@ -2180,19 +2180,22 @@ fn handle(
             let n = docs.len();
             let (taken, last, stopped, confirm) = {
                 let d = db.exclusive();
-                let (mut taken, mut last, mut stopped) = (0usize, 0, None);
-                for doc in docs {
-                    match d.insert_here(&collection, doc) {
-                        Ok(ts) => {
-                            taken += 1;
-                            last = last.max(ts);
-                        }
-                        Err(e) => {
-                            stopped = Some(e.to_string());
-                            break;
+                let (taken, last, stopped) = d.deferring(|d| {
+                    let (mut taken, mut last, mut stopped) = (0usize, 0, None);
+                    for doc in docs {
+                        match d.insert_here(&collection, doc) {
+                            Ok(ts) => {
+                                taken += 1;
+                                last = last.max(ts);
+                            }
+                            Err(e) => {
+                                stopped = Some(e.to_string());
+                                break;
+                            }
                         }
                     }
-                }
+                    Ok((taken, last, stopped))
+                })?;
                 (taken, last, stopped, d.confirmation())
             };
             drop(db);
@@ -2217,7 +2220,7 @@ fn handle(
             let key = get_string(body, &mut 0)?;
             let (gone, confirm) = {
                 let d = db.exclusive();
-                let gone = d.delete_key_here(&collection, &key)?;
+                let gone = d.deferring(|d| d.delete_key_here(&collection, &key))?;
                 (gone, d.confirmation())
             };
             drop(db);
@@ -2309,7 +2312,7 @@ fn handle(
                 Call::TermStats => {
                     let path = get_string(body, &mut j)?;
                     let terms = get_strs(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let t = local.term_stats(&path, &terms, ts)?;
                     put_u64(&mut out, t.num_docs);
                     put_u64(&mut out, t.total_doc_len);
@@ -2322,7 +2325,7 @@ fn handle(
                 Call::PrefixTerms => {
                     let path = get_string(body, &mut j)?;
                     let prefix = get_string(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let limit = get_num(body, &mut j)?;
                     let key_prefix = get_opt(body, &mut j)?;
                     let terms =
@@ -2332,7 +2335,7 @@ fn handle(
                 Call::Candidates => {
                     let sql = get_string(body, &mut j)?;
                     let params = get_values(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let prefix = get_opt(body, &mut j)?;
                     let k_prime = get_num(body, &mut j)?;
                     let stats = get_stats(body, &mut j)?;
@@ -2359,7 +2362,7 @@ fn handle(
                 Call::Scan => {
                     let sql = get_string(body, &mut j)?;
                     let params = get_values(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let prefix = get_opt(body, &mut j)?;
                     let stats = get_stats(body, &mut j)?;
                     let analyze = get_bool(body, &mut j)?;
@@ -2392,7 +2395,7 @@ fn handle(
                 }
                 Call::Documents => {
                     let mv = get_u64(body, &mut j).ok_or_else(truncated)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let n = get_count(body, &mut j)?;
                     let mut handles = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -2404,7 +2407,7 @@ fn handle(
                 }
                 Call::Get => {
                     let key = get_string(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     match local.get(&key, ts)? {
                         Some(d) => {
                             put_bool(&mut out, true);
@@ -2414,13 +2417,13 @@ fn handle(
                     }
                 }
                 Call::Count => {
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     put_u64(&mut out, local.count(ts)?.unwrap_or(0));
                 }
                 Call::Expand => {
                     let sql = get_string(body, &mut j)?;
                     let params = get_values(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     let frontier = get_strs(body, &mut j)?;
                     let limit =
                         if get_bool(body, &mut j)? { Some(get_num(body, &mut j)?) } else { None };
@@ -2457,7 +2460,7 @@ fn handle(
                 }
                 Call::Present => {
                     let keys = get_strs(body, &mut j)?;
-                    let ts = get_ts(body, &mut j)?;
+                    let ts = sh.clock.visible(get_ts(body, &mut j)?);
                     put_strs(&mut out, &local.present(&keys, ts)?);
                 }
                 _ => unreachable!(),

@@ -966,6 +966,14 @@ fn serve(
             .as_str(),
         "0" | "off" | "false" | "no"
     );
+    let group_commit = !matches!(
+        std::env::var("CELASTRO_GROUP_COMMIT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    );
     let server = match bind {
         // The operator's token, or nothing: a per-run token is printed where
         // a client on the network cannot read it, and differs per node.
@@ -984,7 +992,8 @@ fn serve(
                 Ok(s) => s
                     .with_tls(tls.clone())
                     .with_max_connections(connections)
-                    .with_auto_compact(auto_compact),
+                    .with_auto_compact(auto_compact)
+                    .with_group_commit(group_commit),
                 Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
             }
         }
@@ -992,7 +1001,8 @@ fn serve(
             Ok(s) => s
                 .with_tls(tls.clone())
                 .with_max_connections(connections)
-                .with_auto_compact(auto_compact),
+                .with_auto_compact(auto_compact)
+                .with_group_commit(group_commit),
             Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
         },
     };

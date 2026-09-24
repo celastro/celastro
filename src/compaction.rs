@@ -192,7 +192,7 @@ pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
 /// and a version superseded after it is kept as well — in an output segment of
 /// its own, because one segment holds one version per key.
 pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
-    let now = shard.clock.peek();
+    let now = shard.clock.visible(shard.clock.peek());
     let retain_from = shard.retain_from(now);
     let (inputs, out_level) = match job {
         Job::Rewrite { input, .. } => {
@@ -265,7 +265,7 @@ pub fn absorb(
     carried: &[crate::shard::CarriedDelete],
     opts: &CompactionOpts,
 ) -> Result<()> {
-    let now = shard.clock.peek();
+    let now = shard.clock.visible(shard.clock.peek());
     let retain_from = shard.retain_from(now);
     let layers = crate::segment::layer_by_version(docs);
     let chunk = opts.segment_cap.max(1);
@@ -323,7 +323,7 @@ impl std::fmt::Debug for Reserved {
 /// Plan the next job on `shard` and pin what it needs, reserving segment
 /// ids for its outputs. `None` when the shard is quiet.
 pub fn reserve(shard: &mut Shard, opts: &CompactionOpts) -> Option<Reserved> {
-    let now = shard.clock.peek();
+    let now = shard.clock.visible(shard.clock.peek());
     let job = plan(shard, now, opts)?;
     let (inputs, level) = match &job {
         Job::Rewrite { input, .. } => {
@@ -403,7 +403,7 @@ pub fn run_to_quiescence(
 ) -> Result<usize> {
     let mut n = 0;
     while n < max_jobs {
-        let t = shard.clock.peek();
+        let t = shard.clock.visible(shard.clock.peek());
         let Some(job) = plan(shard, t, opts) else { break };
         run(shard, &job, opts)?;
         n += 1;
