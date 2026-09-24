@@ -1035,6 +1035,25 @@ pub(crate) mod durable {
                     seen.push(Event { op, path: path.to_path_buf() });
                 }
             });
+            HOOK.with(|h| {
+                if let Some(f) = h.borrow_mut().as_mut() {
+                    f(op, path);
+                }
+            });
+        }
+
+        type Hook = Box<dyn FnMut(Op, &Path)>;
+
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        /// Run `f` on this thread at every event, just after the operation
+        /// it records: the moment a crash would leave the disk holding it.
+        /// The crash sweep copies the directory there. `f` must not touch a
+        /// shard's files through this crate, or it notes events of its own.
+        pub(crate) fn on_event(f: Option<Hook>) {
+            HOOK.with(|h| *h.borrow_mut() = f);
         }
 
         /// Record one of the three fsyncs. Private to [`super`], which is the

@@ -12453,6 +12453,204 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A crash at every durability point of a node's life -- each log
+    /// record written, each fsync, each rename, each truncation, through
+    /// writes, replacements, a delete, seals and a compaction -- leaves a
+    /// directory that opens, holds every row acknowledged before the crash
+    /// with the value it was acknowledged with, holds nothing that was never
+    /// sent and nothing acknowledged as deleted, and opens the same way
+    /// twice. At every log record the sweep also tears the record: the
+    /// directory is copied with the log cut part of the way into it, which
+    /// is a power cut during the `write`.
+    ///
+    /// The tests beside it each pin one ordering at one call site. This one
+    /// asks the question they are all in service of, at every point where
+    /// the answer could change, so a publication added tomorrow is swept the
+    /// day it is written. The statement in flight may land in part: a batch
+    /// is a record per row, no statement is promised atomic across a crash,
+    /// and the part it left is printed rather than asserted.
+    #[test]
+    fn a_crash_at_every_durability_point_leaves_a_directory_that_opens_with_what_was_acknowledged()
+    {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::rc::Rc;
+
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for e in fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                let (src, dst) = (e.path(), to.join(e.file_name()));
+                if e.file_type().unwrap().is_dir() {
+                    copy_tree(&src, &dst);
+                } else {
+                    // A file can go between the listing and the copy only if
+                    // something else is writing, and nothing else is.
+                    fs::copy(&src, &dst).unwrap();
+                }
+            }
+        }
+
+        let dir = tmp("crashsweep");
+        let crashes = tmp("crashsweep-copies");
+        fs::create_dir_all(&crashes).unwrap();
+        let mut opts = DbOpts::default();
+        // Small enough that the inserts seal on their own, inline.
+        opts.thresholds.max_bytes = 4096;
+        let mut db = Db::open(&dir, opts.clone()).unwrap();
+
+        // Each copy is taken while statement `done` is in flight, after
+        // `done` statements have been acknowledged.
+        struct Copy {
+            path: PathBuf,
+            done: usize,
+            at: String,
+        }
+        let copies: Rc<RefCell<Vec<Copy>>> = Rc::new(RefCell::new(Vec::new()));
+        let done = Rc::new(RefCell::new(0usize));
+        {
+            let (copies, done, dir, crashes) =
+                (copies.clone(), done.clone(), dir.clone(), crashes.clone());
+            durability_probe::on_event(Some(Box::new(move |op, path| {
+                let n = copies.borrow().len();
+                let to = crashes.join(format!("{n:05}"));
+                copy_tree(&dir, &to);
+                let at = format!("{op:?} {}", path.strip_prefix(&dir).unwrap_or(path).display());
+                copies.borrow_mut().push(Copy { path: to, done: *done.borrow(), at: at.clone() });
+                if op == Op::WalAppend {
+                    // The same instant with the record half written.
+                    let rel = path.strip_prefix(&dir).unwrap();
+                    let len = fs::metadata(path).unwrap().len();
+                    let n = copies.borrow().len();
+                    let to = crashes.join(format!("{n:05}"));
+                    copy_tree(&dir, &to);
+                    let f = fs::OpenOptions::new().write(true).open(to.join(rel)).unwrap();
+                    f.set_len(len - 3).unwrap();
+                    copies.borrow_mut().push(Copy {
+                        path: to,
+                        done: *done.borrow(),
+                        at: format!("{at}, torn"),
+                    });
+                }
+            })));
+        }
+
+        // The statements, and what the collection holds once each is
+        // acknowledged. `None` before the collection exists.
+        let doc = |i: usize, n: i64| format!(r#"('{{"id":"k{i:03}","n":{n}}}')"#);
+        let mut sql: Vec<String> = vec!["CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)".into()];
+        for b in 0..6 {
+            let rows: Vec<String> = (b * 30..b * 30 + 30).map(|i| doc(i, i as i64)).collect();
+            sql.push(format!("INSERT INTO items VALUES {}", rows.join(", ")));
+        }
+        // Replacements of rows already sealed, and a delete of some of them.
+        let rows: Vec<String> = (0..40).map(|i| doc(i, 1000 + i as i64)).collect();
+        sql.push(format!("INSERT INTO items VALUES {}", rows.join(", ")));
+        sql.push("DELETE FROM items WHERE n >= 150 AND n < 170".into());
+        sql.push("FLUSH items".into());
+        let rows: Vec<String> = (180..200).map(|i| doc(i, i as i64)).collect();
+        sql.push(format!("INSERT INTO items VALUES {}", rows.join(", ")));
+        sql.push("FLUSH items".into());
+        sql.push("COMPACT items".into());
+        let rows: Vec<String> = (200..210).map(|i| doc(i, i as i64)).collect();
+        sql.push(format!("INSERT INTO items VALUES {}", rows.join(", ")));
+
+        let mut states: Vec<Option<BTreeMap<String, i64>>> = vec![None];
+        let mut model: BTreeMap<String, i64> = BTreeMap::new();
+        let segments_before_compact = RefCell::new(0usize);
+        for (k, q) in sql.iter().enumerate() {
+            if q.starts_with("COMPACT") {
+                *segments_before_compact.borrow_mut() =
+                    db.shards("items").unwrap()[0].manifest().segments.len();
+            }
+            db.execute(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            if q.starts_with("COMPACT") {
+                let after = db.shards("items").unwrap()[0].manifest().segments.len();
+                assert!(
+                    after < *segments_before_compact.borrow(),
+                    "the COMPACT merged nothing ({after} segments), so the sweep did not cover one"
+                );
+            }
+            if k > 0 {
+                let r = db.query("SELECT id, n FROM items LIMIT 1000").unwrap();
+                model = r
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let id = row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string();
+                        (id, row.doc.path("n").and_then(|v| v.as_i64()).unwrap())
+                    })
+                    .collect();
+            }
+            states.push(if k == 0 { Some(BTreeMap::new()) } else { Some(model.clone()) });
+            *done.borrow_mut() += 1;
+        }
+        durability_probe::on_event(None);
+        assert_eq!(model.len(), 190, "the workload's own arithmetic: 210 rows less 20 deleted");
+        drop(db);
+
+        let copies = copies.borrow();
+        let seen = |needle: &str| copies.iter().filter(|c| c.at.contains(needle)).count();
+        assert!(seen("MANIFEST") >= 3, "the sweep saw {} manifest events", seen("MANIFEST"));
+        assert!(seen("torn") >= 100, "the sweep tore {} records", seen("torn"));
+
+        let read = |d: &Path| -> Option<BTreeMap<String, i64>> {
+            let mut db = Db::open(d, opts.clone()).unwrap_or_else(|e| panic!("{d:?}: {e}"));
+            if db.shards("items").is_err() {
+                return None;
+            }
+            let r = db.query("SELECT id, n FROM items LIMIT 1000").unwrap();
+            Some(
+                r.rows
+                    .iter()
+                    .map(|row| {
+                        let id = row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string();
+                        (id, row.doc.path("n").and_then(|v| v.as_i64()).unwrap())
+                    })
+                    .collect(),
+            )
+        };
+        let mut partial = 0;
+        for c in copies.iter() {
+            let before = &states[c.done];
+            let after = &states[c.done + 1];
+            let got = read(&c.path);
+            let again = read(&c.path);
+            assert_eq!(got, again, "a crash at {}: the second open disagreed", c.at);
+            let Some(got) = got else {
+                assert!(before.is_none(), "a crash at {}: the collection was gone", c.at);
+                continue;
+            };
+            let empty = BTreeMap::new();
+            let before = before.as_ref().unwrap_or(&empty);
+            let after = after.as_ref().unwrap_or(&empty);
+            // Every key either as it was acknowledged, or as the statement in
+            // flight leaves it: nothing else, and nothing from nowhere.
+            for key in before.keys().chain(after.keys()).chain(got.keys()) {
+                let (b, a, g) = (before.get(key), after.get(key), got.get(key));
+                assert!(
+                    g == b || g == a,
+                    "a crash at {} during statement {}: {key} is {g:?}, acknowledged {b:?}, \
+                     the statement in flight makes it {a:?}",
+                    c.at,
+                    c.done,
+                );
+            }
+            if &got != before && &got != after {
+                partial += 1;
+            }
+        }
+        eprintln!(
+            "crash sweep: {} crash points ({} torn records), every one opened with what was \
+             acknowledged; {partial} left the statement in flight in part",
+            copies.len(),
+            seen("torn")
+        );
+        drop(copies);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&crashes);
+    }
+
     /// CATALOG and MANIFEST are published by a rename, and a rename is a change
     /// to a directory: until that directory is fsynced the bytes can be durable
     /// while the name that reaches them is not. Asserted at the callers rather
