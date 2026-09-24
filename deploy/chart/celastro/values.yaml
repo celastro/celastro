@@ -154,6 +154,10 @@ monitoring:
     # A pod that restarts is briefly short of its peers; this is how long
     # that is allowed to last.
     attachedFor: 10m
+    # How long seals may keep failing before it is worth saying so. The
+    # maintenance thread retries each second, so a disk that filled for a
+    # moment clears well inside this.
+    sealFor: 15m
 
 persistence:
   size: 10Gi

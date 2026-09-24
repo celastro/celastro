@@ -1,5 +1,5 @@
 {{- if and .Values.monitoring.enabled .Values.monitoring.rules.enabled }}
-{{- /* Four rules, and no more: each one is a state an operator has to act
+{{- /* Five rules, and no more: each one is a state an operator has to act
        on and cannot see any other way. Everything else the dashboard in
        deploy/grafana/ draws is for looking at, not for waking someone. */}}
 apiVersion: monitoring.coreos.com/v1
@@ -57,6 +57,21 @@ spec:
               refuse. Expected briefly while a pod restarts; sustained, it
               is the wire, the token or the peer itself.
         {{- end }}
+        - alert: CelastroSealNotLanding
+          expr: increase(celastro_seal_failures_total[10m]) > 0
+          for: {{ .Values.monitoring.rules.sealFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }} has been failing to seal for {{ .Values.monitoring.rules.sealFor }}"
+            description: >-
+              Writes are still acknowledged, from memory and the write-ahead
+              log, which is why nothing else notices. But the rows are not
+              reaching segments: memory grows, and the next restart replays
+              every one of them (celastro_wal_bytes is how much). It is the
+              disk -- full, read-only, or its permissions -- and the node's
+              log says which at each retry (`seal_failed`,
+              `seal_not_installed`).
         - alert: CelastroDataDirectoryGone
           expr: celastro_directory_present == 0
           for: 5m

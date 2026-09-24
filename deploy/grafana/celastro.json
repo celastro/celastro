@@ -504,7 +504,7 @@
       "gridPos": {
         "x": 0,
         "y": 19,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "fieldConfig": {
@@ -553,9 +553,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 8,
+        "x": 6,
         "y": 19,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "fieldConfig": {
@@ -604,9 +604,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 16,
+        "x": 12,
         "y": 19,
-        "w": 8,
+        "w": 6,
         "h": 8
       },
       "fieldConfig": {
@@ -660,6 +660,56 @@
           "refId": "C",
           "expr": "sum by (instance) (rate(celastro_seal_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{instance}} seal failures/s"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Write-ahead log",
+      "description": "Bytes a restart of each node would replay: the live log and the logs of seals not yet landed. It rises with writes and falls at each seal; one that only climbs is a seal that is not landing, and its height is the length of the next restart.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 19,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "sum by (instance) (celastro_wal_bytes{instance=~\"$instance\"})",
+          "legendFormat": "{{instance}}"
         }
       ]
     },
