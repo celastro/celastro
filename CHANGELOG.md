@@ -6,6 +6,33 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.75.0 — 2026-09-24
+
+**A seal whose install failed is tried again.** A seal builds a memtable's
+segments and then installs them: the segment files, then the manifest
+that names them. When the install failed -- a disk that filled between
+the build and the write, a directory that would not take a file -- the
+seal was dropped. Nothing acknowledged was lost: the rows stayed
+readable in the frozen memtable and durable in the log it rotated
+aside, and a restart replayed them. But until that restart nothing
+sealed them, so a node whose disk filled during a seal and then got its
+room back kept those rows in memory and on the log indefinitely, and
+the `celastro_seal_failures_total` counter did not count it. The
+install now puts the seal back on its shard's queue, as a failed build
+always has; the maintenance thread retries it a second later, with no
+write needed to prompt it, and counts the failure.
+
+**`celastro_wal_bytes`**, a gauge per collection: the bytes of
+write-ahead log a restart of this node would replay -- the live log and
+the rotated logs of seals that have not landed. It rises with writes
+and falls at each seal, so one that only grows is a seal that is not
+landing, and its value is how long the next restart's replay will take,
+at the rate the resilience suite prints. The dashboard does not draw it
+yet; the Compactions panel's description says what to read beside it.
+
+Nothing to do on upgrade. A node on 0.74.0 holding a dropped seal
+replays its log at the restart the upgrade is, as it always would have.
+
 ## 0.74.0 — 2026-09-24
 
 **A dashboard, an alert set, and a Monitoring section in the console.**
