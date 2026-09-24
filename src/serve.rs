@@ -2799,13 +2799,18 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let started = Instant::now();
     let response = run_sql_untimed(db, sql);
     // A seal that failed inside that statement did not fail it (the write
-    // is on the log); it is the operator's to hear about.
-    let (failed, last) = read(db).seal_failures();
-    if failed > SEALS_FAILED_SEEN.swap(failed, AtomicOrdering::Relaxed) {
-        crate::log::warn(
-            "seal_failed",
-            &[("failures", failed.to_string()), ("error", last.unwrap_or_default())],
-        );
+    // is on the log); it is the operator's to hear about. Only if the lock
+    // is free: a read that waited out a writer here had its answer already,
+    // and the next statement reports the count this one skipped.
+    if let Ok(g) = db.try_read() {
+        let (failed, last) = g.seal_failures();
+        drop(g);
+        if failed > SEALS_FAILED_SEEN.swap(failed, AtomicOrdering::Relaxed) {
+            crate::log::warn(
+                "seal_failed",
+                &[("failures", failed.to_string()), ("error", last.unwrap_or_default())],
+            );
+        }
     }
     let micros = started.elapsed().as_micros() as u64;
     COUNTERS.statements.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2838,13 +2843,18 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
         Err(e) => return Response::json(error_json(&e.to_string())),
     };
     let outcome = if is_read {
-        let out = read(db).read(sql);
+        // One acquisition for the read and its bookkeeping: each one more is
+        // a turn behind a steady writer, a whole write and its log sync.
+        let g = read(db);
+        let out = g.read(sql);
+        let touched = g.touches_pending();
+        drop(g);
         // An index the read faulted in counts as used, and a demoted one is
         // promoted: that needs the write lock, taken now when nobody holds
         // the lock, so it lands in the request that caused it; with other
         // reads in flight it waits for the next writer instead of making
         // this read wait for them.
-        if read(db).touches_pending() {
+        if touched {
             if let Ok(mut db) = db.try_write() {
                 if let Err(e) = db.apply_touches() {
                     return Response::json(error_json(&e.to_string()));
@@ -4457,6 +4467,76 @@ mod tests {
         // path, so its existence is the persist having happened.
         let manifest = dir.join("collections").join("items").join("shard-0000").join("MANIFEST");
         assert!(manifest.exists(), "an acknowledged write must be on disk: {manifest:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a slow disk costs a reader. A write holds the exclusive lock
+    /// for the whole statement, the log's fdatasync included, so a point
+    /// read that arrives during a write waits out that sync. Measured, not
+    /// asserted: the log's sync on the writing thread is made 50 ms slower,
+    /// a reader on another thread times its lookups through the same path
+    /// the console takes, and the same run without the delay is printed
+    /// beside it.
+    #[test]
+    #[ignore]
+    fn what_a_slow_log_sync_costs_a_reader() {
+        use crate::shard::durability_probe::{self, Op};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tag = format!("celastro-serve-slow-disk-{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = RwLock::new(Db::open(&dir, crate::engine::DbOpts::default()).unwrap());
+        let r = run_sql(&db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+        assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
+        let r = run_sql(&db, r#"INSERT INTO items VALUES ('{"id":"k0","n":0}')"#);
+        assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
+
+        let mut report = Vec::new();
+        for delay_ms in [0u64, 50] {
+            durability_probe::slow(
+                (delay_ms > 0).then(|| (Op::WalSync, Duration::from_millis(delay_ms))),
+            );
+            let stop = AtomicBool::new(false);
+            let (mut reads, writes) = std::thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    let mut took = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let t = Instant::now();
+                        let r = run_sql(&db, "SELECT n FROM items WHERE id = 'k0'");
+                        took.push(t.elapsed());
+                        assert!(r.body.contains(r#""n":0"#), "{}", r.body);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    took
+                });
+                let started = Instant::now();
+                for i in 1..=40 {
+                    let r = run_sql(
+                        &db,
+                        &format!(r#"INSERT INTO items VALUES ('{{"id":"w{i}","n":{i}}}')"#),
+                    );
+                    assert!(r.body.starts_with(r#"{"ok":true"#), "{}", r.body);
+                }
+                let writes = started.elapsed();
+                stop.store(true, Ordering::Relaxed);
+                (reader.join().unwrap(), writes)
+            });
+            reads.sort();
+            let at = |q: f64| reads[((reads.len() - 1) as f64 * q) as usize];
+            report.push(format!(
+                "log sync +{delay_ms} ms: 40 writes in {writes:.0?}; {} reads, p50 {:.1?}, p99 \
+                 {:.1?}, max {:.1?}",
+                reads.len(),
+                at(0.5),
+                at(0.99),
+                reads[reads.len() - 1]
+            ));
+        }
+        durability_probe::slow(None);
+        for line in report {
+            eprintln!("slow disk: {line}");
+        }
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

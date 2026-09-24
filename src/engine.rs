@@ -12538,7 +12538,8 @@ mod tests {
         // The statements, and what the collection holds once each is
         // acknowledged. `None` before the collection exists.
         let doc = |i: usize, n: i64| format!(r#"('{{"id":"k{i:03}","n":{n}}}')"#);
-        let mut sql: Vec<String> = vec!["CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)".into()];
+        let mut sql: Vec<String> =
+            vec!["CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)".into()];
         for b in 0..6 {
             let rows: Vec<String> = (b * 30..b * 30 + 30).map(|i| doc(i, i as i64)).collect();
             sql.push(format!("INSERT INTO items VALUES {}", rows.join(", ")));

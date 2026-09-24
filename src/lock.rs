@@ -25,6 +25,15 @@
 //! Writers do not starve: the statements that start on a node are held
 //! back the moment one waits, and the served reads are the short ones.
 //!
+//! Nor do readers, since 0.76.0. A writer's release lets in every read
+//! that was already waiting before the next writer may take the lock --
+//! one turn each, and a read that arrives after the release still queues
+//! behind a waiting writer. Without that turn, a writer that asked again
+//! the moment it let go was always first back: a point read under a steady
+//! insert waited out several writes, each with its log sync, and with the
+//! sync made 50 ms slower the read's median was 234 ms rather than one
+//! sync's worth.
+//!
 //! The rest is the standard API -- `read`, `write`, `try_read`,
 //! `try_write`, the guards and the poisoning -- so a `Db` is used as it
 //! always was.
@@ -48,6 +57,14 @@ struct State {
     readers: usize,
     writer: bool,
     writers_waiting: usize,
+    /// Plain reads waiting now.
+    readers_waiting: usize,
+    /// Writer releases so far: a read that saw a lower number when it
+    /// began waiting was waiting at a release, and has its turn.
+    releases: u64,
+    /// Reads let in by the last release that have not yet taken the lock.
+    /// A writer waits for them as it waits for the readers holding it.
+    admitted: usize,
 }
 
 // The value moves between threads only through the guards, which borrow
@@ -59,7 +76,14 @@ unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 impl<T> RwLock<T> {
     pub const fn new(value: T) -> RwLock<T> {
         RwLock {
-            state: Mutex::new(State { readers: 0, writer: false, writers_waiting: 0 }),
+            state: Mutex::new(State {
+                readers: 0,
+                writer: false,
+                writers_waiting: 0,
+                readers_waiting: 0,
+                releases: 0,
+                admitted: 0,
+            }),
             changed: Condvar::new(),
             poisoned: AtomicBool::new(false),
             cell: UnsafeCell::new(value),
@@ -74,9 +98,26 @@ impl<T> RwLock<T> {
     /// statement starting on this node takes.
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
         let mut s = self.state();
-        while s.writer || s.writers_waiting > 0 {
+        let since = s.releases;
+        s.readers_waiting += 1;
+        loop {
+            // Let in by a release it waited through: its turn, ahead of
+            // the writers waiting now.
+            if !s.writer && s.releases > since && s.admitted > 0 {
+                s.admitted -= 1;
+                break;
+            }
+            if !s.writer && s.writers_waiting == 0 {
+                // In without a turn; one it was given goes unused, and must
+                // not hold a writer back.
+                if s.releases > since && s.admitted > 0 {
+                    s.admitted -= 1;
+                }
+                break;
+            }
             s = self.changed.wait(s).unwrap_or_else(|p| p.into_inner());
         }
+        s.readers_waiting -= 1;
         s.readers += 1;
         drop(s);
         self.reading()
@@ -112,7 +153,7 @@ impl<T> RwLock<T> {
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
         let mut s = self.state();
         s.writers_waiting += 1;
-        while s.writer || s.readers > 0 {
+        while s.writer || s.readers > 0 || s.admitted > 0 {
             s = self.changed.wait(s).unwrap_or_else(|p| p.into_inner());
         }
         s.writers_waiting -= 1;
@@ -126,7 +167,7 @@ impl<T> RwLock<T> {
     /// periodic work wants.
     pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
         let mut s = self.state();
-        if s.writer || s.readers > 0 {
+        if s.writer || s.readers > 0 || s.admitted > 0 {
             return Err(TryLockError::WouldBlock);
         }
         s.writer = true;
@@ -248,6 +289,8 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
         }
         let mut s = self.lock.state();
         s.writer = false;
+        s.releases += 1;
+        s.admitted = s.readers_waiting;
         self.lock.changed.notify_all();
     }
 }
@@ -270,6 +313,49 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A read waiting when a writer lets go goes in before the next writer,
+    /// even one that was waiting first. Before 0.76.0 the writer
+    /// always won, and a steady writer held a read back for several writes.
+    #[test]
+    fn a_read_waiting_at_a_release_goes_before_the_next_writer() {
+        // A hundred rounds: a lock that let the writer race the read would
+        // win some and lose some, and one round could pass either way.
+        for round in 0..100 {
+            let lock = Arc::new(RwLock::new(Vec::<&str>::new()));
+            let wait_for = |readers: usize, writers: usize| {
+                let started = Instant::now();
+                loop {
+                    let s = lock.state();
+                    if s.readers_waiting == readers && s.writers_waiting == writers {
+                        return;
+                    }
+                    drop(s);
+                    assert!(started.elapsed() < Duration::from_secs(10), "never queued");
+                    thread::sleep(Duration::from_micros(200));
+                }
+            };
+            let first = lock.write().unwrap();
+            let writer = {
+                let lock = lock.clone();
+                thread::spawn(move || lock.write().unwrap().push("second writer"))
+            };
+            wait_for(0, 1);
+            let reader = {
+                let lock = lock.clone();
+                // What the read saw: empty, if it went before the writer.
+                thread::spawn(move || lock.read().unwrap().len())
+            };
+            wait_for(1, 1);
+            drop(first);
+            writer.join().unwrap();
+            let seen = reader.join().unwrap();
+            assert_eq!(
+                seen, 0,
+                "round {round}: the read waiting at the release went after the writer"
+            );
+        }
+    }
 
     /// A waiting writer holds a plain read behind it and a served read
     /// not at all; it gets the lock the moment the readers before it are

@@ -1042,6 +1042,17 @@ pub(crate) mod durable {
             });
         }
 
+        thread_local! {
+            static SLOW: RefCell<Option<(Op, std::time::Duration)>> = const { RefCell::new(None) };
+        }
+
+        /// Make every `op` on this thread take `d` longer, as a slow disk
+        /// does: the sleep is where the syscall's wait would be. `None`
+        /// puts the disk back.
+        pub(crate) fn slow(op: Option<(Op, std::time::Duration)>) {
+            SLOW.with(|s| *s.borrow_mut() = op);
+        }
+
         type Hook = Box<dyn FnMut(Op, &Path)>;
 
         thread_local! {
@@ -1109,6 +1120,9 @@ pub(crate) mod durable {
         /// [`note_sync`] is: a call site that could arm and answer its own
         /// failures could pass the tests that exist to follow a real one out.
         pub(crate) fn check(op: Op, path: &Path) -> Result<()> {
+            if let Some(d) = SLOW.with(|s| s.borrow().filter(|(o, _)| *o == op).map(|(_, d)| d)) {
+                std::thread::sleep(d);
+            }
             let armed = ARMED.with(|a| {
                 let hit = matches!(&*a.borrow(), Some((o, p)) if *o == op && p == path);
                 if hit {

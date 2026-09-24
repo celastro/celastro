@@ -1604,6 +1604,20 @@ which waits for local work only -- a holding writer, which since 0.53.0
 never waits on the network -- so no cycle can close. Writers do not
 starve: `read`, what a statement starting on the node takes, still
 yields to a waiting writer, and the served reads are the short ones.
+Nor, since 0.76.0, do reads: a writer's release lets in every `read`
+already waiting before the next writer may take the lock, one turn
+each. A writer that asked again the moment it let go had been first
+back every time, so a point read under a steady insert waited out
+several writes and their log syncs -- a median of 234 ms and a worst of
+430 ms with the sync made 50 ms slower, against 52 and 55 ms now, which
+is one sync (`what_a_slow_log_sync_costs_a_reader`, ignored, prints
+both). The turn closes no cycle: the writer waits for reads that were
+already waiting, as it waits for the ones holding the lock, and a read
+waits across the network only on served reads. A read through the
+console also takes the lock once rather than three times; its
+bookkeeping each cost a turn of its own. What remains is the sync
+itself under the exclusive lock -- a write still holds it across its
+fdatasync, so a slow disk costs every read one sync.
 A two-node test runs the mixed load in-process and asserts no
 statement waits over two seconds; with the plain read on the wire it
 deadlocks both nodes until the deadline, every time. The replication
