@@ -12939,6 +12939,90 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A full disk during a compaction, at the two writes it makes: an output
+    /// segment that cannot be written, and a manifest that cannot be
+    /// published after the outputs were. Each fails the `COMPACT` and leaves
+    /// the shard as it was -- every row read as before, the same segment set
+    /// -- a reopen agrees, and the next `COMPACT`, with room, lands. The
+    /// failure is the probe's, at the file's fsync, which is where a full
+    /// disk refuses a write that the page cache took.
+    #[test]
+    fn a_compaction_on_a_full_disk_leaves_the_shard_as_it_was_and_the_next_one_lands() {
+        let dir = tmp("compact-full");
+        let shard = dir.join("collections/items/shard-0000");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        let doc = |i: usize, n: usize| format!(r#"('{{"id":"k{i:03}","n":{n}}}')"#);
+        for b in 0..4 {
+            let rows: Vec<String> = (b * 20..b * 20 + 20).map(|i| doc(i, i)).collect();
+            db.execute(&format!("INSERT INTO items VALUES {}", rows.join(", "))).unwrap();
+            // Something for the merge to drop: replacements and deletes of
+            // rows in the segments before this one.
+            if b > 0 {
+                let rows: Vec<String> = (0..5).map(|i| doc(i + b, 1000 * b + i)).collect();
+                db.execute(&format!("INSERT INTO items VALUES {}", rows.join(", "))).unwrap();
+                db.execute(&format!("DELETE FROM items WHERE id = 'k{:03}'", 70 + b)).unwrap();
+            }
+            db.execute("FLUSH items").unwrap();
+        }
+        let rows = |db: &mut Db| -> BTreeMap<String, i64> {
+            let r = db.query("SELECT id, n FROM items LIMIT 1000").unwrap();
+            r.rows
+                .iter()
+                .map(|row| {
+                    let id = row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string();
+                    (id, row.doc.path("n").and_then(|v| v.as_i64()).unwrap())
+                })
+                .collect()
+        };
+        let segments = |db: &Db| -> Vec<u64> {
+            db.shards("items").unwrap()[0].manifest().segments.iter().map(|m| m.id).collect()
+        };
+        let model = rows(&mut db);
+        let before = segments(&db);
+        assert!(before.len() >= 4, "{before:?}");
+
+        // The first output segment cannot be written.
+        let out = db.shards("items").unwrap()[0].next_segment_id;
+        let seg_tmp = shard.join("segments").join(format!("{out:016x}.tmp"));
+        durability_probe::fail_next(Op::TempSync, &seg_tmp);
+        let e = db.execute("COMPACT items").unwrap_err();
+        assert!(e.to_string().contains("injected"), "{e}");
+        assert_eq!(rows(&mut db), model, "a compaction that failed moved a row");
+        assert_eq!(segments(&db), before, "a compaction that failed changed the segment set");
+
+        // The outputs are written and the manifest that names them is not.
+        durability_probe::fail_next(Op::TempSync, &shard.join("MANIFEST.tmp"));
+        let e = db.execute("COMPACT items").unwrap_err();
+        assert!(e.to_string().contains("injected"), "{e}");
+        assert_eq!(rows(&mut db), model, "a compaction whose manifest failed moved a row");
+        assert_eq!(segments(&db), before, "a manifest that failed installed its segment set");
+
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows(&mut db), model, "the reopen after two failed compactions");
+        assert_eq!(segments(&db), before);
+
+        // With room, the same compaction lands, and the reopen agrees.
+        let n = db.execute("COMPACT items").unwrap();
+        assert!(matches!(n, Outcome::Ack(ref m) if !m.starts_with("0 ")), "{n:?}");
+        assert!(segments(&db).len() < before.len(), "{:?}", segments(&db));
+        assert_eq!(rows(&mut db), model);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows(&mut db), model, "the reopen after the compaction that landed");
+        // And nothing the failures wrote is left taking the room a full disk
+        // needs back: every file in `segments/` is one the manifest names.
+        let named: BTreeSet<String> =
+            segments(&db).iter().map(|id| format!("{id:016x}.seg")).collect();
+        let on_disk: BTreeSet<String> = fs::read_dir(shard.join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(on_disk, named, "files the failed compactions left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// CATALOG and MANIFEST are published by a rename, and a rename is a change
     /// to a directory: until that directory is fsynced the bytes can be durable
     /// while the name that reaches them is not. Asserted at the callers rather
