@@ -150,11 +150,12 @@ what was verified and how.
 ## Watching it
 
 `/api/metrics` is the Prometheus text format, on the console's port and
-behind the console's token: statements and their latency as a histogram,
-refusals, the nodes this one has attached, reconciliations, backpressure,
-compactions and seal failures, the data-key ring, the certificate's
-expiry, and per collection the shards, segments and documents held here
-with each shard's reads and writes. Two things read it.
+behind the console's token: statements and their latency as a histogram
+by kind, refusals, answers short of a shard, the nodes this one has
+attached, reconciliations, backpressure, compactions and seal failures,
+the log syncs and the writes each covered, the data-key ring, the
+certificate's expiry, and per collection the shards, segments, documents
+and resident bytes held here with each shard's reads and writes. Two things read it.
 
 **The dashboard.** [grafana/celastro.json](grafana/celastro.json) imports
 as it is -- the only thing it asks for is a Prometheus datasource -- and
@@ -166,7 +167,7 @@ drops because a node stopped being scraped).
 
 **The scrape.** Under Kubernetes the chart does it: `--set
 monitoring.enabled=true` emits a PodMonitor for every pod and a
-PrometheusRule with four alerts -- with `--set
+PrometheusRule with six alerts -- with `--set
 monitoring.labels.release=<your kube-prometheus-stack release>` beside
 it, since that stack takes only the objects labelled with its own
 release and otherwise creates nothing and scrapes nothing. On hosts, this is the scrape config --

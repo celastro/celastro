@@ -280,10 +280,10 @@ peer that is down does not get every pod restarted.
 ## Monitoring
 
 `--set monitoring.enabled=true` emits a `PodMonitor` that scrapes
-every pod's `/api/metrics` and a `PrometheusRule` with five alerts: a
+every pod's `/api/metrics` and a `PrometheusRule` with six alerts: a
 data-key ring nobody retired, a certificate inside thirty days, a node
-short of its peers, seals that keep failing, and a data directory that
-has gone. Both need the
+short of its peers, seals that keep failing, a data directory that has
+gone, and a write-ahead log whose sync failed. Both need the
 prometheus-operator CRDs in the cluster; without them the install fails
 naming the missing kind rather than quietly monitoring nothing. The
 dashboard that draws the rest is
@@ -364,7 +364,7 @@ later and has been restarted together.
 | `monitoring.enabled` | `false` | a `PodMonitor` over every pod's `/api/metrics` and a `PrometheusRule`; also puts the console on the pod's network, since a scrape comes from another pod |
 | `monitoring.namespace`, `monitoring.labels` | empty | where the two objects go, and the labels the Prometheus instance selects on |
 | `monitoring.interval`, `monitoring.scrapeTimeout` | `30s`, `10s` | the scrape |
-| `monitoring.rules.enabled` | `true` | the five alerts; `rules.ringFor`, `rules.certDays`, `rules.attachedFor` and `rules.sealFor` are their thresholds |
+| `monitoring.rules.enabled` | `true` | the six alerts; `rules.ringFor`, `rules.certDays`, `rules.attachedFor` and `rules.sealFor` are their thresholds |
 | `console.token`, `console.existingSecret` | empty | the console token (at least sixteen characters), or a `Secret` with the key `CELASTRO_TOKEN`; both empty generates one, kept across upgrades |
 | `persistence.size`, `persistence.storageClass` | `10Gi`, the cluster default | the data volume |
 | `archive.endpoint` | empty | `http://host:port` or `https://host` of an S3-compatible store; empty keeps the `archived` tier in the data volume |

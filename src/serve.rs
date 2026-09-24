@@ -147,7 +147,41 @@ struct Counters {
     /// histogram a scraper can take a quantile of. The sum and the count
     /// are `statement_micros` and `statements` above, which is why they
     /// are not repeated here.
-    statement_buckets: [AtomicU64; STATEMENT_BUCKETS.len() + 1],
+    statement_buckets: [[AtomicU64; STATEMENT_BUCKETS.len() + 1]; KINDS.len()],
+    /// Each kind's share of `statement_micros` and `statements`: the
+    /// histogram's `_sum` and `_count` per `kind`.
+    kind_micros: [AtomicU64; KINDS.len()],
+    /// Row answers that came back without some of their shards
+    /// (`partial_results`), and how many shards they were missing between
+    /// them: a holder that stopped answering, seen from the statements.
+    partial: AtomicU64,
+    shards_missing: AtomicU64,
+}
+
+/// The kinds a statement's latency is counted under, the `kind` label of
+/// `celastro_statement_seconds`: what an operator tells apart on a
+/// dashboard, where a slow scan must not hide in the same series as a
+/// point insert. Few, so a scrape of a hundred nodes stays cheap.
+const KINDS: [&str; 5] = ["select", "insert", "delete", "ddl", "other"];
+
+/// A statement's index in [`KINDS`].
+fn kind_of(stmt: &sql::Statement) -> usize {
+    use sql::Statement;
+    match stmt {
+        Statement::Local(inner) => kind_of(inner),
+        s if Db::is_read(s) => 0,
+        Statement::Insert(_) => 1,
+        Statement::Delete(_) => 2,
+        Statement::CreateCollection(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropCollection { .. }
+        | Statement::DropIndex { .. }
+        | Statement::AlterIndexTier { .. }
+        | Statement::AlterCollection { .. }
+        | Statement::CreateLifecyclePolicy(_)
+        | Statement::DropLifecyclePolicy { .. } => 3,
+        _ => 4,
+    }
 }
 
 /// The upper bounds of the statement-latency histogram, in seconds. A
@@ -157,6 +191,14 @@ struct Counters {
 /// notice, few enough series that a scrape of a hundred nodes is cheap.
 const STATEMENT_BUCKETS: [f64; 11] =
     [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 10.0];
+
+// `[AtomicU64::new(0); N]` needs Copy, which AtomicU64 is not; a const item
+// may be repeated, and each repetition is a fresh atomic. Never read through,
+// which is what the lint guards against.
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const KIND_BUCKETS: [AtomicU64; STATEMENT_BUCKETS.len() + 1] = [ZERO; STATEMENT_BUCKETS.len() + 1];
 
 static COUNTERS: Counters = Counters {
     statements: AtomicU64::new(0),
@@ -168,21 +210,10 @@ static COUNTERS: Counters = Counters {
     compaction_millis: AtomicU64::new(0),
     connections: AtomicU64::new(0),
     reconciled: AtomicU64::new(0),
-    // `[AtomicU64::new(0); N]` needs Copy, which AtomicU64 is not.
-    statement_buckets: [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ],
+    statement_buckets: [KIND_BUCKETS; KINDS.len()],
+    kind_micros: [ZERO; KINDS.len()],
+    partial: AtomicU64::new(0),
+    shards_missing: AtomicU64::new(0),
 };
 
 /// The metrics page: the process's counters, then what the database holds
@@ -230,37 +261,62 @@ fn metrics_text(db: &Db) -> String {
     // it had when it was a counter of its own; the buckets and `_count`
     // are what `histogram_quantile` needs, and without them a dashboard
     // can only draw the mean.
-    let hist_help = "How long statements took, in buckets.";
-    let mut counted = 0u64;
-    for (i, bound) in STATEMENT_BUCKETS.iter().enumerate() {
-        counted = c.statement_buckets[i].load(Relaxed);
+    // One histogram per kind, the `kind` label on every series: summed by
+    // `le` they are the histogram this was before it had the label.
+    let hist_help = "How long statements took, in buckets, by kind.";
+    for (k, kind) in KINDS.iter().enumerate() {
+        let mut counted = 0u64;
+        for (i, bound) in STATEMENT_BUCKETS.iter().enumerate() {
+            counted = c.statement_buckets[k][i].load(Relaxed);
+            line(
+                "celastro_statement_seconds",
+                "histogram",
+                hist_help,
+                &format!("_bucket{{kind=\"{kind}\",le=\"{bound}\"}}"),
+                counted.to_string(),
+            );
+        }
+        // A bucket read after the one below it can be the lower of the two
+        // when a statement lands between the loads; +Inf is the count, so it
+        // may not come out smaller than a bound under it.
+        let total = c.statement_buckets[k][STATEMENT_BUCKETS.len()].load(Relaxed).max(counted);
         line(
             "celastro_statement_seconds",
             "histogram",
             hist_help,
-            &format!("_bucket{{le=\"{bound}\"}}"),
-            counted.to_string(),
+            &format!("_bucket{{kind=\"{kind}\",le=\"+Inf\"}}"),
+            total.to_string(),
+        );
+        line(
+            "celastro_statement_seconds",
+            "histogram",
+            hist_help,
+            &format!("_sum{{kind=\"{kind}\"}}"),
+            format!("{:.6}", c.kind_micros[k].load(Relaxed) as f64 / 1e6),
+        );
+        line(
+            "celastro_statement_seconds",
+            "histogram",
+            hist_help,
+            &format!("_count{{kind=\"{kind}\"}}"),
+            total.to_string(),
         );
     }
-    // A bucket read after the one below it can be the lower of the two when
-    // a statement lands between the loads; +Inf is the count, so it may not
-    // come out smaller than a bound under it.
-    let total = c.statement_buckets[STATEMENT_BUCKETS.len()].load(Relaxed).max(counted);
     line(
-        "celastro_statement_seconds",
-        "histogram",
-        hist_help,
-        "_bucket{le=\"+Inf\"}",
-        total.to_string(),
+        "celastro_statements_partial_total",
+        "counter",
+        "Row answers that came back without some of their shards (partial_results).",
+        "",
+        c.partial.load(Relaxed).to_string(),
     );
     line(
-        "celastro_statement_seconds",
-        "histogram",
-        hist_help,
-        "_sum",
-        format!("{:.6}", c.statement_micros.load(Relaxed) as f64 / 1e6),
+        "celastro_shards_missing_total",
+        "counter",
+        "Shards those partial answers were missing, summed: a holder that stopped answering, \
+         seen from the statements that needed it.",
+        "",
+        c.shards_missing.load(Relaxed).to_string(),
     );
-    line("celastro_statement_seconds", "histogram", hist_help, "_count", total.to_string());
     line(
         "celastro_statement_seconds_max",
         "gauge",
@@ -439,6 +495,29 @@ fn metrics_text(db: &Db) -> String {
             &labels,
             docs.to_string(),
         );
+        // Resident bytes by the tier each component is declared on: what
+        // SHOW RESIDENCY lists row by row, summed, so a hot tier that has
+        // grown past the memory it was sized for shows before the node does.
+        use crate::residency::Tier;
+        let mut resident: std::collections::BTreeMap<&'static str, usize> =
+            [Tier::Active, Tier::Minimal, Tier::Cached, Tier::Archived]
+                .iter()
+                .map(|t| (t.name(), 0))
+                .collect();
+        for s in shards {
+            for (_, _, tier, _, bytes) in s.residency_rows() {
+                *resident.entry(tier.name()).or_insert(0) += bytes;
+            }
+        }
+        for (tier, bytes) in resident {
+            line(
+                "celastro_resident_bytes",
+                "gauge",
+                "Bytes of segment components loaded in memory, by the tier they are declared on.",
+                &format!("{{collection={},tier={}}}", jstr(&name), jstr(tier)),
+                bytes.to_string(),
+            );
+        }
         // Per shard, so a hot one shows: the reads and writes each has
         // served since the process started.
         for s in shards {
@@ -2841,7 +2920,7 @@ static SEALS_FAILED_SEEN: AtomicU64 = AtomicU64::new(0);
 
 fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let started = Instant::now();
-    let response = run_sql_untimed(db, sql);
+    let (response, kind) = run_sql_untimed(db, sql);
     // A seal that failed inside that statement did not fail it (the write
     // is on the log); it is the operator's to hear about. Only if the lock
     // is free: a read that waited out a writer here had its answer already,
@@ -2862,6 +2941,7 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
         COUNTERS.statements_failed.fetch_add(1, AtomicOrdering::Relaxed);
     }
     COUNTERS.statement_micros.fetch_add(micros, AtomicOrdering::Relaxed);
+    COUNTERS.kind_micros[kind].fetch_add(micros, AtomicOrdering::Relaxed);
     COUNTERS.statement_micros_max.fetch_max(micros, AtomicOrdering::Relaxed);
     // Cumulative, as the text format wants: a statement counts in its own
     // bucket and in every wider one, so the series read left to right is
@@ -2869,22 +2949,23 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
     let secs = micros as f64 / 1e6;
     for (i, bound) in STATEMENT_BUCKETS.iter().enumerate() {
         if secs <= *bound {
-            COUNTERS.statement_buckets[i].fetch_add(1, AtomicOrdering::Relaxed);
+            COUNTERS.statement_buckets[kind][i].fetch_add(1, AtomicOrdering::Relaxed);
         }
     }
-    COUNTERS.statement_buckets[STATEMENT_BUCKETS.len()].fetch_add(1, AtomicOrdering::Relaxed);
+    COUNTERS.statement_buckets[kind][STATEMENT_BUCKETS.len()].fetch_add(1, AtomicOrdering::Relaxed);
     response
 }
 
-fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
+/// The statement's response, and the [`KINDS`] index it is timed under.
+fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> (Response, usize) {
     let started = Instant::now();
     // Parsed first, without any lock, to know which lock: a read runs under
     // the shared one beside other reads; everything else takes the
     // exclusive one. Parsing twice for a write is cheap; a wrong lock is
     // not.
-    let is_read = match sql::parse(sql, &[]) {
-        Ok(stmt) => Db::is_read(&stmt),
-        Err(e) => return Response::json(error_json(&e.to_string())),
+    let (is_read, kind) = match sql::parse(sql, &[]) {
+        Ok(stmt) => (Db::is_read(&stmt), kind_of(&stmt)),
+        Err(e) => return (Response::json(error_json(&e.to_string())), KINDS.len() - 1),
     };
     let outcome = if is_read {
         // One acquisition for the read and its bookkeeping: each one more is
@@ -2901,7 +2982,7 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
         if touched {
             if let Ok(mut db) = db.try_write() {
                 if let Err(e) = db.apply_touches() {
-                    return Response::json(error_json(&e.to_string()));
+                    return (Response::json(error_json(&e.to_string())), kind);
                 }
             }
         }
@@ -2919,8 +3000,14 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
         }
     };
     let elapsed = started.elapsed().as_millis();
-    match outcome {
-        Ok(Outcome::Rows(r)) => Response::json(rows_json(&r, elapsed)),
+    let response = match outcome {
+        Ok(Outcome::Rows(r)) => {
+            if !r.missing.is_empty() {
+                COUNTERS.partial.fetch_add(1, AtomicOrdering::Relaxed);
+                COUNTERS.shards_missing.fetch_add(r.missing.len() as u64, AtomicOrdering::Relaxed);
+            }
+            Response::json(rows_json(&r, elapsed))
+        }
         Ok(Outcome::Ack(m)) => match write(db).persist() {
             Ok(()) => Response::json(ack_json(&m)),
             Err(e) => Response::json(error_json(&format!("{m}, but it is not on disk yet: {e}"))),
@@ -2931,7 +3018,8 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> Response {
             Response::json(error_json("deferred work returned deferred work"))
         }
         Err(e) => Response::json(error_json(&e.to_string())),
-    }
+    };
+    (response, kind)
 }
 
 fn ack_json(message: &str) -> String {
@@ -2991,22 +3079,16 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("celastro_documents{collection=\"notes\"} 1"), "{text}");
-        assert!(text.contains("celastro_statement_seconds_sum "), "{text}");
-        // The histogram is one family: one TYPE line, a bucket per bound and
-        // one for +Inf, and a count that no bucket under it exceeds -- which
-        // is what a scraper rejects a histogram for.
+        assert!(text.contains("celastro_statement_seconds_sum{kind=\"insert\"} "), "{text}");
+        // The histogram is one family: one TYPE line, and per kind a bucket
+        // per bound and one for +Inf, and a count that no bucket under it
+        // exceeds -- which is what a scraper rejects a histogram for.
         assert_eq!(
             text.matches("# TYPE celastro_statement_seconds ").count(),
             1,
             "one TYPE line for the family: {text}"
         );
         assert!(text.contains("# TYPE celastro_statement_seconds histogram"), "{text}");
-        for bound in STATEMENT_BUCKETS {
-            assert!(
-                text.contains(&format!("celastro_statement_seconds_bucket{{le=\"{bound}\"}} ")),
-                "no bucket for {bound}: {text}"
-            );
-        }
         let series = |name: &str| -> u64 {
             text.lines()
                 .find(|l| l.starts_with(name))
@@ -3014,17 +3096,51 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| panic!("no {name} in {text}"))
         };
-        let count = series("celastro_statement_seconds_count");
-        let inf = series("celastro_statement_seconds_bucket{le=\"+Inf\"}");
-        assert_eq!(count, inf, "+Inf is the count: {text}");
-        assert!(count >= 3, "three statements ran: {text}");
-        let mut last = 0;
-        for bound in STATEMENT_BUCKETS {
-            let v = series(&format!("celastro_statement_seconds_bucket{{le=\"{bound}\"}}"));
-            assert!(v >= last, "the buckets are cumulative: {text}");
-            assert!(v <= inf, "no bucket exceeds +Inf: {text}");
-            last = v;
+        let mut counted = 0;
+        for kind in KINDS {
+            let count = series(&format!("celastro_statement_seconds_count{{kind=\"{kind}\"}}"));
+            let inf = series(&format!(
+                "celastro_statement_seconds_bucket{{kind=\"{kind}\",le=\"+Inf\"}}"
+            ));
+            assert_eq!(count, inf, "+Inf is the count: {text}");
+            counted += count;
+            let mut last = 0;
+            for bound in STATEMENT_BUCKETS {
+                let v = series(&format!(
+                    "celastro_statement_seconds_bucket{{kind=\"{kind}\",le=\"{bound}\"}}"
+                ));
+                assert!(v >= last, "the buckets are cumulative: {text}");
+                assert!(v <= inf, "no bucket exceeds +Inf: {text}");
+                last = v;
+            }
         }
+        assert!(counted >= 3, "three statements ran: {text}");
+        // Each where it belongs: the CREATE a ddl, the INSERT an insert.
+        for kind in ["ddl", "insert"] {
+            let n = series(&format!("celastro_statement_seconds_count{{kind=\"{kind}\"}}"));
+            assert!(n >= 1, "no {kind} statement counted: {text}");
+        }
+        assert!(text.contains("# TYPE celastro_resident_bytes gauge"), "{text}");
+        assert!(
+            text.contains("celastro_resident_bytes{collection=\"notes\",tier=\"active\"} "),
+            "{text}"
+        );
+        assert!(text.contains("# TYPE celastro_shards_missing_total counter"), "{text}");
+        // An answer short of a shard is counted, with the shard: a deadline
+        // of nothing leaves every shard unanswered.
+        let (partial, missing) = (
+            COUNTERS.partial.load(AtomicOrdering::Relaxed),
+            COUNTERS.shards_missing.load(AtomicOrdering::Relaxed),
+        );
+        let r =
+            run_sql(&db, "SELECT id FROM notes LIMIT 5 WITH (partial_results, deadline_ms = 0)");
+        assert!(
+            r.body.contains(r#""missing":["#) && !r.body.contains(r#""missing":[]"#),
+            "{}",
+            r.body
+        );
+        assert!(COUNTERS.partial.load(AtomicOrdering::Relaxed) > partial);
+        assert!(COUNTERS.shards_missing.load(AtomicOrdering::Relaxed) > missing);
         assert!(COUNTERS.statements.load(AtomicOrdering::Relaxed) >= before + 3);
         assert!(COUNTERS.statements_failed.load(AtomicOrdering::Relaxed) >= 1);
         assert_eq!(text.matches("# TYPE celastro_shards ").count(), 1, "one TYPE line per name");

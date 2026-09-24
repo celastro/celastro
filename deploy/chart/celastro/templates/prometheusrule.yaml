@@ -83,4 +83,17 @@ spec:
               The volume this node opened is no longer where it was. It can
               still answer from memory, which is why nothing else notices.
               Its writes are going nowhere durable.
+        - alert: CelastroLogSyncFailed
+          expr: celastro_wal_sync_failed == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ `{{ $labels.instance }}` }} had a write-ahead log sync fail"
+            description: >-
+              An fdatasync of a shard's log failed. The write it covered was
+              refused and taken back off the log; that shard takes no more
+              writes, and reads on the node stay at the instant before it.
+              A failed sync is not retried, since the page cache cannot be
+              trusted with a second one: restart the node, which replays
+              the log, after the disk is seen to.
 {{- end }}

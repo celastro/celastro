@@ -114,7 +114,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Statement latency",
-      "description": "The quantiles come from celastro_statement_seconds_bucket, whose widest bound under +Inf is 10 s: a p95 pinned at 10 means the 95th statement was SLOWER than the histogram can say, not that it took ten seconds. `max since start` is a gauge that never falls, so it is the worst statement this process has run, not a window.",
+      "description": "The quantiles come from celastro_statement_seconds_bucket, whose widest bound under +Inf is 10 s: a p95 pinned at 10 means the 95th statement was SLOWER than the histogram can say, not that it took ten seconds. `max since start` is a gauge that never falls, so it is the worst statement this process has run, not a window. `p95 <kind>` splits it by the statement's kind -- select, insert, delete, ddl, other -- so a slow scan does not hide behind a thousand fast inserts, nor a slow insert behind reads.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -175,6 +175,15 @@
           "refId": "C",
           "expr": "max(celastro_statement_seconds_max{instance=~\"$instance\"})",
           "legendFormat": "max since start"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(celastro_statement_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{kind}}"
         }
       ]
     },
@@ -182,7 +191,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Refused and failed",
-      "description": "Refused is the guard: a missing or wrong token, a Host or Origin that did not pass. Failed is a statement the database ran and rejected, which includes every SQL error a user made, so it is normal for it to be non-zero where people type. A wire refusal is CELASTRO_WIRE_MAX_CONNECTIONS turning a peer away, and is not normal.",
+      "description": "Refused is the guard: a missing or wrong token, a Host or Origin that did not pass. Failed is a statement the database ran and rejected, which includes every SQL error a user made, so it is normal for it to be non-zero where people type. A wire refusal is CELASTRO_WIRE_MAX_CONNECTIONS turning a peer away, and is not normal. Shards missing is what answers under partial_results came back without: a holder that stopped answering, counted by the statements that needed it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -243,6 +252,15 @@
           "refId": "C",
           "expr": "sum by (instance) (rate(celastro_wire_connections_refused_total{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{instance}} wire refused"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D",
+          "expr": "sum by (instance) (rate(celastro_shards_missing_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} shards missing"
         }
       ]
     },
@@ -667,7 +685,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Write-ahead log",
-      "description": "Bytes a restart of each node would replay: the live log and the logs of seals not yet landed. It rises with writes and falls at each seal; one that only climbs is a seal that is not landing, and its height is the length of the next restart.",
+      "description": "Bytes a restart of each node would replay: the live log and the logs of seals not yet landed. It rises with writes and falls at each seal; one that only climbs is a seal that is not landing, and its height is the length of the next restart. Writes per sync is group commit's grouping: one when writers come one at a time, higher when many write at once on a slow disk. It is on the right axis.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -688,7 +706,24 @@
           },
           "unit": "bytes"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*writes per sync"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -710,6 +745,15 @@
           "refId": "A",
           "expr": "sum by (instance) (celastro_wal_bytes{instance=~\"$instance\"})",
           "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "sum by (instance) (rate(celastro_wal_sync_writers_total{instance=~\"$instance\"}[$__rate_interval])) / sum by (instance) (rate(celastro_wal_syncs_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} writes per sync"
         }
       ]
     },

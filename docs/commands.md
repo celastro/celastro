@@ -373,9 +373,10 @@ prints; an error is `{"ok":false,"error":"..."}` with status 200, so a
 client reads `ok`.
 
 `GET /api/metrics` is the Prometheus text format, behind the same token:
-statement, refusal and compaction counters, a latency histogram
-(`celastro_statement_seconds_bucket`), the nodes attached, the data-key
-ring, the certificate's expiry, and per collection what this node holds.
+statement, refusal and compaction counters, a latency histogram by the
+statement's kind (`celastro_statement_seconds_bucket{kind=...}`: select,
+insert, delete, ddl, other), the nodes attached, the data-key ring, the
+certificate's expiry, and per collection what this node holds.
 [deploy/](../deploy/README.md#watching-it) has the scrape config, the
 chart's `monitoring.enabled`, and a dashboard that draws it.
 
@@ -398,22 +399,27 @@ curl -s -X POST -H "$T" http://127.0.0.1:18787/api/shutdown
 `/api/health` needs no token: `ok:true` says the process answers,
 `attached` how many peers it has verified, and `busy:true` that the
 database lock was held when it was asked (alive, not ready). It says
-`ok:false` when the data directory is gone. `/api/metrics` is the text
-format a Prometheus scraper reads: statements and their time, refusals,
-compactions, connections, reconciliations, backpressure, TLS
-resumptions, the certificate's expiry, the data-key ring's size (above
-zero is a rotation nobody finished -- see `key reseal`), and per
-collection the shards,
-segments and documents held here and each shard's reads and writes:
+`ok:false` when the data directory is gone, or when a write-ahead log
+failed to sync (the node needs a restart). `/api/metrics` is the text
+format a Prometheus scraper reads: statements and their time by kind,
+refusals, answers short of a shard and the shards they missed
+(`celastro_shards_missing_total`), compactions, connections,
+reconciliations, backpressure, the log syncs group commit made and the
+writes they covered, TLS resumptions, the certificate's expiry, the
+data-key ring's size (above zero is a rotation nobody finished -- see
+`key reseal`), and per collection the shards, segments, documents and
+resident bytes by tier held here and each shard's reads and writes:
 
 ```
 celastro_statements_total 5
+celastro_statement_seconds_count{kind="insert"} 2
 celastro_statement_seconds_max 0.000318
 celastro_data_key_ring_size 0
 celastro_compactions_total 1
 celastro_attached_nodes 0
 celastro_shards{collection="notes"} 1
 celastro_documents{collection="notes"} 2
+celastro_resident_bytes{collection="notes",tier="active"} 18244
 celastro_shard_reads_total{collection="notes",shard="0"} 4
 celastro_shard_writes_total{collection="notes",shard="0"} 0
 ```
