@@ -2417,7 +2417,17 @@ fn copies_span_regions_and_a_quorum_acknowledges_with_one_follower_away() {
         t0.elapsed() < std::time::Duration::from_secs(2),
         "a quorum write waited for the away follower"
     );
-    let h = a.ack("SHOW HEALTH");
+    // The write did not wait for the away follower, so the ship to it may
+    // not have failed yet: it reads live and one behind for a moment (one
+    // run in twenty, on 2026-09-24). Give it the moment.
+    let mut h = a.ack("SHOW HEALTH");
+    for _ in 0..50 {
+        if h.contains("confirm = quorum, 2 of 3 copies live") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        h = a.ack("SHOW HEALTH");
+    }
     assert!(
         h.contains("confirm = quorum, 2 of 3 copies live") && !h.contains("BELOW QUORUM"),
         "{h}"
