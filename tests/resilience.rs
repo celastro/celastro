@@ -212,15 +212,18 @@ fn no_acknowledged_write_is_lost_across_a_node_that_restarts_under_load() {
 
 /// A write-ahead log of two hundred thousand rows, never sealed, replays
 /// on reopen with every row -- and the time it takes is printed, since a
-/// replay is the length of a restart.
+/// replay is the length of a restart. `CELASTRO_WAL_ROWS` sets the size:
+/// a million is the figure in docs/tuning.md, and a log that long is what
+/// a node whose seals kept failing would restart from.
 #[test]
 #[ignore]
 fn a_large_write_ahead_log_replays_every_row() {
     let d = dir("wal");
     let mut opts = DbOpts::default();
-    opts.thresholds.max_bytes = 1 << 30;
-    opts.memtable_budget_bytes = 1 << 30;
-    let n = 200_000usize;
+    opts.thresholds.max_bytes = 4 << 30;
+    opts.memtable_budget_bytes = 4 << 30;
+    let n: usize =
+        std::env::var("CELASTRO_WAL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
     {
         let mut db = Db::open(&d, opts.clone()).unwrap();
         db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
@@ -231,9 +234,16 @@ fn a_large_write_ahead_log_replays_every_row() {
         }
         eprintln!("resilience: {n} rows written in {:.1?}", started.elapsed());
     }
+    let wal: u64 = std::fs::read_dir(d.join("collections").join("items").join("shard-0000"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("wal"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
     let started = Instant::now();
     let mut db = Db::open(&d, opts).unwrap();
     let replay = started.elapsed();
+    eprintln!("resilience: a {} MB log", wal >> 20);
     let r = db.query("SELECT count(*) AS c FROM items").unwrap();
     let count = r.rows[0].doc.path("c").and_then(|v| v.as_i64()).unwrap() as usize;
     eprintln!(
