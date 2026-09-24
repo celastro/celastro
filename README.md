@@ -319,7 +319,7 @@ Each release carries a static binary for amd64 and arm64
 binary installs itself as a systemd service:
 
 ```sh
-curl -fsSL https://github.com/celastro/celastro/releases/download/v0.75.0/celastro-0.75.0-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
+curl -fsSL https://github.com/celastro/celastro/releases/download/v0.76.0/celastro-0.76.0-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN=... CELASTRO_WIRE_TOKEN=... celastro install --node 10.0.0.2 --attach 10.0.0.2,10.0.0.3,10.0.0.4
 ```
 

@@ -6,6 +6,53 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.76.0 — 2026-09-24
+
+**A write's log sync no longer holds up reads (group commit).** A
+write statement held the database's lock through its `fdatasync`, so on
+a slow disk every read waited out a sync and writers queued on the
+disk's latency. `serve` now appends and applies a write under the lock,
+lets it go, and syncs the log with every writer that arrived meanwhile.
+What a read sees has not changed: a row, a delete or a replacement is
+seen only once it is on disk, and a write is acknowledged only once a
+read would see it. With the sync made 50 ms slower, a point read beside
+a writer went from one sync (p99 61-67 ms) to under a millisecond, and
+eight writers made 74 writes a second where they had made 18.
+`CELASTRO_GROUP_COMMIT=off` keeps the sync under the lock; the embedded
+API is unchanged.
+
+A sync that fails is not retried, since a page cache that failed one
+cannot be trusted with a second: the write is refused and cut from the
+log, that shard takes no more writes, reads on the node stay at the
+instant before it, `/api/health` answers `ok:false`, and a restart
+replays the log. The new alert `CelastroLogSyncFailed` fires on it.
+
+**A read waiting at a writer's release goes before the next writer.**
+A writer that asked for the lock the moment it let go had been first
+back every time, so a point read under a steady insert waited out
+several writes: a median of 234 ms at a 50 ms sync, now one sync or
+less. A console read also takes the lock once rather than three times.
+
+**Metrics.** `celastro_statement_seconds` carries a `kind` label
+(select, insert, delete, ddl, other); summed by `le` it is the histogram
+it was, and the dashboard reads it unchanged, with a p95 per kind
+beside it. New: `celastro_resident_bytes` per collection and tier;
+`celastro_statements_partial_total` and `celastro_shards_missing_total`
+for answers that came back without a shard; `celastro_wal_syncs_total`,
+`celastro_wal_sync_writers_total` and `celastro_wal_sync_failed`. The
+dashboard draws the write-ahead log, the shards missing and the writes
+per sync, and the chart's rules gain `CelastroSealNotLanding` and
+`CelastroLogSyncFailed` (six in all; the chart is 0.37.0).
+
+Tests: a crash at every durability point -- each log record, fsync,
+rename and truncation, and each record torn -- opens with exactly what
+was acknowledged, with group commit and without; a million-row log
+replays; a compaction on a full disk leaves the shard as it was.
+
+Upgrading: a query on `celastro_statement_seconds_sum` or `_count` that
+did not aggregate now returns a series per kind; wrap it in `sum()`.
+Nothing else to do.
+
 ## 0.75.0 — 2026-09-24
 
 **A seal whose install failed is tried again.** A seal builds a memtable's
