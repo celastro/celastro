@@ -1349,6 +1349,11 @@ impl Wal {
         Ok(WalMark { len: self.file.metadata()?.len(), records: self.records })
     }
 
+    /// The log's length on disk.
+    pub(crate) fn len(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
     /// Cut the log back to `mark`: the records a refused statement wrote
     /// are gone, and a reopen replays only what was acknowledged. Best
     /// effort on a disk that is full -- shrinking a file needs no space --
@@ -2669,10 +2674,24 @@ impl Shard {
     /// Commit a build: the segments to disk and the manifest, the deletes
     /// the frozen memtable took before and during the build into their
     /// logs, the frozen memtable let go, its rotated log removed.
+    ///
+    /// An install that fails before the manifest is published -- a segment
+    /// that cannot be written, a manifest that cannot be -- puts the ticket
+    /// back as a failed build does. Until 0.75.0 it was dropped: the rows
+    /// stayed readable in the frozen memtable and durable in the rotated
+    /// log, but nothing queued them again before a restart, so a node whose
+    /// disk filled during a seal and then emptied never sealed them.
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
         let deletes = Shard::deletes_of(&t.frozen);
-        let handles = self.handles_for(built.segments, &deletes)?;
-        let sealed = self.commit_handles(handles)?;
+        let committed =
+            self.handles_for(built.segments, &deletes).and_then(|h| self.commit_handles(h));
+        let sealed = match committed {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                self.seal_requeue(t, &e);
+                return Err(e);
+            }
+        };
         self.sealed.merge(&t.tally);
         self.frozen.retain(|f| !Arc::ptr_eq(f, &t.frozen));
         t.frozen.release_budget();
@@ -2943,6 +2962,29 @@ impl Shard {
         // The local file is now the source; the in-memory copy can go.
         seg.set_source(self.wrap_source(seg.id, crate::segment::SegmentSource::File(p.clone())));
         Ok(Some(p))
+    }
+
+    /// The bytes a reopen of this shard would replay: the live
+    /// write-ahead log, and every log a freeze rotated aside whose seal has
+    /// not landed yet. Zero for a shard with no directory.
+    ///
+    /// Both halves matter, and the live log alone would hide the case worth
+    /// seeing: a freeze rotates the log aside and starts an empty one, so a
+    /// seal that keeps failing leaves the rows in `wal.NNNNNN.log` while
+    /// the live log looks healthy. A number that only grows is a seal that
+    /// is not landing, and it is also the length of the next restart, at
+    /// the replay rate the resilience suite prints.
+    pub fn wal_bytes(&self) -> u64 {
+        let live = self.wal.as_ref().and_then(|w| w.len().ok()).unwrap_or(0);
+        // A freeze moves the rotated logs into its ticket: the ones queued
+        // for a seal are there, not in `unsealed_wals`.
+        let rotated: u64 = self
+            .unsealed_wals
+            .iter()
+            .chain(self.pending_seals.iter().flat_map(|t| t.wals.iter()))
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        live + rotated
     }
 
     pub fn manifest(&self) -> Manifest {

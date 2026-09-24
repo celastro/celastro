@@ -598,7 +598,7 @@
       "id": 13,
       "type": "timeseries",
       "title": "Compactions",
-      "description": "The second line is the fraction of wall-clock the maintenance thread spent compacting: near 1 it is saturated. A seal failure is a seal left for a later write to retry and should be flat at zero.",
+      "description": "The second line is the fraction of wall-clock the maintenance thread spent compacting: near 1 it is saturated. A seal failure is a seal the maintenance thread will retry, and should be flat at zero; celastro_wal_bytes climbing beside it is the seal not landing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

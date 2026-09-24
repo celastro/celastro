@@ -394,6 +394,16 @@ fn metrics_text(db: &Db) -> String {
             &labels,
             segments.to_string(),
         );
+        let wal: u64 = shards.iter().map(|s| s.wal_bytes()).sum();
+        line(
+            "celastro_wal_bytes",
+            "gauge",
+            "Bytes in the write-ahead logs of the shards held here. A seal empties a log, so a \
+             number that only grows is a seal that is not landing -- and it is the length of the \
+             next reopen, which replays it.",
+            &labels,
+            wal.to_string(),
+        );
         let docs: usize = shards.iter().map(|s| s.num_docs(now)).sum();
         line(
             "celastro_documents",
@@ -2250,10 +2260,16 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
                         ("seconds", format!("{:.1}", started.elapsed().as_secs_f64())),
                     ],
                 ),
-                Err(e) => crate::log::warn(
-                    "seal_not_installed",
-                    &[("what", what), ("error", e.to_string())],
-                ),
+                Err(e) => {
+                    // The ticket is back on its shard (`seal_install` puts
+                    // it there), to be built and installed again -- not at
+                    // once, for the same reason as a failed build.
+                    crate::log::warn(
+                        "seal_not_installed",
+                        &[("what", what), ("error", e.to_string())],
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
+                }
             },
             Err(e) => {
                 crate::log::warn("seal_failed", &[("what", what), ("error", e.to_string())]);
@@ -4441,6 +4457,99 @@ mod tests {
         // path, so its existence is the persist having happened.
         let manifest = dir.join("collections").join("items").join("shard-0000").join("MANIFEST");
         assert!(manifest.exists(), "an acknowledged write must be on disk: {manifest:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A seal that fails is retried by the maintenance thread, and lands
+    /// when the disk lets it, without a write to prompt it.
+    ///
+    /// The design notes said "the next write tries again", which was true
+    /// of the write path and stopped being the whole story when the sealer
+    /// moved to this thread: a node that goes quiet after a failed seal
+    /// keeps the rows in a rotated log until something writes again, and
+    /// on a disk that came back there is nothing to wait for. The failure
+    /// is injected by taking write permission off the shard's directory,
+    /// which is a full disk's behaviour for the segment file without
+    /// needing one.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_seal_is_retried_by_the_maintenance_thread_and_lands_when_the_disk_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let tag = format!("celastro-serve-seal-retry-{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut opts = crate::engine::DbOpts::default();
+        opts.background_seal = true;
+        let db = RwLock::new(Db::open(&dir, opts).expect("a temp dir opens"));
+        write(&db).set_background_seal(true);
+        let ok = |sql: &str| {
+            let r = run_sql(&db, sql);
+            assert!(r.body.starts_with(r#"{"ok":true"#), "{sql}: {}", r.body);
+        };
+        ok("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+        for i in 0..40 {
+            ok(&format!("INSERT INTO items VALUES ('{{\"id\":\"k{i:04}\",\"n\":{i}}}')"));
+        }
+        let shard = dir.join("collections").join("items").join("shard-0000");
+
+        // Freeze the memtable: the rows go to a rotated log and a ticket
+        // goes to the queue this thread serves.
+        assert_eq!(write(&db).freeze("items").expect("a freeze"), 1);
+
+        let mut perms = std::fs::metadata(&shard).unwrap().permissions();
+        let was = perms.mode();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&shard, perms).unwrap();
+        // Running as root, an unwritable directory is not unwritable: say so
+        // rather than pass on an injection that did not happen.
+        if std::fs::File::create(shard.join(".probe")).is_ok() {
+            let _ = std::fs::remove_file(shard.join(".probe"));
+            let mut back = std::fs::metadata(&shard).unwrap().permissions();
+            back.set_mode(was);
+            let _ = std::fs::set_permissions(&shard, back);
+            eprintln!("skipped: this process can write a directory it has no write bit for");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let before = read(&db).seal_failures().0;
+        assert!(maintenance_step(&db), "the step did not take the seal");
+        let (failed, last) = read(&db).seal_failures();
+        assert!(failed > before, "the seal did not fail on an unwritable directory");
+        assert!(last.is_some(), "a failed seal says why");
+        // The rows are still answered from the frozen memtable, and still on
+        // a log: this is a seal that has not landed, not data that is gone.
+        let r = run_sql(&db, "SELECT count(*) AS c FROM items");
+        assert!(r.body.contains(r#""c":40"#), "{}", r.body);
+        let waiting = read(&db).shards("items").unwrap()[0].wal_bytes();
+        assert!(waiting > 0, "a seal that has not landed leaves its log to replay");
+
+        let mut back = std::fs::metadata(&shard).unwrap().permissions();
+        back.set_mode(was);
+        std::fs::set_permissions(&shard, back).unwrap();
+
+        // No write, no statement: only the thread that runs anyway.
+        let mut installed = false;
+        for _ in 0..20 {
+            maintenance_step(&db);
+            if read(&db).shards("items").unwrap()[0].manifest().segments.len() == 1 {
+                installed = true;
+                break;
+            }
+        }
+        assert!(installed, "the retry never landed once the directory was writable again");
+        assert_eq!(
+            read(&db).seal_failures().0,
+            failed,
+            "the seal failed again after the directory came back"
+        );
+        let r = run_sql(&db, "SELECT count(*) AS c FROM items");
+        assert!(r.body.contains(r#""c":40"#), "{}", r.body);
+        assert_eq!(
+            read(&db).shards("items").unwrap()[0].wal_bytes(),
+            0,
+            "a seal that landed empties the log it rotated aside"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

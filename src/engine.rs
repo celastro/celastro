@@ -5875,6 +5875,23 @@ impl Db {
         Ok(true)
     }
 
+    /// Freeze every shard of `collection` for the sealer, as a due seal
+    /// does on the write path.
+    #[cfg(test)]
+    pub(crate) fn freeze(&mut self, collection: &str) -> Result<usize> {
+        let shards = self
+            .shards
+            .get_mut(collection)
+            .ok_or_else(|| Error::Plan(format!("no such collection `{collection}`")))?;
+        let mut n = 0;
+        for s in shards.iter_mut() {
+            if s.seal_freeze()? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// A build that failed: the ticket goes back to its shard, retried by
     /// the next reserve; the failure is counted on the shard.
     pub fn seal_requeue(&mut self, job: SealJob, err: &Error) {

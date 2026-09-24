@@ -245,6 +245,129 @@ fn a_large_write_ahead_log_replays_every_row() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A node killed outright keeps every row it acknowledged, and a second
+/// open agrees with the first.
+///
+/// The drill of 2026-09-16 measured this by hand and nothing has held it
+/// since. The restart tests above drop a `Db` and open it again, which
+/// runs every destructor and flushes what a power cut would not: this one
+/// spawns the binary, writes through its console until several thousand
+/// rows are acknowledged, and sends SIGKILL (`Child::kill` on Unix) with a
+/// batch still in flight.
+///
+/// What must hold: every acknowledged row is there, nothing that was never
+/// sent is, and the count does not move on a second open. The batch in
+/// flight may be there or not -- it was never acknowledged, and both
+/// answers are correct -- so which way it fell is printed, not asserted.
+#[test]
+#[ignore]
+fn a_node_killed_outright_keeps_every_row_it_acknowledged() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicUsize;
+
+    const BATCH: usize = 500;
+    const BEFORE_THE_KILL: usize = 8; // batches, so four thousand rows
+
+    // One connection per statement, like any client: after the kill the
+    // connect fails, which is how the writer learns to stop.
+    fn post(addr: &str, token: &str, sql: &str) -> std::io::Result<String> {
+        let body =
+            celastro::json::to_string(&Value::obj(vec![("sql".into(), Value::Str(sql.into()))]));
+        let mut s = std::net::TcpStream::connect(addr)?;
+        write!(
+            s,
+            "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
+        let mut reply = String::new();
+        s.read_to_string(&mut reply)?;
+        Ok(reply)
+    }
+
+    let d = dir("kill9");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
+        .args(["--json", "--dir", d.to_str().unwrap(), "serve", "--port", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn celastro");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
+    let addr = hello.get("addr").and_then(|v| v.as_str()).unwrap().to_string();
+    let token = hello.get("token").and_then(|v| v.as_str()).unwrap().to_string();
+    let r = post(&addr, &token, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+    assert!(r.contains("\"ok\":true"), "{r}");
+
+    // The writer counts only what came back ok: a batch whose answer never
+    // arrived is not acknowledged, whatever reached the disk.
+    let acked = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let (addr, token, acked) = (addr.clone(), token.clone(), acked.clone());
+        std::thread::spawn(move || {
+            for batch in 0usize.. {
+                let rows: Vec<String> = (0..BATCH)
+                    .map(|i| {
+                        let n = batch * BATCH + i;
+                        format!("(\'{{\"id\":\"k-{n:06}\",\"n\":{n}}}\')")
+                    })
+                    .collect();
+                let sql = format!("INSERT INTO items VALUES {}", rows.join(", "));
+                match post(&addr, &token, &sql) {
+                    Ok(r) if r.contains("\"ok\":true") => {
+                        acked.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => break, // the console is gone: the kill landed
+                }
+            }
+        })
+    };
+
+    let waited = Instant::now();
+    while acked.load(Ordering::SeqCst) < BEFORE_THE_KILL {
+        assert!(waited.elapsed() < Duration::from_secs(120), "the writer never got going");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().expect("SIGKILL");
+    let _ = child.wait();
+    let _ = writer.join();
+    // Read after the writer has stopped: a batch acknowledged between the
+    // loop above and the kill is still acknowledged and still has to be
+    // there.
+    let batches = acked.load(Ordering::SeqCst);
+    let rows_acked = batches * BATCH;
+    assert!(rows_acked >= BEFORE_THE_KILL * BATCH, "only {rows_acked} rows were acknowledged");
+
+    let started = Instant::now();
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    let replay = started.elapsed();
+    let count = |db: &mut Db, sql: &str| -> usize {
+        let r = db.query(sql).unwrap();
+        r.rows[0].doc.path("c").and_then(|v| v.as_i64()).unwrap() as usize
+    };
+    let total = count(&mut db, "SELECT count(*) AS c FROM items");
+    let kept = count(&mut db, &format!("SELECT count(*) AS c FROM items WHERE n < {rows_acked}"));
+    assert_eq!(kept, rows_acked, "the kill lost a row the console had acknowledged");
+    assert!(
+        total <= rows_acked + BATCH,
+        "{total} rows after {rows_acked} acknowledged and one batch in flight"
+    );
+    drop(db);
+
+    let mut again = Db::open(&d, DbOpts::default()).unwrap();
+    let second = count(&mut again, "SELECT count(*) AS c FROM items");
+    assert_eq!(second, total, "the second open disagreed with the first");
+    drop(again);
+    eprintln!(
+        "resilience: SIGKILL after {batches} acknowledged batches ({rows_acked} rows); reopened \
+         in {replay:.1?} with {total} rows, {} of them from the batch in flight",
+        total - rows_acked
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A cluster backup taken while a writer keeps every edge's endpoints
 /// ahead of the edge restores to a cut where that still holds on every
 /// node, which three per-node backups at their own instants need not.

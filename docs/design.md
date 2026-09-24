@@ -1895,9 +1895,17 @@ needs no space) when an append or the sync fails, so a refused statement
 leaves nothing to replay. And the seal a write triggers runs after the
 whole batch is applied and cannot fail the write: the write is on the log
 and in memory, which is what was promised; the seal's failure is counted
-on the shard (`seal_failures`, in `/api/metrics`) and the next write
-tries again -- on a disk that stays full, each following append is
-refused cleanly instead. A directory that vanished under a running node
+on the shard (`seal_failures`, in `/api/metrics`) and the seal is tried
+again -- by the next write, and with a sealer running by the maintenance
+thread, which needs no write to prompt it, so a node that went quiet
+after its disk filled seals once there is room. That covers a failed
+install as well as a failed build: until 0.75.0 an install that could not
+write its segment or publish its manifest dropped the ticket, and the
+rows sat in the frozen memtable and the rotated log until a restart. On a
+disk that stays full, each following append is refused cleanly instead.
+`celastro_wal_bytes` is the length of what a reopen would replay, the
+rotated logs of seals not yet landed included: one that only grows is a
+seal that is not landing. A directory that vanished under a running node
 (unmounted, removed) is the third case the same run showed: the log's
 open descriptor accepts bytes into a file no reopen can find, so a write
 is refused when the `LOCK` this process holds is not where it was, and
@@ -2477,7 +2485,7 @@ guarantee:
 | a tier move publishes its renames like everything else | `engine::tests::an_archive_move_fsyncs_both_directories_and_survives_a_reopen` (the rename into `archive/` and back is recorded, no rename is left without a directory fsync after it, and the moved segment is found at the next open) |
 | the statistics cache ages by its own collection's writes | `engine::tests::writes_to_another_collection_do_not_age_this_ones_statistics` (a refresh interval of writes to B leaves A's epoch and anchor where they were; the same writes to A end it) |
 | `serve` ends cleanly on SIGTERM, promptly, with the last write saved | `serve_signals::sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives` (the real binary, a real signal, an exit bounded in time, and a reopen that finds the collection created a moment before), `signal::tests::the_handlers_install_and_nothing_is_requested_until_a_signal_arrives` |
-| a refused write leaves no record and no row; a failed seal does not fail the write and is retried; a vanished directory refuses writes and is not well | `shard::tests::a_write_the_log_refuses_leaves_no_record_and_no_row` (an append that fails at the third record of a batch: the log cut back, memory untouched, a reopen with the acknowledged rows; the same for one document and a delete), `shard::tests::a_seal_that_fails_leaves_the_write_acknowledged_and_is_retried` (the segment's temporary fsync fails: the batch acknowledged and visible, the failure counted, the next write seals, a reopen has every row), `engine::tests::a_vanished_directory_refuses_writes_and_is_not_well` |
+| a refused write leaves no record and no row; a failed seal does not fail the write and is retried; a vanished directory refuses writes and is not well | `shard::tests::a_write_the_log_refuses_leaves_no_record_and_no_row` (an append that fails at the third record of a batch: the log cut back, memory untouched, a reopen with the acknowledged rows; the same for one document and a delete), `shard::tests::a_seal_that_fails_leaves_the_write_acknowledged_and_is_retried` (the segment's temporary fsync fails: the batch acknowledged and visible, the failure counted, the next write seals, a reopen has every row), `engine::tests::a_vanished_directory_refuses_writes_and_is_not_well`, `serve::tests::a_failed_seal_is_retried_by_the_maintenance_thread_and_lands_when_the_disk_does` (the shard's directory unwritable during the install: the ticket kept, the log counted in `celastro_wal_bytes`, the seal landing with no write once the directory is writable), `a_node_killed_outright_keeps_every_row_it_acknowledged` in `tests/resilience.rs` (the binary sent SIGKILL with a batch in flight: every acknowledged row after the reopen, a second open agreeing) |
 | a coordinator holds no shards, takes none, hears every definition, and answers what a data node answers | `wire::a_coordinator_holds_no_shards_and_answers_over_the_data_nodes` (created at the coordinator: three shards over two data nodes and none here; an index made at a data node in the coordinator's catalog; every query answering what one process answers; a move and a placement naming it refused; a rebalance skipping it; `SHOW HEALTH` naming the roles) |
 | retention removes older backups and only the pool segments nobody names | `backup::keep_removes_older_backups_and_the_pool_segments_nobody_references` (`tests/backup.rs`: three backups, `KEEP 2`; the oldest instant gone and refused `AS OF`, the newest restores and verifies, a pool segment only the oldest named is gone and one the newer ones share is kept) |
 | what a byte search of a running process finds after the secret paths have run: none of a file key, none of the X25519 scalar, none of a derived block, one copy of a traffic secret after a handshake | `cipher::core_dump::a_file_key_is_not_left_in_memory`, `::the_x25519_scalar_is_not_left_in_memory`, `::an_hkdf_block_is_not_left_in_memory`, `::a_secret_returned_by_value_can_leave_one_copy` (the residue, bounded rather than asserted away), `tls13::tests::a_traffic_secret_is_not_left_in_memory_after_a_handshake` (all `#[ignore]`d: release only, and they read `/proc/self/mem`) |
