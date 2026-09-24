@@ -1355,6 +1355,35 @@ fn truncate_file(path: &Path) -> Result<fs::File> {
     Ok(f)
 }
 
+/// A shard's segment directory, cipher and file naming, detached from the
+/// shard: what a compaction's build takes so it can write its outputs with
+/// no lock held, leaving the install under the lock only the manifest to
+/// publish. A merge's output is the size of its inputs -- 220 MB at the
+/// second level under a sustained insert load -- and writing and syncing it
+/// under the lock held every writer for nine seconds.
+#[derive(Clone)]
+pub(crate) struct SegmentDisk {
+    dir: PathBuf,
+    cipher: crate::cipher::Shared,
+    /// The shard's file-id prefix: `Shard::file_id` of an empty name.
+    prefix: String,
+}
+
+impl SegmentDisk {
+    pub(crate) fn path(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("{id:016x}.seg"))
+    }
+
+    /// Write `seg` durably at its path: temp file, fsync, rename, and the
+    /// directory fsync that makes the name survive.
+    pub(crate) fn write(&self, seg: &Segment) -> Result<PathBuf> {
+        let p = self.path(seg.id);
+        let bytes = seg.encode()?;
+        write_content(&self.cipher, &format!("{}{:016x}.seg", self.prefix, seg.id), &p, &bytes)?;
+        Ok(p)
+    }
+}
+
 /// A write's log sync, left for its caller to settle outside the lock:
 /// the log, the record count to reach, and the write's first timestamp,
 /// which reads are held below until it is settled.
@@ -1787,6 +1816,9 @@ pub struct SealTicket {
     retain_from: Timestamp,
     tally: PathTally,
     wals: Vec<PathBuf>,
+    /// Where the build writes the segments, so the install under the lock
+    /// does not: `None` for a shard in memory.
+    disk: Option<SegmentDisk>,
 }
 
 impl std::fmt::Debug for SealTicket {
@@ -1798,6 +1830,8 @@ impl std::fmt::Debug for SealTicket {
 /// The segments a ticket's build produced, in memory, for `seal_install`.
 pub struct SealBuilt {
     segments: Vec<Segment>,
+    /// The segments already on the disk, by id: the build wrote them.
+    written: BTreeMap<u64, PathBuf>,
 }
 
 impl Sealed {
@@ -2916,6 +2950,7 @@ impl Shard {
             retain_from,
             tally: std::mem::take(&mut self.unsealed),
             wals,
+            disk: self.segment_disk(),
         });
         Ok(true)
     }
@@ -2940,10 +2975,19 @@ impl Shard {
             }
             segments.push(b.build(id, 0, &t.coll)?);
         }
-        Ok(SealBuilt { segments })
+        // Written here, with no lock held, under the ids the freeze
+        // reserved; a ticket that fails and is built again writes the same
+        // names over. Durable before the install's manifest can name them.
+        let mut written = BTreeMap::new();
+        if let Some(disk) = &t.disk {
+            for seg in &segments {
+                written.insert(seg.id, disk.write(seg)?);
+            }
+        }
+        Ok(SealBuilt { segments, written })
     }
 
-    /// Commit a build: the segments to disk and the manifest, the deletes
+    /// Commit a build: the manifest naming the segments the build wrote, the deletes
     /// the frozen memtable took before and during the build into their
     /// logs, the frozen memtable let go, its rotated log removed.
     ///
@@ -2955,8 +2999,9 @@ impl Shard {
     /// disk filled during a seal and then emptied never sealed them.
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
         let deletes = Shard::deletes_of(&t.frozen);
-        let committed =
-            self.handles_for(built.segments, &deletes).and_then(|h| self.commit_handles(h));
+        let committed = self
+            .handles_for(built.segments, &deletes, &built.written)
+            .and_then(|h| self.commit_handles(h));
         let sealed = match committed {
             Ok(sealed) => sealed,
             Err(e) => {
@@ -3018,11 +3063,19 @@ impl Shard {
         &self,
         built: Vec<Segment>,
         deletes: &[(String, Timestamp, Timestamp)],
+        written: &BTreeMap<u64, PathBuf>,
     ) -> Result<Vec<Arc<SegmentHandle>>> {
         let mut handles: Vec<Arc<SegmentHandle>> = Vec::new();
         for seg in built {
             self.adopt_segment(&seg);
-            let path = self.persist_segment(&seg)?;
+            // Written by a build off the lock when there was one.
+            let path = match written.get(&seg.id) {
+                Some(p) => {
+                    self.adopt_file(&seg, p);
+                    Some(p.clone())
+                }
+                None => self.persist_segment(&seg)?,
+            };
             let handle = SegmentHandle::new(seg, DeleteLog::new(), path);
             self.mask_handle(&handle);
             for (key, version_ts, delete_ts) in deletes {
@@ -3170,7 +3223,7 @@ impl Shard {
         // must not leave the first one live in `self.segments` while the
         // memtable still holds all of its rows, because then the same key is
         // reachable twice and a retry makes the duplicate permanent.
-        let handles = self.handles_for(built, &deletes)?;
+        let handles = self.handles_for(built, &deletes, &BTreeMap::new())?;
         // The ids are committed here rather than below, and deliberately not
         // as part of the commit: the files under them are already on the disk,
         // so they have been spoken for whatever happens next. Handing one out
@@ -3226,15 +3279,31 @@ impl Shard {
     }
 
     fn persist_segment(&self, seg: &Segment) -> Result<Option<PathBuf>> {
-        let Some(dir) = self.dir.as_ref() else { return Ok(None) };
-        let p = dir.join("segments").join(format!("{:016x}.seg", seg.id));
+        let Some(disk) = self.segment_disk() else { return Ok(None) };
         // Durable before the manifest names it, and long before the WAL that
         // could rebuild it is truncated.
-        let bytes = seg.encode()?;
-        write_content(&self.opts.cipher, &self.segment_file_id(seg.id), &p, &bytes)?;
-        // The local file is now the source; the in-memory copy can go.
-        seg.set_source(self.wrap_source(seg.id, crate::segment::SegmentSource::File(p.clone())));
+        let p = disk.write(seg)?;
+        self.adopt_file(seg, &p);
         Ok(Some(p))
+    }
+
+    /// `seg`'s file is on the disk at `p`: it is the source now, and the
+    /// in-memory copy can go.
+    fn adopt_file(&self, seg: &Segment, p: &Path) {
+        seg.set_source(
+            self.wrap_source(seg.id, crate::segment::SegmentSource::File(p.to_path_buf())),
+        );
+    }
+
+    /// Where this shard's segment files go, for a build that writes them
+    /// with no lock held; `None` for a shard in memory.
+    pub(crate) fn segment_disk(&self) -> Option<SegmentDisk> {
+        let dir = self.dir.as_ref()?;
+        Some(SegmentDisk {
+            dir: dir.join("segments"),
+            cipher: self.opts.cipher.clone(),
+            prefix: self.file_id(""),
+        })
     }
 
     /// The bytes a reopen of this shard would replay: the live
@@ -3890,6 +3959,7 @@ impl Shard {
         outputs: Vec<Segment>,
         carried_deletes: &[(String, Timestamp, Timestamp)],
         retain_from: Timestamp,
+        written: &BTreeMap<u64, PathBuf>,
     ) -> Result<()> {
         // What this compaction forgets: every delete at or before the
         // horizon in an input is dropped with its row (`collect_from_handles`
@@ -3914,7 +3984,15 @@ impl Shard {
         let mut handles = Vec::new();
         for seg in outputs {
             self.adopt_segment(&seg);
-            let path = self.persist_segment(&seg)?;
+            // Written by the build, off the lock, when it could be; the
+            // install then writes nothing but the manifest.
+            let path = match written.get(&seg.id) {
+                Some(p) => {
+                    self.adopt_file(&seg, p);
+                    Some(p.clone())
+                }
+                None => self.persist_segment(&seg)?,
+            };
             let h = SegmentHandle::new(seg, DeleteLog::new(), path);
             self.mask_handle(&h);
             for (key, version_ts, delete_ts) in carried_deletes {

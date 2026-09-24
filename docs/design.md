@@ -484,11 +484,11 @@ peers was a partition. It now has compaction's shape: `Shard::seal_freeze`
 under the lock moves the memtable into `frozen` (where `Loc::Frozen` has
 let reads and deletes find one since the tiering work), lays its rows out
 as the layers a build makes of them, reserves the segment ids and rotates
-the write-ahead log aside; `Shard::seal_build` builds the segments holding
-nothing; `Shard::seal_install` persists and publishes them, applies the
-deletes the frozen memtable took before and during the build, lets it go
-and removes its rotated log. The console's maintenance thread runs the
-triple ahead of compactions, and turns the freezing on
+the write-ahead log aside; `Shard::seal_build` builds the segments and
+writes them to disk holding nothing; `Shard::seal_install` publishes the
+manifest that names them, applies the deletes the frozen memtable took
+before and during the build, lets it go and removes its rotated log. The
+console's sealer thread runs the triple, and turns the freezing on
 (`DbOpts::background_seal`) when it starts; without it a due seal builds
 inline as before, and `FLUSH` seals everything inline, frozen memtables
 first. Two frozen seals the thread has not caught up with are the bound,
@@ -2016,6 +2016,24 @@ pieces `run` makes), and installs it under the lock
 (`compaction::install`), where a shard that moved on declines it. One
 job at a time, a log line each, `CELASTRO_AUTO_COMPACT=off` to stop it:
 what §12.1 asked for, minus the waiting to be asked.
+
+Since 0.77.0 the build also writes the outputs to disk, under the ids
+the reservation took, and the install under the lock only adopts the
+files and publishes the manifest; a build the install declines has its
+files removed, and one whose publication fails leaves them for the
+reopen's reclamation, since a failed publication may still have put a
+manifest naming them on the disk. A merge's output is the size of its
+inputs, and writing and syncing a 220 MB second-level one under the lock
+held every writer for nine seconds under a sustained insert load; the
+same install now holds the lock for 56 ms, and the longest of any install
+in a ten-minute run was 362 ms (each install's `lock_ms`, in its
+`sealed` or `compacted` log line). Seals write in their build the same way. And
+seals and compactions have a thread each: one thread for both left every
+seal waiting out a compaction's build, so through a four-minute
+second-level merge the write path found two frozen memtables still
+waiting and sealed the rest itself under the lock, 0.7 s of graph each
+with every writer held. With the sealer apart, every seal of the run was
+the sealer's (44 of 44) and none was built on the write path.
 
 **A statement's cost is bounded by a deadline that is on by default and
 checked inside the loops.** Thirty seconds unless the `Db` or the statement

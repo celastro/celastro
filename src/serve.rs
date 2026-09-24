@@ -775,7 +775,9 @@ impl Server {
                 // due seal may freeze for it.
                 write(db).set_background_seal(true);
                 let stop = &stop;
-                scope.spawn(move || maintenance(db, stop));
+                for step in MAINTAINERS {
+                    scope.spawn(move || maintenance(db, stop, step));
+                }
             }
             if let Some(every) = reconcile_interval() {
                 let (stop, grants) = (&stop, &grants);
@@ -1795,12 +1797,23 @@ impl Served {
 /// notes ask of compaction, only no longer waiting to be asked. A
 /// shutdown waits for a build in flight; a kill loses nothing, since
 /// nothing is installed until the end.
-fn maintenance(db: &RwLock<Db>, stop: &AtomicBool) {
+/// The console's maintenance loops, one thread each: the sealer and the
+/// compactor. Apart, so that no seal waits out a compaction's build.
+const MAINTAINERS: [fn(&RwLock<Db>) -> bool; 2] = [seal_step, compaction_step];
+
+/// One maintenance loop: `step` until the console stops, a second's rest
+/// whenever it finds nothing to do. The console runs two -- seals, and
+/// compactions -- because one thread for both left every seal waiting out
+/// a compaction's build: a second-level merge built for four minutes, the
+/// write path found two frozen memtables still waiting and sealed the next
+/// ones itself, under the lock, 0.7 s each with every writer held, and
+/// flat segments piled up to twenty-one.
+fn maintenance(db: &RwLock<Db>, stop: &AtomicBool, step: fn(&RwLock<Db>) -> bool) {
     loop {
         if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
             return;
         }
-        if !maintenance_step(db) {
+        if !step(db) {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
@@ -2345,7 +2358,16 @@ fn steward_sweep(
     }
 }
 
+/// One step of either, the sealer's first: what the tests drive by hand
+/// in place of the two threads.
+#[cfg(test)]
 fn maintenance_step(db: &RwLock<Db>) -> bool {
+    seal_step(db) || compaction_step(db)
+}
+
+/// The sealer's step: a follower's next chunk, or a frozen memtable built
+/// and installed. `false` when there was neither.
+fn seal_step(db: &RwLock<Db>) -> bool {
     // Followers catching up: the next chunk of each, cut under the served
     // shared lock -- the one a waiting writer cannot hold back, since a
     // step that waits is a follower that never catches up -- and shipped
@@ -2353,8 +2375,8 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
     if db.read_served().unwrap_or_else(|p| p.into_inner()).replication_step() > 0 {
         return true;
     }
-    // A seal frozen by the write path first: the graph it builds is the
-    // pause a statement would otherwise wait out under the lock. The guard
+    // A seal frozen by the write path: the graph it builds is the pause a
+    // statement would otherwise wait out under the lock. The guard
     // is bound and dropped on its own line: as a temporary in the `if let`
     // it lived through the build and the install, which takes the lock
     // again, and the first run of the check for this deadlocked the node.
@@ -2365,18 +2387,16 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
         let what = job.describe();
         let started = Instant::now();
         match Db::seal_build(&job) {
-            Ok(built) => match write_soon(db, Duration::from_secs(5))
-                .unwrap_or_else(|| write(db))
-                .seal_install(job, built)
-            {
-                Ok(_) => crate::log::info(
+            Ok(built) => match locked(db, |g| g.seal_install(job, built)) {
+                (Ok(_), held) => crate::log::info(
                     "sealed",
                     &[
                         ("what", what),
                         ("seconds", format!("{:.1}", started.elapsed().as_secs_f64())),
+                        ("lock_ms", held.as_millis().to_string()),
                     ],
                 ),
-                Err(e) => {
+                (Err(e), _) => {
                     // The ticket is back on its shard (`seal_install` puts
                     // it there), to be built and installed again -- not at
                     // once, for the same reason as a failed build.
@@ -2398,6 +2418,12 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
         }
         return true;
     }
+    false
+}
+
+/// The compactor's step: the next job the planner wants, built with no
+/// lock held and installed under it. `false` when the shards are quiet.
+fn compaction_step(db: &RwLock<Db>) -> bool {
     let Some(mut g) = write_soon(db, Duration::from_millis(200)) else { return false };
     let ticket = g.compaction_reserve();
     drop(g);
@@ -2405,11 +2431,8 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
     let what = ticket.describe();
     let started = Instant::now();
     match Db::compaction_build(&ticket) {
-        Ok(Some(built)) => match write_soon(db, Duration::from_secs(5))
-            .unwrap_or_else(|| write(db))
-            .compaction_install(ticket, built)
-        {
-            Ok(true) => {
+        Ok(Some(built)) => match locked(db, |g| g.compaction_install(ticket, built)) {
+            (Ok(true), held) => {
                 COUNTERS.compactions.fetch_add(1, AtomicOrdering::Relaxed);
                 COUNTERS
                     .compaction_millis
@@ -2419,11 +2442,12 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
                     &[
                         ("what", what.clone()),
                         ("seconds", format!("{:.1}", started.elapsed().as_secs_f64())),
+                        ("lock_ms", held.as_millis().to_string()),
                     ],
                 )
             }
-            Ok(false) => {}
-            Err(e) => crate::log::warn(
+            (Ok(false), _) => {}
+            (Err(e), _) => crate::log::warn(
                 "compaction_not_installed",
                 &[("what", what.clone()), ("error", e.to_string())],
             ),
@@ -2435,6 +2459,19 @@ fn maintenance_step(db: &RwLock<Db>) -> bool {
         ),
     }
     true
+}
+
+/// `f` under the write lock the maintenance thread takes for an install,
+/// and how long it held the lock: the time every statement on the node
+/// waited, which the `sealed` and `compacted` log lines report as
+/// `lock_ms`, since a seal or a merge that holds it for seconds is what a
+/// writer's p99 shows and nothing else names.
+fn locked<T>(db: &RwLock<Db>, f: impl FnOnce(&mut Db) -> T) -> (T, Duration) {
+    let mut g = write_soon(db, Duration::from_secs(5)).unwrap_or_else(|| write(db));
+    let at = Instant::now();
+    let out = f(&mut g);
+    drop(g);
+    (out, at.elapsed())
 }
 
 /// The database for a read: many at once, beside no write. Poisoning is
@@ -4165,6 +4202,75 @@ mod tests {
         assert!(writer.join().unwrap().body.contains("\"ok\":true"));
         let rows = run_sql(&db, "SELECT id FROM items LIMIT 10");
         assert!(rows.body.contains("\"count\":2"), "{}", rows.body);
+    }
+
+    /// A seal goes through while a compaction builds. One thread did both,
+    /// in turn, and a second-level merge built for four minutes while the
+    /// write path, finding two frozen memtables still waiting, sealed the
+    /// next ones itself under the lock -- 0.7 s each, every writer held.
+    /// The compaction's segment fsync is made three seconds slower on its
+    /// own thread, and the seal on this one has to land inside those three
+    /// seconds, before the compaction does.
+    #[test]
+    fn a_seal_lands_while_a_compaction_is_still_building() {
+        use crate::shard::durability_probe::{self, Op};
+        let tag = format!("celastro-serve-seal-beside-compaction-{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = RwLock::new(Db::open(&dir, crate::engine::DbOpts::default()).unwrap());
+        write(&db).set_background_seal(true);
+        let ok = |sql: &str| {
+            let r = run_sql(&db, sql);
+            assert!(r.body.starts_with(r#"{"ok":true"#), "{sql}: {}", r.body);
+        };
+        ok("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+        let insert = |round: usize| {
+            let docs: Vec<String> =
+                (0..20).map(|i| format!("('{{\"id\":\"d{round}-{i}\",\"n\":{i}}}')")).collect();
+            ok(&format!("INSERT INTO items VALUES {}", docs.join(",")));
+        };
+        for round in 0..4 {
+            insert(round);
+            ok("FLUSH items");
+        }
+        // A frozen memtable waiting for the sealer, beside the four flat
+        // segments waiting for the compactor.
+        insert(4);
+        assert_eq!(write(&db).freeze("items").unwrap(), 1);
+        let segments = dir.join("collections/items/shard-0000/segments");
+        let building = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "tmp"))
+        };
+        std::thread::scope(|scope| {
+            let compactor = scope.spawn(|| {
+                durability_probe::slow(Some((Op::TempSync, Duration::from_secs(3))));
+                let did = MAINTAINERS[1](&db);
+                durability_probe::slow(None);
+                did
+            });
+            // The build has written its output and is in the slowed fsync.
+            let until = Instant::now() + Duration::from_secs(10);
+            while !building(&segments) {
+                assert!(Instant::now() < until, "the compaction never reached its write");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let t = Instant::now();
+            assert!(MAINTAINERS[0](&db), "the sealer found nothing to seal");
+            assert!(
+                !compactor.is_finished(),
+                "the compaction finished first ({:?}): the seal waited for it",
+                t.elapsed()
+            );
+            assert!(compactor.join().unwrap(), "the compaction did not land");
+        });
+        let n = read(&db).shards("items").unwrap()[0].segment_summary(crate::time::MAX_TS).len();
+        assert_eq!(n, 2, "one merged segment and the sealed one");
+        let r = run_sql(&db, "SELECT id FROM items LIMIT 1000");
+        assert!(r.body.contains(r#""count":100"#), "{}", r.body);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The maintenance step merges what the planner would: four flat

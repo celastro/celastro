@@ -16,6 +16,8 @@
 //! 3. **Format and parameter upgrades** (§12.3) — a rolling rebuild, never a
 //!    migration.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -221,7 +223,7 @@ pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
 
     let mut outputs: Vec<Segment> = Vec::new();
     if layers.is_empty() {
-        shard.install_compaction(&inputs, outputs, &carried, retain_from)?;
+        shard.install_compaction(&inputs, outputs, &carried, retain_from, &BTreeMap::new())?;
         return Ok(());
     }
     // Split at the cap rather than producing one oversized segment: this is
@@ -251,7 +253,7 @@ pub fn run(shard: &mut Shard, job: &Job, opts: &CompactionOpts) -> Result<()> {
             outputs.push(seg);
         }
     }
-    shard.install_compaction(&inputs, outputs, &carried, retain_from)?;
+    shard.install_compaction(&inputs, outputs, &carried, retain_from, &BTreeMap::new())?;
     Ok(())
 }
 
@@ -285,7 +287,7 @@ pub fn absorb(
             outputs.push(b.build(id, 0, &coll)?);
         }
     }
-    shard.install_compaction(&[], outputs, carried, retain_from)
+    shard.install_compaction(&[], outputs, carried, retain_from, &BTreeMap::new())
 }
 
 /// A job planned and its inputs pinned, for a build that runs with no lock
@@ -304,6 +306,9 @@ pub struct Reserved {
     pub ids: Vec<u64>,
     pub retain_from: Timestamp,
     pub segment_cap: usize,
+    /// Where the build writes its outputs, so the install under the lock
+    /// does not: `None` for a shard in memory.
+    pub(crate) disk: Option<crate::shard::SegmentDisk>,
 }
 
 /// What `build` made, to be installed by the shard it was reserved on.
@@ -312,6 +317,17 @@ pub struct Built {
     pub outputs: Vec<Segment>,
     pub carried: Vec<crate::shard::CarriedDelete>,
     pub retain_from: Timestamp,
+    /// The outputs already on the disk, by id: the build wrote them.
+    written: BTreeMap<u64, PathBuf>,
+}
+
+/// Take back files a build wrote that no manifest can name: a build that
+/// failed partway, or an install that declined before publishing. A reopen
+/// would reclaim them too; this does it before the disk has to wait.
+fn discard(written: &BTreeMap<u64, PathBuf>) {
+    for p in written.values() {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 impl std::fmt::Debug for Reserved {
@@ -353,6 +369,7 @@ pub fn reserve(shard: &mut Shard, opts: &CompactionOpts) -> Option<Reserved> {
         ids,
         retain_from: shard.retain_from(now),
         segment_cap: opts.segment_cap,
+        disk: shard.segment_disk(),
     })
 }
 
@@ -379,17 +396,46 @@ pub fn build(r: &Reserved) -> Result<Option<Built>> {
             outputs.push(b.build(id, level, &r.coll)?);
         }
     }
-    Ok(Some(Built { inputs: r.inputs.clone(), outputs, carried, retain_from: r.retain_from }))
+    // Written here, with no lock held, under the ids the reservation took:
+    // nothing else writes those names. Durable before the install's
+    // manifest can name them.
+    let mut written = BTreeMap::new();
+    if let Some(disk) = &r.disk {
+        for seg in &outputs {
+            match disk.write(seg) {
+                Ok(p) => {
+                    written.insert(seg.id, p);
+                }
+                Err(e) => {
+                    discard(&written);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(Some(Built {
+        inputs: r.inputs.clone(),
+        outputs,
+        carried,
+        retain_from: r.retain_from,
+        written,
+    }))
 }
 
 /// Install what `build` made, if the shard still holds every input: a
 /// shard that moved on meanwhile -- another compaction took the inputs, a
 /// drop -- gets nothing, and `false` says so.
 pub fn install(shard: &mut Shard, built: Built) -> Result<bool> {
-    if !built.inputs.iter().all(|id| shard.segments.iter().any(|h| h.id() == *id)) {
+    let Built { inputs, outputs, carried, retain_from, written } = built;
+    if !inputs.iter().all(|id| shard.segments.iter().any(|h| h.id() == *id)) {
+        discard(&written);
         return Ok(false);
     }
-    shard.install_compaction(&built.inputs, built.outputs, &built.carried, built.retain_from)?;
+    // A failed install keeps its files: a publication that reports failure
+    // may still have put its MANIFEST on the disk -- the rename landed and
+    // only the fsync did not -- and that manifest names them. The reopen's
+    // reclamation takes whatever no manifest names.
+    shard.install_compaction(&inputs, outputs, &carried, retain_from, &written)?;
     Ok(true)
 }
 

@@ -12939,6 +12939,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A seal and a compaction write their segments while they build, with
+    /// no lock held, and their installs under the lock write only what names
+    /// them, a manifest. A merge's output is the size of its inputs, and
+    /// writing one under the lock held every writer for nine seconds on a
+    /// sustained insert load.
+    #[test]
+    fn seals_and_compactions_write_their_segments_before_the_lock() {
+        let dir = tmp("offlock");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.set_background_seal(true);
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        let segment = |p: &PathBuf| {
+            p.extension().is_some_and(|e| e == "tmp")
+                && p.parent().is_some_and(|d| d.ends_with("segments"))
+        };
+        let manifest = |p: &PathBuf| p.ends_with("MANIFEST.tmp");
+        for b in 0..4 {
+            let rows: Vec<String> = (b * 20..b * 20 + 20)
+                .map(|i| format!(r#"('{{"id":"k{i:03}","n":{i}}}')"#))
+                .collect();
+            db.execute(&format!("INSERT INTO items VALUES {}", rows.join(", "))).unwrap();
+            assert_eq!(db.freeze("items").unwrap(), 1);
+            let job = db.seal_reserve().expect("the frozen memtable");
+            durability_probe::start();
+            let built = Db::seal_build(&job).unwrap();
+            let ev = durability_probe::take();
+            assert!(ev.paths(Op::TempSync).iter().any(segment), "the build wrote nothing: {ev:?}");
+            durability_probe::start();
+            assert!(db.seal_install(job, built).unwrap());
+            let ev = durability_probe::take();
+            assert!(
+                !ev.paths(Op::TempSync).iter().any(segment),
+                "the seal's install wrote a segment under the lock: {ev:?}"
+            );
+            assert!(ev.paths(Op::TempSync).iter().any(manifest), "no manifest named it: {ev:?}");
+        }
+        let ticket = db.compaction_reserve().expect("four flat segments to merge");
+        durability_probe::start();
+        let built = Db::compaction_build(&ticket).unwrap().expect("a build");
+        let ev = durability_probe::take();
+        assert!(ev.paths(Op::TempSync).iter().any(segment), "the build wrote nothing: {ev:?}");
+        durability_probe::start();
+        assert!(db.compaction_install(ticket, built).unwrap());
+        let ev = durability_probe::take();
+        assert!(
+            !ev.paths(Op::TempSync).iter().any(segment),
+            "the compaction's install wrote a segment under the lock: {ev:?}"
+        );
+        assert!(ev.paths(Op::TempSync).iter().any(manifest), "no manifest named it: {ev:?}");
+        let count = |db: &mut Db| db.query("SELECT id FROM items LIMIT 1000").unwrap().rows.len();
+        assert_eq!(count(&mut db), 80);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(count(&mut db), 80, "the reopen of segments written off the lock");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A full disk during a compaction, at the two writes it makes: an output
     /// segment that cannot be written, and a manifest that cannot be
     /// published after the outputs were. Each fails the `COMPACT` and leaves
