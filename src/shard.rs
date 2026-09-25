@@ -13,7 +13,7 @@
 //! write, but the shape is the shape: everything that must commit together goes
 //! into one record.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -1318,6 +1318,7 @@ pub(crate) struct WalRecord {
 pub(crate) struct WalMark {
     len: u64,
     records: u64,
+    appended: u64,
 }
 
 pub(crate) struct Wal {
@@ -1427,6 +1428,9 @@ pub(crate) struct SyncState {
     syncing: bool,
     /// The log's length at the last good sync: where a failed one cuts to.
     synced_len: u64,
+    /// Records to ship to the followers once synced, in log order: the
+    /// count of records up to and including each, its shipper, the item.
+    ship: VecDeque<(u64, Arc<crate::replication::Shipper>, crate::replication::ShipItem)>,
     /// The shortest the log was cut to by a refused statement while a sync
     /// was in the air, so that sync does not claim bytes it may not have.
     low_water: u64,
@@ -1447,6 +1451,7 @@ impl LogSync {
                 synced: 0,
                 syncing: false,
                 synced_len: len,
+                ship: VecDeque::new(),
                 low_water: u64::MAX,
                 failed: None,
                 syncs: 0,
@@ -1458,6 +1463,16 @@ impl LogSync {
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, SyncState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Ship every queued record the syncs so far cover, in order. Under
+    /// the state's lock, so two threads' syncs cannot interleave their
+    /// pushes.
+    fn ship_synced(st: &mut SyncState) {
+        while st.ship.front().is_some_and(|(seq, _, _)| *seq <= st.synced) {
+            let (_, sh, item) = st.ship.pop_front().expect("checked");
+            sh.push(item);
+        }
     }
 
     fn appended(&self) -> u64 {
@@ -1486,6 +1501,7 @@ impl LogSync {
         st.synced = st.appended;
         st.synced_len = 0;
         st.low_water = u64::MAX;
+        LogSync::ship_synced(&mut st);
         drop(st);
         self.done.notify_all();
     }
@@ -1525,12 +1541,16 @@ impl LogSync {
                     if st.generation == generation {
                         st.synced_len = len.min(st.low_water);
                     }
+                    LogSync::ship_synced(&mut st);
                 }
                 Err(e) => {
                     st.failed = Some(e.to_string());
                     if st.generation == generation {
                         let _ = st.file.set_len(st.synced_len);
                     }
+                    // What the cut took off the log was never on the disk:
+                    // no follower may have it.
+                    st.ship.clear();
                 }
             }
             self.done.notify_all();
@@ -1572,7 +1592,26 @@ impl Wal {
     /// Where the log ends now: what a statement takes before its records,
     /// so a statement that fails partway can be taken back off the log.
     pub(crate) fn mark(&self) -> Result<WalMark> {
-        Ok(WalMark { len: self.file.metadata()?.len(), records: self.records })
+        let appended = self.group.lock().appended;
+        Ok(WalMark { len: self.file.metadata()?.len(), records: self.records, appended })
+    }
+
+    /// Ship `item` to the followers once the record it carries is on the
+    /// disk: at once if the log is synced that far, else by the sync that
+    /// covers it. In the order of the log, whichever thread makes the sync.
+    /// A follower must never hold what this node could still lose -- a
+    /// crash before the sync, or a sync that fails and cuts the log -- and a
+    /// follower applies what it is sent in the order sent, so two versions
+    /// of a key shipped by two statements' settles must not cross.
+    pub(crate) fn ship_after_sync(
+        &self,
+        sh: Arc<crate::replication::Shipper>,
+        item: crate::replication::ShipItem,
+    ) {
+        let mut st = self.group.lock();
+        let seq = st.appended;
+        st.ship.push_back((seq, sh, item));
+        LogSync::ship_synced(&mut st);
     }
 
     /// The log's length on disk.
@@ -1587,6 +1626,8 @@ impl Wal {
     pub(crate) fn rollback(&mut self, mark: WalMark) -> Result<()> {
         let mut st = self.group.lock();
         st.low_water = st.low_water.min(mark.len);
+        // Nothing the cut takes off the log may reach a follower.
+        st.ship.retain(|(seq, _, _)| *seq <= mark.appended);
         self.file.set_len(mark.len)?;
         self.records = mark.records;
         Ok(())
@@ -1657,6 +1698,7 @@ impl Wal {
         durable::sync_data(&self.file, &self.path)?;
         st.synced = st.synced.max(target);
         st.synced_len = len;
+        LogSync::ship_synced(&mut st);
         Ok(())
     }
 
@@ -2394,7 +2436,7 @@ impl Shard {
                 self.pending.push(PendingSync { log, seq, first: ts });
             }
             if let Some(sh) = &self.shipper {
-                sh.push(ship_item(&record));
+                w.ship_after_sync(sh.clone(), ship_item(&record));
             }
             // `append` ends at `write_all`, which reaches the page cache and
             // stops there, so without this the timestamp returned below names a
@@ -2508,12 +2550,15 @@ impl Shard {
             }
             if let Some(sh) = &self.shipper {
                 for (key, ts, doc, _) in &prepared {
-                    sh.push(crate::replication::ShipItem {
-                        kind: crate::replication::SHIP_INSERT,
-                        key: key.clone(),
-                        ts: *ts,
-                        doc: Some(doc.clone()),
-                    });
+                    w.ship_after_sync(
+                        sh.clone(),
+                        crate::replication::ShipItem {
+                            kind: crate::replication::SHIP_INSERT,
+                            key: key.clone(),
+                            ts: *ts,
+                            doc: Some(doc.clone()),
+                        },
+                    );
                 }
             }
         }
@@ -2598,7 +2643,7 @@ impl Shard {
                 self.pending.push(PendingSync { log, seq, first: ts });
             }
             if let Some(sh) = &self.shipper {
-                sh.push(ship_item(&record));
+                w.ship_after_sync(sh.clone(), ship_item(&record));
             }
         }
         self.mark_superseded(prev, ts);
@@ -2981,7 +3026,18 @@ impl Shard {
         let mut written = BTreeMap::new();
         if let Some(disk) = &t.disk {
             for seg in &segments {
-                written.insert(seg.id, disk.write(seg)?);
+                match disk.write(seg) {
+                    Ok(p) => {
+                        written.insert(seg.id, p);
+                    }
+                    Err(e) => {
+                        // Nothing names them; the retry writes them again.
+                        for p in written.values() {
+                            let _ = fs::remove_file(p);
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
         Ok(SealBuilt { segments, written })
@@ -6057,6 +6113,73 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 1, "two live versions of one key");
         assert_eq!(live[0].get("body").and_then(|v| v.as_str()), Some("the second version"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A follower is shipped a record only once this node's log has it on
+    /// the disk, in the order of the log whichever statement's settle made
+    /// the sync, and never a record a failed sync cut off the log. Group
+    /// commit moved the sync out from under the lock; the push to the
+    /// followers stayed where it was, right after the append, so a follower
+    /// could hold a row a crash would take back here and, with two settles
+    /// on two threads, receive two statements' records crossed.
+    #[test]
+    fn a_follower_is_shipped_a_record_after_its_sync_in_log_order_and_never_a_cut_one() {
+        let dir = test_dir("shipsync");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let sh = crate::replication::Shipper::with_live_follower("tcp://127.0.0.1:1");
+        s.shipper = Some(sh.clone());
+        let coll = s.coll.clone();
+        let key = |i: usize| sort_key(&coll, &doc(i)).unwrap();
+
+        // The sync under the lock: shipped by the time the insert returns.
+        s.insert(doc(1)).unwrap();
+        assert_eq!(sh.backlog().len(), 1, "the synced record was not shipped");
+
+        // Deferred: nothing reaches the follower until the sync.
+        s.defer_sync = true;
+        s.insert(doc(2)).unwrap();
+        s.delete(&key(1)).unwrap();
+        s.insert(doc(3)).unwrap();
+        let mut pending = s.take_pending();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(sh.backlog().len(), 1, "a record not yet on the disk was shipped");
+        // The newest statement's settle syncs the log for all three, and
+        // ships them in the log's order, not the settles'.
+        let last = pending.pop().unwrap();
+        last.log.settle(last.seq).unwrap();
+        let shipped: Vec<(u8, String)> =
+            sh.backlog().into_iter().map(|(k, key, _)| (k, key)).collect();
+        assert_eq!(
+            shipped,
+            vec![
+                (crate::replication::SHIP_INSERT, key(1)),
+                (crate::replication::SHIP_INSERT, key(2)),
+                (crate::replication::SHIP_DELETE, key(1)),
+                (crate::replication::SHIP_INSERT, key(3)),
+            ],
+            "the follower's order is not the log's"
+        );
+        for p in pending {
+            p.log.settle(p.seq).unwrap();
+        }
+        assert_eq!(sh.backlog().len(), 4, "a settle after the sync shipped again");
+
+        // A sync that fails cuts the record off the log; the follower must
+        // not have it either.
+        s.insert(doc(4)).unwrap();
+        let p = s.take_pending().pop().unwrap();
+        durability_probe::fail_next(Op::WalSync, &log);
+        assert!(p.log.settle(p.seq).is_err(), "the injected failure was swallowed");
+        assert_eq!(sh.backlog().len(), 4, "a record a failed sync cut off the log was shipped");
+        assert!(
+            p.log.lock().ship.is_empty(),
+            "the cut record is still queued to ship, should the log ever sync again"
+        );
+        assert_eq!(Wal::replay(&log, &None, "t/wal.log").unwrap().len(), 4, "the cut");
         let _ = fs::remove_dir_all(&dir);
     }
 

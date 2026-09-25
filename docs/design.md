@@ -1630,7 +1630,12 @@ it, and compaction collects below the same bound. A sync that fails is
 not retried -- a page cache that failed one cannot be trusted with a
 second -- so the log is cut back to what its last good sync covered, the
 shard takes no more writes, reads stay below the failed write, and the
-health says to restart, which replays the log. At a sync made 50 ms
+health says to restart, which replays the log. A record reaches the
+followers only once its sync has made it durable here, in the log's
+order whichever settle made the sync (`Wal::ship_after_sync`): 0.76.0
+pushed it to the shipper at the append, so a follower could hold a row a
+crash here would take back and, with two statements settling on two
+threads, receive two versions of a key crossed. At a sync made 50 ms
 slower a point read went from one sync (p99 61-67 ms) to 0.5-0.9 ms,
 and eight writers made 74 writes a second where they had made 18, four
 to a sync; one writer is still one sync a write
@@ -2032,8 +2037,11 @@ seals and compactions have a thread each: one thread for both left every
 seal waiting out a compaction's build, so through a four-minute
 second-level merge the write path found two frozen memtables still
 waiting and sealed the rest itself under the lock, 0.7 s of graph each
-with every writer held. With the sealer apart, every seal of the run was
-the sealer's (44 of 44) and none was built on the write path.
+with every writer held. With the sealer apart, the run's 44 seals came
+one every 15-40 s with no bursts of queued tickets after a merge, as
+there had been, so the write path's fallback -- two frozen memtables
+waiting -- was not reached as far as the log can say; a seal built
+inline is not logged.
 
 **A statement's cost is bounded by a deadline that is on by default and
 checked inside the loops.** Thirty seconds unless the `Db` or the statement

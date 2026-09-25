@@ -81,7 +81,7 @@ pub fn measure_recall(
     let logged: Vec<LoggedVectorQuery> =
         db.logged_queries(collection).into_iter().filter(|q| q.path == path).collect();
     let mut notes = Vec::new();
-    let ts = db.clock.peek();
+    let ts = db.read_ts();
 
     // Build the query set: production queries first, synthesised from stored
     // vectors only to make up the numbers.

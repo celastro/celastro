@@ -220,6 +220,44 @@ impl Shipper {
         }
     }
 
+    /// A shipper with one live follower and no thread, for a test of what
+    /// reaches the follower's backlog and when: nothing drains it.
+    #[cfg(test)]
+    pub(crate) fn with_live_follower(url: &str) -> Arc<Shipper> {
+        let node = Arc::new(crate::wire::Node::new(url, Some("t"), None).expect("a node"));
+        let f = Follower {
+            url: url.to_string(),
+            node,
+            state: FollowerState::Live,
+            acked: 0,
+            backlog: VecDeque::new(),
+            catchup: VecDeque::new(),
+            last_error: None,
+            retry_at: None,
+            backoff: Duration::from_millis(200),
+            in_flight: false,
+            caught_up_mark: None,
+        };
+        Arc::new(Shipper {
+            collection: String::new(),
+            shard: 0,
+            term: 0,
+            confirm: Confirm::All,
+            inner: Mutex::new(vec![f]),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(true),
+            dir: None,
+            confirmed_written: Mutex::new((None, 0)),
+        })
+    }
+
+    /// The first follower's backlog: each item's kind, key and instant.
+    #[cfg(test)]
+    pub(crate) fn backlog(&self) -> Vec<(u8, String, Timestamp)> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g[0].backlog.iter().map(|i| (i.kind, i.key.clone(), i.ts)).collect()
+    }
+
     pub fn followers(&self) -> Vec<String> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|f| f.url.clone()).collect()
     }
