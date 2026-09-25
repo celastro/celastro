@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.79.0 — 2026-09-25
 
 **An ingest's last batch lands.** 0.78.0's `POST /api/ingest/<c>`
 dropped the tail of a body that ended with a newline -- every file does
