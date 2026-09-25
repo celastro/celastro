@@ -6,6 +6,46 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A write sent and unanswered is not sent again.** A call to a holder
+that failed after its frame was written -- a connection reset, a holder
+that took the call and fell silent -- was sent once more over a fresh
+connection, as every call was: a batch of rows landed twice as new
+versions of each key, a delete landed as nothing, a forwarded statement
+as whatever it did. A call that writes now stops at the first send and
+its caller hears "after the call was sent: it may have landed there"; a
+call that only reads, or that the holder applies once however often it
+arrives (a shipped batch), goes again as before; and a call that writes
+goes out on a connection shown live within the last quarter second, an
+idle one asked first, so a process gone since is a redial and not a
+frame into a dead socket reported as maybe landed. The coordinator's
+acknowledgement already says which rows to retry.
+
+**A changed follower list, or a new holder, is a new term.** `ALTER ...
+SET (replicas | regions)` and a shard moved or placed raised no term, so
+a node that missed the carry kept its old follower list at an equal
+term for good: its shipper retried a copy that did not exist, or never
+shipped to one that did. Every change of holder or followers raises the
+shard's term now, as a promotion does, and the higher term wins at the
+next sweep.
+
+**Deletes travel as one call per holder.** A statement's keys for
+another holder went one call and one sync each (`carry_deletes`, the
+sibling F9 left); they go as one `delete_many` call per holder per
+chunk of `insert_batch` keys now, checked whole there and deleted with
+one sync a shard. A holder too old to know the call is fed one key at a
+time, as it was.
+
+**Two more drills.** `catchupcut`: a follower cut off, healed over a
+slowed link so its catch-up takes seconds, cut again in the middle of it
+and healed for good; promoted, it answers every key the holder
+acknowledged. `splitbrain`: the holder of a shard cut off from its
+copies and the steward but not from its clients, three copies under
+quorum; it acknowledges nothing, the steward promotes a follower, the
+promoted node's answer fences it, and after the heal nothing
+acknowledged is missing and nothing refused is there.
+
 ## 0.79.0 — 2026-09-25
 
 **An ingest's last batch lands.** 0.78.0's `POST /api/ingest/<c>`

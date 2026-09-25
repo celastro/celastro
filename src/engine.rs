@@ -3921,8 +3921,23 @@ impl Db {
         // later move's map still names an earlier move's old holder.
         let mut map = if old.len() == tablets.len() { old.clone() } else { tablets.to_vec() };
         map[shard] = tablets[shard].clone();
+        let (was, old_term) = old.get(shard).map(|t| (t.node.clone(), t.term)).unwrap_or_default();
         self.adopt_shard(coll, &map, shard, incoming)?;
         self.place_shard(&coll.name, shard, &me)?;
+        // The plan's entry names this node already, so `place_shard` saw no
+        // change of holder here: the new term is raised now, as it is on
+        // every peer the switch reaches, or the peers would be a term ahead
+        // of the holder itself.
+        if was != me {
+            if let Some(t) =
+                self.catalog.placement.get_mut(&coll.name).and_then(|v| v.get_mut(shard))
+            {
+                if t.term == old_term {
+                    t.term += 1;
+                    self.persist_catalog()?;
+                }
+            }
+        }
         let mut order: Vec<String> = Vec::new();
         // Every node this one knows: the holders old and new, the nodes
         // and coordinators the catalog names, and the peers that attached
@@ -4475,6 +4490,20 @@ impl Db {
         let mut nodes = self.data_nodes();
         nodes.sort();
         let mut tablets = self.catalog.placement.get(collection).cloned().unwrap_or_default();
+        // And from a list that names every node the map does: a node whose
+        // list is short of one -- attached by another, attaching no one --
+        // would plan something else (an empty list) at the same new term,
+        // and two maps at one term are never reconciled. It plans nothing;
+        // the node that knows every one raises the term, which wins here
+        // at the next sweep.
+        let known = |n: &str| self.is_self(n) || nodes.iter().any(|x| x == n);
+        let short = tablets
+            .iter()
+            .filter(|t| !t.is_merged())
+            .any(|t| !known(&t.node) || t.followers.iter().any(|f| !known(f)));
+        if short {
+            return;
+        }
         for t in tablets.iter_mut() {
             if t.is_merged() {
                 continue;
@@ -4482,10 +4511,21 @@ impl Db {
             let holder_at = nodes
                 .iter()
                 .position(|x| x == &t.node || (self.is_self(x) && self.is_self(&t.node)));
-            t.followers = match holder_at {
-                Some(h) => self.followers_over_regions(&nodes, h, replicas, regions),
-                None => Vec::new(),
-            };
+            // A holder this node cannot place among the nodes it knows is
+            // not this node's to plan for: the tablet stays as it is, and
+            // the node that knows the holders raises the term below, which
+            // wins here at the next sweep. (Planned from a node list short
+            // of the holder, the list came out empty, at the same term.)
+            let Some(h) = holder_at else { continue };
+            let followers = self.followers_over_regions(&nodes, h, replicas, regions);
+            // A changed follower list is a new term: the higher term wins
+            // wherever two maps disagree, so a node that missed the carry
+            // takes the new list at its next sweep rather than keeping the
+            // old one at an equal term for good.
+            if followers != t.followers {
+                t.followers = followers;
+                t.term += 1;
+            }
         }
         self.catalog.placement.insert(collection.to_string(), tablets);
     }
@@ -5468,9 +5508,16 @@ impl Db {
         // The new holder was a follower, or was not; the old holder follows
         // from here on, so a move keeps the copies where they are.
         let prev = std::mem::replace(&mut t.node, node.to_string());
+        let changed = prev != node;
         t.followers.retain(|f| f != node);
-        if !prev.is_empty() && prev != node && !t.followers.contains(&prev) {
+        if !prev.is_empty() && changed && !t.followers.contains(&prev) {
             t.followers.push(prev);
+        }
+        // A new holder is a new term, as a promotion is: every peer applies
+        // the same switch and raises it alike, and one that missed it takes
+        // the higher term at its next sweep.
+        if changed {
+            t.term += 1;
         }
         let held = self.shards.get(collection).is_some_and(|v| v.iter().any(|s| s.index == shard));
         if self.is_self(node) {
@@ -6066,6 +6113,69 @@ impl Db {
             }
         }
         Ok(false)
+    }
+
+    /// A batch of keys forwarded to this node as the holder, deleted as a
+    /// statement's own keys are: every key checked first -- that this node
+    /// holds it, no move under way, the lease -- so a refusal is whole and
+    /// names the key, then each shard's share deleted with one sync, or
+    /// one pending sync under a deferring caller. How many were there and
+    /// are gone, and the error that stopped it: at the check nothing has
+    /// gone; a shard whose log fails leaves the shards before it done and
+    /// the count says so.
+    pub fn delete_many_here(
+        &mut self,
+        collection: &str,
+        keys: Vec<String>,
+    ) -> Result<(usize, Option<String>)> {
+        self.catalog.get(collection)?;
+        let mut here: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (i, key) in keys.into_iter().enumerate() {
+            let checked = (|| -> Result<usize> {
+                if let Some(url) = self.owner_of(collection, &key)? {
+                    return Err(Error::Plan(format!(
+                        "key `{key}` of `{collection}` belongs to the shard on {url}, not to \
+                         this node; the placement maps disagree"
+                    )));
+                }
+                self.refuse_if_moving(collection, &key)?;
+                let shards = self.shards.get(collection).ok_or_else(|| {
+                    Error::Plan(format!("no shard of `{collection}` is on this node"))
+                })?;
+                shards
+                    .iter()
+                    .position(|s| s.owns(&key))
+                    .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))
+            })();
+            match checked {
+                Ok(idx) => here.entry(idx).or_default().push(key),
+                Err(e) => return Ok((0, Some(format!("key {i}: {e}")))),
+            }
+        }
+        if let Err(e) = self.lease_check() {
+            return Ok((0, Some(e.to_string())));
+        }
+        let mut gone = 0usize;
+        for (idx, batch) in here {
+            let (deleted, index) = {
+                let shards = self.shards.get_mut(collection).expect("checked above");
+                let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
+                match Db::on_shard(defer, pending, &mut shards[idx], |s| s.delete_many(&batch)) {
+                    Ok(deleted) => (deleted, shards[idx].index),
+                    Err(e) => return Ok((gone, Some(e.to_string()))),
+                }
+            };
+            let mut last = 0;
+            for (_, ts) in &deleted {
+                self.note_write(collection, *ts);
+                last = last.max(*ts);
+            }
+            if last > 0 {
+                self.recent_writes.push((collection.to_string(), index, last));
+            }
+            gone += deleted.len();
+        }
+        Ok((gone, None))
     }
 
     pub fn flush(&mut self, collection: &str) -> Result<usize> {
@@ -6959,8 +7069,9 @@ impl Db {
         let collection = d.collection.clone();
         let remaining = crate::deadline::remaining_ms();
         let dialer = self.dialer();
+        let chunk = self.opts.insert_batch.max(1);
         Ok(Outcome::Deferred(Deferred::new(move || {
-            let n = n + carry_deletes(&collection, away, remaining, &dialer)?;
+            let n = n + carry_deletes(&collection, away, remaining, &dialer, chunk)?;
             confirm.wait()?;
             Ok(Outcome::Ack(format!("{n} document(s) deleted")))
         })))
@@ -9763,11 +9874,34 @@ fn carry_writes(
 
 /// Delete keys on their holders, holder by holder at once, holding
 /// nothing; how many were there.
+/// A holder's keys deleted in calls of `chunk` at most, each deleted there
+/// with one sync a shard: how many were there and are gone, and the error
+/// that stopped it, if one did. The holder checks a call's keys whole
+/// before it deletes any, so what a stopped call left is the whole of it.
+fn delete_many_in_chunks(
+    n: &crate::wire::Node,
+    collection: &str,
+    keys: &[String],
+    chunk: usize,
+) -> Result<(usize, usize, Result<()>)> {
+    let (mut gone, mut sent) = (0usize, 0usize);
+    for part in keys.chunks(chunk.max(1)) {
+        let (g, stopped) = n.delete_many(collection, part)?;
+        gone += g;
+        if let Err(e) = stopped {
+            return Ok((gone, sent, Err(e)));
+        }
+        sent += part.len();
+    }
+    Ok((gone, sent, Ok(())))
+}
+
 fn carry_deletes(
     collection: &str,
     away: Away<String>,
     remaining: Option<u64>,
     dialer: &Dialer,
+    chunk: usize,
 ) -> Result<usize> {
     let answers: Vec<Result<usize>> = std::thread::scope(|scope| {
         let handles: Vec<_> = away
@@ -9778,7 +9912,24 @@ fn carry_deletes(
                     let _deadline = crate::deadline::arm(remaining);
                     let mut n_deleted = 0;
                     let mut moved = Moved::default();
-                    for k in keys {
+                    // The holder's keys in calls of a chunk each; a holder
+                    // too old to know the call, or a shard that moved under
+                    // the batch, is fed one key at a time from where the
+                    // batch stopped -- a key already gone is gone.
+                    let mut from = 0;
+                    match delete_many_in_chunks(&n, collection, keys, chunk) {
+                        Ok((gone, _, Ok(()))) => return Ok(gone),
+                        Ok((gone, sent, Err(e))) => {
+                            n_deleted = gone;
+                            from = sent;
+                            if moved_to(&e).is_none() {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) if e.to_string().contains("unknown call") => {}
+                        Err(e) => return Err(e),
+                    }
+                    for k in keys.iter().skip(from) {
                         let gone = match n.delete(collection, k) {
                             Ok(gone) => gone,
                             Err(e) => match moved_to(&e) {
@@ -10047,6 +10198,14 @@ mod tests {
                 (0..5).map(|i| Tablet { node: nodes[i].clone(), ..Default::default() }).collect(),
             );
             db.replan_followers("items", 3, 2);
+            // A changed list is a new term; a plan that changes nothing
+            // keeps it.
+            assert!(db.catalog.placement["items"].iter().all(|t| t.term == 1), "no new term");
+            db.replan_followers("items", 3, 2);
+            assert!(
+                db.catalog.placement["items"].iter().all(|t| t.term == 1),
+                "a term for nothing"
+            );
             db.catalog.placement["items"].iter().map(|t| t.followers.clone()).collect::<Vec<_>>()
         };
         let on_0 = plan_on(0);

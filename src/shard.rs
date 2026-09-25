@@ -2677,6 +2677,73 @@ impl Shard {
     /// [`Shard::retain_from`]. A row that is merely *deleted* is not in that
     /// class at the default: an unpinned seal still writes it, so a snapshot
     /// below the delete keeps reading it until a compaction collects.
+    /// `keys` deleted as one: every one live at the instant has its record
+    /// appended, one sync for them all -- or one pending sync under a
+    /// deferring caller -- and is then marked dead, as `delete` marks one.
+    /// All or nothing on the log, as `insert_many` is. A key named twice
+    /// is deleted once; a key not there is not counted. The keys that were
+    /// there, with their instants.
+    pub(crate) fn delete_many(&mut self, keys: &[String]) -> Result<Vec<(String, Timestamp)>> {
+        self.writes.fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
+        let mut seen = BTreeSet::new();
+        let mut prepared: Vec<(WalRecord, Loc)> = Vec::new();
+        for key in keys {
+            if !seen.insert(key.as_str()) {
+                continue;
+            }
+            let Some(prev) = self.locate(key, MAX_TS) else { continue };
+            let record = WalRecord {
+                kind: WAL_DELETE,
+                key: key.clone(),
+                ts: self.clock.now(),
+                doc: None,
+                supersedes: true,
+                segment_id: 0,
+            };
+            prepared.push((record, prev));
+        }
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+        let defer = self.defer_sync;
+        if let Some(w) = self.wal.as_mut() {
+            let mark = w.mark()?;
+            let written: Result<()> = 'log: {
+                for (record, _) in &prepared {
+                    if let Err(e) = w.append(record) {
+                        break 'log Err(e);
+                    }
+                }
+                if defer {
+                    Ok(())
+                } else {
+                    w.sync()
+                }
+            };
+            if let Err(e) = written {
+                let _ = w.rollback(mark);
+                return Err(e);
+            }
+            if defer {
+                let (log, seq) = w.pending();
+                let first = prepared.iter().map(|p| p.0.ts).min().unwrap_or(0);
+                self.clock.begin(first);
+                self.pending.push(PendingSync { log, seq, first });
+            }
+            if let Some(sh) = &self.shipper {
+                for (record, _) in &prepared {
+                    w.ship_after_sync(sh.clone(), ship_item(record));
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(prepared.len());
+        for (record, prev) in prepared {
+            self.mark_superseded(prev, record.ts);
+            out.push((record.key, record.ts));
+        }
+        Ok(out)
+    }
+
     pub fn get(&self, key: &str, t: Timestamp) -> Result<Option<Value>> {
         match self.locate(key, t) {
             None => Ok(None),
@@ -4933,6 +5000,45 @@ mod tests {
         assert_eq!(s.num_docs(u64::MAX), 4);
         // Live from here: a batch moves the copy.
         assert_eq!(s.apply_shipped(&[row(5, 500)]).unwrap(), (true, 500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Many keys deleted as one statement's share: one sync for them all,
+    /// the keys that were there answered, a key named twice or not there
+    /// not counted, and none of them synced under a deferring caller.
+    #[test]
+    fn deletes_of_many_keys_sync_once_and_answer_the_keys_that_were_there() {
+        let dir = std::env::temp_dir().join(format!("celastro-delmany-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for i in 0..12 {
+            s.insert(doc(i)).unwrap();
+        }
+        let key = |i: usize| format!("t{}{KEY_SEP}d{i:04}", i % 3);
+        durability_probe::start();
+        let gone =
+            s.delete_many(&[key(0), key(3), key(0), "t0\u{1}nowhere".to_string(), key(6)]).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!(
+            gone.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![key(0), key(3), key(6)]
+        );
+        assert_eq!(ev.paths(Op::WalSync).len(), 1, "{ev:?}");
+        for i in [0, 3, 6] {
+            assert!(s.get(&key(i), MAX_TS).unwrap().is_none(), "{i} still there");
+        }
+        assert!(s.get(&key(1), MAX_TS).unwrap().is_some());
+        assert!(s.delete_many(&[key(0)]).unwrap().is_empty(), "a dead key deleted again");
+        s.defer_sync = true;
+        durability_probe::start();
+        assert_eq!(s.delete_many(&[key(1), key(4)]).unwrap().len(), 2);
+        assert!(
+            durability_probe::take().paths(Op::WalSync).is_empty(),
+            "synced under a deferring caller"
+        );
+        assert_eq!(s.take_pending().len(), 1);
+        s.defer_sync = false;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

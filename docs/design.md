@@ -791,8 +791,13 @@ catch-up is whole and one cut short starts again from there (0.79.0;
 before it a copy already caught up moved its position with every chunk,
 and a catch-up cut short skipped the rows the chunks after it held).
 
-The map entry of a shard carries a term, raised by every promotion and
-every copy replaced. `PROMOTE SHARD i OF c ON 'follower'` is made on the
+The map entry of a shard carries a term, raised by every promotion,
+every copy replaced, and (0.80.0) every change of holder or followers
+-- a move, a placement, `ALTER ... SET (replicas | regions)` -- so that
+a node that missed the carry takes the change at its next sweep; at an
+equal term two maps' follower lists were never reconciled, and a node
+left behind shipped to a copy that was not there, or never to one that
+was. `PROMOTE SHARD i OF c ON 'follower'` is made on the
 follower: its copy's directory moves beside
 the held ones -- the files are sealed under `shard-NNNN/<name>`
 whether they sit under `followed/` or not, so nothing is re-sealed --
@@ -2211,7 +2216,18 @@ landed, the latest instant and what stopped it, so the coordinator's
 acknowledgement names the rows that did not, and a holder too old to
 know the call is fed one at a time from where the batch stopped.
 Before 0.79.0 the holder wrote a batch one row at a time: one sync a
-row unless group commit folded them. A raised replica count: the DDL carry's target set is
+row unless group commit folded them. A statement's deletes for another
+holder go the same way (`delete_many`, 0.80.0; one call and one sync a
+key before). And a call that writes -- a row, a batch, a delete, a
+forwarded statement -- is sent once: failed after its frame was
+written, it is not sent again over a fresh connection as a read is,
+since it may have landed and again it would land twice; its caller
+hears "after the call was sent: it may have landed there", and the
+coordinator's acknowledgement names the rows to retry; and it goes out
+on a connection shown live within the last quarter second -- an idle
+one is asked with a hello first, so a process gone since is a redial,
+not a frame into a dead socket (0.80.0; before it every call was sent
+again once). A raised replica count: the DDL carry's target set is
 taken after the statement ran as well as before, and a target that
 refuses the `LOCAL ALTER` with "no such collection" is handed the
 definition and the map through the `create_collection` call, which is

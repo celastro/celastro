@@ -101,6 +101,9 @@ fn within_deadline(d: Duration) -> Duration {
 const DIAL_RETRY: Duration = Duration::from_secs(2);
 /// A pooled connection idle longer than this is asked a hello before it
 /// carries a call, within `REVALIDATE_TIMEOUT`.
+/// An idle connection is asked whether it is live before a call that
+/// writes goes out on it, after this long; a read after `POOL_REVALIDATE`.
+const WRITE_REVALIDATE: Duration = Duration::from_millis(250);
 const POOL_REVALIDATE: Duration = Duration::from_secs(10);
 const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Connections a node keeps to one peer.
@@ -170,12 +173,60 @@ enum Call {
     /// stopped it. A holder too old to know the call answers "unknown
     /// call" and is fed one at a time.
     InsertMany = 27,
+    /// `Delete` for many keys of one holder at once, each deleted as
+    /// `Delete` deletes one and the followers' confirmation waited for
+    /// once; the answer carries how many were there, and what stopped it.
+    /// A holder too old to know the call answers "unknown call" and is
+    /// fed one at a time.
+    DeleteMany = 28,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
 }
 
+/// A fault a test asks for: the connection dropped by the caller right
+/// after its frame was sent, once, for one call -- what a holder that
+/// took the call and fell silent looks like from here.
+#[doc(hidden)]
+pub mod fault {
+    use super::Call;
+    use std::sync::Mutex;
+    static DROP_AFTER_SENT: Mutex<Option<String>> = Mutex::new(None);
+    /// Drop the next connection after a frame of the call named `call`
+    /// (as the wire names it: `insert`, `count`, ...) is sent on it.
+    pub fn drop_after_next(call: &str) {
+        *DROP_AFTER_SENT.lock().unwrap_or_else(|p| p.into_inner()) = Some(call.to_string());
+    }
+    pub(super) fn take(call: Call) -> bool {
+        let mut g = DROP_AFTER_SENT.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_deref() == Some(call.name()) {
+            *g = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Call {
+    /// Whether the call may be sent again after it was sent once without an
+    /// answer: a read, or a write the holder applies once however often it
+    /// arrives (a shipped batch is deduplicated by instant).
+    fn idempotent(self) -> bool {
+        !matches!(
+            self,
+            Call::Insert
+                | Call::InsertMany
+                | Call::Delete
+                | Call::DeleteMany
+                | Call::Statement
+                | Call::CreateCollection
+                | Call::BeginMove
+                | Call::AbortMove
+                | Call::FenceMove
+        )
+    }
+
     fn from_u8(b: u8) -> Option<Call> {
         Some(match b {
             1 => Call::Hello,
@@ -196,6 +247,7 @@ impl Call {
             25 => Call::Vote,
             26 => Call::Query,
             27 => Call::InsertMany,
+            28 => Call::DeleteMany,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -229,6 +281,7 @@ impl Call {
             Call::Vote => "vote",
             Call::Query => "query",
             Call::InsertMany => "insert_many",
+            Call::DeleteMany => "delete_many",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -944,7 +997,12 @@ impl Node {
         }
         let idle = slot.last_used.elapsed();
         let guard = &mut slot.stream;
-        if call != Call::Hello && idle > POOL_REVALIDATE {
+        // A call that writes is not sent again once sent, so it goes out
+        // on a connection shown live a moment ago: an idle one is asked
+        // first, and a process gone since is a redial below rather than a
+        // frame into a dead socket and a write reported as maybe landed.
+        let revalidate = if call.idempotent() { POOL_REVALIDATE } else { WRITE_REVALIDATE };
+        if call != Call::Hello && idle > revalidate {
             if let Some(s) = guard.as_mut() {
                 let fresh = s
                     .set_read_timeout(Some(within_deadline(REVALIDATE_TIMEOUT)))
@@ -1015,10 +1073,17 @@ impl Node {
             }
             let s = guard.as_mut().expect("connected above");
             let timeout = deadline_ms.map(|ms| Duration::from_millis(ms.max(1)));
-            let r = s
-                .set_read_timeout(timeout)
-                .and_then(|_| write_frame(s, &req))
-                .and_then(|_| read_frame(s));
+            let mut sent = false;
+            let r = s.set_read_timeout(timeout).and_then(|_| write_frame(s, &req)).and_then(|_| {
+                sent = true;
+                if fault::take(call) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::ConnectionReset,
+                        "dropped after the frame was sent, as a test asked",
+                    ));
+                }
+                read_frame(s)
+            });
             match r {
                 Ok(resp) => {
                     slot.last_used = Instant::now();
@@ -1027,6 +1092,20 @@ impl Node {
                 Err(e) => {
                     *guard = None;
                     let timed_out = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+                    // A call that writes, sent and unanswered, may have
+                    // landed: sent again it would land twice -- a batch of
+                    // rows as new versions, a delete as nothing, a statement
+                    // as whatever it does. Its caller hears it did not
+                    // answer and says so; a call that only reads, or is
+                    // applied once whatever the count, goes again.
+                    if sent && !call.idempotent() {
+                        return Err(Error::Deadline(self.refusal(
+                            call,
+                            collection,
+                            shard,
+                            &format!("after the call was sent ({e}): it may have landed there"),
+                        )));
+                    }
                     if timed_out || attempt >= 2 {
                         // A node that cannot be reached and a node that does
                         // not answer in time are one case at the coordinator:
@@ -1192,6 +1271,23 @@ impl Node {
         put_str(&mut body, key);
         let b = self.call(Call::Delete, collection, 0, &body)?;
         get_bool(&b, &mut 0)
+    }
+
+    /// `keys` deleted on the holder in one call: how many were there and
+    /// are gone (durable there and confirmed on its followers), and the
+    /// error that stopped it, if one did.
+    pub fn delete_many(&self, collection: &str, keys: &[String]) -> Result<(usize, Result<()>)> {
+        let mut body = Vec::new();
+        put_uvarint(&mut body, keys.len() as u64);
+        for k in keys {
+            put_str(&mut body, k);
+        }
+        let b = self.call(Call::DeleteMany, collection, 0, &body)?;
+        let mut i = 0;
+        let gone = get_num(&b, &mut i)?;
+        let stopped =
+            if get_bool(&b, &mut i)? { Ok(()) } else { Err(Error::Plan(get_string(&b, &mut i)?)) };
+        Ok((gone, stopped))
     }
 
     /// Run a statement on the node, which must carry its `LOCAL` prefix so
@@ -2214,6 +2310,32 @@ fn handle(
             let _ = n;
             put_uvarint(&mut out, taken as u64);
             put_ts(&mut out, last);
+            match stopped {
+                None => put_bool(&mut out, true),
+                Some(m) => {
+                    put_bool(&mut out, false);
+                    put_str(&mut out, &m);
+                }
+            }
+            return Ok(out);
+        }
+        Call::DeleteMany => {
+            let mut j = 0;
+            let n = get_count(body, &mut j)?;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                keys.push(get_string(body, &mut j)?);
+            }
+            let (gone, stopped, confirm) = {
+                let d = db.exclusive();
+                let (gone, stopped) = d.deferring(|d| d.delete_many_here(&collection, keys))?;
+                (gone, stopped, d.confirmation())
+            };
+            drop(db);
+            if gone > 0 {
+                confirm.wait()?;
+            }
+            put_uvarint(&mut out, gone as u64);
             match stopped {
                 None => put_bool(&mut out, true),
                 Some(m) => {

@@ -2419,6 +2419,161 @@ fn a_holder_behind_a_promotion_is_fenced_by_the_node_promoted() {
     }
 }
 
+/// A call that writes, sent to its holder and left unanswered, is not sent
+/// again -- it may have landed, and again it would land twice -- and its
+/// caller hears so; a call that only reads goes again.
+#[test]
+fn a_write_sent_and_unanswered_is_not_sent_again_but_a_read_is() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("resend-a");
+    let b = Node::start("resend-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    settle();
+    let count = |n: &Node, sql: &str| {
+        let r = n.query(sql).unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    let row = |id: &str| {
+        Value::obj(vec![("id".into(), Value::Str(id.into())), ("n".into(), Value::Int(1))])
+    };
+    a.db.write().unwrap().insert("items", row("r0001")).unwrap();
+    assert_eq!(count(&b, "SELECT count(*) AS n FROM items"), 1);
+    // The next insert's frame is sent to b and the answer never read.
+    celastro::wire::fault::drop_after_next("insert");
+    let e = a.db.write().unwrap().insert("items", row("r0002")).unwrap_err().to_string();
+    assert!(e.contains("after the call was sent") && e.contains("may have landed"), "{e}");
+    // It landed there -- the frame was read and applied after the caller
+    // gave up -- and once.
+    let mut landed = 0;
+    for _ in 0..50 {
+        landed = count(&b, "SELECT count(*) AS n FROM items WHERE id = 'r0002'");
+        if landed == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(landed, 1, "it landed once");
+    // A read, dropped the same way, is asked again and answers.
+    celastro::wire::fault::drop_after_next("count");
+    assert_eq!(count(&a, "SELECT count(*) AS n FROM items"), 2);
+    let dirs = [a.dir.clone(), b.dir.clone()];
+    drop((a, b));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A changed follower list is a new term, so a node that missed the
+/// change takes it at its next sweep instead of keeping the old list at
+/// an equal term for good.
+#[test]
+fn a_changed_follower_list_is_a_new_term_and_reaches_a_node_that_missed_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("term-a");
+    let b = Node::start("term-b");
+    let c = Node::start("term-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    settle();
+    let map = |n: &Node| {
+        let g = n.db.read().unwrap();
+        g.catalog.placement["items"]
+            .iter()
+            .map(|t| (t.followers.clone(), t.term))
+            .collect::<Vec<_>>()
+    };
+    let before = map(&a);
+    assert!(before.iter().all(|(f, term)| f.len() == 1 && *term == 0), "{before:?}");
+    let (c_url, c_dir) = (c.url.clone(), c.dir.clone());
+    let c_port: u16 = c_url.rsplit(':').next().unwrap().parse().unwrap();
+    drop(c);
+    settle();
+    // The carry does not reach c, and the statement says so; a and b have
+    // the new list.
+    let e = match a.exec("ALTER COLLECTION items SET (replicas = 3)") {
+        Ok(o) => o.finished_with(&a.db).map(|_| String::new()).unwrap_or_else(|e| e.to_string()),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains(&format!("not on {c_url}")), "{e}");
+    let after = map(&a);
+    assert!(after.iter().all(|(f, term)| f.len() == 2 && *term == 1), "{after:?}");
+    // b, attached by a and knowing no peer of its own, cannot place the
+    // holders: it plans nothing rather than an empty list, and takes a's
+    // higher term when it hears from a.
+    assert_eq!(map(&b), before, "b planned from a node list short of the holders");
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    assert_eq!(map(&b), after, "the higher term did not win on b");
+    let c = Node::start_at("term-c", c_port, Some(c_dir));
+    assert_eq!(map(&c), before, "c came back with a newer map than it left with");
+    c.ack(&format!("ATTACH NODE '{}'", a.url));
+    assert_eq!(map(&c), after, "the higher term did not win on c");
+    // A new holder is a new term too.
+    let m = a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", b.url));
+    assert!(m.contains("map switched"), "{m}");
+    for n in [&a, &b, &c] {
+        let g = n.db.read().unwrap();
+        let t = &g.catalog.placement["items"][0];
+        assert_eq!((t.node.as_str(), t.term), (b.url.as_str(), 2), "{}", n.url);
+    }
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A statement's keys for another holder are deleted there as one batch,
+/// with one sync a shard, and every node reads the same after.
+#[test]
+fn a_delete_over_three_holders_goes_as_one_call_each() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("delmany-a");
+    let b = Node::start("delmany-b");
+    let c = Node::start("delmany-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['h', 'p'], nodes = ['{a}', '{b}', '{c}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .replace("{c}", &c.url)
+            .as_str(),
+    );
+    settle();
+    let count = |n: &Node, sql: &str| {
+        let r = n.query(sql).unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    let vals: Vec<String> = (0..30)
+        .map(|i| format!(r#"('{{"id":"{}{i:03}","n":{i}}}')"#, ['a', 'k', 't'][i % 3]))
+        .collect();
+    a.ack(&format!("INSERT INTO items VALUES {}", vals.join(", ")));
+    let m = a.ack("DELETE FROM items WHERE n < 21");
+    assert!(m.starts_with("21 document(s) deleted"), "{m}");
+    for n in [&a, &b, &c] {
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items"), 9, "{}", n.url);
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items WHERE n < 21"), 0, "{}", n.url);
+    }
+    let m = a.ack("DELETE FROM items WHERE n < 21");
+    assert!(m.starts_with("0 document(s) deleted"), "{m}");
+    let dirs = [a.dir.clone(), b.dir.clone(), c.dir.clone()];
+    drop((a, b, c));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A plain `count(*)` is the sum of the holders' live counts, no scan:
 /// it answers what the scanning shape answers, after deletes too, and
 /// the plan says the shards were counted rather than scanned.
@@ -2850,7 +3005,8 @@ fn a_replica_count_raised_hands_the_collection_to_a_follower_that_never_had_it()
     assert!(followers.contains(&b.url) && followers.contains(&c.url), "{cat}");
     let mut ok = false;
     for _ in 0..100 {
-        if c.ack("SHOW HEALTH").contains("follows shard 0 of `items` at term 0: caught up") {
+        // The raised replica count is a new term.
+        if c.ack("SHOW HEALTH").contains("follows shard 0 of `items` at term 1: caught up") {
             ok = true;
             break;
         }
