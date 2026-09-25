@@ -1156,7 +1156,9 @@ struct Head {
     /// The raw query string, without the `?`.
     query: String,
     headers: Vec<(String, String)>,
-    /// Already bounded by [`MAX_BODY`]; see `parse_head`.
+    /// As declared. A statement's body is bounded by [`MAX_BODY`] where it
+    /// is read (`read_body`); an ingest's is read a line at a time and may
+    /// be any length.
     content_length: usize,
 }
 
@@ -1386,16 +1388,18 @@ fn parse_head(text: &str) -> std::result::Result<Head, Reject> {
     })
 }
 
-/// Bound the declared body length *before* anything can treat it as a size to
-/// allocate. A number too large to be a `u64` is over the cap by inspection; it
-/// is not a parse accident to report as a malformed request.
+/// The declared body length. Nothing here allocates from it: a statement's
+/// body is bounded by [`MAX_BODY`] in `read_body`, an ingest's is read a
+/// line at a time, and a refused request's is drained to a cap. A number
+/// too large to be a `u64` is over any cap by inspection; it is not a parse
+/// accident to report as a malformed request.
 fn parse_content_length(v: &str) -> std::result::Result<usize, Reject> {
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
         return Err(Reject::BadRequest);
     }
-    match v.parse::<u64>() {
-        Ok(n) if n <= MAX_BODY as u64 => Ok(n as usize),
-        _ => Err(Reject::PayloadTooLarge),
+    match v.parse::<u64>().ok().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Ok(n),
+        None => Err(Reject::PayloadTooLarge),
     }
 }
 
@@ -1584,6 +1588,9 @@ enum Action {
     Metrics,
     /// Read the body and run the SQL in it; needs `&mut Db`.
     Query,
+    /// Read the body as NDJSON, a document a line, and insert it in batches
+    /// into the collection named; needs `&mut Db` per batch.
+    Ingest(String),
     /// Acknowledge, then stop serving so the caller can close the database.
     Shutdown,
 }
@@ -1627,6 +1634,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             Some("GET")
         }
         "/api/query" | "/api/shutdown" => Some("POST"),
+        p if p.starts_with("/api/ingest/") => Some("POST"),
         _ => None,
     }
 }
@@ -1660,6 +1668,12 @@ fn origin_is_host(origin: &str, host: &str) -> bool {
 fn is_json_media_type(value: &str) -> bool {
     let base = value.split(';').next().unwrap_or("").trim();
     base.eq_ignore_ascii_case("application/json")
+}
+
+fn is_ndjson_media_type(value: &str) -> bool {
+    let base = value.split(';').next().unwrap_or("").trim();
+    base.eq_ignore_ascii_case("application/x-ndjson")
+        || base.eq_ignore_ascii_case("application/jsonl")
 }
 
 /// The cross-site guard on the routes that change something.
@@ -1764,6 +1778,19 @@ fn dispatch_for(
         ("POST", "/api/shutdown") => {
             same_site_post(head, port, reach)?;
             Ok(Action::Shutdown)
+        }
+        ("POST", p) if p.starts_with("/api/ingest/") => {
+            same_site_post(head, port, reach)?;
+            let collection = &p["/api/ingest/".len()..];
+            if collection.is_empty() || collection.contains('/') {
+                return Err(Reject::NotFound);
+            }
+            match head.header("content-type") {
+                Some(v) if is_ndjson_media_type(v) || is_json_media_type(v) => {
+                    Ok(Action::Ingest(collection.to_string()))
+                }
+                _ => Err(Reject::UnsupportedMediaType),
+            }
         }
         _ => match allowed_methods(&head.path) {
             Some(allow) => Err(Reject::MethodNotAllowed(allow)),
@@ -2554,7 +2581,7 @@ fn answer<W: Wire>(
     // ignores the body, and an ignored body is drained rather than left to make
     // the close an RST.
     let action = dispatch_for(&head, token, port, reach);
-    if !matches!(action, Ok(Action::Query)) {
+    if !matches!(action, Ok(Action::Query) | Ok(Action::Ingest(_))) {
         drain(io, head.content_length as u64);
     }
     let served = match action {
@@ -2575,6 +2602,9 @@ fn answer<W: Wire>(
             Served::keep(Response::new(200, "OK", CT_METRICS, metrics_text(&read(db))))
         }
         Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
+        Ok(Action::Ingest(collection)) => {
+            Served::keep(ingest_response(io, &head, &collection, db, dl.body))
+        }
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
     };
     // A HEAD gets the head a GET would have got and not one byte of the body.
@@ -2994,8 +3024,15 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
         }
     }
     let micros = started.elapsed().as_micros() as u64;
+    note_statement(kind, micros, !response.body.starts_with(r#"{"ok":true"#));
+    response
+}
+
+/// Count a statement in the metrics: total, failed, its kind's time and
+/// bucket.
+fn note_statement(kind: usize, micros: u64, failed: bool) {
     COUNTERS.statements.fetch_add(1, AtomicOrdering::Relaxed);
-    if !response.body.starts_with(r#"{"ok":true"#) {
+    if failed {
         COUNTERS.statements_failed.fetch_add(1, AtomicOrdering::Relaxed);
     }
     COUNTERS.statement_micros.fetch_add(micros, AtomicOrdering::Relaxed);
@@ -3011,7 +3048,170 @@ fn run_sql(db: &RwLock<Db>, sql: &str) -> Response {
         }
     }
     COUNTERS.statement_buckets[kind][STATEMENT_BUCKETS.len()].fetch_add(1, AtomicOrdering::Relaxed);
-    response
+}
+
+/// Documents an ingest writes in one statement: the console's own
+/// `INSERT` of this many, which `DbOpts::insert_batch` then syncs in chunks.
+const INGEST_BATCH: usize = 1000;
+
+/// `POST /api/ingest/<collection>`: the body is NDJSON, a document a line,
+/// read a line at a time under the connection's deadline -- so it may be
+/// any length, where a statement's body is bounded -- and written in
+/// batches of [`INGEST_BATCH`], each the `INSERT` a statement of them would
+/// be: through the lock once, group commit, the carry to other holders and
+/// the followers' confirmation, then the persist. The answer counts what
+/// landed. A line that does not parse, or a batch a shard refuses, ends the
+/// ingest there: what was read before it is written first, so the count in
+/// the answer is where a loader resumes, and the error names the line.
+fn ingest_response<W: Wire>(
+    io: &mut W,
+    head: &Head,
+    collection: &str,
+    db: &RwLock<Db>,
+    deadline: Instant,
+) -> Response {
+    // Refused before a line is read: a missing collection would refuse the
+    // first batch after the whole of it was read.
+    if let Err(e) = read(db).catalog.get(collection) {
+        drain(io, head.content_length as u64);
+        return Response::json(error_json(&e.to_string()));
+    }
+    let mut left = head.content_length;
+    let mut line: Vec<u8> = Vec::new();
+    let mut batch: Vec<Value> = Vec::new();
+    let (mut documents, mut batches, mut last_ts) = (0usize, 0usize, 0u64);
+    let (mut lineno, mut batch_first) = (0usize, 1usize);
+    let failed = |io: &mut W, left: usize, msg: String, documents: usize, batches: usize| {
+        drain(io, left as u64);
+        Response::json(format!(
+            r#"{{"ok":false,"error":{},"documents":{documents},"batches":{batches}}}"#,
+            jstr(&msg)
+        ))
+    };
+    loop {
+        // The next line, or the body's end.
+        let mut ended = false;
+        while left > 0 {
+            if let Err(r) = io.arm(deadline) {
+                return r.response();
+            }
+            let buf = match io.fill_buf() {
+                Ok(b) => b,
+                Err(e) => return read_failure(&e).response(),
+            };
+            if buf.is_empty() {
+                // Short of the declared length: the client framed its own
+                // request wrong, or hung up in the middle of it.
+                return Reject::BadRequest.response();
+            }
+            let take = buf.len().min(left);
+            match buf[..take].iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    line.extend_from_slice(&buf[..i]);
+                    io.consume(i + 1);
+                    left -= i + 1;
+                    ended = true;
+                    break;
+                }
+                None => {
+                    line.extend_from_slice(&buf[..take]);
+                    io.consume(take);
+                    left -= take;
+                }
+            }
+            if line.len() > MAX_BODY {
+                let msg = format!("line {}: longer than {} bytes", lineno + 1, MAX_BODY);
+                return failed(io, left, msg, documents, batches);
+            }
+        }
+        let done = !ended && left == 0;
+        if done && line.is_empty() {
+            break;
+        }
+        lineno += 1;
+        let text = String::from_utf8_lossy(&line).trim().to_string();
+        line.clear();
+        if !text.is_empty() {
+            match json::parse(&text) {
+                Ok(doc) => batch.push(doc),
+                Err(e) => {
+                    // What was read before the bad line lands first, so
+                    // the count is where to resume.
+                    let pending = std::mem::take(&mut batch);
+                    if !pending.is_empty() {
+                        match write_batch(db, collection, pending) {
+                            Ok((n, _)) => {
+                                documents += n;
+                                batches += 1;
+                            }
+                            Err(e2) => {
+                                let msg = format!("lines {batch_first}-{}: {e2}", lineno - 1);
+                                return failed(io, left, msg, documents, batches);
+                            }
+                        }
+                    }
+                    let msg = format!("line {lineno}: {e}");
+                    return failed(io, left, msg, documents, batches);
+                }
+            }
+        }
+        if batch.len() >= INGEST_BATCH || (done && !batch.is_empty()) {
+            let pending = std::mem::take(&mut batch);
+            match write_batch(db, collection, pending) {
+                Ok((n, ts)) => {
+                    documents += n;
+                    batches += 1;
+                    last_ts = ts;
+                }
+                Err(e) => {
+                    let msg = format!("lines {batch_first}-{lineno}: {e}");
+                    return failed(io, left, msg, documents, batches);
+                }
+            }
+            batch_first = lineno + 1;
+        }
+        if done {
+            break;
+        }
+    }
+    Response::json(format!(
+        r#"{{"ok":true,"kind":"ingest","documents":{documents},"batches":{batches},"ts":{last_ts}}}"#
+    ))
+}
+
+/// One batch of an ingest, as the console runs an `INSERT`: under the lock
+/// for this node's shards, deferred work with it let go, the persist after,
+/// counted as an insert statement. The documents written and the instant
+/// the acknowledgement names.
+fn write_batch(
+    db: &RwLock<Db>,
+    collection: &str,
+    docs: Vec<Value>,
+) -> std::result::Result<(usize, u64), String> {
+    let started = Instant::now();
+    let n = docs.len();
+    let outcome = {
+        let mut guard = write(db);
+        match guard.insert_documents(collection, docs) {
+            Ok(out @ Outcome::Deferred(_)) => {
+                drop(guard);
+                out.finished_with(db)
+            }
+            other => other,
+        }
+    };
+    let r = match outcome {
+        Ok(Outcome::Ack(m)) => match write(db).persist() {
+            // The acknowledgement names the instant last: "N document(s)
+            // written at ts T".
+            Ok(()) => Ok((n, m.rsplit("ts ").next().and_then(|t| t.parse().ok()).unwrap_or(0))),
+            Err(e) => Err(format!("{m}, but it is not on disk yet: {e}")),
+        },
+        Ok(other) => Err(format!("an insert answered {other:?}")),
+        Err(e) => Err(e.to_string()),
+    };
+    note_statement(1, started.elapsed().as_micros() as u64, r.is_err());
+    r
 }
 
 /// The statement's response, and the [`KINDS`] index it is timed under.
@@ -4826,6 +5026,72 @@ mod tests {
         let (response, next) = serve_request(&mut db, &anonymous);
         assert_eq!(status_line(&response), "HTTP/1.1 401 Unauthorized");
         assert_eq!(next, Next::Serve, "an anonymous request must not stop the console");
+    }
+
+    /// A bulk ingest: NDJSON over the statement's body limit, written in
+    /// batches and counted; a bad line ends it with what came before it
+    /// landed and the line named; the route's refusals.
+    #[test]
+    fn an_ingest_writes_ndjson_in_batches_and_a_bad_line_ends_it_with_the_count_to_resume_at() {
+        let mut db = Db::in_memory();
+        let ok = |db: &mut Db, sql: &str| {
+            let shared = RwLock::new(std::mem::take(db));
+            let r = run_sql(&shared, sql);
+            *db = shared.into_inner().unwrap_or_else(|p| p.into_inner());
+            assert!(r.body.starts_with(r#"{"ok":true"#), "{sql}: {}", r.body);
+            r.body
+        };
+        ok(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+        let request = |body: &str| {
+            format!(
+                "POST /api/ingest/items HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\
+                 Content-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let n = 50_000usize;
+        let body: String =
+            (0..n).map(|i| format!(r#"{{"id":"k{i:05}","n":{i}}}"#)).collect::<Vec<_>>().join("\n");
+        assert!(body.len() > MAX_BODY, "the body must be past a statement's limit");
+        let (response, next) = serve_request(&mut db, &request(&body));
+        assert_eq!(next, Next::Serve);
+        assert!(
+            body_of(&response).contains(r#""documents":50000,"batches":50,"ts":"#),
+            "{response}"
+        );
+        let count = ok(&mut db, "SELECT count(*) FROM items");
+        assert!(count.contains(r#""count(*)":50000"#), "{count}");
+
+        // A bad line: the twenty-five full batches before it and the five
+        // hundred pending lines land, the error names the line.
+        let mut lines: Vec<String> =
+            (0..26_000).map(|i| format!(r#"{{"id":"m{i:05}","n":{i}}}"#)).collect();
+        lines[25_500] = r#"{"id":"#.to_string();
+        let (response, _) = serve_request(&mut db, &request(&lines.join("\n")));
+        let body = body_of(&response);
+        assert!(body.starts_with(r#"{"ok":false,"error":"line 25501: "#), "{body}");
+        assert!(body.ends_with(r#""documents":25500,"batches":26}"#), "{body}");
+        let count = ok(&mut db, "SELECT count(*) FROM items");
+        assert!(count.contains(r#""count(*)":75500"#), "{count}");
+
+        // A collection that is not there is refused before a line is read;
+        // the wrong method and media type at the route.
+        let (response, _) = serve_request(
+            &mut db,
+            &request(r#"{"id":"x"}"#).replace("/api/ingest/items", "/api/ingest/nowhere"),
+        );
+        let body = body_of(&response);
+        assert!(body.starts_with(r#"{"ok":false"#) && !body.contains("documents"), "{body}");
+        let (response, _) = serve_request(
+            &mut db,
+            "GET /api/ingest/items HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\r\n",
+        );
+        assert_eq!(status_line(&response), "HTTP/1.1 405 Method Not Allowed", "{response}");
+        let (response, _) = serve_request(
+            &mut db,
+            &request(r#"{"id":"x"}"#).replace("application/x-ndjson", "text/plain"),
+        );
+        assert_eq!(status_line(&response), "HTTP/1.1 415 Unsupported Media Type", "{response}");
     }
 
     #[test]

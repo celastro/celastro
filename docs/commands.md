@@ -372,6 +372,15 @@ API takes a header only, because a URL is what proxies log). `POST
 prints; an error is `{"ok":false,"error":"..."}` with status 200, so a
 client reads `ok`.
 
+`POST /api/ingest/<collection>` takes NDJSON -- a document a line, as
+`application/x-ndjson` -- of any length: the body is read a line at a
+time and written in batches of a thousand, each the `INSERT` a statement
+of them would be, so a loader streams a file rather than building
+statements under the megabyte a statement may be. The answer counts what
+landed (`documents`, `batches`, the instant `ts`); a line that does not
+parse, or a batch a shard refuses, ends the ingest with what came before
+it written and the line named, so `documents` is where to resume.
+
 `GET /api/metrics` is the Prometheus text format, behind the same token:
 statement, refusal and compaction counters, a latency histogram by the
 statement's kind (`celastro_statement_seconds_bucket{kind=...}`: select,
@@ -383,6 +392,7 @@ chart's `monitoring.enabled`, and a dashboard that draws it.
 ```sh
 T="X-Celastro-Token: $CELASTRO_TOKEN"
 curl -s -H "$T" -H "Content-Type: application/json" http://127.0.0.1:18787/api/query -d '{"sql": "SELECT count(*) FROM notes"}'
+curl -s -H "$T" -H "Content-Type: application/x-ndjson" --data-binary @notes.ndjson http://127.0.0.1:18787/api/ingest/notes
 curl -s http://127.0.0.1:18787/api/health
 curl -s -H "$T" http://127.0.0.1:18787/api/catalog
 curl -s -H "$T" http://127.0.0.1:18787/api/metrics
@@ -391,6 +401,7 @@ curl -s -X POST -H "$T" http://127.0.0.1:18787/api/shutdown
 
 ```json
 {"ok":true,"kind":"rows","count":1,"elapsed_ms":0,"missing":[],"truncated_prefixes":[],"cut_walks":[],"next_cursor":null,"rows":[{"key":"","score":null,"distance":null,"doc":{"count(*)":2}}]}
+{"ok":true,"kind":"ingest","documents":120000,"batches":120,"ts":7333190881139294208}
 {"ok":true,"name":"celastro","version":"0.55.0","source":"https://github.com/celastro/celastro/tree/v0.55.0","license":"AGPL-3.0-only","copyright":"Copyright (C) 2026 celastro","collections":1,"node":null,"attached":0}
 {"ok":true,"collections":[{"name":"notes","primary_key":"id","partition_key":null,"doc_count":4,"indexes":[{"name":"notes_body","path":"body","kind":"fulltext","tier":"active"},...]}]}
 {"ok":true,"kind":"ack","message":"shutting down"}

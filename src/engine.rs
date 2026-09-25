@@ -6492,23 +6492,48 @@ impl Db {
         self.execute_with(sql, &[])
     }
 
+    /// `INSERT INTO collection VALUES ...` with the documents already
+    /// parsed: what the console's ingest endpoint runs per batch, the same
+    /// path as the statement -- this node's shards under the lock, the
+    /// carry to other holders and the followers' confirmation as deferred
+    /// work -- without a statement's text to parse.
+    /// `INSERT INTO collection VALUES ...` with the documents already
+    /// parsed: what the console's ingest endpoint runs per batch, the same
+    /// path as the statement -- this node's shards under the lock, the
+    /// carry to other holders and the followers' confirmation as deferred
+    /// work -- without a statement's text to parse.
+    pub fn insert_documents(&mut self, collection: &str, docs: Vec<Value>) -> Result<Outcome> {
+        self.refuse_if_directory_gone()?;
+        let _deadline = self.arm_default_deadline();
+        self.apply_touches()?;
+        let stmt = Statement::Insert(sql::Insert { collection: collection.to_string(), docs });
+        let out = self.run(stmt, "", &[], false, false);
+        self.apply_touches()?;
+        out
+    }
+
+    /// A directory that vanished under a running node -- unmounted,
+    /// removed, renamed -- must not be written to: the log's descriptor
+    /// still accepts bytes into a file no reopen can find, and that is a
+    /// write acknowledged into nothing. The LOCK this process holds is
+    /// the cheapest witness that the directory is still where it was.
+    fn refuse_if_directory_gone(&self) -> Result<()> {
+        if let Some(dir) = &self.dir {
+            if !dir.join("LOCK").exists() {
+                return Err(Error::Storage(format!(
+                    "the data directory {} is gone (its LOCK is not there); nothing was \
+                     written, and this node should be stopped",
+                    dir.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
         let stmt = sql::parse(sql, params)?;
-        // A directory that vanished under a running node -- unmounted,
-        // removed, renamed -- must not be written to: the log's descriptor
-        // still accepts bytes into a file no reopen can find, and that is a
-        // write acknowledged into nothing. The LOCK this process holds is
-        // the cheapest witness that the directory is still where it was.
         if !Db::is_read(&stmt) {
-            if let Some(dir) = &self.dir {
-                if !dir.join("LOCK").exists() {
-                    return Err(Error::Storage(format!(
-                        "the data directory {} is gone (its LOCK is not there); nothing was \
-                         written, and this node should be stopped",
-                        dir.display()
-                    )));
-                }
-            }
+            self.refuse_if_directory_gone()?;
         }
         // Every statement runs under the default deadline, not only a SELECT
         // (which re-arms with its own WITH). A forwarded write or a DDL that
