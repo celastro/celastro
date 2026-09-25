@@ -774,9 +774,14 @@ impl Server {
                 // The thread that builds seals off the lock exists, so a
                 // due seal may freeze for it.
                 write(db).set_background_seal(true);
-                for step in MAINTAINERS {
+                for (name, step) in MAINTAINER_NAMES.iter().zip(MAINTAINERS) {
                     let stop = stop.clone();
-                    scope.spawn(move || maintenance(db, stop, step));
+                    // Named, so `ps -L` and a trace tell the sealer's and the
+                    // compactor's syscalls from a statement's.
+                    std::thread::Builder::new()
+                        .name(name.to_string())
+                        .spawn_scoped(scope, move || maintenance(db, stop, step))
+                        .expect("a thread for the maintainer");
                 }
             }
             if let Some(every) = reconcile_interval() {
@@ -1800,6 +1805,7 @@ impl Served {
 /// The console's maintenance loops, one thread each: the sealer and the
 /// compactor. Apart, so that no seal waits out a compaction's build.
 const MAINTAINERS: [fn(&RwLock<Db>) -> bool; 2] = [seal_step, compaction_step];
+const MAINTAINER_NAMES: [&str; 2] = ["sealer", "compactor"];
 
 /// One maintenance loop: `step` until the console stops, a second's rest
 /// whenever it finds nothing to do. The console runs two -- seals, and
