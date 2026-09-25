@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.80.0 — 2026-09-25
 
 **A write sent and unanswered is not sent again.** A call to a holder
 that failed after its frame was written -- a connection reset, a holder
