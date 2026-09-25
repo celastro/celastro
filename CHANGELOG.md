@@ -6,6 +6,44 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.78.0 — 2026-09-25
+
+**A restore to any instant.** A backup is exact at its instant and a
+restore was exactly one backup. With `CELASTRO_LOG_ARCHIVE=<dir or
+s3://...>` every held shard's write-ahead log is copied to the
+destination as a seal rotates it -- by the build, off the lock, before
+the install removes it; a seal the archive refuses is tried again with
+the log still on the disk -- and `BACKUP LOG TO '<the same>'` copies the
+live logs now. `RESTORE FROM '<the same>' AS OF <t>` then takes the
+newest backup at or before `t` and replays the archived logs up to it,
+and its answer says how far it reached: `t`, or where the archive ends,
+or a gap where a log was never archived. `AS OF` exactly a backup's
+instant is that backup, as before; `AS OF` any other instant used to be
+refused and now restores the newest backup before it, and says so.
+
+**Facets, snippets, a change stream, a bulk ingest.** `SELECT ... FACET
+path[, path...] [TOP n]` counts the values of each path over the rows
+the predicate admits, on every holder; the console's JSON carries them
+under `facets` and the CLI prints them. `snippet(path, n)` in a select
+list gives `n` of a text field's words around the query's matches, the
+matches marked `<em>`. `GET /api/changes/<collection>?since=<ts>`
+streams a collection's inserts and deletes after an instant, paged
+under one snapshot with the deletes first, `reset` when the log no
+longer reaches that far. `POST /api/ingest/<collection>` takes NDJSON
+of any length, a thousand documents a statement, and a bad line ends
+it with the count to resume at. A query body is still refused above
+1 MiB.
+
+**A token for one collection.** `CELASTRO_SCOPED_TOKENS=<token>=
+<collection>[:ro],...` opens one collection, or every collection
+read-only (`*:ro`), and nothing else: no catalog, no metrics, no
+shutdown, and a statement outside the scope is refused after it is
+parsed. The operator token is as it was.
+
+**Wire version 7.** A scan carries its facet; a holder on an older
+version refuses a `FACET` and says so. Everything else on the wire is
+unchanged, so a mixed cluster upgrades one node at a time as before.
+
 ## 0.77.0 — 2026-09-25
 
 **Writers take their turns in phases.** Since 0.76.0 every writer's
