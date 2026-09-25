@@ -2181,12 +2181,17 @@ transcript); the client answers a retry for the share it withheld or
 with a cookie, and refuses a group it lacks or a share it already
 sent. `openssl s_client -groups P-256:X25519` connects where it was
 refused. Forwarded documents: a statement's rows for another holder go
-as one `insert_many` call, written there as `insert` writes one and
-the followers' confirmation waited for once; the answer carries how
-many landed, the latest instant and what stopped it, so the
-coordinator's acknowledgement names the rows that did not, and a
-holder too old to know the call is fed one at a time from where the
-batch stopped. A raised replica count: the DDL carry's target set is
+as `insert_many` calls of `insert_batch` rows at most, and the holder
+writes each as a statement's own rows are written -- checked whole
+first (the key, the schema, the placement, a move under way, the
+lease), so a refusal is whole and names the row, then each shard's
+share in chunks of `insert_batch` with one sync each -- and the
+followers' confirmation waited for once; the answer carries how many
+landed, the latest instant and what stopped it, so the coordinator's
+acknowledgement names the rows that did not, and a holder too old to
+know the call is fed one at a time from where the batch stopped.
+Before 0.79.0 the holder wrote a batch one row at a time: one sync a
+row unless group commit folded them. A raised replica count: the DDL carry's target set is
 taken after the statement ran as well as before, and a target that
 refuses the `LOCAL ALTER` with "no such collection" is handed the
 definition and the map through the `create_collection` call, which is

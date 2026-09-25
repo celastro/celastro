@@ -6,6 +6,20 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A forwarded batch is written as a statement's own rows are.** Since
+0.66.0 a statement's rows for another holder travelled in one call,
+but the holder wrote them one at a time: one fdatasync a row unless
+group commit folded them, and a row it could not take stopped the
+batch part-way. The holder now checks the batch whole before it writes
+any of it -- the key, the schema, the placement, a move under way, the
+lease -- so a refusal is whole and names the row, and then writes each
+shard's share in chunks of `insert_batch` with one sync each, as it
+writes its own. The coordinator sends its calls in the same chunks, so
+no frame outgrows the wire. Nothing changes on the wire: an older
+holder still takes the same call.
+
 ## 0.78.0 — 2026-09-25
 
 **A restore to any instant.** A backup is exact at its instant and a

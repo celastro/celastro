@@ -5687,8 +5687,8 @@ impl Db {
 
     /// The documents of one statement: the ones this node's shards own go to
     /// each shard in chunks of `DbOpts::insert_batch` -- one WAL sync per
-    /// chunk, not one per document -- and the ones another node owns are
-    /// forwarded one at a time as [`insert`](Self::insert) forwards them. In
+    /// chunk, not one per document -- and the ones another node owns go to
+    /// it in calls of the same chunk, written there the same way. In
     /// statement order within a shard; the last timestamp is what the
     /// acknowledgement names.
     pub fn insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
@@ -5705,6 +5705,7 @@ impl Db {
         let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
         let mut away: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut last = self.last_commit;
+        let chunk = self.opts.insert_batch.max(1);
         for doc in docs {
             let coll = self.catalog.get(collection)?;
             let key = sort_key(coll, &doc)?;
@@ -5727,7 +5728,7 @@ impl Db {
         // holder too old to know the call is fed one at a time.
         for (url, docs) in away {
             let conn = self.node_conn(&url)?;
-            let ts = match conn.insert_many(collection, &docs) {
+            let ts = match insert_many_in_chunks(&conn, collection, &docs, chunk) {
                 Ok((taken, ts, stopped)) => {
                     self.writes += taken as u64;
                     self.last_commit = self.last_commit.max(ts);
@@ -5748,7 +5749,6 @@ impl Db {
             self.last_commit = self.last_commit.max(ts);
             last = last.max(ts);
         }
-        let chunk = self.opts.insert_batch.max(1);
         if !here.is_empty() {
             self.lease_check()?;
         }
@@ -5872,6 +5872,81 @@ impl Db {
         self.note_write(collection, ts);
         self.recent_writes.push((collection.to_string(), index, ts));
         Ok(ts)
+    }
+
+    /// A batch forwarded to this node as the holder, written as a
+    /// statement's own documents are: every document checked first -- its
+    /// key, its schema, that this node holds it, no move under way, the
+    /// lease -- so a refusal is whole and names the document, then each
+    /// shard's share appended in chunks of `insert_batch` with one sync
+    /// each, or one pending sync under a deferring caller. How many
+    /// landed, the latest instant among them, and the error that stopped
+    /// it: at the check nothing has landed; a chunk that fails to append
+    /// leaves the chunks before it landed and the count says so.
+    pub fn insert_many_here(
+        &mut self,
+        collection: &str,
+        docs: Vec<Value>,
+    ) -> Result<(usize, Timestamp, Option<String>)> {
+        let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        for (i, doc) in docs.into_iter().enumerate() {
+            let checked = (|| -> Result<usize> {
+                let coll = self.catalog.get(collection)?;
+                let key = sort_key(coll, &doc)?;
+                coll.validate(&doc)?;
+                if let Some(url) = self.owner_of(collection, &key)? {
+                    return Err(Error::Plan(format!(
+                        "key `{key}` of `{collection}` belongs to the shard on {url}, not to \
+                         this node; the placement maps disagree"
+                    )));
+                }
+                self.refuse_if_moving(collection, &key)?;
+                let shards = self.shards.get(collection).ok_or_else(|| {
+                    Error::Plan(format!("no shard of `{collection}` is on this node"))
+                })?;
+                shards
+                    .iter()
+                    .position(|s| s.owns(&key))
+                    .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))
+            })();
+            match checked {
+                Ok(idx) => here.entry(idx).or_default().push(doc),
+                Err(e) => return Ok((0, 0, Some(format!("document {i}: {e}")))),
+            }
+        }
+        if let Err(e) = self.lease_check() {
+            return Ok((0, 0, Some(e.to_string())));
+        }
+        let chunk = self.opts.insert_batch.max(1);
+        let (mut taken, mut last) = (0usize, 0);
+        for (idx, mut batch) in here {
+            self.wait_for_compaction(collection, idx);
+            while !batch.is_empty() {
+                let tail = batch.split_off(batch.len().min(chunk));
+                let n = batch.len();
+                let (stamps, index) = {
+                    let shards = self.shards.get_mut(collection).expect("checked above");
+                    let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
+                    match Db::on_shard(defer, pending, &mut shards[idx], |s| s.insert_many(batch)) {
+                        Ok(stamps) => (stamps, shards[idx].index),
+                        Err(e) => return Ok((taken, last, Some(e.to_string()))),
+                    }
+                };
+                let mut chunk_last = 0;
+                for ts in stamps {
+                    self.note_write(collection, ts);
+                    last = last.max(ts);
+                    chunk_last = chunk_last.max(ts);
+                }
+                if chunk_last > 0 {
+                    self.recent_writes.push((collection.to_string(), index, chunk_last));
+                }
+                taken += n;
+                batch = tail;
+            }
+        }
+        self.maybe_run_lifecycle()?;
+        Ok((taken, last, None))
     }
 
     /// Inserts and deletes this node has applied or forwarded for a
@@ -7195,9 +7270,11 @@ impl Db {
                 let collection = i.collection.clone();
                 let remaining = crate::deadline::remaining_ms();
                 let dialer = self.dialer();
+                let chunk = self.opts.insert_batch.max(1);
                 let here_n = n - away.values().map(|(_, d)| d.len()).sum::<usize>();
                 Ok(Outcome::Deferred(Deferred::new(move || {
-                    let last = carry_writes(&collection, away, last, here_n, remaining, &dialer)?;
+                    let last =
+                        carry_writes(&collection, away, last, here_n, remaining, &dialer, chunk)?;
                     confirm.wait()?;
                     Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
                 })))
@@ -9484,6 +9561,29 @@ fn carry_statement(
 /// Write documents to their holders, holder by holder at once, holding
 /// nothing; the latest commit instant. A holder that refuses is the
 /// statement's failure, after every holder was tried, naming it.
+/// A holder's documents in calls of `chunk` at most, so no frame outgrows
+/// the wire and the holder syncs each as one: how many it took, the latest
+/// instant among them, and after the ones it took the error that stopped
+/// it, if one did. The holder checks a call's documents whole before it
+/// writes any, so what it took is the calls before the one that stopped.
+fn insert_many_in_chunks(
+    n: &crate::wire::Node,
+    collection: &str,
+    docs: &[Value],
+    chunk: usize,
+) -> Result<(usize, Timestamp, Result<()>)> {
+    let (mut taken, mut last) = (0usize, 0);
+    for part in docs.chunks(chunk.max(1)) {
+        let (t, ts, stopped) = n.insert_many(collection, part)?;
+        taken += t;
+        last = last.max(ts);
+        if let Err(e) = stopped {
+            return Ok((taken, last, Err(e)));
+        }
+    }
+    Ok((taken, last, Ok(())))
+}
+
 fn carry_writes(
     collection: &str,
     away: Away<Value>,
@@ -9491,6 +9591,7 @@ fn carry_writes(
     here_n: usize,
     remaining: Option<u64>,
     dialer: &Dialer,
+    chunk: usize,
 ) -> Result<Timestamp> {
     // Per holder: its url, how many rows it took, and the ts or the error.
     // A statement over several holders is per holder, not all or nothing;
@@ -9505,14 +9606,14 @@ fn carry_writes(
                 let url = url.clone();
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
-                    // The holder's documents in one call and one sync there;
-                    // a holder too old to know the call, or a shard that
-                    // moved under the batch, is fed one at a time from where
-                    // the batch stopped, as before.
+                    // The holder's documents in calls of a chunk each, one
+                    // sync there per shard and chunk; a holder too old to
+                    // know the call, or a shard that moved under the batch,
+                    // is fed one at a time from where the batch stopped.
                     let mut last = 0;
                     let mut moved = Moved::default();
                     let mut taken = 0usize;
-                    match n.insert_many(collection, docs) {
+                    match insert_many_in_chunks(&n, collection, docs, chunk) {
                         Ok((n_taken, ts, Ok(()))) => return (url, n_taken, docs.len(), Ok(ts)),
                         Ok((n_taken, ts, Err(e))) => {
                             taken = n_taken;
@@ -13191,6 +13292,55 @@ mod tests {
     /// them, a manifest. A merge's output is the size of its inputs, and
     /// writing one under the lock held every writer for nine seconds on a
     /// sustained insert load.
+    /// A batch forwarded to this node is checked whole before a byte is
+    /// written, and then written as a statement's own documents are: each
+    /// shard's share in chunks of `insert_batch`, one sync a chunk -- and
+    /// none under the lock of a deferring caller.
+    #[test]
+    fn a_forwarded_batch_is_checked_whole_and_synced_once_per_shard_chunk() {
+        let dir = tmp("batch-here");
+        let mut db = Db::open(&dir, DbOpts { insert_batch: 4, ..DbOpts::default() }).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT NOT NULL) WITH (splits = ['m'])")
+            .unwrap();
+        let doc = |id: &str, n: i64| crate::json::parse(&format!(r#"{{"id":"{id}","n":{n}}}"#)).unwrap();
+        // A document the schema refuses, in the middle: nothing lands, the
+        // answer names it, and no log was touched.
+        let mut docs: Vec<Value> = (0..5).map(|i| doc(&format!("a{i}"), i)).collect();
+        docs.push(crate::json::parse(r#"{"id":"a9"}"#).unwrap());
+        docs.extend((0..4).map(|i| doc(&format!("z{i}"), i)));
+        durability_probe::start();
+        let (taken, last, stopped) = db.insert_many_here("items", docs.clone()).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!((taken, last), (0, 0));
+        let m = stopped.expect("refused");
+        assert!(m.starts_with("document 5: ") && m.contains("NOT NULL"), "{m}");
+        assert!(ev.paths(Op::WalSync).is_empty(), "{ev:?}");
+        assert!(ids(&mut db).is_empty());
+        // Mended: five below 'm' and four above, four a chunk -- two syncs
+        // for the first shard, one for the second.
+        docs.remove(5);
+        durability_probe::start();
+        let (taken, last, stopped) = db.insert_many_here("items", docs.clone()).unwrap();
+        let ev = durability_probe::take();
+        assert_eq!((taken, stopped), (9, None));
+        assert!(last > 0);
+        assert_eq!(ev.paths(Op::WalSync).len(), 3, "{ev:?}");
+        assert_eq!(ids(&mut db).len(), 9);
+        // Under a deferring caller, as the wire's handler is: nothing synced
+        // under the lock, everything once the confirmation is waited for.
+        let more: Vec<Value> = (10..14).map(|i| doc(&format!("a{i}"), i)).collect();
+        durability_probe::start();
+        let (taken, _, stopped) = db.deferring(|db| db.insert_many_here("items", more)).unwrap();
+        assert_eq!((taken, stopped), (4, None));
+        assert!(durability_probe::take().paths(Op::WalSync).is_empty(), "synced under the lock");
+        durability_probe::start();
+        db.confirmation().wait().unwrap();
+        assert_eq!(durability_probe::take().paths(Op::WalSync).len(), 1);
+        assert_eq!(ids(&mut db).len(), 13);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn seals_and_compactions_write_their_segments_before_the_lock() {
         let dir = tmp("offlock");

@@ -2191,24 +2191,11 @@ fn handle(
         Call::InsertMany => {
             let docs = get_values(body, &mut 0)?;
             let n = docs.len();
+            // Written as a statement's own documents are: checked whole,
+            // then each shard's share in chunks with one sync each.
             let (taken, last, stopped, confirm) = {
                 let d = db.exclusive();
-                let (taken, last, stopped) = d.deferring(|d| {
-                    let (mut taken, mut last, mut stopped) = (0usize, 0, None);
-                    for doc in docs {
-                        match d.insert_here(&collection, doc) {
-                            Ok(ts) => {
-                                taken += 1;
-                                last = last.max(ts);
-                            }
-                            Err(e) => {
-                                stopped = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    Ok((taken, last, stopped))
-                })?;
+                let (taken, last, stopped) = d.deferring(|d| d.insert_many_here(&collection, docs))?;
                 (taken, last, stopped, d.confirmation())
             };
             drop(db);

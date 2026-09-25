@@ -2315,6 +2315,59 @@ fn an_insert_refused_by_one_holder_says_which_rows_landed() {
     let _ = std::fs::remove_dir_all(&b_dir);
 }
 
+/// A statement's documents for another holder go there as one batch, and
+/// the holder checks the batch whole before it writes any of it: a
+/// document it cannot take refuses that holder's share whole and names
+/// it, while the shares the other holders took have landed.
+#[test]
+fn a_statement_over_three_holders_lands_whole_and_a_bad_document_refuses_its_holders_share() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("batch-a");
+    let b = Node::start("batch-b");
+    let c = Node::start("batch-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT NOT NULL) WITH (splits = ['h', 'p'], nodes = ['{a}', '{b}', '{c}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .replace("{c}", &c.url)
+            .as_str(),
+    );
+    settle();
+    let count = |n: &Node, sql: &str| {
+        let r = n.query(sql).unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    // Thirty documents in one statement, ten a holder.
+    let vals: Vec<String> = (0..30)
+        .map(|i| format!(r#"('{{"id":"{}{i:03}","n":{i}}}')"#, ['a', 'k', 't'][i % 3]))
+        .collect();
+    let m = a.ack(&format!("INSERT INTO items VALUES {}", vals.join(", ")));
+    assert!(m.starts_with("30 document(s) written"), "{m}");
+    for n in [&a, &b, &c] {
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items"), 30, "{}", n.url);
+    }
+    // One of c's three omits a NOT NULL column: c's share is refused whole
+    // and the answer says which document; a's and b's shares landed.
+    let sql = r#"INSERT INTO items VALUES ('{"id":"a900","n":1}'), ('{"id":"k900","n":2}'), ('{"id":"t900","n":3}'), ('{"id":"t901"}'), ('{"id":"t902","n":5}')"#;
+    let e = a.exec(sql).unwrap().finished_with(&a.db).unwrap_err().to_string();
+    assert!(e.contains(&format!("NOT written: 3 on {}", c.url)), "{e}");
+    assert!(e.contains("document 1: ") && e.contains("NOT NULL"), "{e}");
+    assert!(e.contains(&format!("written: 1 here, 1 on {}", b.url)), "{e}");
+    for n in [&a, &b, &c] {
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items"), 32, "{}", n.url);
+        assert_eq!(count(n, "SELECT count(*) AS n FROM items WHERE id >= 'p'"), 10, "{}", n.url);
+    }
+    let dirs = [a.dir.clone(), b.dir.clone(), c.dir.clone()];
+    drop((a, b, c));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A plain `count(*)` is the sum of the holders' live counts, no scan:
 /// it answers what the scanning shape answers, after deletes too, and
 /// the plan says the shards were counted rather than scanned.

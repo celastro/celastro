@@ -2463,8 +2463,8 @@ impl Shard {
             // makes it *on* the disk. Per document here, because the unit that
             // is promised is the statement and this statement is one document;
             // `insert_many` syncs once for a statement of many, which is the
-            // same promise. A sync that covered every document since the last
-            // one, across statements, would be group commit, and is not here.
+            // same promise; a sync that covers every document since the last
+            // one, across statements, is group commit, deferred by the caller.
             //
             // It also sits above the mutations below rather than after them,
             // so a sync that fails returns `Err` with the in-memory shard
