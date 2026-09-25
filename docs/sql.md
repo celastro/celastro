@@ -507,8 +507,11 @@ disk alone), and every copy this node follows.
 `PROMOTE SHARD i OF c ON 'follower'` makes a follower the holder at the
 next term -- what to run when a holder is lost, from any node; the
 follower answers every acknowledged row -- and the old holder, back,
-demotes its copy and follows. With `CELASTRO_AUTO_FAILOVER=on` the
-steward does it once a holder has missed two sweeps.
+demotes its copy and follows. A copy that is not caught up is refused
+-- promoted, what it lacks would be lost -- unless the statement ends
+in `FORCE`, which takes it as it is. With `CELASTRO_AUTO_FAILOVER=on`
+the steward does it once a holder has missed two sweeps, caught-up
+copies only.
 
 ```sql
 PROMOTE SHARD 1 OF notes ON 'tcp://127.0.0.1:7879';

@@ -2250,8 +2250,11 @@ fn a_demoted_holder_is_cut_at_what_was_confirmed_and_follows_from_there() {
     a.ack(&format!("ATTACH NODE '{}'", b.url));
     assert_eq!(a.local_shards("items"), Vec::<usize>::new(), "demoted at the attach");
     let (caught_up, at) = {
-        let followed = a.db.read().unwrap().followed();
-        celastro::engine::follower_status(&followed, "items", 0, 1).unwrap()
+        let (followed, held) = {
+            let g = a.db.read().unwrap();
+            (g.followed(), g.held_terms())
+        };
+        celastro::engine::follower_status(&followed, &held, "items", 0, 1).unwrap()
     };
     assert!(caught_up && at > 0, "the demoted copy was not cut at a confirmed instant ({at})");
     let mut live = false;
@@ -2362,6 +2365,54 @@ fn a_statement_over_three_holders_lands_whole_and_a_bad_document_refuses_its_hol
     }
     let dirs = [a.dir.clone(), b.dir.clone(), c.dir.clone()];
     drop((a, b, c));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A holder behind a promotion it has not heard of ships its next write
+/// to the node promoted, which answers with the higher term: the write is
+/// refused, not acknowledged on the old holder's disk alone -- the fence.
+#[test]
+fn a_holder_behind_a_promotion_is_fenced_by_the_node_promoted() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fence-a");
+    let b = Node::start("fence-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+        .replace("{a}", &a.url)
+        .replace("{b}", &b.url)
+        .as_str());
+    // b live as the follower of shard 0, so a's writes wait for it.
+    let mut live = false;
+    for _ in 0..100 {
+        a.ack(r#"INSERT INTO items VALUES ('{"id":"d0001","n":1}')"#);
+        if a.ack("SHOW HEALTH").contains(&format!("follower {} live", b.url)) {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(live, "b never came live");
+    // Promoted at b, carried to nobody: a still holds shard 0 at term 0.
+    let m = b.ack(&format!("LOCAL PROMOTE SHARD 0 OF items ON '{}' TERM 1", b.url));
+    assert!(m.contains("promoted here at term 1"), "{m}");
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(5000);
+    let e = a
+        .exec(r#"INSERT INTO items VALUES ('{"id":"d0900","n":900}')"#)
+        .unwrap()
+        .finished_with(&a.db)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("behind a promotion") && e.contains("term 1"), "{e}");
+    let r = b.query("SELECT count(*) AS n FROM items WHERE id = 'd0900'").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(0));
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("term 1"), "{h}");
+    let dirs = [a.dir.clone(), b.dir.clone()];
+    drop((a, b));
     settle();
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);

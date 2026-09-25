@@ -1029,7 +1029,7 @@ pub struct Db {
     pub catalog: Catalog,
     shards: BTreeMap<String, Vec<Shard>>,
     /// The shards this node follows -- a copy of each, fed by the holder's
-    /// log, under `follow-NNNN` beside the held ones -- with the term each
+    /// log, under `followed/shard-NNNN` beside the held ones -- with the term each
     /// follows at. Behind a lock of their own, shared with the wire, so a
     /// holder's batch is applied without this node's lock: a write
     /// forwarded from here under this lock waits for that holder, which
@@ -1037,6 +1037,11 @@ pub struct Db {
     /// close the cycle. Not read by any statement; a promotion makes one
     /// a held shard.
     followed: Followed,
+    /// The shards this node holds, at the term each is held at, shared
+    /// with the wire as the copies are: what a holder behind a promotion
+    /// is answered when it ships to the node promoted -- the higher term,
+    /// which fences it -- rather than "does not follow".
+    held_terms: HeldTerms,
     /// Each known node's region, as its hello said; this node's own
     /// under its address. Not persisted: a hello brings it back.
     regions: BTreeMap<String, String>,
@@ -1186,6 +1191,7 @@ impl Db {
             catalog: Catalog::default(),
             shards: BTreeMap::new(),
             followed: Arc::new(Mutex::new(BTreeMap::new())),
+            held_terms: Arc::new(Mutex::new(BTreeMap::new())),
             recent_writes: Vec::new(),
             defer_syncs: false,
             pending_syncs: Vec::new(),
@@ -4632,7 +4638,15 @@ impl Db {
                         doc: None,
                     });
                 } else {
-                    items.extend(s.deletes_since(from));
+                    // The follower stands at `from` until the catch-up is
+                    // whole: the chunks come in key order.
+                    items.push(crate::replication::ShipItem {
+                        kind: crate::replication::SHIP_CATCHING_UP,
+                        key: String::new(),
+                        ts: from,
+                        doc: None,
+                    });
+                    items.extend(s.deletes_since(from, upto));
                 }
             }
             let from = if reset { 0 } else { from };
@@ -4665,6 +4679,24 @@ impl Db {
     }
 
     /// The followed copies, shared with the wire.
+    /// The terms this node holds its shards at, shared with the wire.
+    pub fn held_terms(&self) -> HeldTerms {
+        self.held_terms.clone()
+    }
+
+    /// `held_terms` from the map: every tablet placed here, at its term.
+    fn refresh_held_terms(&self) {
+        let mut h = self.held_terms.lock().unwrap_or_else(|p| p.into_inner());
+        h.clear();
+        for (name, tablets) in &self.catalog.placement {
+            for (i, t) in tablets.iter().enumerate() {
+                if self.is_self(&t.node) && !t.is_merged() {
+                    h.insert((name.clone(), i), t.term);
+                }
+            }
+        }
+    }
+
     pub fn followed(&self) -> Followed {
         self.followed.clone()
     }
@@ -4685,6 +4717,7 @@ impl Db {
         shard: usize,
         node: &str,
         term: Option<u64>,
+        force: bool,
         local: bool,
     ) -> Result<Outcome> {
         let _deadline = self.arm_default_deadline();
@@ -4751,8 +4784,10 @@ impl Db {
                 )));
             }
             let conn = self.node_conn(node)?;
-            let sql =
-                format!("LOCAL PROMOTE SHARD {shard} OF {collection} ON '{node}' TERM {new_term}");
+            let sql = format!(
+                "LOCAL PROMOTE SHARD {shard} OF {collection} ON '{node}' TERM {new_term}{}",
+                if force { " FORCE" } else { "" }
+            );
             let remaining = crate::deadline::remaining_ms();
             return Ok(Outcome::Deferred(Deferred::new(move || {
                 let _deadline = crate::deadline::arm(remaining);
@@ -4761,7 +4796,7 @@ impl Db {
         }
         // This node is promoted: its copy becomes the shard, then everyone
         // hears.
-        self.promote_here(collection, shard, &t, new_term)?;
+        self.promote_here(collection, shard, &t, new_term, force)?;
         let new = self.catalog.placement.get(collection).cloned().unwrap_or_default();
         let peers = self.every_peer(&new)?;
         let switch = Switch {
@@ -4933,6 +4968,7 @@ impl Db {
         shard: usize,
         t: &Tablet,
         term: u64,
+        force: bool,
     ) -> Result<()> {
         let dir = self
             .dir
@@ -4949,6 +4985,20 @@ impl Db {
             )));
         };
         let (caught_up, at, copy_term) = (copy.shard.caught_up, copy.shard.ship_ts, copy.term);
+        // A copy not caught up lacks writes the holder acknowledged: taken
+        // as the shard, they are lost. Refused unless said; the steward
+        // promotes caught-up copies only.
+        if !caught_up && !force {
+            self.followed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert((collection.to_string(), shard), copy);
+            return Err(Error::Plan(format!(
+                "the copy of shard {shard} of `{collection}` on this node is not caught up (it \
+                 stands at ts {at}): promoted, what it lacks is lost; PROMOTE ... FORCE takes \
+                 it as it is"
+            )));
+        }
         // The copy closes and its files stay: they are the shard now. (It
         // was retired here, which unlinks every sealed segment the
         // manifest names, and the first promotion of a copy with a sealed
@@ -5129,6 +5179,9 @@ impl Db {
                     sh
                 }
                 None => {
+                    // From nothing: the mark the copy kept says nothing
+                    // now, and a reopen must not read it as caught up.
+                    let _ = fs::remove_file(to.join("SHIPPED"));
                     let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
                     sh.caught_up = false;
                     sh.ship_ts = 0;
@@ -5579,6 +5632,7 @@ impl Db {
             self.ensure_followed(&n)?;
         }
         self.refresh_shippers();
+        self.refresh_held_terms();
         if let Some(dir) = &self.dir {
             let bytes = self.persisted_catalog().encode();
             let p = dir.join("CATALOG");
@@ -6768,7 +6822,7 @@ impl Db {
         // Not on a reset, which rebuilds from nothing.
         if cursor.is_none() && !reset {
             for s in shards.iter() {
-                items.extend(s.deletes_since(since));
+                items.extend(s.deletes_since(since, upto));
             }
         }
         let mut next = None;
@@ -7049,8 +7103,8 @@ impl Db {
         if let Statement::MergeShards { collection, a, b } = &stmt {
             return self.merge_shards(collection, *a, *b, local);
         }
-        if let Statement::PromoteShard { collection, shard, node, term } = &stmt {
-            return self.promote_shard(collection, *shard, node, *term, local);
+        if let Statement::PromoteShard { collection, shard, node, term, force } = &stmt {
+            return self.promote_shard(collection, *shard, node, *term, *force, local);
         }
         if let Statement::ReplaceCopy { collection, shard, node, with, term } = &stmt {
             return self.replace_copy(collection, *shard, node, with, *term, local);
@@ -7540,8 +7594,8 @@ impl Db {
                 Statement::MergeShards { collection, a, b } => {
                     self.merge_shards(&collection, a, b, true)
                 }
-                Statement::PromoteShard { collection, shard, node, term } => {
-                    self.promote_shard(&collection, shard, &node, term, true)
+                Statement::PromoteShard { collection, shard, node, term, force } => {
+                    self.promote_shard(&collection, shard, &node, term, force, true)
                 }
                 Statement::ReplaceCopy { collection, shard, node, with, term } => {
                     self.replace_copy(&collection, shard, &node, &with, term, true)
@@ -7554,8 +7608,8 @@ impl Db {
             Statement::MergeShards { collection, a, b } => {
                 self.merge_shards(&collection, a, b, false)
             }
-            Statement::PromoteShard { collection, shard, node, term } => {
-                self.promote_shard(&collection, shard, &node, term, false)
+            Statement::PromoteShard { collection, shard, node, term, force } => {
+                self.promote_shard(&collection, shard, &node, term, force, false)
             }
             Statement::ReplaceCopy { collection, shard, node, with, term } => {
                 self.replace_copy(&collection, shard, &node, &with, term, false)
@@ -9274,6 +9328,26 @@ pub struct FollowedShard {
 /// own: the wire applies a holder's batch under this lock and no other.
 pub type Followed = Arc<Mutex<BTreeMap<(String, usize), FollowedShard>>>;
 
+/// The shards a node holds, at their terms, by `(collection, shard)`:
+/// what the wire answers a shipper whose copy this node no longer keeps.
+pub type HeldTerms = Arc<Mutex<BTreeMap<(String, usize), u64>>>;
+
+/// The refusal for a shipper of `term` whose copy this node does not
+/// keep: the term this node holds the shard at when that is higher -- a
+/// promotion the shipper has not seen, which fences it -- or plainly
+/// that it does not follow.
+fn not_followed(held: &HeldTerms, collection: &str, shard: usize, term: u64) -> Error {
+    let key = (collection.to_string(), shard);
+    let mine = held.lock().unwrap_or_else(|p| p.into_inner()).get(&key).copied();
+    Error::Plan(match mine {
+        Some(t) if t > term => format!(
+            "shard {shard} of `{collection}`: this node holds it at term {t}, the shipper is \
+             term {term}"
+        ),
+        _ => format!("this node does not follow shard {shard} of `{collection}`"),
+    })
+}
+
 /// The followed copies of one collection, for a definition that reaches
 /// them; a guard with the lock.
 fn followed_of<'a>(f: &'a Followed, collection: &str) -> FollowedOf<'a> {
@@ -9310,15 +9384,16 @@ impl FollowedOf<'_> {
 /// stands. The first item may say to start from nothing.
 pub fn apply_shipped(
     followed: &Followed,
+    held: &HeldTerms,
     collection: &str,
     shard: usize,
     term: u64,
     items: &[crate::replication::ShipItem],
 ) -> Result<(bool, Timestamp)> {
     let mut g = followed.lock().unwrap_or_else(|p| p.into_inner());
-    let f = g.get_mut(&(collection.to_string(), shard)).ok_or_else(|| {
-        Error::Plan(format!("this node does not follow shard {shard} of `{collection}`"))
-    })?;
+    let f = g
+        .get_mut(&(collection.to_string(), shard))
+        .ok_or_else(|| not_followed(held, collection, shard, term))?;
     if f.term != term {
         return Err(Error::Plan(format!(
             "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
@@ -9338,14 +9413,15 @@ pub fn apply_shipped(
 /// Where a copy this node follows stands.
 pub fn follower_status(
     followed: &Followed,
+    held: &HeldTerms,
     collection: &str,
     shard: usize,
     term: u64,
 ) -> Result<(bool, Timestamp)> {
     let g = followed.lock().unwrap_or_else(|p| p.into_inner());
-    let f = g.get(&(collection.to_string(), shard)).ok_or_else(|| {
-        Error::Plan(format!("this node does not follow shard {shard} of `{collection}`"))
-    })?;
+    let f = g
+        .get(&(collection.to_string(), shard))
+        .ok_or_else(|| not_followed(held, collection, shard, term))?;
     if f.term != term {
         return Err(Error::Plan(format!(
             "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
@@ -13300,9 +13376,12 @@ mod tests {
     fn a_forwarded_batch_is_checked_whole_and_synced_once_per_shard_chunk() {
         let dir = tmp("batch-here");
         let mut db = Db::open(&dir, DbOpts { insert_batch: 4, ..DbOpts::default() }).unwrap();
-        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT NOT NULL) WITH (splits = ['m'])")
-            .unwrap();
-        let doc = |id: &str, n: i64| crate::json::parse(&format!(r#"{{"id":"{id}","n":{n}}}"#)).unwrap();
+        db.execute(
+            "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT NOT NULL) WITH (splits = ['m'])",
+        )
+        .unwrap();
+        let doc =
+            |id: &str, n: i64| crate::json::parse(&format!(r#"{{"id":"{id}","n":{n}}}"#)).unwrap();
         // A document the schema refuses, in the middle: nothing lands, the
         // answer names it, and no log was touched.
         let mut docs: Vec<Value> = (0..5).map(|i| doc(&format!("a{i}"), i)).collect();
@@ -13329,6 +13408,7 @@ mod tests {
         // Under a deferring caller, as the wire's handler is: nothing synced
         // under the lock, everything once the confirmation is waited for.
         let more: Vec<Value> = (10..14).map(|i| doc(&format!("a{i}"), i)).collect();
+        db.set_group_commit(true);
         durability_probe::start();
         let (taken, _, stopped) = db.deferring(|db| db.insert_many_here("items", more)).unwrap();
         assert_eq!((taken, stopped), (4, None));
@@ -13337,6 +13417,83 @@ mod tests {
         db.confirmation().wait().unwrap();
         assert_eq!(durability_probe::take().paths(Op::WalSync).len(), 1);
         assert_eq!(ids(&mut db).len(), 13);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A copy not caught up lacks writes the holder acknowledged: a
+    /// promotion of it is refused unless said, and the copy stays a copy.
+    #[test]
+    fn a_promotion_refuses_a_copy_not_caught_up_unless_forced() {
+        let dir = tmp("promote-stale");
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        opts.statement_deadline_ms = Some(500);
+        let mut db = Db::open(&dir, opts).unwrap();
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![Tablet {
+                node: "tcp://127.0.0.1:2".into(),
+                followers: vec!["tcp://127.0.0.1:1".into()],
+                ..Default::default()
+            }],
+        );
+        db.ensure_followed("items").unwrap();
+        let e =
+            db.execute("PROMOTE SHARD 0 OF items ON 'tcp://127.0.0.1:1'").unwrap_err().to_string();
+        assert!(e.contains("not caught up") && e.contains("FORCE"), "{e}");
+        assert!(
+            db.followed().lock().unwrap().contains_key(&("items".to_string(), 0)),
+            "the copy went"
+        );
+        let m = match db.execute("PROMOTE SHARD 0 OF items ON 'tcp://127.0.0.1:1' FORCE").unwrap() {
+            Outcome::Ack(m) => m,
+            other => match other.finished() {
+                Ok(Outcome::Ack(m)) => m,
+                Ok(o) => panic!("{o:?}"),
+                Err(e) => e.to_string(),
+            },
+        };
+        assert!(m.contains("promoted here"), "{m}");
+        assert!(!db.followed().lock().unwrap().contains_key(&("items".to_string(), 0)));
+        assert_eq!(db.held_terms().lock().unwrap().get(&("items".to_string(), 0)), Some(&1));
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A catch-up's first chunk names where the follower stands, then the
+    /// deletes since then up to the cut, then the rows.
+    #[test]
+    fn a_catch_up_first_names_where_the_follower_stands() {
+        use crate::replication::{SHIP_CATCHING_UP, SHIP_CAUGHT_UP, SHIP_DELETE, SHIP_INSERT};
+        let dir = tmp("catchup-marker");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        for i in 0..6 {
+            db.execute(&format!(r#"INSERT INTO items VALUES ('{{"id":"k{i}","n":{i}}}')"#))
+                .unwrap();
+        }
+        let from = db.last_commit_ts();
+        db.execute("DELETE FROM items WHERE id = 'k1'").unwrap();
+        db.execute(r#"INSERT INTO items VALUES ('{"id":"k6","n":6}')"#).unwrap();
+        let sh = crate::replication::Shipper::with_live_follower("tcp://127.0.0.1:9");
+        sh.set_catching_up("tcp://127.0.0.1:9", from);
+        db.shards.get_mut("items").unwrap()[0].shipper = Some(sh.clone());
+        assert_eq!(db.replication_step(), 1);
+        let items = sh.catchup_items();
+        let kinds: Vec<u8> = items.iter().map(|i| i.0).collect();
+        assert_eq!(
+            kinds,
+            vec![SHIP_CATCHING_UP, SHIP_DELETE, SHIP_INSERT, SHIP_CAUGHT_UP],
+            "{items:?}"
+        );
+        assert_eq!(items[0].2, from);
+        assert_eq!(items[1].1, "k1");
+        assert_eq!(items[2].1, "k6");
+        assert!(items[3].2 > from);
         drop(db);
         let _ = fs::remove_dir_all(&dir);
     }

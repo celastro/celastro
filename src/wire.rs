@@ -1685,11 +1685,12 @@ pub fn serve(
             })
             .expect("a thread for the replication driver");
     }
-    let (moves, followed, lease, identity) = {
+    let (moves, followed, held, lease, identity) = {
         let g = db.read().unwrap_or_else(|p| p.into_inner());
         (
             g.moves(),
             g.followed(),
+            g.held_terms(),
             g.lease(),
             Arc::new(Identity {
                 node: g.node().map(String::from),
@@ -1740,12 +1741,15 @@ pub fn serve(
                 let stop = stop.clone();
                 let moves = moves.clone();
                 let followed = followed.clone();
+                let held = held.clone();
                 let lease = lease.clone();
                 let identity = identity.clone();
                 let open = open.clone();
                 open.fetch_add(1, Ordering::Relaxed);
                 std::thread::spawn(move || {
-                    serve_connection(s, &db, &moves, &followed, &lease, &identity, &stop, idle);
+                    serve_connection(
+                        s, &db, &moves, &followed, &held, &lease, &identity, &stop, idle,
+                    );
                     open.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -1783,6 +1787,7 @@ fn serve_connection(
     db: &RwLock<Db>,
     moves: &Moves,
     followed: &crate::engine::Followed,
+    held: &crate::engine::HeldTerms,
     lease: &crate::engine::Lease,
     identity: &Identity,
     stop: &AtomicBool,
@@ -1816,7 +1821,7 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, followed, lease, identity, &frame) {
+        match handle(db, moves, followed, held, lease, identity, &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -1891,6 +1896,7 @@ fn handle(
     db: &RwLock<Db>,
     moves: &Moves,
     followed: &crate::engine::Followed,
+    held: &crate::engine::HeldTerms,
     lease: &crate::engine::Lease,
     identity: &Identity,
     frame: &[u8],
@@ -1975,7 +1981,7 @@ fn handle(
                 items.push(crate::replication::ShipItem { kind, key, ts, doc });
             }
             let (caught_up, at) =
-                crate::engine::apply_shipped(followed, &collection, shard, term, &items)?;
+                crate::engine::apply_shipped(followed, held, &collection, shard, term, &items)?;
             put_bool(&mut out, caught_up);
             put_ts(&mut out, at);
             return Ok(out);
@@ -1983,7 +1989,7 @@ fn handle(
         Call::ShipStatus => {
             let term = get_u64(body, &mut 0).ok_or_else(truncated)?;
             let (caught_up, at) =
-                crate::engine::follower_status(followed, &collection, shard, term)?;
+                crate::engine::follower_status(followed, held, &collection, shard, term)?;
             put_bool(&mut out, caught_up);
             put_ts(&mut out, at);
             return Ok(out);
@@ -2195,7 +2201,8 @@ fn handle(
             // then each shard's share in chunks with one sync each.
             let (taken, last, stopped, confirm) = {
                 let d = db.exclusive();
-                let (taken, last, stopped) = d.deferring(|d| d.insert_many_here(&collection, docs))?;
+                let (taken, last, stopped) =
+                    d.deferring(|d| d.insert_many_here(&collection, docs))?;
                 (taken, last, stopped, d.confirmation())
             };
             drop(db);

@@ -782,7 +782,14 @@ acknowledgement: the write goes to the holder's disk alone, `SHOW
 HEALTH` says `DEGRADED`, and the copy is caught up when it answers,
 which is what makes two copies usable rather than three. A live delete
 applied before an older row the catch-up carries would let the row come
-back, so live records are held back until the catch-up is whole.
+back, so live records are held back until the catch-up is whole; and
+since the catch-up comes in key order and the backlog after it in log
+order, a delete kills the version live at its own instant and no newer
+one, and a catch-up begins by naming where the follower stands
+(`SHIP_CATCHING_UP`), so the copy holds that position until the
+catch-up is whole and one cut short starts again from there (0.79.0;
+before it a copy already caught up moved its position with every chunk,
+and a catch-up cut short skipped the rows the chunks after it held).
 
 The map entry of a shard carries a term, raised by every promotion and
 every copy replaced. `PROMOTE SHARD i OF c ON 'follower'` is made on the
@@ -795,10 +802,21 @@ higher term wins wherever two maps disagree: the old holder, reached now
 or by the next sweep, demotes its copy and is caught up from nothing by
 the new holder, so what it took after the promotion goes -- and nothing
 it took was acknowledged, because its follower, the node promoted,
-answers its log with the new term and a write is not acknowledged
-without it. That is the fence, and it needs no consensus: a promotion
-can only be made where a caught-up copy is, and the old holder cannot
-acknowledge without that copy. The catch-up is shipped under the
+answers its log with the new term -- "holds it at term 2", or a
+follower's "follows term 2" -- and a copy answering a higher term
+fences the old holder: from that answer on, nothing it writes is
+acknowledged, whatever the confirmation rule, until the map demotes
+it (0.79.0; before it the answer only dropped the copy from the count,
+and the write was acknowledged on the old holder's disk alone, as a
+write is when a follower is merely away). That is the fence, and it
+needs no consensus: a promotion can only be made where a caught-up copy
+is -- `PROMOTE` refuses one that is not, unless told `FORCE` -- and
+the old holder cannot acknowledge once that copy has answered. What
+the fence does not cover is the old holder cut off from every copy: its
+followers away hold no acknowledgement, so it keeps taking writes on
+its own disk (`DEGRADED`) until the lease runs out -- which is what the
+lease is for, with `CELASTRO_AUTO_FAILOVER=on` -- or it hears of the
+promotion; under `confirm = quorum` it takes none. The catch-up is shipped under the
 followed copies' lock and no other, since a write this node forwarded
 under its own lock waits for that holder, which waits for this node to
 confirm its log; the wire's ship calls take that lock alone.
@@ -920,8 +938,10 @@ without a dot.
 
 ## What is deliberately not here
 
-Consensus and replication, follower reads and closed timestamps, hedged
-requests, two-phase commit for multi-shard writes and for multi-node DDL,
+Consensus on the data path (the map is fenced by shard term and the
+steward elected; a shard's log is shipped, not agreed), follower reads
+and closed timestamps, hedged requests, two-phase commit for multi-shard
+writes and for multi-node DDL,
 stateless compaction workers, dynamic shard split and merge, and a graph
 database's pattern language, unbounded paths and analytics — the bounded walk in the section after this one is a retrieval
 mode, and says what it is not. A collection's shards can be spread over nodes and any

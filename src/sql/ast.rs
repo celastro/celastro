@@ -174,6 +174,8 @@ pub enum Statement {
         shard: usize,
         node: String,
         term: Option<u64>,
+        /// Take a copy that is not caught up, losing what it lacks.
+        force: bool,
     },
     /// `REPLACE COPY OF SHARD <i> OF <collection> ON 'tcp://old' WITH
     /// 'tcp://new' [TERM <n>]` -- the follower on `old` is struck from the

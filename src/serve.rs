@@ -2497,8 +2497,11 @@ fn steward_sweep(
         let mut best: Option<(String, u64)> = None;
         for f in &followers {
             let status = if f == &me {
-                let followed = read(db).followed();
-                crate::engine::follower_status(&followed, &collection, shard, term)
+                let (followed, held) = {
+                    let g = read(db);
+                    (g.followed(), g.held_terms())
+                };
+                crate::engine::follower_status(&followed, &held, &collection, shard, term)
             } else {
                 let Some((_, node)) = peers.iter().find(|(u, _)| u == f) else { continue };
                 let _deadline = crate::deadline::arm(Some(10_000));
@@ -2539,7 +2542,7 @@ fn steward_sweep(
         let answer = if f == me {
             // The steward's own copy: promoted here, the map carried with
             // the lock let go.
-            let out = write(db).promote_shard(&collection, shard, &me, Some(term + 1), true);
+            let out = write(db).promote_shard(&collection, shard, &me, Some(term + 1), false, true);
             out.and_then(|o| o.finished_with(db)).map(|o| match o {
                 Outcome::Ack(m) => m,
                 other => format!("{other:?}"),

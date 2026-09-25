@@ -31,8 +31,9 @@ use crate::Value;
 /// A record as the write-ahead log holds it, or a mark of the protocol.
 pub const SHIP_INSERT: u8 = 1;
 pub const SHIP_DELETE: u8 = 2;
-/// The follower persists the instant carried as where it stands; every
-/// batch ends with one.
+/// The follower takes the instant carried as where it stands. Not sent
+/// today: a batch's own records carry their instants, and the follower
+/// logs a mark of the highest once it is caught up.
 pub const SHIP_MARK: u8 = 3;
 /// The follower drops what it holds before what follows: a catch-up from
 /// nothing.
@@ -40,6 +41,12 @@ pub const SHIP_RESET: u8 = 10;
 /// The catch-up is whole up to the instant carried: the follower is caught
 /// up, and persists the instant.
 pub const SHIP_CAUGHT_UP: u8 = 11;
+/// A catch-up begins, from the instant carried: the follower stands there
+/// until `SHIP_CAUGHT_UP`, whatever the chunks between carry -- they come
+/// in key order, so a later chunk can hold an earlier instant, and a
+/// catch-up cut short must start again from where it began. (A follower
+/// before 0.79.0 ignores the kind.)
+pub const SHIP_CATCHING_UP: u8 = 12;
 
 #[derive(Clone, Debug)]
 pub struct ShipItem {
@@ -137,6 +144,11 @@ pub struct Shipper {
     /// correctness.
     dir: Option<std::path::PathBuf>,
     confirmed_written: Mutex<(Option<Instant>, Timestamp)>,
+    /// A follower's answer that it follows a higher term than this
+    /// shipper's: a promotion this node has not seen. From then on no
+    /// write here is acknowledged -- the fence -- until the map demotes
+    /// this node. The answer, for the refusal.
+    fenced: Mutex<Option<String>>,
 }
 
 /// The file a holder's shipper keeps its followers' confirmed instant in.
@@ -148,6 +160,21 @@ pub fn confirmed_in(dir: &std::path::Path) -> Timestamp {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// A follower's answer that it follows a higher term than the shipper's,
+/// when it is one: what fences the shipper.
+fn fence_of(e: &Error) -> Option<String> {
+    let m = e.to_string();
+    let rest = m
+        .split_once("this node follows term ")
+        .or_else(|| m.split_once("this node holds it at term "))?
+        .1;
+    let (theirs, rest) = rest.split_once(", the shipper is term ")?;
+    let theirs: u64 = theirs.trim().parse().ok()?;
+    let mine: u64 =
+        rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()?;
+    (theirs > mine).then_some(m)
 }
 
 /// One follower's standing, for `SHOW HEALTH`.
@@ -195,6 +222,7 @@ impl Shipper {
             stop: AtomicBool::new(false),
             dir,
             confirmed_written: Mutex::new((None, 0)),
+            fenced: Mutex::new(None),
         });
         let t = s.clone();
         std::thread::Builder::new()
@@ -217,6 +245,7 @@ impl Shipper {
             stop: AtomicBool::new(true),
             dir: None,
             confirmed_written: Mutex::new((None, 0)),
+            fenced: Mutex::new(None),
         }
     }
 
@@ -248,7 +277,13 @@ impl Shipper {
             stop: AtomicBool::new(true),
             dir: None,
             confirmed_written: Mutex::new((None, 0)),
+            fenced: Mutex::new(None),
         })
+    }
+
+    /// The answer that fenced this shipper, if one did.
+    pub fn fenced(&self) -> Option<String> {
+        self.fenced.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// The first follower's backlog: each item's kind, key and instant.
@@ -256,6 +291,30 @@ impl Shipper {
     pub(crate) fn backlog(&self) -> Vec<(u8, String, Timestamp)> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g[0].backlog.iter().map(|i| (i.kind, i.key.clone(), i.ts)).collect()
+    }
+
+    /// The first follower's catch-up queue, as `push_catchup` filled it.
+    #[cfg(test)]
+    pub(crate) fn catchup_items(&self) -> Vec<(u8, String, Timestamp)> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g[0].catchup.iter().map(|i| (i.kind, i.key.clone(), i.ts)).collect()
+    }
+
+    /// The follower at `url` as one that answered `ShipStatus` caught up
+    /// at `from`: a catch-up from there is due.
+    #[cfg(test)]
+    pub(crate) fn set_catching_up(&self, url: &str, from: Timestamp) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+            f.state = FollowerState::CatchingUp {
+                from,
+                upto: 0,
+                cursor: None,
+                reset: false,
+                done: false,
+            };
+            f.catchup.clear();
+        }
     }
 
     pub fn followers(&self) -> Vec<String> {
@@ -342,7 +401,24 @@ impl Shipper {
     }
 
     /// Wait until every follower confirmed `ts`, or the budget runs out.
+    /// Fenced: a follower, or the node promoted, answers a higher term, so
+    /// this node is behind a promotion and nothing it writes is
+    /// acknowledged, whatever the rule -- what it took goes when the map
+    /// demotes it.
+    fn fence(&self) -> Result<()> {
+        match self.fenced() {
+            Some(f) => Err(Error::Plan(format!(
+                "shard {} of `{}` is held here at term {}, and a copy answers a higher one \
+                 ({f}): this node is behind a promotion and acknowledges nothing; the write is \
+                 on this disk only until the map demotes this node",
+                self.shard, self.collection, self.term
+            ))),
+            None => Ok(()),
+        }
+    }
+
     pub fn wait(&self, ts: Timestamp, budget: Option<u64>) -> Result<()> {
+        self.fence()?;
         if self.confirm == Confirm::None {
             return Ok(());
         }
@@ -353,6 +429,8 @@ impl Shipper {
         let copies = g.len() + 1;
         let needed = copies / 2;
         loop {
+            // The answer that fences can come while this write waits.
+            self.fence()?;
             let confirmed = match self.confirm {
                 // A follower that is away (not yet asked, or asked and
                 // silent) or still catching up does not hold the
@@ -572,9 +650,14 @@ impl Shipper {
                 true
             }
             Err(e) => {
-                // A follower that does not answer, or answers with another
-                // term or no copy, is asked again where it stands when it
-                // answers: what it missed meanwhile is caught up from there.
+                // A follower that answers a higher term fences this node:
+                // see `wait`. One that does not answer, or answers with a
+                // lower term or no copy, is asked again where it stands
+                // when it answers: what it missed meanwhile is caught up
+                // from there.
+                if let Some(f) = fence_of(&e) {
+                    *self.fenced.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+                }
                 let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(f) = g.iter_mut().find(|f| f.url == url) {
                     f.state = FollowerState::Unknown;
@@ -678,6 +761,71 @@ mod tests {
     /// holder and one follower -- and a follower away does not hold the
     /// write; with no follower confirmed the write is refused, not
     /// acknowledged on one disk.
+    /// A copy that answers a higher term than the shipper's is a promotion
+    /// this node has not seen: from then on nothing here is acknowledged,
+    /// whatever the rule, and a write already waiting is refused when the
+    /// answer comes. A copy that answers a lower term, or no copy at all,
+    /// is the old story: asked again, and not held against the write.
+    #[test]
+    fn a_copy_answering_a_higher_term_fences_the_shipper() {
+        let mk = || Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
+        let sh = Shipper::new(
+            "items",
+            0,
+            3,
+            vec![("tcp://127.0.0.1:1".into(), mk())],
+            Confirm::All,
+            None,
+        );
+        {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].state = FollowerState::Live;
+            g[0].acked = 10;
+        }
+        sh.wait(10, Some(2000)).unwrap();
+        let lower = Error::Plan(
+            "shard 0 of `items`: this node follows term 2, the shipper is term 3".into(),
+        );
+        assert!(!sh.sent("tcp://127.0.0.1:1", 0, Err(lower)));
+        assert!(sh.fenced().is_none(), "a lower term fenced");
+        // Live again, and a write waits for it; the answer that comes is a
+        // higher term.
+        {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].state = FollowerState::Live;
+            g[0].acked = 10;
+        }
+        let waiter = std::thread::spawn({
+            let sh = sh.clone();
+            move || sh.wait(20, Some(5000))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let higher = Error::Plan(
+            "shard 0 of `items`: this node holds it at term 4, the shipper is term 3".into(),
+        );
+        sh.sent("tcp://127.0.0.1:1", 0, Err(higher));
+        let e = waiter.join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("behind a promotion") && e.contains("term 4"), "{e}");
+        // And every write after it, under any rule.
+        let e = sh.wait(30, Some(200)).unwrap_err().to_string();
+        assert!(e.contains("behind a promotion"), "{e}");
+        let none = Shipper::new(
+            "items",
+            0,
+            3,
+            vec![("tcp://127.0.0.1:1".into(), mk())],
+            Confirm::None,
+            None,
+        );
+        let higher = Error::Plan(
+            "shard 0 of `items`: this node follows term 5, the shipper is term 3".into(),
+        );
+        none.sent("tcp://127.0.0.1:1", 0, Err(higher));
+        assert!(none.wait(1, None).is_err(), "async acknowledged behind a promotion");
+        sh.stop();
+        none.stop();
+    }
+
     #[test]
     fn a_quorum_is_a_majority_of_the_copies_and_nothing_less() {
         let mk = || Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());

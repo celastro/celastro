@@ -218,7 +218,8 @@ impl<'a> Parser<'a> {
             self.expect_kw("ON")?;
             let node = self.node_address()?;
             let term = if self.eat_kw("TERM") { Some(self.usize_literal()? as u64) } else { None };
-            return Ok(Statement::PromoteShard { collection, shard, node, term });
+            let force = self.eat_kw("FORCE");
+            return Ok(Statement::PromoteShard { collection, shard, node, term, force });
         }
         if self.eat_kw("REPLACE") {
             self.expect_kw("COPY")?;

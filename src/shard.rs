@@ -3886,7 +3886,11 @@ impl Shard {
                     }
                 }
                 WAL_DELETE => {
-                    if let Some(loc) = s.locate(&r.key, MAX_TS) {
+                    // The version live at the delete's own instant, not the
+                    // newest: a copy's log can hold a later version of the
+                    // key before an earlier delete of it, the catch-up
+                    // coming in key order and the backlog after it.
+                    if let Some(loc) = s.locate(&r.key, r.ts) {
                         s.mark_superseded(loc, r.ts);
                     }
                 }
@@ -3948,9 +3952,12 @@ impl Shard {
         &mut self,
         items: &[crate::replication::ShipItem],
     ) -> Result<(bool, Timestamp)> {
-        use crate::replication::{SHIP_CAUGHT_UP, SHIP_DELETE, SHIP_INSERT, SHIP_MARK};
+        use crate::replication::{
+            SHIP_CATCHING_UP, SHIP_CAUGHT_UP, SHIP_DELETE, SHIP_INSERT, SHIP_MARK,
+        };
         let mut mark_ts = 0;
         let mut caught_up_at = None;
+        let mut catching_up = false;
         let Some(w) = self.wal.as_mut() else {
             return Err(Error::Storage("a followed copy needs a directory".into()));
         };
@@ -3979,10 +3986,14 @@ impl Shard {
                         mark_ts = mark_ts.max(it.ts);
                         caught_up_at = Some(it.ts);
                     }
+                    // A catch-up begins: the copy stands where it stood
+                    // until it is whole, so a catch-up cut short starts
+                    // again from there and skips nothing.
+                    SHIP_CATCHING_UP => catching_up = true,
                     _ => {}
                 }
             }
-            if mark_ts > 0 && (caught_up_at.is_some() || self.caught_up) {
+            if mark_ts > 0 && (caught_up_at.is_some() || (self.caught_up && !catching_up)) {
                 let m = WalRecord {
                     kind: WAL_SHIP_MARK,
                     key: String::new(),
@@ -4019,7 +4030,11 @@ impl Shard {
                     }
                 }
                 WAL_DELETE => {
-                    if let Some(loc) = self.locate(&r.key, MAX_TS) {
+                    // The version live at the delete's own instant, not the
+                    // newest: the catch-up comes in key order and can
+                    // deliver a later version of the key before the
+                    // backlog's delete of the earlier one.
+                    if let Some(loc) = self.locate(&r.key, r.ts) {
                         self.mark_superseded(loc, r.ts);
                     }
                 }
@@ -4029,6 +4044,8 @@ impl Shard {
         if let Some(at) = caught_up_at {
             self.caught_up = true;
             self.ship_ts = self.ship_ts.max(at);
+        } else if catching_up {
+            self.caught_up = false;
         } else if self.caught_up {
             self.ship_ts = self.ship_ts.max(mark_ts);
         }
@@ -4086,12 +4103,17 @@ impl Shard {
         Ok((items, next))
     }
 
-    /// The deletes after `from` this shard still remembers, for a follower
-    /// catching up from an instant it stood at.
-    pub(crate) fn deletes_since(&self, from: Timestamp) -> Vec<crate::replication::ShipItem> {
+    /// The deletes after `from` and by `upto` this shard still remembers,
+    /// for a follower catching up from an instant it stood at to the one
+    /// the catch-up is cut at: a delete past it may not be synced yet.
+    pub(crate) fn deletes_since(
+        &self,
+        from: Timestamp,
+        upto: Timestamp,
+    ) -> Vec<crate::replication::ShipItem> {
         let mut out = Vec::new();
         let mut push = |key: &str, ts: Timestamp| {
-            if ts > from && ts != MAX_TS {
+            if ts > from && ts <= upto && ts != MAX_TS {
                 out.push(crate::replication::ShipItem {
                     kind: crate::replication::SHIP_DELETE,
                     key: key.to_string(),
@@ -4816,6 +4838,101 @@ mod tests {
         assert!(s.caught_up, "the reopened copy forgot it was caught up");
         assert_eq!(s.ship_ts, 500);
         assert_eq!(s.num_docs(u64::MAX), 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A copy's catch-up comes in key order and the backlog held back
+    /// behind it in log order, so a later version of a key can be
+    /// applied before an earlier delete of it: the delete kills the
+    /// version live at its own instant and no other, in the batch and in
+    /// the replay of the copy's log alike.
+    #[test]
+    fn a_shipped_delete_kills_the_version_live_at_its_instant_and_not_a_newer_one() {
+        use crate::replication::{ShipItem, SHIP_CAUGHT_UP, SHIP_DELETE, SHIP_INSERT};
+        let dir = std::env::temp_dir().join(format!("celastro-shipdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let key = format!("t0{KEY_SEP}d00001");
+        let items = vec![
+            ShipItem { kind: SHIP_INSERT, key: key.clone(), ts: 300, doc: Some(doc(1)) },
+            ShipItem { kind: SHIP_CAUGHT_UP, key: String::new(), ts: 350, doc: None },
+            ShipItem { kind: SHIP_DELETE, key: key.clone(), ts: 200, doc: None },
+        ];
+        s.apply_shipped(&items).unwrap();
+        assert!(
+            s.get(&key, 400).unwrap().is_some(),
+            "a delete of an earlier version killed the newer"
+        );
+        drop(s);
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(s.get(&key, 400).unwrap().is_some(), "the replay killed it");
+        // The delete of the version live at its instant lands as ever.
+        s.apply_shipped(&[ShipItem { kind: SHIP_DELETE, key: key.clone(), ts: 500, doc: None }])
+            .unwrap();
+        assert!(s.get(&key, 600).unwrap().is_none());
+        assert!(s.get(&key, 450).unwrap().is_some(), "dead before its instant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The deletes a catch-up carries stop at the instant the catch-up is
+    /// cut at: past it a delete may not be synced yet.
+    #[test]
+    fn the_deletes_a_catch_up_carries_stop_at_its_cut() {
+        let mut s = shard();
+        for i in 0..4 {
+            s.insert(doc(i)).unwrap();
+        }
+        // Rows 0 and 3 are tenant t0's.
+        let d1 = s.delete(&format!("t0{KEY_SEP}d0000")).unwrap().expect("a row");
+        let d2 = s.delete(&format!("t0{KEY_SEP}d0003")).unwrap().expect("a row");
+        assert!(d1 < d2);
+        let keys = |v: Vec<crate::replication::ShipItem>| -> Vec<String> {
+            v.into_iter().map(|i| i.key).collect()
+        };
+        assert_eq!(keys(s.deletes_since(0, d1)), vec![format!("t0{KEY_SEP}d0000")]);
+        assert_eq!(keys(s.deletes_since(0, d2)).len(), 2);
+        assert_eq!(keys(s.deletes_since(d1, d2)), vec![format!("t0{KEY_SEP}d0003")]);
+        assert!(s.deletes_since(d2, MAX_TS).is_empty());
+    }
+
+    /// A catch-up begins by naming where the follower stands, and the copy
+    /// stands there until the catch-up is whole: its chunks come in key
+    /// order, so one cut short must start again from where it began.
+    #[test]
+    fn a_catch_up_holds_the_copys_position_until_it_is_whole() {
+        use crate::replication::{ShipItem, SHIP_CATCHING_UP, SHIP_CAUGHT_UP, SHIP_INSERT};
+        let dir = std::env::temp_dir().join(format!("celastro-catchpos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let row = |i: u64, ts: Timestamp| ShipItem {
+            kind: SHIP_INSERT,
+            key: format!("t0{KEY_SEP}d{i:05}"),
+            ts,
+            doc: Some(doc(i as usize)),
+        };
+        let caught_up = |ts| ShipItem { kind: SHIP_CAUGHT_UP, key: String::new(), ts, doc: None };
+        let begins = |ts| ShipItem { kind: SHIP_CATCHING_UP, key: String::new(), ts, doc: None };
+        assert_eq!(
+            s.apply_shipped(&[row(1, 50), row(2, 60), caught_up(100)]).unwrap(),
+            (true, 100)
+        );
+        // Away, then back: the catch-up from 100, its first chunk carrying
+        // the later row, and cut short there.
+        assert_eq!(s.apply_shipped(&[begins(100), row(4, 300)]).unwrap(), (false, 100));
+        drop(s);
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.ship_ts, 100, "the cut-short catch-up moved the copy");
+        // Again from 100, whole: the row it had, the earlier one it had
+        // missed, and caught up.
+        assert_eq!(
+            s.apply_shipped(&[begins(100), row(4, 300), row(3, 200), caught_up(400)]).unwrap(),
+            (true, 400)
+        );
+        assert_eq!(s.num_docs(u64::MAX), 4);
+        // Live from here: a batch moves the copy.
+        assert_eq!(s.apply_shipped(&[row(5, 500)]).unwrap(), (true, 500));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

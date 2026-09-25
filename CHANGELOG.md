@@ -28,7 +28,31 @@ lease -- so a refusal is whole and names the row, and then writes each
 shard's share in chunks of `insert_batch` with one sync each, as it
 writes its own. The coordinator sends its calls in the same chunks, so
 no frame outgrows the wire. Nothing changes on the wire: an older
-holder still takes the same call.
+holder still takes the same call. Measured on one box with the console's
+ingest in four streams: with group commit off, a three-node ingest went
+from 1,024 documents a second with every stream past its deadline to
+27,000; with group commit on, the default, the holder's syncs were
+already folded and the rate is unchanged (about 23,000 over three nodes,
+45,000 on one).
+
+**The fence holds, and a copy keeps its place.** Four defects in
+replication, found by reading and each pinned by a test. A copy
+answering a holder's log with a higher term -- a follower at that term,
+or the node promoted, which now says so rather than "does not follow" --
+fences the holder: nothing it writes is acknowledged from that answer
+on, whatever the confirmation rule, where before the answer only dropped
+the copy from the count and the write was acknowledged on the old
+holder's disk alone. A shipped delete kills the version live at its own
+instant and no newer one: the catch-up comes in key order and the
+backlog after it, so a key deleted and re-inserted while a follower was
+away could lose its new version on the copy. A catch-up begins by naming
+where the follower stands (`SHIP_CATCHING_UP`, ignored by an older
+follower) and the copy holds that position until the catch-up is whole,
+where before a copy already caught up moved with every chunk and a
+catch-up cut short skipped rows. The deletes a catch-up carries stop at
+the instant it is cut at. And `PROMOTE SHARD` refuses a copy that is
+not caught up unless told `FORCE`; a demoted copy started from nothing
+no longer keeps a mark a restart could read as caught up.
 
 ## 0.78.0 — 2026-09-25
 
