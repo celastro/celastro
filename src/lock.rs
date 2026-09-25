@@ -34,6 +34,17 @@
 //! sync made 50 ms slower the read's median was 234 ms rather than one
 //! sync's worth.
 //!
+//! Since 0.77.0 the writers take their turns in phases. The writers
+//! waiting when one of them takes the lock after readers are a phase: they
+//! go one after another, and only after the last of them are the reads
+//! waiting let in -- where before every release let them in, so under a
+//! mixed load each write waited out a round of reads and the write rate
+//! was one per round (40-50 a second beside four vector readers, falling
+//! as the collection grew and the rounds lengthened). A writer that asks
+//! after its phase began is in the next one, so a writer that asks again
+//! the moment it let go is still never first back, and a read waits out at
+//! most the phase that was waiting when it arrived.
+//!
 //! The rest is the standard API -- `read`, `write`, `try_read`,
 //! `try_write`, the guards and the poisoning -- so a `Db` is used as it
 //! always was.
@@ -65,6 +76,12 @@ struct State {
     /// Reads let in by the last release that have not yet taken the lock.
     /// A writer waits for them as it waits for the readers holding it.
     admitted: usize,
+    /// Writers are numbered as they start waiting; those numbered up to
+    /// `phase_end` are the current phase, and `phase_left` of them have not
+    /// had the lock yet. Reads are let in when it reaches zero.
+    next_ticket: u64,
+    phase_end: u64,
+    phase_left: usize,
 }
 
 // The value moves between threads only through the guards, which borrow
@@ -83,6 +100,9 @@ impl<T> RwLock<T> {
                 readers_waiting: 0,
                 releases: 0,
                 admitted: 0,
+                next_ticket: 0,
+                phase_end: 0,
+                phase_left: 0,
             }),
             changed: Condvar::new(),
             poisoned: AtomicBool::new(false),
@@ -149,14 +169,32 @@ impl<T> RwLock<T> {
         self.reading().map_err(TryLockError::Poisoned)
     }
 
-    /// The exclusive lock, once every reader and writer before it is done.
+    /// The exclusive lock, once every reader and writer before it is done:
+    /// in the current phase if it was waiting when the phase began, or as
+    /// the first of the next.
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
         let mut s = self.state();
+        s.next_ticket += 1;
+        let ticket = s.next_ticket;
         s.writers_waiting += 1;
-        while s.writer || s.readers > 0 || s.admitted > 0 {
+        loop {
+            let free = !s.writer && s.readers == 0 && s.admitted == 0;
+            // Behind a phase it is not in: the phase goes first.
+            let turn = s.phase_left == 0 || ticket <= s.phase_end;
+            if free && turn {
+                break;
+            }
             s = self.changed.wait(s).unwrap_or_else(|p| p.into_inner());
         }
         s.writers_waiting -= 1;
+        if ticket <= s.phase_end {
+            s.phase_left -= 1;
+        } else {
+            // The first after the reads: a phase of itself and every writer
+            // waiting now.
+            s.phase_end = s.next_ticket;
+            s.phase_left = s.writers_waiting;
+        }
         s.writer = true;
         drop(s);
         self.writing()
@@ -290,7 +328,9 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
         let mut s = self.lock.state();
         s.writer = false;
         s.releases += 1;
-        s.admitted = s.readers_waiting;
+        // The reads waiting go in at the end of the phase; before it, the
+        // next of its writers does.
+        s.admitted = if s.phase_left == 0 { s.readers_waiting } else { 0 };
         self.lock.changed.notify_all();
     }
 }
@@ -355,6 +395,158 @@ mod tests {
                 "round {round}: the read waiting at the release went after the writer"
             );
         }
+    }
+
+    /// The writers waiting when a phase begins all go before the reads that
+    /// queued behind them: the read sees every one of their writes. Before
+    /// 0.77.0 the first writer's release let the read in, and under a
+    /// mixed load every write waited out a round of reads.
+    #[test]
+    fn the_writers_waiting_when_a_phase_begins_all_go_before_the_reads_behind_them() {
+        for round in 0..50 {
+            let lock = Arc::new(RwLock::new(Vec::<usize>::new()));
+            let wait_for = |readers: usize, writers: usize| {
+                let started = Instant::now();
+                loop {
+                    let s = lock.state();
+                    if s.readers_waiting == readers && s.writers_waiting == writers {
+                        return;
+                    }
+                    drop(s);
+                    assert!(started.elapsed() < Duration::from_secs(10), "never queued");
+                    thread::sleep(Duration::from_micros(200));
+                }
+            };
+            let held = lock.read().unwrap();
+            let writers: Vec<_> = (0..3)
+                .map(|i| {
+                    let lock = lock.clone();
+                    thread::spawn(move || lock.write().unwrap().push(i))
+                })
+                .collect();
+            wait_for(0, 3);
+            let reader = {
+                let lock = lock.clone();
+                thread::spawn(move || lock.read().unwrap().len())
+            };
+            wait_for(1, 3);
+            drop(held);
+            for w in writers {
+                w.join().unwrap();
+            }
+            assert_eq!(
+                reader.join().unwrap(),
+                3,
+                "round {round}: the read went in before the phase's writers were done"
+            );
+        }
+    }
+
+    /// A writer that arrives while a phase is going is in the next one: the
+    /// read that was waiting goes before it. What bounds a read's wait to
+    /// one phase, however many writers keep arriving.
+    #[test]
+    fn a_writer_arriving_during_a_phase_waits_behind_the_reads() {
+        use std::sync::atomic::AtomicBool;
+        for round in 0..50 {
+            let lock = Arc::new(RwLock::new(Vec::<usize>::new()));
+            let gate = Arc::new(AtomicBool::new(false));
+            let wait_for = |readers: usize, writers: usize| {
+                let started = Instant::now();
+                loop {
+                    let s = lock.state();
+                    if s.readers_waiting == readers && s.writers_waiting == writers {
+                        return;
+                    }
+                    drop(s);
+                    assert!(started.elapsed() < Duration::from_secs(10), "never queued");
+                    thread::sleep(Duration::from_micros(200));
+                }
+            };
+            let held = lock.read().unwrap();
+            // The phase: three writers, the first of them holding the lock
+            // until the late writer and the read have queued.
+            let phase: Vec<_> = (0..3)
+                .map(|i| {
+                    let (lock, gate) = (lock.clone(), gate.clone());
+                    thread::spawn(move || {
+                        let mut g = lock.write().unwrap();
+                        g.push(i);
+                        while !gate.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_micros(200));
+                        }
+                    })
+                })
+                .collect();
+            wait_for(0, 3);
+            drop(held);
+            wait_for(0, 2);
+            let late = {
+                let lock = lock.clone();
+                thread::spawn(move || lock.write().unwrap().push(99))
+            };
+            wait_for(0, 3);
+            let reader = {
+                let lock = lock.clone();
+                thread::spawn(move || lock.read().unwrap().clone())
+            };
+            wait_for(1, 3);
+            gate.store(true, Ordering::Release);
+            for w in phase {
+                w.join().unwrap();
+            }
+            late.join().unwrap();
+            let seen = reader.join().unwrap();
+            assert_eq!(seen.len(), 3, "round {round}: the read saw {seen:?}");
+            assert!(!seen.contains(&99), "round {round}: the late writer went before the read");
+        }
+    }
+
+    /// Under writers that never let up, a read's wait is bounded by one
+    /// phase: eight writers holding the lock three milliseconds each and
+    /// asking again the moment they let go, a reader beside them for two
+    /// seconds, and no read waits more than a hundred times a phase. A
+    /// missed wake-up, or a phase that admits the writers arriving during
+    /// it, would show here as a wait of the whole run.
+    #[test]
+    fn a_reads_wait_under_writers_that_never_let_up_is_one_phase() {
+        use std::sync::atomic::AtomicBool;
+        let lock = Arc::new(RwLock::new(0u64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (lock, stop) = (lock.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut g = lock.write().unwrap();
+                        *g += 1;
+                        thread::sleep(Duration::from_millis(3));
+                        drop(g);
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        let mut worst = Duration::ZERO;
+        let mut reads = 0u32;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(2) {
+            let t = Instant::now();
+            let g = lock.read().unwrap();
+            worst = worst.max(t.elapsed());
+            drop(g);
+            reads += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let writes: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(writes > 100, "the writers barely ran: {writes}");
+        assert!(reads > 5, "the reads barely ran: {reads}");
+        // A phase is eight holds of three milliseconds; a hundred of those
+        // is far past any scheduling noise and far short of the run.
+        assert!(worst < Duration::from_millis(2400), "a read waited {worst:?}: more than a phase");
     }
 
     /// A waiting writer holds a plain read behind it and a served read

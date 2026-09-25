@@ -6,6 +6,57 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.77.0 — 2026-09-25
+
+**Writers take their turns in phases.** Since 0.76.0 every writer's
+release let in the reads waiting at that moment before the next writer
+could take the lock, so under a mixed load each write waited out a
+round of reads and the write rate was one per round: 60 a second
+beside four vector readers on the dev box, falling as the collection
+grew and the reads with it. The writers waiting when one takes the lock
+after reads now go one after another, and the reads waiting go in at
+the end of that phase; a writer that asks mid-phase is in the next one,
+so a read waits out at most the phase that was waiting when it arrived.
+The same load: 112 writes a second, the reads' median 21-29 ms where it
+was 15. With the sync under the lock (`CELASTRO_GROUP_COMMIT=off`) a
+read beside eight writers can wait a phase of syncs; with group commit,
+the default, a read's wait is unchanged.
+
+**A follower is shipped a record only once this node's log has it.**
+0.76.0's group commit moved the sync out from under the lock and left
+the push to the followers where it was, right after the append: a
+follower could hold a row a crash here would take back, or a failed
+sync would cut, and two statements settling on two threads could ship
+two versions of a key crossed. The push now queues on the log's sync in
+append order and goes out with the sync that covers it.
+
+**A stop reaches a build in flight.** The maintenance threads looked
+for the stop only between steps, so a SIGTERM during a merge's build --
+minutes at the second level under a load -- waited it out past the
+chart's thirty seconds of grace and ended in a SIGKILL; safe, but the
+restart replayed what a clean stop would not have. The graph's build
+now asks every 64 nodes, the segment builder and the merge between
+their pieces, and give up with nothing written; a seal's ticket goes
+back for the next start.
+
+**Segments are written before the lock, and seals have a thread of
+their own.** A merge wrote its output under the exclusive lock -- 220 MB
+at the second level, every writer held nine seconds -- and one
+maintenance thread did seals and compactions in turn, so through a
+four-minute merge the write path sealed its frozen memtables itself
+under the lock, 0.7 s each. Builds write their files holding nothing
+and the install only publishes the manifest (56 ms for that merge); the
+sealer runs beside the compactor. Each `sealed` and `compacted` log
+line says how long its install held the lock (`lock_ms`).
+
+**The image builds on Alpine 3.24** (`rust:1.98-alpine3.24`; the
+compiler and the MSRV are as they were). The examples script's image
+check looked for a 0.55.0 tag and had run nowhere since; it finds this
+version's image now.
+
+Upgrading: nothing to do. A node on 0.76.0 with followers should be
+upgraded for the shipping fix.
+
 ## 0.76.0 — 2026-09-24
 
 **A write's log sync no longer holds up reads (group commit).** A

@@ -1611,7 +1611,16 @@ back every time, so a point read under a steady insert waited out
 several writes and their log syncs -- a median of 234 ms and a worst of
 430 ms with the sync made 50 ms slower, against 52 and 55 ms now, which
 is one sync (`what_a_slow_log_sync_costs_a_reader`, ignored, prints
-both). The turn closes no cycle: the writer waits for reads that were
+both). Since 0.77.0 the writers take those turns in phases: the writers
+waiting when one takes the lock after reads go one after another, and
+the reads waiting go in at the end of the phase; a writer that asks
+mid-phase is in the next one, so a read waits out at most the phase
+that was waiting when it arrived. With a turn at every release, under
+eight single-document writers and four vector readers each write waited
+out a round of reads and the rate was one per round -- 60 a second on
+the dev box, falling as the collection and the reads grew; in phases it
+is 112, with the reads' median 21-29 ms where it was 15 (`lock.rs`'s
+tests pin both halves of the rule). The turn closes no cycle: the writer waits for reads that were
 already waiting, as it waits for the ones holding the lock, and a read
 waits across the network only on served reads. A read through the
 console also takes the lock once rather than three times; its
