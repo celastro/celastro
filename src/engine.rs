@@ -3172,9 +3172,13 @@ impl Db {
                 // map at that term wins, whoever carries it, and a copy this
                 // node still holds at the old term follows from now on.
                 if t.term > m.term {
+                    // A higher term names a holder: another node, and this
+                    // one demotes what it holds; or this node still, after a
+                    // change of followers it missed (0.80.0 raised the term
+                    // for one), and it keeps holding under the new term.
                     let held_here = self.is_self(&m.node)
                         && self.shards.get(name).is_some_and(|s| s.iter().any(|s| s.index == i));
-                    if held_here {
+                    if held_here && !self.is_self(&t.node) {
                         demote.push((name.clone(), i));
                     }
                     updated[i] = t.clone();

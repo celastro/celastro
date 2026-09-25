@@ -2513,10 +2513,16 @@ fn a_changed_follower_list_is_a_new_term_and_reaches_a_node_that_missed_it() {
     assert_eq!(map(&b), before, "b planned from a node list short of the holders");
     b.ack(&format!("ATTACH NODE '{}'", a.url));
     assert_eq!(map(&b), after, "the higher term did not win on b");
+    // And b still holds its shard under the new term: a higher term that
+    // names this node as the holder is not a promotion elsewhere. (It was
+    // taken for one, and b demoted its own shard.)
+    assert_eq!(b.local_shards("items"), vec![1], "b demoted its own shard");
+    b.ack(r#"INSERT INTO items VALUES ('{"id":"k900","tenant":"t1","n":900}')"#);
     let c = Node::start_at("term-c", c_port, Some(c_dir));
     assert_eq!(map(&c), before, "c came back with a newer map than it left with");
     c.ack(&format!("ATTACH NODE '{}'", a.url));
     assert_eq!(map(&c), after, "the higher term did not win on c");
+    assert_eq!(c.local_shards("items"), vec![2], "c demoted its own shard");
     // A new holder is a new term too.
     let m = a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", b.url));
     assert!(m.contains("map switched"), "{m}");

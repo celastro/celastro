@@ -8,6 +8,17 @@ repository.
 
 ## Unreleased
 
+**A holder keeps its shard through a raised term.** 0.80.0 made a
+changed follower list a new term, and a node that had missed the change
+took the higher term, when it heard it, for a promotion it had not seen
+-- and demoted the shard it held, though the map at that term named it
+the holder still. A node attached by another and attaching no one, as
+one started without the cluster's `--attach` list is, is where it
+showed: `ALTER ... SET (replicas = 3)` left it holding nothing, its
+writes refused with "no shard of ... is on this node". A higher term
+naming this node keeps the shard here under the new term now; only one
+naming another node demotes. Upgrade from 0.80.0 for this.
+
 **A restore forks a timeline.** A node restored to an instant went on
 writing logs numbered past the archive's, and the docs said to take a
 backup after a restore, because a later restore from an older backup to
