@@ -3425,12 +3425,19 @@ fn ingest_response<W: Wire>(
                 return failed(io, left, msg, documents, batches);
             }
         }
+        // The body's end: after a line the newline ended -- the usual
+        // case, with nothing of a line read -- or after a last line
+        // without one. Either way what the batch holds is written below
+        // before the answer; leaving here dropped the tail of every body
+        // that ended with a newline, and the answer said `ok` with the
+        // count short.
         let done = !ended && left == 0;
-        if done && line.is_empty() {
-            break;
-        }
-        lineno += 1;
-        let text = String::from_utf8_lossy(&line).trim().to_string();
+        let text = if done && line.is_empty() {
+            String::new()
+        } else {
+            lineno += 1;
+            String::from_utf8_lossy(&line).trim().to_string()
+        };
         line.clear();
         if !text.is_empty() {
             match json::parse(&text) {
@@ -5533,6 +5540,20 @@ mod tests {
         let count = ok(&mut db, "SELECT count(*) FROM items");
         assert!(count.contains(r#""count(*)":50000"#), "{count}");
 
+        // A body that ends with a newline, as a file does, and a partial
+        // last batch: the tail lands too. (It did not: the end was taken
+        // for a line that never came, and the batch it held was dropped
+        // with the answer saying `ok`.)
+        let body: String = (0..1_003)
+            .map(|i| format!(r#"{{"id":"t{i:05}","n":{i}}}"#))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (response, _) = serve_request(&mut db, &request(&body));
+        assert!(body_of(&response).contains(r#""documents":1003,"batches":2,"ts":"#), "{response}");
+        let count = ok(&mut db, "SELECT count(*) FROM items");
+        assert!(count.contains(r#""count(*)":51003"#), "{count}");
+
         // A bad line: the twenty-five full batches before it and the five
         // hundred pending lines land, the error names the line.
         let mut lines: Vec<String> =
@@ -5543,7 +5564,7 @@ mod tests {
         assert!(body.starts_with(r#"{"ok":false,"error":"line 25501: "#), "{body}");
         assert!(body.ends_with(r#""documents":25500,"batches":26}"#), "{body}");
         let count = ok(&mut db, "SELECT count(*) FROM items");
-        assert!(count.contains(r#""count(*)":75500"#), "{count}");
+        assert!(count.contains(r#""count(*)":76503"#), "{count}");
 
         // A collection that is not there is refused before a line is read;
         // the wrong method and media type at the route.

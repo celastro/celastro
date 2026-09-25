@@ -8,6 +8,16 @@ repository.
 
 ## Unreleased
 
+**An ingest's last batch lands.** 0.78.0's `POST /api/ingest/<c>`
+dropped the tail of a body that ended with a newline -- every file does
+-- whenever the last batch was short of a thousand rows: the end was
+taken for a line that never came, the batch it held was never written,
+and the answer said `ok` with the count short. Found by the ingest
+measurement below (198,000 of 200,000 held, in every run). The tail is
+written before the answer now; a client that took the answer's
+`documents` at its word lost nothing, one that took `ok` at its word
+should count. Upgrade from 0.78.0 for this alone.
+
 **A forwarded batch is written as a statement's own rows are.** Since
 0.66.0 a statement's rows for another holder travelled in one call,
 but the holder wrote them one at a time: one fdatasync a row unless
