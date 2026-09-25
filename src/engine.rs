@@ -5998,6 +5998,21 @@ impl Db {
         }
     }
 
+    /// A build the stop interrupted: the ticket back, nothing counted.
+    pub fn seal_put_back(&mut self, job: SealJob) {
+        if job.followed {
+            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) {
+                f.shard.seal_put_back(job.ticket);
+            }
+            return;
+        }
+        if let Some(shard) = self.shards.get_mut(&job.collection).and_then(|s| s.get_mut(job.shard))
+        {
+            shard.seal_put_back(job.ticket);
+        }
+    }
+
     /// Install a built compaction on the shard it was reserved on. `false`
     /// when the shard moved on meanwhile and the build is dropped.
     pub fn compaction_install(

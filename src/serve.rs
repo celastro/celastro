@@ -759,7 +759,7 @@ impl Server {
         // Set by the connection that was asked to shut down; the loop reads
         // it between accepts, and the scope waits for the connections in
         // flight before `run` returns and the caller persists.
-        let stop = AtomicBool::new(false);
+        let stop = Arc::new(AtomicBool::new(false));
         let active = AtomicUsize::new(0);
         let server = &self;
         // Buffered to the connection cap: `active` never lets more than that
@@ -774,8 +774,8 @@ impl Server {
                 // The thread that builds seals off the lock exists, so a
                 // due seal may freeze for it.
                 write(db).set_background_seal(true);
-                let stop = &stop;
                 for step in MAINTAINERS {
+                    let stop = stop.clone();
                     scope.spawn(move || maintenance(db, stop, step));
                 }
             }
@@ -1808,7 +1808,11 @@ const MAINTAINERS: [fn(&RwLock<Db>) -> bool; 2] = [seal_step, compaction_step];
 /// write path found two frozen memtables still waiting and sealed the next
 /// ones itself, under the lock, 0.7 s each with every writer held, and
 /// flat segments piled up to twenty-one.
-fn maintenance(db: &RwLock<Db>, stop: &AtomicBool, step: fn(&RwLock<Db>) -> bool) {
+fn maintenance(db: &RwLock<Db>, stop: Arc<AtomicBool>, step: fn(&RwLock<Db>) -> bool) {
+    // A build in flight on this thread watches the same stop, inside its
+    // loops: the loop here looks only between steps, and a merge's build is
+    // minutes at the second level.
+    crate::signal::stop_this_thread_with(stop.clone());
     loop {
         if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
             return;
@@ -2407,6 +2411,14 @@ fn seal_step(db: &RwLock<Db>) -> bool {
                     std::thread::sleep(Duration::from_secs(1));
                 }
             },
+            Err(e) if crate::signal::interrupted(&e) => {
+                // The console is stopping: the ticket goes back for the next
+                // start, its rows durable in the rotated log meanwhile.
+                crate::log::info("seal_interrupted", &[("what", what)]);
+                write_soon(db, Duration::from_secs(5))
+                    .unwrap_or_else(|| write(db))
+                    .seal_put_back(job);
+            }
             Err(e) => {
                 crate::log::warn("seal_failed", &[("what", what), ("error", e.to_string())]);
                 write_soon(db, Duration::from_secs(5))
@@ -2453,6 +2465,9 @@ fn compaction_step(db: &RwLock<Db>) -> bool {
             ),
         },
         Ok(None) => {}
+        Err(e) if crate::signal::interrupted(&e) => {
+            crate::log::info("compaction_interrupted", &[("what", what.clone())])
+        }
         Err(e) => crate::log::warn(
             "compaction_failed",
             &[("what", what.clone()), ("error", e.to_string())],
@@ -4202,6 +4217,97 @@ mod tests {
         assert!(writer.join().unwrap().body.contains("\"ok\":true"));
         let rows = run_sql(&db, "SELECT id FROM items LIMIT 10");
         assert!(rows.body.contains("\"count\":2"), "{}", rows.body);
+    }
+
+    /// A stop during a seal's build ends the build within a moment, puts the
+    /// ticket back uncounted with no file left behind, and the next start
+    /// seals it. The maintenance loops looked for the stop only between
+    /// steps, so a SIGTERM during a merge's build -- four minutes at the
+    /// second level under a load -- waited it out past the chart's thirty
+    /// seconds of grace and the quadlet's ninety, and ended in a SIGKILL.
+    #[test]
+    fn a_stop_during_a_seal_build_puts_the_ticket_back_and_the_next_start_seals_it() {
+        let tag = format!("celastro-serve-stop-build-{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut opts = crate::engine::DbOpts::default();
+        opts.background_seal = true;
+        // A graph on every seal, and a memtable that holds the rows: the
+        // build has to be long enough to be stopped inside.
+        opts.build.flat_tier_max = 0;
+        opts.thresholds.max_vectors = 1 << 20;
+        opts.thresholds.max_bytes = 1 << 30;
+        let db = RwLock::new(Db::open(&dir, opts).expect("a temp dir opens"));
+        write(&db).set_background_seal(true);
+        let ok = |sql: &str| {
+            let r = run_sql(&db, sql);
+            assert!(r.body.starts_with(r#"{"ok":true"#), "{}: {}", &sql[..60], r.body);
+        };
+        ok("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+        ok("CREATE INDEX items_emb ON items USING vector (embedding) WITH (dims = 32, metric = 'cosine')");
+        let n = 6000usize;
+        let mut rng = crate::codec::Rng::new(7);
+        let mut load = |from: usize| {
+            for chunk in (from..from + n).collect::<Vec<_>>().chunks(500) {
+                let rows: Vec<String> = chunk
+                    .iter()
+                    .map(|i| {
+                        let v: Vec<String> =
+                            (0..32).map(|_| format!("{:.4}", rng.next_normal())).collect();
+                        format!(r#"('{{"id":"k{i:05}","n":{i},"embedding":[{}]}}')"#, v.join(","))
+                    })
+                    .collect();
+                ok(&format!("INSERT INTO items VALUES {}", rows.join(", ")));
+            }
+        };
+        let segments = |suffix: &str| -> usize {
+            std::fs::read_dir(dir.join("collections/items/shard-0000/segments"))
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(suffix))
+                .count()
+        };
+
+        // The baseline: one seal, built and installed in full.
+        load(0);
+        assert_eq!(write(&db).freeze("items").unwrap(), 1);
+        let t = Instant::now();
+        assert!(MAINTAINERS[0](&db), "nothing to seal");
+        let full = t.elapsed();
+        assert_eq!(segments(".seg"), 1);
+
+        // The same again, stopped a quarter of the way in.
+        load(n);
+        assert_eq!(write(&db).freeze("items").unwrap(), 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (took, stepped) = std::thread::scope(|scope| {
+            let (db, flag) = (&db, stop.clone());
+            let sealer = scope.spawn(move || {
+                crate::signal::stop_this_thread_with(flag);
+                let t = Instant::now();
+                let stepped = MAINTAINERS[0](db);
+                (t.elapsed(), stepped)
+            });
+            std::thread::sleep(full / 4);
+            stop.store(true, AtomicOrdering::Release);
+            sealer.join().unwrap()
+        });
+        assert!(stepped, "the step found nothing to seal");
+        assert!(
+            took < full / 2 + Duration::from_millis(100),
+            "the stop waited out the build: {took:?} of a {full:?} build"
+        );
+        assert_eq!(read(&db).seal_failures().0, 0, "a stop was counted as a failure");
+        assert_eq!(segments(".tmp") + segments(".seg"), 1, "the stopped build left a file");
+        let r = run_sql(&db, "SELECT count(*) FROM items");
+        assert!(r.body.contains(&format!(r#""count(*)":{}"#, 2 * n)), "{}", r.body);
+
+        // The next start: the ticket is there, and seals.
+        assert!(MAINTAINERS[0](&db), "the ticket was not put back");
+        assert_eq!(segments(".seg"), 2);
+        let r = run_sql(&db, "SELECT count(*) FROM items");
+        assert!(r.body.contains(&format!(r#""count(*)":{}"#, 2 * n)), "{}", r.body);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A seal goes through while a compaction builds. One thread did both,

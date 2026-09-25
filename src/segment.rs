@@ -1260,6 +1260,7 @@ impl SegmentBuilder {
         for (path, pairs) in adj_pairs {
             regions.push((format!("adj/{path}.idx"), AdjIndex::build(pairs).encode()));
         }
+        crate::signal::check_stop()?;
         for (path, (ib, an)) in text_builders {
             let (dict, postings, lens) = ib.finish();
             regions.push((format!("text/{path}/terms.dict"), dict));
@@ -1269,7 +1270,7 @@ impl SegmentBuilder {
         }
         let mut num_vectors = 0usize;
         for (path, vs) in vec_stores.iter_mut() {
-            vs.seal(self.opts.quantizer, self.opts.hnsw, self.opts.flat_tier_max);
+            vs.seal(self.opts.quantizer, self.opts.hnsw, self.opts.flat_tier_max)?;
             num_vectors = num_vectors.max(vs.len());
             regions.push((format!("vec/{path}/vectors.full"), vs.encode_full()));
             regions.push((format!("vec/{path}/vectors.codes"), vs.codes.encode_bytes()));

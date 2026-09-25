@@ -3014,6 +3014,7 @@ impl Shard {
     pub(crate) fn seal_build(t: &SealTicket) -> Result<SealBuilt> {
         let mut segments = Vec::new();
         for (id, layer) in (t.first_id..).zip(t.layers.iter().rev()) {
+            crate::signal::check_stop()?;
             let mut b = SegmentBuilder::new(t.build);
             for pd in layer {
                 b.add(pd.clone());
@@ -3100,6 +3101,13 @@ impl Shard {
     pub(crate) fn seal_requeue(&mut self, t: SealTicket, err: &Error) {
         self.seal_failures += 1;
         self.last_seal_error = Some(err.to_string());
+        self.pending_seals.insert(0, t);
+    }
+
+    /// A build the stop interrupted: the ticket goes back to the front of
+    /// the queue as a failed one does, but nothing failed and nothing is
+    /// counted; the next start seals it.
+    pub(crate) fn seal_put_back(&mut self, t: SealTicket) {
         self.pending_seals.insert(0, t);
     }
 

@@ -25,8 +25,10 @@
 //! the way a person at a terminal expects. The one-shot verbs are jobs, and a
 //! job that is killed is a job that stops.
 
+use std::cell::RefCell;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -99,6 +101,49 @@ pub fn install_shutdown_handlers() -> bool {
     {
         false
     }
+}
+
+thread_local! {
+    /// A stop this thread's builds watch beside the process's: the console's
+    /// maintenance threads arm it with the server's own flag.
+    static STOP_HERE: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Watch `flag` as well as the process's signals on this thread, so a build
+/// in flight here gives up when the console is asked to stop
+/// (`/api/shutdown`) as it does on SIGTERM.
+pub fn stop_this_thread_with(flag: Arc<AtomicBool>) {
+    STOP_HERE.with(|s| *s.borrow_mut() = Some(flag));
+}
+
+/// Whether a long build on this thread should give up: the process was
+/// signalled, or the flag this thread watches is set.
+pub fn stopping() -> bool {
+    shutdown_requested()
+        || STOP_HERE.with(|s| s.borrow().as_ref().is_some_and(|f| f.load(Ordering::Acquire)))
+}
+
+/// The error a build gives up with: an `Interrupted` io error, which the
+/// maintenance step tells from a failure by [`interrupted`].
+pub fn stop_error() -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "the node is stopping",
+    ))
+}
+
+/// `Err` when a build should stop, as the builds ask between their pieces.
+pub fn check_stop() -> crate::error::Result<()> {
+    if stopping() {
+        Err(stop_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `e` is a build giving up for the stop, not a failure.
+pub fn interrupted(e: &crate::error::Error) -> bool {
+    matches!(e, crate::error::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted)
 }
 
 /// Whether a SIGTERM or SIGINT has arrived since the handlers were installed.

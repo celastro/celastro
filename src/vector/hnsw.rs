@@ -288,6 +288,20 @@ impl Hnsw {
     /// Build over full-precision vectors. `dist(a, b)` is the metric distance
     /// between two stored vectors.
     pub fn build(count: usize, params: HnswParams, dist: &dyn Fn(u32, u32) -> f32) -> Hnsw {
+        Hnsw::build_unless(count, params, dist, &|| false).expect("nothing stops it")
+    }
+
+    /// `build`, giving up when `stop` says so: `None`, and nothing kept.
+    /// Asked once every 64 nodes -- a node's insertion is the unit of the
+    /// work, and a graph of a hundred thousand is minutes -- so a console
+    /// asked to stop during a merge's build stops within a moment of it
+    /// rather than at its end.
+    pub fn build_unless(
+        count: usize,
+        params: HnswParams,
+        dist: &dyn Fn(u32, u32) -> f32,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Hnsw> {
         let mut g = Hnsw::empty(params);
         g.count = count;
         g.link0 = vec![0u32; count * params.m0];
@@ -303,6 +317,9 @@ impl Hnsw {
         }
 
         for i in 0..count {
+            if i % 64 == 0 && stop() {
+                return None;
+            }
             let id = i as u32;
             let level = g.node_level[i] as usize;
             if g.entry == u32::MAX {
@@ -359,7 +376,7 @@ impl Hnsw {
         }
         g.dist0 = Vec::new();
         g.upper_d = Vec::new();
-        g
+        Some(g)
     }
 
     fn greedy_descend(&self, mut ep: u32, level: usize, d_to: &dyn Fn(u32) -> f32) -> u32 {

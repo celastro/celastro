@@ -2037,7 +2037,21 @@ seals and compactions have a thread each: one thread for both left every
 seal waiting out a compaction's build, so through a four-minute
 second-level merge the write path found two frozen memtables still
 waiting and sealed the rest itself under the lock, 0.7 s of graph each
-with every writer held. With the sealer apart, the run's 44 seals came
+with every writer held. A stop reaches the builds too (0.77.0): the
+maintenance loops looked for it only between steps, so a SIGTERM during
+a merge's build -- four minutes at the second level under a load --
+waited it out past the chart's thirty seconds of grace and the
+quadlet's ninety, and ended in a SIGKILL; safe, since the log replays
+and the build's files are reclaimed at the open, but the restart then
+replayed what a clean stop would not have. The graph's build asks every
+64 nodes whether the node is stopping (`Hnsw::build_unless`), the
+segment builder and the merge between their pieces, and give up with
+nothing written: a seal's ticket goes back uncounted for the next start,
+its rows durable in the rotated log meanwhile, and a merge is simply not
+made. The check is the process's signal or the console's own stop, armed
+per maintenance thread (`signal::stop_this_thread_with`), so a `COMPACT`
+or `FLUSH` a client asked for is not cut short by another's shutdown.
+With the sealer apart, the run's 44 seals came
 one every 15-40 s with no bursts of queued tickets after a merge, as
 there had been, so the write path's fallback -- two frozen memtables
 waiting -- was not reached as far as the log can say; a seal built

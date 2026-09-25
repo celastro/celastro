@@ -190,10 +190,18 @@ impl VectorStore {
     /// Quantize and build the graph. Called once at seal, never incrementally:
     /// segments are immutable, and that is what lets the graph be built by
     /// whoever has spare CPU rather than by whoever owns the write path (§4.5).
-    pub fn seal(&mut self, quantizer: Quantizer, params: HnswParams, flat_tier_max: usize) {
+    ///
+    /// `Err` when the node is stopping (`signal::check_stop`): the graph is
+    /// the long part of a seal or a merge, and it gives up inside.
+    pub fn seal(
+        &mut self,
+        quantizer: Quantizer,
+        params: HnswParams,
+        flat_tier_max: usize,
+    ) -> crate::error::Result<()> {
         let n = self.len();
         if n == 0 {
-            return;
+            return Ok(());
         }
         self.codes = Codes::build(quantizer, self.dims, &self.full);
         if n > flat_tier_max {
@@ -207,8 +215,12 @@ impl VectorStore {
                     &full[b as usize * dims..(b as usize + 1) * dims],
                 )
             };
-            self.graph = Some(Hnsw::build(n, params, &dist));
+            let Some(g) = Hnsw::build_unless(n, params, &dist, &crate::signal::stopping) else {
+                return Err(crate::signal::stop_error());
+            };
+            self.graph = Some(g);
         }
+        Ok(())
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -564,7 +576,7 @@ mod tests {
             vs.push(i as u32, &v).unwrap();
         }
         if seal {
-            vs.seal(Quantizer::Sq8, HnswParams::default(), FLAT_TIER_MAX);
+            vs.seal(Quantizer::Sq8, HnswParams::default(), FLAT_TIER_MAX).unwrap();
         }
         vs
     }
@@ -746,7 +758,7 @@ mod regression_tests {
             distance::prepare(Metric::Cosine, &mut v);
             vs.push(i as u32, &v).unwrap();
         }
-        vs.seal(Quantizer::Sq8, HnswParams::default(), flat_max);
+        vs.seal(Quantizer::Sq8, HnswParams::default(), flat_max).unwrap();
         vs
     }
 

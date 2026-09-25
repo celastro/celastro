@@ -389,6 +389,10 @@ pub fn build(r: &Reserved) -> Result<Option<Built>> {
             let take = chunk.min(rest.len());
             let piece: Vec<PendingDoc> = rest.drain(..take).collect();
             let Some(&id) = ids.next() else { return Ok(None) };
+            // A console asked to stop gives the merge up, piece by piece
+            // and inside the graph: nothing is written until every piece is
+            // built, so nothing is left behind.
+            crate::signal::check_stop()?;
             let mut b = SegmentBuilder::new(r.build);
             for pd in piece {
                 b.add(pd);
