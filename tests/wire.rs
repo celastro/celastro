@@ -1850,7 +1850,9 @@ fn shards_merge_on_their_holder_and_a_split_without_a_key_takes_the_median() {
         copied = {
             let followed = b.db.read().unwrap().followed();
             let g = followed.lock().unwrap();
-            g.get(&("items".to_string(), 0)).map(|f| f.shard.num_docs(u64::MAX)).unwrap_or(0)
+            g.get(&("items".to_string(), 0))
+                .map(|c| c.lock().unwrap().shard.num_docs(u64::MAX))
+                .unwrap_or(0)
         };
         if copied == 40 {
             break;

@@ -61,3 +61,20 @@ macro_rules! bail {
         return Err($crate::error::Error::$kind(format!($($arg)*)))
     };
 }
+
+impl Error {
+    /// The same error with `prefix` before its message -- which row of a
+    /// batch, which key -- its kind kept, so a deadline stays a deadline.
+    pub(crate) fn prefixed(self, prefix: &str) -> Error {
+        match self {
+            Error::Sql(m) => Error::Sql(format!("{prefix}{m}")),
+            Error::Plan(m) => Error::Plan(format!("{prefix}{m}")),
+            Error::Schema(m) => Error::Schema(format!("{prefix}{m}")),
+            Error::Storage(m) => Error::Storage(format!("{prefix}{m}")),
+            Error::SnapshotGone(m) => Error::SnapshotGone(format!("{prefix}{m}")),
+            Error::Deadline(m) => Error::Deadline(format!("{prefix}{m}")),
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), format!("{prefix}{e}"))),
+            Error::NotYet(m) => Error::NotYet(m),
+        }
+    }
+}

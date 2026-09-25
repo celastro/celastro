@@ -1441,7 +1441,10 @@ impl Db {
             let mut g = db.followed.lock().unwrap_or_else(|p| p.into_inner());
             for sh in followed {
                 let term = tablets.get(sh.index).map(|t| t.term).unwrap_or(0);
-                g.insert((name.to_string(), sh.index), FollowedShard { shard: sh, term });
+                g.insert(
+                    (name.to_string(), sh.index),
+                    Arc::new(Mutex::new(FollowedShard { shard: sh, term })),
+                );
             }
         }
         Ok(derived)
@@ -1581,7 +1584,7 @@ impl Db {
             &node,
         )?;
         let (mut shards, mut empty, mut reach) = (0usize, 0usize, 0u64);
-        for s in self.shards.values().flatten() {
+        for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
             match s.archive_live_log(&a)? {
                 Some((_, last)) => {
                     shards += 1;
@@ -1883,32 +1886,40 @@ impl Db {
                 // instant and up to the one asked, by the bounds below. The
                 // shard's next log takes a number the archive does not hold,
                 // so a run continued from here replaces nothing there.
-                let Some(t) = past else { continue };
-                let (logs, next) = log_archive.logs_after(name, *index, fetched.ts)?;
+                // The archived logs along the chain of timelines, placed
+                // as rotated logs the open replays -- above the backup's
+                // instant and up to the one asked, by the bounds below --
+                // one cut where its timeline's part of the history ended.
+                let upto = past.unwrap_or(fetched.ts);
+                let replay = log_archive.logs_after(name, *index, fetched.ts, upto)?;
                 let (mut taken, mut here) = (0usize, fetched.ts);
-                for l in logs.iter().take_while(|l| l.first <= t) {
-                    fs::write(
-                        sdir.join(format!("wal.{:06}.log", l.seq)),
-                        log_archive.get(&l.key)?,
-                    )?;
+                let id = format!("shard-{index:04}/wal.log");
+                for l in &replay.logs {
+                    let p = sdir.join(format!("wal.{:06}.log", taken + 1));
+                    fs::write(&p, log_archive.get(&l.key)?)?;
+                    if l.cut {
+                        crate::shard::trim_log(&p, &self.cipher, &id, l.last)?;
+                    }
                     taken += 1;
-                    here = l.last.min(t);
+                    here = l.last.min(upto);
                 }
                 // A log that begins after the instant: nothing happened
                 // between the one before it and the instant.
-                if taken < logs.len() {
-                    here = t;
+                if replay.more {
+                    here = upto;
                 }
                 replayed += taken;
-                if !logs.is_empty() {
+                if past.is_some() && (!replay.logs.is_empty() || replay.more) {
                     reach = Some(reach.map_or(here, |r| r.min(here)));
                 }
-                if next > 1 {
-                    crate::shard::atomic_write(
-                        &sdir.join("ARCHIVED"),
-                        next.to_string().as_bytes(),
-                    )?;
-                }
+                // The restored shard forks a timeline of its own here, made
+                // the archive's when it first archives a log: its logs then
+                // replace nothing of the run it left, and a later restore
+                // follows the fork.
+                crate::shard::atomic_write(
+                    &sdir.join("ARCHIVED"),
+                    format!("fork {} {upto} {}", replay.parent, taken as u64 + 1).as_bytes(),
+                )?;
             }
             crate::shard::sync_dir(&tmp)?;
             fs::rename(&tmp, &dest)?;
@@ -2161,7 +2172,8 @@ impl Db {
                 }
             }
         }
-        for f in followed_of(&self.followed, collection).iter_mut() {
+        for c in followed_of(&self.followed, collection) {
+            let mut f = c.lock().unwrap_or_else(|p| p.into_inner());
             f.shard.adopt_catalog(coll.clone())?;
             for h in &f.shard.segments {
                 h.segment.unload_component(&component);
@@ -2465,7 +2477,8 @@ impl Db {
                 }
             }
         }
-        for ((name, i), f) in self.followed.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        for ((name, i), c) in self.followed.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            let f = c.lock().unwrap_or_else(|p| p.into_inner());
             out.push_str(&format!(
                 "follows shard {i} of `{name}` at term {}: {}\n",
                 f.term,
@@ -2667,9 +2680,10 @@ impl Db {
             // copy left with the old one masked out the rows a merge
             // absorbed: they arrived, counted for nothing, and a copy
             // promoted after the merge answered two rows of three.
-            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
             for i in wanted.iter().filter(|i| have.contains(i)) {
-                if let Some(f) = g.get_mut(&(collection.to_string(), *i)) {
+                if let Some(c) = g.get(&(collection.to_string(), *i)) {
+                    let mut f = c.lock().unwrap_or_else(|p| p.into_inner());
                     let t = &tablets[*i];
                     f.term = t.term;
                     if f.shard.key_range() != (t.lo.clone(), t.hi.clone()) {
@@ -2720,10 +2734,10 @@ impl Db {
                 sh.attach_dir(&fdir)?;
                 crate::shard::sync_dir(&dir.join("collections").join(collection))?;
             }
-            self.followed
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert((collection.to_string(), *i), FollowedShard { shard: sh, term: t.term });
+            self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                (collection.to_string(), *i),
+                Arc::new(Mutex::new(FollowedShard { shard: sh, term: t.term })),
+            );
         }
         Ok(())
     }
@@ -2734,9 +2748,10 @@ impl Db {
             .followed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&(collection.to_string(), shard))
-            .map(|f| f.shard);
-        if let Some(mut s) = gone {
+            .remove(&(collection.to_string(), shard));
+        if let Some(c) = gone {
+            let mut g = c.lock().unwrap_or_else(|p| p.into_inner());
+            let s = &mut g.shard;
             s.retire_all();
             if let Some(d) = s.dir().map(|d| d.to_path_buf()) {
                 let _ = fs::remove_dir_all(&d);
@@ -4719,6 +4734,16 @@ impl Db {
     }
 
     /// The followed copies, shared with the wire.
+    /// The handle of the copy this node follows of `shard`, if any: the
+    /// map's lock held to find it and let go.
+    fn followed_copy(&self, collection: &str, shard: usize) -> Option<Arc<Mutex<FollowedShard>>> {
+        self.followed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(collection.to_string(), shard))
+            .cloned()
+    }
+
     /// The terms this node holds its shards at, shared with the wire.
     pub fn held_terms(&self) -> HeldTerms {
         self.held_terms.clone()
@@ -5024,7 +5049,10 @@ impl Db {
                 "this node has no copy of shard {shard} of `{collection}` to promote"
             )));
         };
-        let (caught_up, at, copy_term) = (copy.shard.caught_up, copy.shard.ship_ts, copy.term);
+        let (caught_up, at, copy_term) = {
+            let g = copy.lock().unwrap_or_else(|p| p.into_inner());
+            (g.shard.caught_up, g.shard.ship_ts, g.term)
+        };
         // A copy not caught up lacks writes the holder acknowledged: taken
         // as the shard, they are lost. Refused unless said; the steward
         // promotes caught-up copies only.
@@ -5044,8 +5072,9 @@ impl Db {
         // manifest names, and the first promotion of a copy with a sealed
         // segment -- on five real nodes, not in the tests' forty rows --
         // failed to open what it had just deleted, and the shard stayed
-        // down with its holder.)
-        drop(copy);
+        // down with its holder.) A batch applying to it on the wire's
+        // thread finishes first.
+        drop(take_copy(copy));
         let cdir = dir.join("collections").join(collection);
         let from = cdir.join("followed").join(format!("shard-{shard:04}"));
         let to = cdir.join(format!("shard-{shard:04}"));
@@ -5077,7 +5106,10 @@ impl Db {
                             back.index = shard;
                             self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
                                 (collection.to_string(), shard),
-                                FollowedShard { shard: back, term: copy_term },
+                                Arc::new(Mutex::new(FollowedShard {
+                                    shard: back,
+                                    term: copy_term,
+                                })),
                             );
                         }
                     }
@@ -5230,10 +5262,10 @@ impl Db {
             };
             sh.set_key_range(lo, hi);
             sh.index = shard;
-            self.followed
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert((collection.to_string(), shard), FollowedShard { shard: sh, term });
+            self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                (collection.to_string(), shard),
+                Arc::new(Mutex::new(FollowedShard { shard: sh, term })),
+            );
         }
         crate::log::info(
             "demoted",
@@ -5617,8 +5649,8 @@ impl Db {
                 s.adopt_catalog(coll.clone())?;
             }
         }
-        for f in followed_of(&self.followed, collection).iter_mut() {
-            f.shard.adopt_catalog(coll.clone())?;
+        for c in followed_of(&self.followed, collection) {
+            c.lock().unwrap_or_else(|p| p.into_inner()).shard.adopt_catalog(coll.clone())?;
         }
         // A new index changes where this collection's segments belong: the
         // resolved tier of a segment is the coldest tier over the indexes it
@@ -5988,13 +6020,16 @@ impl Db {
         &mut self,
         collection: &str,
         docs: Vec<Value>,
-    ) -> Result<(usize, Timestamp, Option<String>)> {
-        let mut here: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
-        for (i, doc) in docs.into_iter().enumerate() {
-            let checked = (|| -> Result<usize> {
+    ) -> Result<(usize, Timestamp, Option<Error>)> {
+        let mut here: BTreeMap<usize, Vec<(String, Value)>> = BTreeMap::new();
+        for (i, mut doc) in docs.into_iter().enumerate() {
+            // Validated, coerced and keyed once, here; the shard takes the
+            // rows as they are.
+            let checked = (|| -> Result<(usize, String)> {
                 let coll = self.catalog.get(collection)?;
-                let key = sort_key(coll, &doc)?;
                 coll.validate(&doc)?;
+                coll.coerce(&mut doc);
+                let key = sort_key(coll, &doc)?;
                 if let Some(url) = self.owner_of(collection, &key)? {
                     return Err(Error::Plan(format!(
                         "key `{key}` of `{collection}` belongs to the shard on {url}, not to \
@@ -6005,18 +6040,20 @@ impl Db {
                 let shards = self.shards.get(collection).ok_or_else(|| {
                     Error::Plan(format!("no shard of `{collection}` is on this node"))
                 })?;
-                shards
+                let idx = shards
                     .iter()
                     .position(|s| s.owns(&key))
-                    .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))
+                    .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))?;
+                shards[idx].validate_indexable(&doc)?;
+                Ok((idx, key))
             })();
             match checked {
-                Ok(idx) => here.entry(idx).or_default().push(doc),
-                Err(e) => return Ok((0, 0, Some(format!("document {i}: {e}")))),
+                Ok((idx, key)) => here.entry(idx).or_default().push((key, doc)),
+                Err(e) => return Ok((0, 0, Some(e.prefixed(&format!("document {i}: "))))),
             }
         }
         if let Err(e) = self.lease_check() {
-            return Ok((0, 0, Some(e.to_string())));
+            return Ok((0, 0, Some(e)));
         }
         let chunk = self.opts.insert_batch.max(1);
         let (mut taken, mut last) = (0usize, 0);
@@ -6028,9 +6065,11 @@ impl Db {
                 let (stamps, index) = {
                     let shards = self.shards.get_mut(collection).expect("checked above");
                     let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
-                    match Db::on_shard(defer, pending, &mut shards[idx], |s| s.insert_many(batch)) {
+                    match Db::on_shard(defer, pending, &mut shards[idx], |s| {
+                        s.insert_many_keyed(batch)
+                    }) {
                         Ok(stamps) => (stamps, shards[idx].index),
-                        Err(e) => return Ok((taken, last, Some(e.to_string()))),
+                        Err(e) => return Ok((taken, last, Some(e))),
                     }
                 };
                 let mut chunk_last = 0;
@@ -6127,7 +6166,7 @@ impl Db {
         &mut self,
         collection: &str,
         keys: Vec<String>,
-    ) -> Result<(usize, Option<String>)> {
+    ) -> Result<(usize, Option<Error>)> {
         self.catalog.get(collection)?;
         let mut here: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for (i, key) in keys.into_iter().enumerate() {
@@ -6149,11 +6188,11 @@ impl Db {
             })();
             match checked {
                 Ok(idx) => here.entry(idx).or_default().push(key),
-                Err(e) => return Ok((0, Some(format!("key {i}: {e}")))),
+                Err(e) => return Ok((0, Some(e.prefixed(&format!("key {i}: "))))),
             }
         }
         if let Err(e) = self.lease_check() {
-            return Ok((0, Some(e.to_string())));
+            return Ok((0, Some(e)));
         }
         let mut gone = 0usize;
         for (idx, batch) in here {
@@ -6162,7 +6201,7 @@ impl Db {
                 let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
                 match Db::on_shard(defer, pending, &mut shards[idx], |s| s.delete_many(&batch)) {
                     Ok(deleted) => (deleted, shards[idx].index),
-                    Err(e) => return Ok((gone, Some(e.to_string()))),
+                    Err(e) => return Ok((gone, Some(e))),
                 }
             };
             let mut last = 0;
@@ -6298,8 +6337,11 @@ impl Db {
         // built inline under the ship lock -- fourteen to twenty-seven
         // seconds on the two-datacentre run, every acknowledgement waiting
         // on that copy with it.
-        let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
-        for ((name, index), f) in g.iter_mut() {
+        let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+        for ((name, index), c) in g.iter() {
+            // A copy mid-batch keeps its lock; its seal waits for the next
+            // turn rather than holding every other copy's.
+            let Ok(mut f) = c.try_lock() else { continue };
             if let Some(ticket) = f.shard.seal_take() {
                 return Some(SealJob {
                     collection: name.clone(),
@@ -6319,9 +6361,8 @@ impl Db {
     /// Commit a built seal. `false` when the shard is gone.
     pub fn seal_install(&mut self, job: SealJob, built: crate::shard::SealBuilt) -> Result<bool> {
         if job.followed {
-            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) else { return Ok(false) };
-            f.shard.seal_install(job.ticket, built)?;
+            let Some(c) = self.followed_copy(&job.collection, job.shard) else { return Ok(false) };
+            c.lock().unwrap_or_else(|p| p.into_inner()).shard.seal_install(job.ticket, built)?;
             return Ok(true);
         }
         let Some(shards) = self.shards.get_mut(&job.collection) else { return Ok(false) };
@@ -6354,9 +6395,8 @@ impl Db {
     /// the next reserve; the failure is counted on the shard.
     pub fn seal_requeue(&mut self, job: SealJob, err: &Error) {
         if job.followed {
-            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) {
-                f.shard.seal_requeue(job.ticket, err);
+            if let Some(c) = self.followed_copy(&job.collection, job.shard) {
+                c.lock().unwrap_or_else(|p| p.into_inner()).shard.seal_requeue(job.ticket, err);
             }
             return;
         }
@@ -6369,9 +6409,8 @@ impl Db {
     /// A build the stop interrupted: the ticket back, nothing counted.
     pub fn seal_put_back(&mut self, job: SealJob) {
         if job.followed {
-            let mut g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(f) = g.get_mut(&(job.collection.clone(), job.shard)) {
-                f.shard.seal_put_back(job.ticket);
+            if let Some(c) = self.followed_copy(&job.collection, job.shard) {
+                c.lock().unwrap_or_else(|p| p.into_inner()).shard.seal_put_back(job.ticket);
             }
             return;
         }
@@ -9436,8 +9475,32 @@ pub struct FollowedShard {
 }
 
 /// The followed copies by `(collection, shard)`, behind a lock of their
-/// own: the wire applies a holder's batch under this lock and no other.
-pub type Followed = Arc<Mutex<BTreeMap<(String, usize), FollowedShard>>>;
+/// own: the wire applies a holder's batch under a copy's lock and no
+/// other. The map's lock is held to find a copy, not while one applies:
+/// each copy syncs its own log under its own lock, so the copies a node
+/// follows land in parallel rather than in turn (0.81.0; before it the
+/// map's one lock was held across every copy's fsync).
+pub type Followed = Arc<Mutex<BTreeMap<(String, usize), Arc<Mutex<FollowedShard>>>>>;
+
+/// A copy taken out of the map, as its own once every other holder of the
+/// handle has let go -- a batch applying on the wire's thread finishes
+/// first -- so its files close when it is dropped; `None` after a moment
+/// regardless, the copy then living on in the hand that holds it.
+fn take_copy(mut arc: Arc<Mutex<FollowedShard>>) -> Option<FollowedShard> {
+    let started = std::time::Instant::now();
+    loop {
+        match Arc::try_unwrap(arc) {
+            Ok(m) => return Some(m.into_inner().unwrap_or_else(|p| p.into_inner())),
+            Err(a) => {
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    return None;
+                }
+                arc = a;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
 
 /// The shards a node holds, at their terms, by `(collection, shard)`:
 /// what the wire answers a shipper whose copy this node no longer keeps.
@@ -9460,39 +9523,12 @@ fn not_followed(held: &HeldTerms, collection: &str, shard: usize, term: u64) -> 
 }
 
 /// The followed copies of one collection, for a definition that reaches
-/// them; a guard with the lock.
-fn followed_of<'a>(f: &'a Followed, collection: &str) -> FollowedOf<'a> {
+/// them: their handles, the map's lock let go.
+fn followed_of(f: &Followed, collection: &str) -> Vec<Arc<Mutex<FollowedShard>>> {
     let guard = f.lock().unwrap_or_else(|p| p.into_inner());
-    let keys: Vec<(String, usize)> =
-        guard.keys().filter(|(c, _)| c == collection).cloned().collect();
-    FollowedOf { guard, keys }
+    guard.iter().filter(|((c, _), _)| c == collection).map(|(_, a)| a.clone()).collect()
 }
 
-struct FollowedOf<'a> {
-    guard: MutexGuard<'a, BTreeMap<(String, usize), FollowedShard>>,
-    keys: Vec<(String, usize)>,
-}
-
-impl FollowedOf<'_> {
-    fn iter_mut(&mut self) -> Vec<&mut FollowedShard> {
-        let keys = self.keys.clone();
-        let mut out = Vec::new();
-        // Distinct keys, so the mutable borrows are disjoint.
-        let map: *mut BTreeMap<(String, usize), FollowedShard> = &mut *self.guard;
-        for k in keys {
-            // SAFETY: each key is looked up once and the keys are distinct,
-            // so no two references alias.
-            if let Some(f) = unsafe { (*map).get_mut(&k) } {
-                out.push(f);
-            }
-        }
-        out
-    }
-}
-
-/// A batch of a holder's log into a copy this node follows, at the
-/// holder's term, under the followed copies' lock alone; where the copy
-/// stands. The first item may say to start from nothing.
 pub fn apply_shipped(
     followed: &Followed,
     held: &HeldTerms,
@@ -9501,10 +9537,13 @@ pub fn apply_shipped(
     term: u64,
     items: &[crate::replication::ShipItem],
 ) -> Result<(bool, Timestamp)> {
-    let mut g = followed.lock().unwrap_or_else(|p| p.into_inner());
-    let f = g
-        .get_mut(&(collection.to_string(), shard))
+    let copy = followed
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(collection.to_string(), shard))
+        .cloned()
         .ok_or_else(|| not_followed(held, collection, shard, term))?;
+    let mut f = copy.lock().unwrap_or_else(|p| p.into_inner());
     if f.term != term {
         return Err(Error::Plan(format!(
             "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
@@ -9529,10 +9568,13 @@ pub fn follower_status(
     shard: usize,
     term: u64,
 ) -> Result<(bool, Timestamp)> {
-    let g = followed.lock().unwrap_or_else(|p| p.into_inner());
-    let f = g
+    let copy = followed
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&(collection.to_string(), shard))
+        .cloned()
         .ok_or_else(|| not_followed(held, collection, shard, term))?;
+    let f = copy.lock().unwrap_or_else(|p| p.into_inner());
     if f.term != term {
         return Err(Error::Plan(format!(
             "shard {shard} of `{collection}`: this node follows term {}, the shipper is term {term}",
@@ -10328,14 +10370,8 @@ mod tests {
                     ),
                 })
                 .collect();
-            followed
-                .lock()
-                .unwrap()
-                .get_mut(&("items".to_string(), 0))
-                .unwrap()
-                .shard
-                .apply_shipped(&items)
-                .unwrap();
+            let copy = followed.lock().unwrap().get(&("items".to_string(), 0)).cloned().unwrap();
+            copy.lock().unwrap().shard.apply_shipped(&items).unwrap();
             // The sealer's turn, as the maintenance thread takes it.
             while let Some(job) = db.seal_reserve() {
                 assert!(job.describe().contains("followed copy"), "{}", job.describe());
@@ -10345,8 +10381,9 @@ mod tests {
             }
         }
         assert!(built >= 3, "the sealer built {built} seals of the copy");
-        let g = followed.lock().unwrap();
-        let copy = &g.get(&("items".to_string(), 0)).unwrap().shard;
+        let handle = followed.lock().unwrap().get(&("items".to_string(), 0)).cloned().unwrap();
+        let g = handle.lock().unwrap();
+        let copy = &g.shard;
         assert!(!copy.segments.is_empty(), "the copy has no sealed segment");
         assert_eq!(copy.num_docs(u64::MAX), 240);
         drop(g);
@@ -13550,8 +13587,8 @@ mod tests {
         let (taken, last, stopped) = db.insert_many_here("items", docs.clone()).unwrap();
         let ev = durability_probe::take();
         assert_eq!((taken, last), (0, 0));
-        let m = stopped.expect("refused");
-        assert!(m.starts_with("document 5: ") && m.contains("NOT NULL"), "{m}");
+        let m = stopped.expect("refused").to_string();
+        assert!(m.contains("document 5: ") && m.contains("NOT NULL"), "{m}");
         assert!(ev.paths(Op::WalSync).is_empty(), "{ev:?}");
         assert!(ids(&mut db).is_empty());
         // Mended: five below 'm' and four above, four a chunk -- two syncs
@@ -13560,7 +13597,7 @@ mod tests {
         durability_probe::start();
         let (taken, last, stopped) = db.insert_many_here("items", docs.clone()).unwrap();
         let ev = durability_probe::take();
-        assert_eq!((taken, stopped), (9, None));
+        assert!(taken == 9 && stopped.is_none(), "{taken} {stopped:?}");
         assert!(last > 0);
         assert_eq!(ev.paths(Op::WalSync).len(), 3, "{ev:?}");
         assert_eq!(ids(&mut db).len(), 9);
@@ -13570,7 +13607,7 @@ mod tests {
         db.set_group_commit(true);
         durability_probe::start();
         let (taken, _, stopped) = db.deferring(|db| db.insert_many_here("items", more)).unwrap();
-        assert_eq!((taken, stopped), (4, None));
+        assert!(taken == 4 && stopped.is_none(), "{taken} {stopped:?}");
         assert!(durability_probe::take().paths(Op::WalSync).is_empty(), "synced under the lock");
         durability_probe::start();
         db.confirmation().wait().unwrap();
@@ -13653,6 +13690,77 @@ mod tests {
         assert_eq!(items[1].1, "k1");
         assert_eq!(items[2].1, "k6");
         assert!(items[3].2 > from);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The copies a node follows land in parallel: one copy's batch, its
+    /// sync held slow, does not hold the other copy's, which syncs under
+    /// its own lock.
+    #[test]
+    fn two_followed_copies_apply_their_batches_side_by_side() {
+        use crate::replication::{ShipItem, SHIP_INSERT};
+        use std::time::{Duration, Instant};
+        let dir = tmp("copies-apart");
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        let mut db = Db::open(&dir, opts).unwrap();
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![
+                Tablet {
+                    node: "tcp://127.0.0.1:2".into(),
+                    followers: vec!["tcp://127.0.0.1:1".into()],
+                    hi: Some("m".into()),
+                    ..Default::default()
+                },
+                Tablet {
+                    node: "tcp://127.0.0.1:3".into(),
+                    followers: vec!["tcp://127.0.0.1:1".into()],
+                    lo: Some("m".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        db.ensure_followed("items").unwrap();
+        let (followed, held) = (db.followed(), db.held_terms());
+        let batch = |key: &str| {
+            vec![ShipItem {
+                kind: SHIP_INSERT,
+                key: key.to_string(),
+                ts: 100,
+                doc: Some(crate::json::parse(&format!(r#"{{"id":"{key}","n":1}}"#)).unwrap()),
+            }]
+        };
+        // Copy 0's batch on a thread whose syncs take 600 ms.
+        let slow = std::thread::spawn({
+            let (followed, held) = (followed.clone(), held.clone());
+            let items = batch("a1");
+            move || {
+                durability_probe::slow(Some((Op::WalSync, Duration::from_millis(600))));
+                let t0 = Instant::now();
+                apply_shipped(&followed, &held, "items", 0, 0, &items).unwrap();
+                durability_probe::slow(None);
+                t0.elapsed()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        apply_shipped(&followed, &held, "items", 1, 0, &batch("z1")).unwrap();
+        let other = t0.elapsed();
+        let held_for = slow.join().unwrap();
+        assert!(held_for >= Duration::from_millis(600), "the slow sync was not slow: {held_for:?}");
+        assert!(
+            other < Duration::from_millis(400),
+            "the other copy waited out the slow one: {other:?}"
+        );
+        for (i, key) in [(0usize, "a1"), (1, "z1")] {
+            let c = followed.lock().unwrap().get(&("items".to_string(), i)).cloned().unwrap();
+            assert_eq!(c.lock().unwrap().shard.num_docs(u64::MAX), 1, "copy {i} lacks {key}");
+        }
         drop(db);
         let _ = fs::remove_dir_all(&dir);
     }

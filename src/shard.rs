@@ -1153,6 +1153,24 @@ pub(crate) mod durable {
     }
 }
 
+/// A placed log cut at `ceiling`: the records past it dropped and the
+/// file rewritten, as a restore does to a log that runs past the end of
+/// its timeline's part of the history.
+pub(crate) fn trim_log(
+    path: &Path,
+    cipher: &crate::cipher::Shared,
+    id: &str,
+    ceiling: Timestamp,
+) -> Result<()> {
+    let records = Wal::replay(path, cipher, id)?;
+    let mut w = Wal::open(path, cipher.clone(), id.to_string())?;
+    w.truncate()?;
+    for r in records.iter().filter(|r| r.ts <= ceiling) {
+        w.append(r)?;
+    }
+    w.sync()
+}
+
 /// The rotation number of a rotated log, from its name `wal.NNNNNN.log`.
 fn rotated_seq(p: &Path) -> Result<u64> {
     p.file_name()
@@ -1878,6 +1896,8 @@ pub struct SealTicket {
     index: usize,
     cipher: crate::cipher::Shared,
     log_id: String,
+    timeline: u64,
+    fork: Option<(u64, Timestamp)>,
 }
 
 impl std::fmt::Debug for SealTicket {
@@ -1888,6 +1908,9 @@ impl std::fmt::Debug for SealTicket {
 
 /// The segments a ticket's build produced, in memory, for `seal_install`.
 pub struct SealBuilt {
+    /// The timeline the build opened in the archive for a pending fork,
+    /// for the install to take up.
+    timeline: Option<u64>,
     segments: Vec<Segment>,
     /// The segments already on the disk, by id: the build wrote them.
     written: BTreeMap<u64, PathBuf>,
@@ -1981,6 +2004,14 @@ pub struct Shard {
     unsealed_wals: Vec<PathBuf>,
     /// The next rotation's number, past every rotated log in the directory.
     wal_seq: u64,
+    /// The timeline the shard archives its logs under: 0 until a restore
+    /// forks one (`ARCHIVED` carries it with the next number).
+    timeline: u64,
+    /// A fork a restore recorded and the archive does not know yet: the
+    /// timeline forked from and the instant, made a timeline of the
+    /// archive's -- numbered past every one there -- when this shard first
+    /// archives a log, so a restore that never writes forks nothing.
+    fork: Option<(u64, Timestamp)>,
     /// Seals that failed and were left for the next write to retry, and
     /// the last one's reason: a disk that is full or gone, seen here first.
     pub(crate) seal_failures: u64,
@@ -2061,6 +2092,8 @@ impl Shard {
             pending_seals: Vec::new(),
             unsealed_wals: Vec::new(),
             wal_seq: 1,
+            timeline: 0,
+            fork: None,
             segments: Vec::new(),
             manifest_version: 0,
             next_segment_id: 1,
@@ -2503,16 +2536,30 @@ impl Shard {
     /// `supersedes` is computed against the version the one before it made.
     /// Returns the timestamps in order.
     pub(crate) fn insert_many(&mut self, docs: Vec<Value>) -> Result<Vec<Timestamp>> {
-        self.writes.fetch_add(docs.len() as u64, AtomicOrdering::Relaxed);
-        let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
-            Vec::with_capacity(docs.len());
-        let mut keys = std::collections::BTreeSet::new();
-        let mut recurring = false;
+        let mut keyed = Vec::with_capacity(docs.len());
         for mut doc in docs {
             self.coll.validate(&doc)?;
             self.coll.coerce(&mut doc);
             let key = sort_key(&self.coll, &doc)?;
             self.validate_indexable(&doc)?;
+            keyed.push((key, doc));
+        }
+        self.insert_many_keyed(keyed)
+    }
+
+    /// `insert_many` for rows the caller has validated, coerced and keyed
+    /// already -- a forwarded batch's, at its check -- so none is checked
+    /// twice.
+    pub(crate) fn insert_many_keyed(
+        &mut self,
+        docs: Vec<(String, Value)>,
+    ) -> Result<Vec<Timestamp>> {
+        self.writes.fetch_add(docs.len() as u64, AtomicOrdering::Relaxed);
+        let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
+            Vec::with_capacity(docs.len());
+        let mut keys = std::collections::BTreeSet::new();
+        let mut recurring = false;
+        for (key, doc) in docs {
             if !keys.insert(key.clone()) {
                 recurring = true;
             }
@@ -2597,7 +2644,7 @@ impl Shard {
     }
 
     /// Check every index's precondition. Called before anything is durable.
-    fn validate_indexable(&self, doc: &Value) -> Result<()> {
+    pub(crate) fn validate_indexable(&self, doc: &Value) -> Result<()> {
         for idx in &self.coll.indexes {
             let crate::catalog::IndexKind::Vector { dims, .. } = &idx.kind else { continue };
             let Some(v) = doc.path(&idx.path) else { continue };
@@ -3012,18 +3059,43 @@ impl Shard {
     /// rotation will have -- the rotation then replaces the copy with the
     /// whole. The instants it spans, or none for an empty log.
     pub(crate) fn archive_live_log(
-        &self,
+        &mut self,
         a: &crate::backup::LogArchive,
     ) -> Result<Option<(Timestamp, Timestamp)>> {
+        if self.dir.is_none() {
+            return Ok(None);
+        }
+        self.resolve_fork(a)?;
         let Some(dir) = &self.dir else { return Ok(None) };
         a.put_log(
             &self.coll.name,
             self.index,
+            self.timeline,
             self.wal_seq,
             &dir.join("wal.log"),
             &self.opts.cipher,
             &self.file_id("wal.log"),
         )
+    }
+
+    /// A fork a restore recorded, made a timeline of the archive's: the
+    /// next number there, its marker written, and this shard's from now
+    /// on. Nothing to do without one.
+    fn resolve_fork(&mut self, a: &crate::backup::LogArchive) -> Result<()> {
+        let Some((parent, at)) = self.fork else { return Ok(()) };
+        let tl = a.next_timeline(&self.coll.name, self.index)?;
+        a.put_timeline(&self.coll.name, self.index, tl, parent, at)?;
+        self.took_timeline(tl)
+    }
+
+    /// The shard archives under `tl` from here on, and a reopen knows it.
+    fn took_timeline(&mut self, tl: u64) -> Result<()> {
+        self.timeline = tl;
+        self.fork = None;
+        if let Some(dir) = &self.dir {
+            atomic_write(&dir.join("ARCHIVED"), format!("{tl} {}", self.wal_seq).as_bytes())?;
+        }
+        Ok(())
     }
 
     /// Whether a seal must keep versions a newer one supersedes: a backup
@@ -3102,6 +3174,8 @@ impl Shard {
             index: self.index,
             cipher: self.opts.cipher.clone(),
             log_id: self.file_id("wal.log"),
+            timeline: self.timeline,
+            fork: self.fork,
         });
         Ok(true)
     }
@@ -3121,9 +3195,19 @@ impl Shard {
         // The rotated logs to the archive first, before the minutes a graph
         // takes: an archive that is down fails the seal here, and the seal
         // is tried again with the logs still on the disk.
+        let mut timeline = None;
         if let Some(a) = &t.archive {
+            let tl = match t.fork {
+                Some((parent, at)) => {
+                    let tl = a.next_timeline(&t.coll.name, t.index)?;
+                    a.put_timeline(&t.coll.name, t.index, tl, parent, at)?;
+                    timeline = Some(tl);
+                    tl
+                }
+                None => t.timeline,
+            };
             for p in &t.wals {
-                a.put_log(&t.coll.name, t.index, rotated_seq(p)?, p, &t.cipher, &t.log_id)?;
+                a.put_log(&t.coll.name, t.index, tl, rotated_seq(p)?, p, &t.cipher, &t.log_id)?;
             }
         }
         let mut segments = Vec::new();
@@ -3155,7 +3239,7 @@ impl Shard {
                 }
             }
         }
-        Ok(SealBuilt { segments, written })
+        Ok(SealBuilt { timeline, segments, written })
     }
 
     /// Commit a build: the manifest naming the segments the build wrote, the deletes
@@ -3169,6 +3253,9 @@ impl Shard {
     /// log, but nothing queued them again before a restart, so a node whose
     /// disk filled during a seal and then emptied never sealed them.
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
+        if let Some(tl) = built.timeline {
+            self.took_timeline(tl)?;
+        }
         let deletes = Shard::deletes_of(&t.frozen);
         let committed = self
             .handles_for(built.segments, &deletes, &built.written)
@@ -3448,10 +3535,12 @@ impl Shard {
         // its rotation would have had, which is then consumed and kept
         // across a restart (`ARCHIVED`), so no number is ever reused.
         if let Some(a) = self.opts.log_archive.clone() {
+            self.resolve_fork(&a)?;
             for p in &self.unsealed_wals {
                 a.put_log(
                     &self.coll.name,
                     self.index,
+                    self.timeline,
                     rotated_seq(p)?,
                     p,
                     &self.opts.cipher,
@@ -3464,6 +3553,7 @@ impl Shard {
                 if a.put_log(
                     &self.coll.name,
                     self.index,
+                    self.timeline,
                     seq,
                     &live,
                     &self.opts.cipher,
@@ -3472,7 +3562,10 @@ impl Shard {
                 .is_some()
                 {
                     self.wal_seq += 1;
-                    atomic_write(&dir.join("ARCHIVED"), self.wal_seq.to_string().as_bytes())?;
+                    atomic_write(
+                        &dir.join("ARCHIVED"),
+                        format!("{} {}", self.timeline, self.wal_seq).as_bytes(),
+                    )?;
                 }
             }
         }
@@ -3853,9 +3946,27 @@ impl Shard {
         }
         // A number an inline seal consumed for the archive, kept across
         // restarts so no archived number is reused for another log.
+        // `ARCHIVED`: the next number, under the timeline before it (a file
+        // from before timelines holds the number alone: timeline 0).
         if let Ok(t) = fs::read_to_string(dir.join("ARCHIVED")) {
-            if let Ok(n) = t.trim().parse::<u64>() {
-                s.wal_seq = s.wal_seq.max(n);
+            let words: Vec<&str> = t.split_whitespace().collect();
+            let num = |i: usize| words.get(i).and_then(|x| x.parse::<u64>().ok());
+            if words.first() == Some(&"fork") {
+                // `fork <parent> <instant> <next>`: a restore's, not yet a
+                // timeline of the archive's.
+                if let (Some(parent), Some(at), Some(n)) = (num(1), num(2), num(3)) {
+                    s.fork = Some((parent, at));
+                    s.wal_seq = s.wal_seq.max(n);
+                }
+            } else {
+                match (num(0), num(1)) {
+                    (Some(timeline), Some(n)) => {
+                        s.timeline = timeline;
+                        s.wal_seq = s.wal_seq.max(n);
+                    }
+                    (Some(n), None) => s.wal_seq = s.wal_seq.max(n),
+                    _ => {}
+                }
             }
         }
         let mut records = Vec::new();

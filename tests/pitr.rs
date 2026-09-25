@@ -105,35 +105,33 @@ fn a_restore_reaches_any_instant_the_archive_covers_and_says_where_it_stopped() 
     let (m, held) = restore_at(&fresh, &dest, t40);
     assert_eq!(held, expected((0..30).filter(|i| *i != 3)), "{m}");
     assert!(m.contains(&format!("of the {t40} asked: the archive ends there")), "{m}");
-    // The restored database goes on, and its logs take numbers past the
-    // archive's: a backup of it is a base the next instant is reached
-    // from, and nothing archived was replaced.
+    // The restored database goes on, on a timeline of its own: its first
+    // archived log opens it, and nothing archived was replaced.
     let mut db = Db::open(&fresh, {
         let mut o = DbOpts::default();
         o.log_archive = Some(dest.display().to_string());
         o
     })
     .unwrap();
-    let before: Vec<_> = std::fs::read_dir(dest.join("nodes/local/logs/items/shard-0000"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
+    let logs_of = |d: &Path| -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(d.join("nodes/local/logs/items/shard-0000"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".log"))
+            .collect()
+    };
+    let before = logs_of(&dest);
     insert(&mut db, 40, 45);
     ack(&mut db, "FLUSH items");
-    let mut after: Vec<_> = std::fs::read_dir(dest.join("nodes/local/logs/items/shard-0000"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
+    let mut after = logs_of(&dest);
     assert_eq!(after.len(), before.len() + 1, "{after:?}");
     after.retain(|n| !before.contains(n));
     let newest = after[0].to_string_lossy().to_string();
-    let max_before = before
-        .iter()
-        .filter_map(|n| n.to_string_lossy().split('-').next()?.parse::<u64>().ok())
-        .max()
-        .unwrap();
-    let seq: u64 = newest.split('-').next().unwrap().parse().unwrap();
-    assert!(seq > max_before, "{newest} after {before:?}");
+    assert!(
+        newest.starts_with("0001-"),
+        "{newest} is not on the fork's timeline; before: {before:?}"
+    );
+    assert!(dest.join("nodes/local/logs/items/shard-0000/timeline-0001").exists());
     drop(db);
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&dest);
@@ -262,4 +260,72 @@ fn a_seal_archives_the_log_it_rotated_before_the_install_removes_it_and_keeps_it
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&fresh);
+}
+
+/// A restore forks a timeline of its own: what the restored node writes
+/// is archived apart from the run it left, and a later restore -- from
+/// the same backup, to an instant after the fork -- follows the chain of
+/// timelines: the old run to the fork, the new one after, and none of
+/// what the old run wrote past the fork.
+#[test]
+fn a_restore_forks_a_timeline_and_a_later_restore_follows_it() {
+    let dest = dir("tl-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let data = dir("tl-data");
+    let with_archive = |d: &Path| {
+        let mut o = DbOpts::default();
+        o.log_archive = Some(d.display().to_string());
+        o
+    };
+    let mut db = Db::open(&data, with_archive(&dest)).unwrap();
+    ack(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    insert(&mut db, 0, 10);
+    ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    insert(&mut db, 10, 15);
+    let t15 = db.now_ts();
+    insert(&mut db, 15, 20);
+    let t20 = db.now_ts();
+    ack(&mut db, "FLUSH items");
+    insert(&mut db, 20, 25);
+    let t25 = db.now_ts();
+    insert(&mut db, 25, 30);
+    ack(&mut db, &format!("BACKUP LOG TO '{}'", dest.display()));
+    drop(db);
+    // The first restore, to t20: rows 0..19, and a fork recorded in the
+    // shard -- not in the archive yet, which still reads as one run.
+    let fresh = dir("tl-fresh");
+    let (m, held) = restore_at(&fresh, &dest, t20);
+    assert_eq!(held, expected(0..20), "{m}");
+    let marker = dest.join("nodes/local/logs/items/shard-0000/timeline-0001");
+    assert!(!marker.exists(), "a restore that wrote nothing forked the archive");
+    let archived_file = fresh.join("collections/items/shard-0000/ARCHIVED");
+    let text = std::fs::read_to_string(&archived_file).unwrap();
+    assert!(text.starts_with(&format!("fork 0 {t20} ")), "{text}");
+    // It goes on: its first archived log opens timeline 1 in the archive,
+    // forked from 0 at t20.
+    let mut db = Db::open(&fresh, with_archive(&dest)).unwrap();
+    insert(&mut db, 100, 105);
+    ack(&mut db, "FLUSH items");
+    let t105 = db.now_ts();
+    drop(db);
+    let text = std::fs::read_to_string(&marker).expect("the fork's marker");
+    assert!(text.starts_with(&format!("0 {t20}")), "{text}");
+    let names = archived(&dest);
+    assert!(names.iter().any(|n| n.starts_with("0001-")), "{names:?}");
+    // From the same backup to an instant after the fork: the old run to
+    // the fork, the new one after it.
+    let fresh2 = dir("tl-fresh2");
+    let (m, held) = restore_at(&fresh2, &dest, t105);
+    assert_eq!(held, expected((0..20).chain(100..105)), "{m}");
+    // To an instant the old run wrote at, past the fork: the fork's
+    // history, not the rows the old run went on to write.
+    let (m, held) = restore_at(&fresh2, &dest, t25);
+    assert_eq!(held, expected(0..20), "{m}");
+    // Before the fork: as ever.
+    let (m, held) = restore_at(&fresh2, &dest, t15);
+    assert_eq!(held, expected(0..15), "{m}");
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&fresh);
+    let _ = std::fs::remove_dir_all(&fresh2);
 }

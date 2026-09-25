@@ -1261,8 +1261,7 @@ impl Node {
         let mut i = 0;
         let taken = get_num(&b, &mut i)?;
         let last = get_ts(&b, &mut i)?;
-        let stopped =
-            if get_bool(&b, &mut i)? { Ok(()) } else { Err(Error::Plan(get_string(&b, &mut i)?)) };
+        let stopped = get_stop(&b, &mut i)?;
         Ok((taken, last, stopped))
     }
 
@@ -1285,8 +1284,7 @@ impl Node {
         let b = self.call(Call::DeleteMany, collection, 0, &body)?;
         let mut i = 0;
         let gone = get_num(&b, &mut i)?;
-        let stopped =
-            if get_bool(&b, &mut i)? { Ok(()) } else { Err(Error::Plan(get_string(&b, &mut i)?)) };
+        let stopped = get_stop(&b, &mut i)?;
         Ok((gone, stopped))
     }
 
@@ -1494,6 +1492,30 @@ impl Node {
         // What the target switched; a target from before it says nothing.
         Ok(get_string(&b, &mut 0).unwrap_or_default())
     }
+}
+
+/// What stopped a batch, at the end of its reply: nothing, or the message
+/// and, trailing, the error's kind -- a coordinator before 0.81.0 reads
+/// the message and ignores the byte, and a holder before it sends none,
+/// which reads as a `Plan`.
+fn put_stop(out: &mut Vec<u8>, stopped: Option<&Error>) {
+    match stopped {
+        None => put_bool(out, true),
+        Some(e) => {
+            put_bool(out, false);
+            put_str(out, &error_message(e));
+            out.push(error_kind(e));
+        }
+    }
+}
+
+fn get_stop(b: &[u8], i: &mut usize) -> Result<Result<()>> {
+    if get_bool(b, i)? {
+        return Ok(Ok(()));
+    }
+    let m = get_string(b, i)?;
+    let kind = get_u8(b, i).unwrap_or(2);
+    Ok(Err(error_from(kind, m)))
 }
 
 fn decode_response(resp: Vec<u8>) -> Result<Vec<u8>> {
@@ -2310,13 +2332,7 @@ fn handle(
             let _ = n;
             put_uvarint(&mut out, taken as u64);
             put_ts(&mut out, last);
-            match stopped {
-                None => put_bool(&mut out, true),
-                Some(m) => {
-                    put_bool(&mut out, false);
-                    put_str(&mut out, &m);
-                }
-            }
+            put_stop(&mut out, stopped.as_ref());
             return Ok(out);
         }
         Call::DeleteMany => {
@@ -2336,13 +2352,7 @@ fn handle(
                 confirm.wait()?;
             }
             put_uvarint(&mut out, gone as u64);
-            match stopped {
-                None => put_bool(&mut out, true),
-                Some(m) => {
-                    put_bool(&mut out, false);
-                    put_str(&mut out, &m);
-                }
-            }
+            put_stop(&mut out, stopped.as_ref());
             return Ok(out);
         }
         Call::Delete => {
@@ -2632,6 +2642,28 @@ fn select_of(sql: &str, params: &[Value]) -> Result<Select> {
 
 #[cfg(test)]
 mod tests {
+    /// A batch's stop keeps its kind across the wire, so a holder's
+    /// deadline is a deadline at the coordinator; a holder before 0.81.0
+    /// sends no kind, which reads as a `Plan`, as it always did.
+    #[test]
+    fn a_batchs_stop_keeps_its_kind_and_an_older_holders_reads_as_a_plan() {
+        let mut b = Vec::new();
+        put_stop(&mut b, Some(&Error::Deadline("the holder ran out of time".into())));
+        let e = get_stop(&b, &mut 0).unwrap().unwrap_err();
+        assert!(matches!(e, Error::Deadline(ref m) if m == "the holder ran out of time"), "{e}");
+        let mut b = Vec::new();
+        put_stop(&mut b, Some(&Error::Io(std::io::Error::other("disk full"))));
+        assert!(matches!(get_stop(&b, &mut 0).unwrap().unwrap_err(), Error::Io(_)));
+        let mut b = Vec::new();
+        put_stop(&mut b, None);
+        assert!(get_stop(&b, &mut 0).unwrap().is_ok());
+        // As a holder before 0.81.0 wrote it: the message, no kind.
+        let mut b = Vec::new();
+        put_bool(&mut b, false);
+        put_str(&mut b, "belongs to the shard on tcp://x:1, not to this node");
+        let e = get_stop(&b, &mut 0).unwrap().unwrap_err();
+        assert!(matches!(e, Error::Plan(_)), "{e}");
+    }
 
     #[test]
     fn fuzz_wire_answers_never_panic() {

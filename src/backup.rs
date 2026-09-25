@@ -26,6 +26,7 @@
 //! returned its [`Deferred`] work and the caller
 //! let go of the lock; the node answers other statements meanwhile.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -168,9 +169,25 @@ pub struct LogArchive {
 /// One archived log, by name.
 pub(crate) struct ArchivedLog {
     pub key: String,
+    pub timeline: u64,
     pub seq: u64,
     pub first: Timestamp,
     pub last: Timestamp,
+    /// The log runs past its timeline's end: read only to `last`, the
+    /// rest being what the child timeline took over.
+    pub cut: bool,
+}
+
+/// The archived logs a restore replays for one shard, in order, and the
+/// timeline the restored shard writes from then on.
+pub(crate) struct Replay {
+    pub logs: Vec<ArchivedLog>,
+    /// A log on the chain begins after the instant asked: nothing happened
+    /// between the last one replayed and the instant.
+    pub more: bool,
+    /// The timeline the instant asked falls in: the restored shard forks
+    /// from it, when it first archives a log of its own.
+    pub parent: u64,
 }
 
 impl LogArchive {
@@ -191,15 +208,72 @@ impl LogArchive {
         format!("nodes/{}/logs/{collection}/shard-{shard:04}/", self.slug)
     }
 
+    /// A log's name: its number and the instants it spans, under its
+    /// timeline from the first fork on -- timeline 0's logs keep the name
+    /// a node before 0.81.0 reads, so such a node restoring from here
+    /// still reaches the instants before any fork.
     fn key(
         &self,
         collection: &str,
         shard: usize,
+        timeline: u64,
         seq: u64,
         first: Timestamp,
         last: Timestamp,
     ) -> String {
-        format!("{}{seq:06}-{first:020}-{last:020}.log", self.prefix(collection, shard))
+        let p = self.prefix(collection, shard);
+        if timeline == 0 {
+            format!("{p}{seq:06}-{first:020}-{last:020}.log")
+        } else {
+            format!("{p}{timeline:04}-{seq:06}-{first:020}-{last:020}.log")
+        }
+    }
+
+    /// The marker of a timeline: what it forked from, and at what instant.
+    fn timeline_key(&self, collection: &str, shard: usize, timeline: u64) -> String {
+        format!("{}timeline-{timeline:04}", self.prefix(collection, shard))
+    }
+
+    /// Open timeline `timeline` for the shard, forked from `parent` at
+    /// `at`: a restore to an instant writes it before the restored shard
+    /// archives anything.
+    pub(crate) fn put_timeline(
+        &self,
+        collection: &str,
+        shard: usize,
+        timeline: u64,
+        parent: u64,
+        at: Timestamp,
+    ) -> Result<()> {
+        let key = self.target.key(&self.timeline_key(collection, shard, timeline));
+        self.target.store.put(&key, format!("{parent} {at}\n").as_bytes())?;
+        Ok(())
+    }
+
+    /// The number the shard's next timeline takes: past every one recorded.
+    pub(crate) fn next_timeline(&self, collection: &str, shard: usize) -> Result<u64> {
+        Ok(self.timelines(collection, shard)?.iter().map(|t| t.0 + 1).max().unwrap_or(1))
+    }
+
+    /// The timelines under the shard: `(timeline, parent, switch instant)`,
+    /// timeline 0 implied.
+    fn timelines(&self, collection: &str, shard: usize) -> Result<Vec<(u64, u64, Timestamp)>> {
+        let prefix = self.target.key(&format!("{}timeline-", self.prefix(collection, shard)));
+        let mut out = Vec::new();
+        for key in self.target.store.list(&prefix)? {
+            let Some(n) = key.rsplit("timeline-").next().and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&self.target.store.get(&key)?).to_string();
+            let mut parts = text.split_whitespace();
+            let parent = parts.next().and_then(|s| s.parse::<u64>().ok());
+            let at = parts.next().and_then(|s| s.parse::<Timestamp>().ok());
+            if let (Some(parent), Some(at)) = (parent, at) {
+                out.push((n, parent, at));
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Copy one log under `seq`, as the bytes it is -- under the shard's
@@ -207,10 +281,12 @@ impl LogArchive {
     /// -- replayed first for the instants it spans. Nothing for an empty
     /// log. The same `seq` written again replaces what was there: a live
     /// log's copy, then the rotated whole of it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn put_log(
         &self,
         collection: &str,
         shard: usize,
+        timeline: u64,
         seq: u64,
         path: &Path,
         cipher: &crate::cipher::Shared,
@@ -222,7 +298,7 @@ impl LogArchive {
         else {
             return Ok(None);
         };
-        let key = self.key(collection, shard, seq, first, last);
+        let key = self.key(collection, shard, timeline, seq, first, last);
         self.target.store.put_file(&self.target.key(&key), path)?;
         Ok(Some((first, last)))
     }
@@ -235,43 +311,105 @@ impl LogArchive {
     /// there the sequence runs unbroken and stops at the first number
     /// missing: a log that was never archived is a stretch a restore
     /// cannot claim.
+    /// The archived logs a restore to `upto` replays over a backup that
+    /// holds everything to `covered`: along the chain of timelines the
+    /// latest one descends from -- each timeline's logs between its switch
+    /// instant and its child's, so an abandoned run's logs are read only
+    /// before its fork -- and within a timeline in sequence, from the log
+    /// that straddles the segment's start (or the timeline's first, or
+    /// the one after a log held whole) to the first number missing.
     pub(crate) fn logs_after(
         &self,
         collection: &str,
         shard: usize,
         covered: Timestamp,
-    ) -> Result<(Vec<ArchivedLog>, u64)> {
+        upto: Timestamp,
+    ) -> Result<Replay> {
         let prefix = self.target.key(&self.prefix(collection, shard));
         let mut logs: Vec<ArchivedLog> = Vec::new();
         for key in self.target.store.list(&prefix)? {
             let name = key.rsplit('/').next().unwrap_or("");
             let Some(stem) = name.strip_suffix(".log") else { continue };
-            let mut parts = stem.splitn(3, '-');
-            let seq = parts.next().and_then(|s| s.parse::<u64>().ok());
-            let first = parts.next().and_then(|s| s.parse::<Timestamp>().ok());
-            let last = parts.next().and_then(|s| s.parse::<Timestamp>().ok());
-            if let (Some(seq), Some(first), Some(last)) = (seq, first, last) {
-                logs.push(ArchivedLog { key: key.clone(), seq, first, last });
+            let parts: Vec<&str> = stem.split('-').collect();
+            let (timeline, rest) = match parts.len() {
+                3 => (Some(0u64), &parts[..]),
+                4 => (parts[0].parse::<u64>().ok(), &parts[1..]),
+                _ => continue,
+            };
+            let seq = rest[0].parse::<u64>().ok();
+            let first = rest[1].parse::<Timestamp>().ok();
+            let last = rest[2].parse::<Timestamp>().ok();
+            if let (Some(timeline), Some(seq), Some(first), Some(last)) =
+                (timeline, seq, first, last)
+            {
+                logs.push(ArchivedLog { key: key.clone(), timeline, seq, first, last, cut: false });
             }
         }
-        // One log per number, the one that reaches furthest: a live log's
-        // copy and the rotation of it share a number.
-        logs.sort_by_key(|l| (l.seq, std::cmp::Reverse(l.last)));
-        logs.dedup_by_key(|l| l.seq);
-        let next = logs.last().map_or(1, |l| l.seq + 1);
-        let held_whole = logs.iter().filter(|l| l.last <= covered).map(|l| l.seq).max();
-        let mut out: Vec<ArchivedLog> = Vec::new();
-        for l in logs.into_iter().filter(|l| l.last > covered) {
-            let claimed = match out.last() {
-                Some(prev) => l.seq == prev.seq + 1,
-                None => l.first <= covered || l.seq == 1 || held_whole == Some(l.seq - 1),
+        // One log per number and timeline, the one that reaches furthest:
+        // a live log's copy and the rotation of it share a number.
+        logs.sort_by_key(|l| (l.timeline, l.seq, std::cmp::Reverse(l.last)));
+        logs.dedup_by_key(|l| (l.timeline, l.seq));
+        let timelines = self.timelines(collection, shard)?;
+        // The chain: the latest timeline, its parent, and so on to 0; then
+        // in order from 0, each with the instant it ends at (its child's
+        // switch), the latest open-ended.
+        let mut chain: Vec<(u64, Timestamp)> = Vec::new();
+        let mut at = timelines.iter().map(|t| t.0).max().unwrap_or(0);
+        let mut start_of: BTreeMap<u64, Timestamp> = BTreeMap::new();
+        loop {
+            let Some((_, parent, switch)) = timelines.iter().find(|t| t.0 == at).copied() else {
+                chain.push((at, 0));
+                break;
             };
-            if !claimed {
+            chain.push((at, switch));
+            start_of.insert(at, switch);
+            if chain.len() > timelines.len() + 1 {
                 break;
             }
-            out.push(l);
+            at = parent;
         }
-        Ok((out, next))
+        chain.reverse();
+        let mut out: Vec<ArchivedLog> = Vec::new();
+        let mut more = false;
+        let mut parent = 0;
+        for (k, (timeline, starts)) in chain.iter().enumerate() {
+            let ends = chain.get(k + 1).map(|c| c.1).unwrap_or(Timestamp::MAX);
+            if *starts <= upto {
+                parent = *timeline;
+            }
+            // This timeline's segment, and the part of it past the backup.
+            let from = covered.max(*starts);
+            if from >= ends || from >= upto {
+                continue;
+            }
+            let mine: Vec<&ArchivedLog> = logs.iter().filter(|l| l.timeline == *timeline).collect();
+            let held_whole = mine.iter().filter(|l| l.last <= from).map(|l| l.seq).max();
+            if mine.iter().any(|l| l.first > upto && l.first <= ends) {
+                more = true;
+            }
+            let mut taken: Vec<ArchivedLog> = Vec::new();
+            for l in mine.into_iter().filter(|l| l.last > from && l.first <= ends.min(upto)) {
+                let claimed = match taken.last() {
+                    Some(prev) => l.seq == prev.seq + 1,
+                    None => l.first <= from || l.seq == 1 || held_whole == Some(l.seq - 1),
+                };
+                if !claimed {
+                    break;
+                }
+                taken.push(ArchivedLog {
+                    key: l.key.clone(),
+                    timeline: l.timeline,
+                    seq: l.seq,
+                    first: l.first,
+                    // Read only to the segment's end: what the child
+                    // timeline took over from there.
+                    last: l.last.min(ends),
+                    cut: l.last > ends,
+                });
+            }
+            out.extend(taken);
+        }
+        Ok(Replay { logs: out, more, parent })
     }
 
     pub(crate) fn get(&self, key: &str) -> Result<Vec<u8>> {

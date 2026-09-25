@@ -449,9 +449,14 @@ same>' AS OF <any instant>` then takes the newest backup at or before it,
 replays the archived logs up to it, and says how far it reached: the
 instant asked, or where the archive ends, or a gap where a log was never
 archived. The logs are under `nodes/<node>/logs/<collection>/shard-NNNN/`,
-named by their rotation number and the instants they span. Take a backup
-after a restore: it is the base every later instant is reached from, and
-the logs of the run the restore left behind stay in the archive.
+named by their rotation number and the instants they span. A restore
+forks a timeline of its own for every shard it opens: what the restored
+node writes is archived under it (`0001-<number>-...`) beside the run's
+it left, the fork's instant is recorded (`timeline-0001`), and a later
+restore follows the chain of timelines, reading the run left behind only
+up to the fork. An archive written before 0.81.0 reads as timeline 0;
+a node before 0.81.0 restoring from one written after reaches the
+instants before the first fork.
 
 ```sql
 BACKUP LOG TO '/mnt/backups';

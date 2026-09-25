@@ -406,9 +406,19 @@ rotated logs, and opens the shard with the records at or below the
 backup's instant and above `t` dropped. Its answer names the instant
 reached: `t` when a log covers it or a later log begins after it, the
 last log's end otherwise, which is where the archive ends or a gap is.
-The restored shard's next number is one past the archive's, so a run
-continued from a restore replaces nothing there; the logs of the run it
-left stay, which is why the docs say to take a backup after a restore.
+A restore records a fork in every shard it opens (`ARCHIVED`: the
+timeline forked from and the instant), and the shard's first archived
+log after that makes it a timeline of the archive's -- the next number
+under the shard, its marker `timeline-NNNN` naming the parent and the
+instant -- so a run continued from a restore replaces nothing of the
+run it left, and a restore that never writes forks nothing. A restore
+`AS OF t` walks the chain from the latest timeline back to 0 and
+replays each timeline's logs between its own switch instant and its
+child's (a log that runs past that end is cut there), so the run left
+behind is read only before its fork; timeline 0's logs keep the name
+a node before 0.81.0 reads, so such a node restoring from a newer
+archive still reaches the instants before the first fork (0.81.0;
+before it the docs said to take a backup after a restore).
 Per-shard read and write counters on the metrics page
 (`celastro_shard_reads_total`, `celastro_shard_writes_total`, by collection
 and shard) are what shows a hot shard, which range partitioning with fixed
@@ -822,9 +832,11 @@ followers away hold no acknowledgement, so it keeps taking writes on
 its own disk (`DEGRADED`) until the lease runs out -- which is what the
 lease is for, with `CELASTRO_AUTO_FAILOVER=on` -- or it hears of the
 promotion; under `confirm = quorum` it takes none. The catch-up is shipped under the
-followed copies' lock and no other, since a write this node forwarded
+followed copy's own lock and no other, since a write this node forwarded
 under its own lock waits for that holder, which waits for this node to
-confirm its log; the wire's ship calls take that lock alone.
+confirm its log; the wire's ship calls take that lock alone -- one per
+copy since 0.81.0, the map's held only to find the copy, so the copies
+a node follows sync side by side rather than in turn.
 
 Automatic failover is the steward's: one node -- named, or the lowest
 attached address -- renews every node's lease every quarter of the lease

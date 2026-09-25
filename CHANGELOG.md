@@ -6,6 +6,35 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A restore forks a timeline.** A node restored to an instant went on
+writing logs numbered past the archive's, and the docs said to take a
+backup after a restore, because a later restore from an older backup to
+an instant past the fork replayed the logs of the run left behind. Every
+shard a restore opens now writes from a timeline of its own, its logs
+archived under it beside the old run's and the fork's instant recorded,
+and a restore `AS OF t` follows the chain of timelines -- the old run to
+its fork, the new one after -- so the abandoned run is read only before
+the fork. An archive written before this version reads as timeline 0; a
+node before this version restoring from one written after it reaches
+the instants before the first fork.
+
+**A holder's stop keeps its kind.** `insert_many` and `delete_many`
+answered what stopped a batch as a message, and the coordinator read
+every one as a planner error: a holder's deadline was not a deadline
+there. The reply carries the kind now, trailing, where an older
+coordinator ignores it and an older holder sends none.
+
+**A forwarded batch is checked once.** The holder's whole-batch check
+validated, coerced and keyed every row, and the shard did it again; the
+shard now takes the rows as checked.
+
+**The copies a node follows land side by side.** A holder's batch was
+applied under the one lock of the followed copies, held across the
+copy's fsync, so every copy a node follows synced in turn; each copy has
+its lock now and the map's is held only to find it.
+
 ## 0.80.0 — 2026-09-25
 
 **A write sent and unanswered is not sent again.** A call to a holder
