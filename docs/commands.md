@@ -239,6 +239,22 @@ celastro --dir ./data serve --bind 127.0.0.1 --port 18787 &
 http://127.0.0.1:18787/
 ```
 
+**Scoped tokens.** `CELASTRO_SCOPED_TOKENS` lists tokens that open one
+collection, or every one, for reading or for reading and writing, and
+nothing else: `token=notes` reads and writes `notes` (its rows, `FLUSH`,
+`COMPACT`, `SHOW SEGMENTS`, `SHOW CATALOG notes`, the ingest and the
+change stream of it; a walk may cross only edge collections it opens),
+`token=notes:ro` reads it, `token=*` and `token=*:ro` every collection.
+Entries are separated by commas; each token is as strong as the
+operator's must be. What a scoped token asks beyond its scope is
+answered 403: the catalog whole and the metrics need a `*` scope, and
+the health of the nodes, backups, restores, the nodes themselves, the
+stop and every other administrative statement are the operator's alone.
+
+```sh
+export CELASTRO_SCOPED_TOKENS="app-notes-token-0123456789=notes,reader-token-0123456789ab=*:ro"
+```
+
 **The token is not in that line when it came from `CELASTRO_TOKEN`**, and
 `--json`'s first line leaves the `token` field out for the same reason:
 the URL is printed to stdout before the first request is served, which
@@ -300,7 +316,7 @@ celastro send http://127.0.0.1:18787 "SELECT id FROM notes ORDER BY id LIMIT 1"
 ```
 
 ```json
-{"ok":true,"kind":"rows","count":1,"elapsed_ms":0,"missing":[],"truncated_prefixes":[],"cut_walks":[],"next_cursor":null,"rows":[{"key":"n2","score":null,"distance":null,"doc":{"id":"n2"}}]}
+{"ok":true,"kind":"rows","count":1,"elapsed_ms":0,"missing":[],"truncated_prefixes":[],"cut_walks":[],"facets":{},"next_cursor":null,"rows":[{"key":"n2","score":null,"distance":null,"doc":{"id":"n2"}}]}
 ```
 
 **`--url <URL>`** makes `exec`, `run`, `repl` and `catalog` clients of
@@ -381,6 +397,19 @@ landed (`documents`, `batches`, the instant `ts`); a line that does not
 parse, or a batch a shard refuses, ends the ingest with what came before
 it written and the line named, so `documents` is where to resume.
 
+`GET /api/changes/<collection>?since=<ts>` is the collection's change
+stream over the shards this node holds, for a cache or an index
+elsewhere that follows the database: the deletes still remembered after
+`since` (a replaced row's old version among them) and then the rows
+written after it in key order, each with its instant -- applied in that
+order they leave the follower where the node is -- a thousand a page (`limit`), with `next` the cursor for the
+page after (`after=`) and `upto` the instant the round read at -- the
+next round's `since`. A round reads one snapshot: its cursor pins
+`upto`. When a compaction has forgotten a delete since `since`, the
+answer says `reset: true` and reads from nothing, and what follows the
+stream rebuilds from that round. Each node streams what it holds; in a
+cluster, follow every node.
+
 `GET /api/metrics` is the Prometheus text format, behind the same token:
 statement, refusal and compaction counters, a latency histogram by the
 statement's kind (`celastro_statement_seconds_bucket{kind=...}`: select,
@@ -393,6 +422,7 @@ chart's `monitoring.enabled`, and a dashboard that draws it.
 T="X-Celastro-Token: $CELASTRO_TOKEN"
 curl -s -H "$T" -H "Content-Type: application/json" http://127.0.0.1:18787/api/query -d '{"sql": "SELECT count(*) FROM notes"}'
 curl -s -H "$T" -H "Content-Type: application/x-ndjson" --data-binary @notes.ndjson http://127.0.0.1:18787/api/ingest/notes
+curl -s -H "$T" "http://127.0.0.1:18787/api/changes/notes?since=0"
 curl -s http://127.0.0.1:18787/api/health
 curl -s -H "$T" http://127.0.0.1:18787/api/catalog
 curl -s -H "$T" http://127.0.0.1:18787/api/metrics
@@ -400,8 +430,9 @@ curl -s -X POST -H "$T" http://127.0.0.1:18787/api/shutdown
 ```
 
 ```json
-{"ok":true,"kind":"rows","count":1,"elapsed_ms":0,"missing":[],"truncated_prefixes":[],"cut_walks":[],"next_cursor":null,"rows":[{"key":"","score":null,"distance":null,"doc":{"count(*)":2}}]}
+{"ok":true,"kind":"rows","count":1,"elapsed_ms":0,"missing":[],"truncated_prefixes":[],"cut_walks":[],"facets":{},"next_cursor":null,"rows":[{"key":"","score":null,"distance":null,"doc":{"count(*)":2}}]}
 {"ok":true,"kind":"ingest","documents":120000,"batches":120,"ts":7333190881139294208}
+{"ok":true,"kind":"changes","upto":7333190881139300000,"reset":false,"next":null,"changes":[{"kind":"delete","key":"n9","ts":7333190881139200000},{"kind":"insert","key":"n1","ts":7333190881139100000,"doc":{"id":"n1","topic":"search"}}]}
 {"ok":true,"name":"celastro","version":"0.55.0","source":"https://github.com/celastro/celastro/tree/v0.55.0","license":"AGPL-3.0-only","copyright":"Copyright (C) 2026 celastro","collections":1,"node":null,"attached":0}
 {"ok":true,"collections":[{"name":"notes","primary_key":"id","partition_key":null,"doc_count":4,"indexes":[{"name":"notes_body","path":"body","kind":"fulltext","tier":"active"},...]}]}
 {"ok":true,"kind":"ack","message":"shutting down"}

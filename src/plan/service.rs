@@ -77,6 +77,10 @@ pub struct ShardCandidates {
 
 /// What a shard needs to run its half of an unranked scan.
 pub struct ScanRequest<'a> {
+    /// The facet this scan is for, if it is one: the path whose values are
+    /// counted. Carried to a holder on another node beside the statement's
+    /// text, from which it builds the same `facet_select`.
+    pub facet: Option<&'a str>,
     pub coll: &'a Collection,
     pub select: &'a Select,
     pub ts: Timestamp,

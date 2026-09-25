@@ -161,6 +161,7 @@ const QUERIES: &[&str] = &[
     "SELECT id FROM items ORDER BY hybrid(text_match(body, 'rank segment'), method => \
      'linear') LIMIT 8",
     "SELECT id, snippet(body, 2) FROM items WHERE text_match(body, 'seg*') LIMIT 100",
+    "SELECT id FROM items WHERE n > 5 FACET tenant, tag TOP 2 LIMIT 5",
 ];
 
 /// A coordinator holds no shards: a placement, a rebalance and a move never
@@ -393,10 +394,12 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
 
     // Every node answers what one process answers, bit for bit.
     for q in QUERIES {
-        let want = shape(&one.query(q).unwrap());
-        assert!(!want.is_empty(), "{q}");
+        let alone = one.query(q).unwrap();
+        let want = (shape(&alone), format!("{:?}", alone.facets));
+        assert!(!want.0.is_empty(), "{q}");
         for n in [&a, &b, &c] {
-            assert_eq!(shape(&n.query(q).unwrap()), want, "{q} on {}", n.url);
+            let r = n.query(q).unwrap();
+            assert_eq!((shape(&r), format!("{:?}", r.facets)), want, "{q} on {}", n.url);
         }
     }
     // A plan lists every shard, the remote ones as their holders rendered them.

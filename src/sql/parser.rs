@@ -972,6 +972,8 @@ impl<'a> Parser<'a> {
         // naturally on either side of `LIMIT`, and rejecting one of the two
         // orderings would be a rule with no purpose behind it.
         let mut collapse = None;
+        let mut facets: Vec<String> = Vec::new();
+        let mut facet_top = 10usize;
         let mut limit = None;
         let mut offset = 0usize;
         let mut cursor = None;
@@ -1002,9 +1004,29 @@ impl<'a> Parser<'a> {
                     Value::Str(s) => s,
                     other => crate::json::to_string(&other),
                 });
+            } else if self.eat_kw("FACET") {
+                once(&mut seen, "FACET")?;
+                loop {
+                    facets.push(self.path()?);
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                if self.eat_kw("TOP") {
+                    facet_top = self.usize_literal()?;
+                }
             } else {
                 break;
             }
+        }
+        if !facets.is_empty()
+            && (group_by.is_some()
+                || projections.iter().any(|p| matches!(p, Projection::Aggregate { .. })))
+        {
+            return Err(Error::Sql(
+                "FACET counts the rows a predicate admits; an aggregate is already that count"
+                    .into(),
+            ));
         }
         let with = self.with_opts()?;
 
@@ -1026,6 +1048,8 @@ impl<'a> Parser<'a> {
             cursor,
             collapse,
             group_by,
+            facets,
+            facet_top,
             with,
         })
     }

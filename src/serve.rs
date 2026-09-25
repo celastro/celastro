@@ -125,6 +125,199 @@ pub struct Server {
     /// than one drawn for this run. It decides whether the token may be
     /// printed: see [`Server::url`].
     operator_token: bool,
+    /// Tokens that open one collection, or every collection, for reading
+    /// or for reading and writing, and nothing else (`CELASTRO_SCOPED_TOKENS`).
+    scoped: Vec<(String, Scope)>,
+}
+
+/// What a scoped token may do: one collection or every one, read-only or
+/// not. Never administration -- the catalog whole, the health, the nodes,
+/// backups, the stop -- which is the operator's token's alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scope {
+    /// `None` is every collection (`*`).
+    pub collection: Option<String>,
+    pub read_only: bool,
+}
+
+impl Scope {
+    fn on(&self, collection: &str) -> bool {
+        self.collection.as_deref().map_or(true, |c| c == collection)
+    }
+
+    fn reads(&self, collection: &str) -> bool {
+        self.on(collection)
+    }
+
+    fn writes(&self, collection: &str) -> bool {
+        !self.read_only && self.on(collection)
+    }
+
+    /// Whether the token may run `stmt`: a read, or a write when it is
+    /// not read-only, of a collection it opens -- an edge collection a
+    /// walk crosses counts -- and nothing administrative.
+    fn allows(&self, stmt: &sql::Statement) -> bool {
+        use sql::Statement;
+        match stmt {
+            Statement::Local(inner) | Statement::Explain { inner, .. } => {
+                return self.allows(inner)
+            }
+            _ => {}
+        }
+        if self.read_only && !Db::is_read(stmt) {
+            return false;
+        }
+        let touched: Vec<&str> = match stmt {
+            Statement::Select(sel) => {
+                let mut c = vec![sel.collection.as_str()];
+                c.extend(select_edges(sel));
+                c
+            }
+            Statement::Insert(i) => vec![i.collection.as_str()],
+            Statement::Delete(d) => vec![d.collection.as_str()],
+            Statement::Flush { collection }
+            | Statement::Compact { collection }
+            | Statement::ShowSegments { collection } => vec![collection.as_str()],
+            Statement::ShowCatalog { collection: Some(c) } => vec![c.as_str()],
+            _ => return false,
+        };
+        touched.iter().all(|c| self.on(c))
+    }
+}
+
+/// The edge collections a select's walks cross, in `WHERE` and in a
+/// `hops(...)` source.
+fn select_edges(sel: &sql::Select) -> Vec<&str> {
+    fn walk<'a>(e: &'a sql::Expr, out: &mut Vec<&'a str>) {
+        match e {
+            sql::Expr::Hops { via, .. } => out.push(via.as_str()),
+            sql::Expr::And(v) | sql::Expr::Or(v) => v.iter().for_each(|x| walk(x, out)),
+            sql::Expr::Not(x) => walk(x, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(e) = &sel.predicate {
+        walk(e, &mut out);
+    }
+    if let Some(sql::OrderBy::Hybrid(h)) = &sel.order {
+        for s in &h.sources {
+            if let sql::HybridSource::Hops { via, .. } = s {
+                out.push(via.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// The tokens a request is checked against: the operator's, and the scoped
+/// ones with what each opens.
+pub(crate) struct Tokens<'a> {
+    operator: &'a str,
+    scoped: &'a [(String, Scope)],
+}
+
+impl<'a> Tokens<'a> {
+    #[cfg(test)]
+    fn operator(token: &'a str) -> Tokens<'a> {
+        Tokens { operator: token, scoped: &[] }
+    }
+
+    /// What `given` opens, if it is a token at all. Every candidate is
+    /// compared in constant time, and the operator's first.
+    fn grant(&self, given: &str) -> Option<Grant> {
+        if token_matches(self.operator, given) {
+            return Some(Grant::Operator);
+        }
+        self.scoped
+            .iter()
+            .find(|(t, _)| token_matches(t, given))
+            .map(|(_, s)| Grant::Scoped(s.clone()))
+    }
+}
+
+/// What the request's token opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Grant {
+    Operator,
+    Scoped(Scope),
+}
+
+impl Grant {
+    /// Whether the token may see what every collection has: the catalog,
+    /// the metrics. The operator's, or a scope over every collection.
+    fn sees_all(&self) -> bool {
+        match self {
+            Grant::Operator => true,
+            Grant::Scoped(s) => s.collection.is_none(),
+        }
+    }
+
+    fn reads(&self, collection: &str) -> bool {
+        match self {
+            Grant::Operator => true,
+            Grant::Scoped(s) => s.reads(collection),
+        }
+    }
+
+    fn writes(&self, collection: &str) -> bool {
+        match self {
+            Grant::Operator => true,
+            Grant::Scoped(s) => s.writes(collection),
+        }
+    }
+}
+
+/// `CELASTRO_SCOPED_TOKENS`: `token=scope` entries separated by commas,
+/// the scope a collection's name, `<collection>:ro`, `*` or `*:ro`. Each
+/// token must be as strong as the operator's; none may be the operator's
+/// or another's. Empty when unset.
+pub const SCOPED_TOKENS_ENV: &str = "CELASTRO_SCOPED_TOKENS";
+
+pub fn scoped_tokens_from_env() -> std::result::Result<Vec<(String, Scope)>, String> {
+    match std::env::var(SCOPED_TOKENS_ENV) {
+        Ok(v) if !v.trim().is_empty() => parse_scoped_tokens(&v),
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub fn parse_scoped_tokens(spec: &str) -> std::result::Result<Vec<(String, Scope)>, String> {
+    let mut out: Vec<(String, Scope)> = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((token, scope)) = entry.split_once('=') else {
+            return Err(format!(
+                "{SCOPED_TOKENS_ENV}: `{entry}` is not `token=scope` (a collection, \
+                 `<collection>:ro`, `*` or `*:ro`)"
+            ));
+        };
+        let token = token.trim();
+        if token.len() < MIN_NETWORK_TOKEN || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(format!(
+                "{SCOPED_TOKENS_ENV}: a token must be at least {MIN_NETWORK_TOKEN} printable ASCII \
+                 bytes with no whitespace; one of {} bytes is not",
+                token.len()
+            ));
+        }
+        if out.iter().any(|(t, _)| t == token) {
+            return Err(format!("{SCOPED_TOKENS_ENV}: a token is listed twice"));
+        }
+        let (collection, read_only) = match scope.trim().rsplit_once(":ro") {
+            Some((c, "")) => (c, true),
+            _ => (scope.trim(), false),
+        };
+        if collection.is_empty()
+            || (collection != "*"
+                && !collection.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            return Err(format!(
+                "{SCOPED_TOKENS_ENV}: `{scope}` is not a scope: a collection's name, \
+                 `<collection>:ro`, `*` or `*:ro`"
+            ));
+        }
+        let collection = (collection != "*").then(|| collection.to_string());
+        out.push((token.to_string(), Scope { collection, read_only }));
+    }
+    Ok(out)
 }
 
 /// What this process has done since it started, for `/api/metrics`: the
@@ -601,6 +794,7 @@ impl Server {
             auto_compact: true,
             group_commit: true,
             operator_token: false,
+            scoped: Vec::new(),
         })
     }
 
@@ -644,6 +838,7 @@ impl Server {
             // Every token this constructor takes is the operator's: that
             // is the whole reason it exists.
             operator_token: true,
+            scoped: Vec::new(),
         })
     }
 
@@ -665,6 +860,13 @@ impl Server {
     /// (`CELASTRO_GROUP_COMMIT=off`).
     pub fn with_group_commit(mut self, on: bool) -> Server {
         self.group_commit = on;
+        self
+    }
+
+    /// Tokens that open one collection or every one, read-only or not
+    /// (`CELASTRO_SCOPED_TOKENS`); the operator's token is unaffected.
+    pub fn with_scoped_tokens(mut self, scoped: Vec<(String, Scope)>) -> Server {
+        self.scoped = scoped;
         self
     }
 
@@ -888,7 +1090,8 @@ impl Server {
         let mut io = BufReader::new(stream);
         // The lock is taken inside `answer`, around the statement and nothing
         // else; the socket is never read or written under it.
-        let served = answer(&mut io, &self.token, self.addr.port(), self.reach, db, deadlines);
+        let tokens = Tokens { operator: &self.token, scoped: &self.scoped };
+        let served = answer(&mut io, &tokens, self.addr.port(), self.reach, db, deadlines);
         if served.response.status == 401 || served.response.status == 403 {
             COUNTERS.refused.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -1586,11 +1789,14 @@ enum Action {
     Health,
     /// The metrics page; needs `&Db` for what it holds.
     Metrics,
-    /// Read the body and run the SQL in it; needs `&mut Db`.
-    Query,
+    /// Read the body and run the SQL in it; needs `&mut Db`. Carries what
+    /// the token opens, for the statement to be checked against once parsed.
+    Query(Grant),
     /// Read the body as NDJSON, a document a line, and insert it in batches
     /// into the collection named; needs `&mut Db` per batch.
     Ingest(String),
+    /// One page of the collection's change stream; needs `&Db`.
+    Changes(String),
     /// Acknowledge, then stop serving so the caller can close the database.
     Shutdown,
 }
@@ -1635,6 +1841,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
         }
         "/api/query" | "/api/shutdown" => Some("POST"),
         p if p.starts_with("/api/ingest/") => Some("POST"),
+        p if p.starts_with("/api/changes/") => Some("GET"),
         _ => None,
     }
 }
@@ -1713,7 +1920,7 @@ fn same_site_post(head: &Head, port: u16, reach: Reach) -> std::result::Result<(
 /// unauthenticated client cannot map which paths exist by their status codes.
 #[cfg(test)]
 fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, Reject> {
-    dispatch_for(head, token, port, Reach::Loopback)
+    dispatch_for(head, &Tokens::operator(token), port, Reach::Loopback)
 }
 
 /// [`dispatch`] for a console of either reach. On a network the `Host`
@@ -1722,7 +1929,7 @@ fn dispatch(head: &Head, token: &str, port: u16) -> std::result::Result<Action, 
 /// guards every path, and a browser's `Origin` must be that `Host`.
 fn dispatch_for(
     head: &Head,
-    token: &str,
+    tokens: &Tokens<'_>,
     port: u16,
     reach: Reach,
 ) -> std::result::Result<Action, Reject> {
@@ -1748,9 +1955,9 @@ fn dispatch_for(
         Some(t) => t,
         None => return Err(Reject::Unauthorized),
     };
-    if !token_matches(token, given) {
+    let Some(grant) = tokens.grant(given) else {
         return Err(Reject::Unauthorized);
-    }
+    };
     // On a network the API takes the token in the header only: a `?t=` in
     // the URL is written into every proxy's and balancer's access log on
     // the way, and into a browser's history. The page and its two assets
@@ -1760,30 +1967,55 @@ fn dispatch_for(
     if reach == Reach::Network && header_token(head).is_none() && head.path.starts_with("/api/") {
         return Err(Reject::Unauthorized);
     }
+    // A body over the statement's bound is refused before a byte of it is
+    // read, on every route but the ingest, which reads its body a line at
+    // a time and may be any length.
+    if head.content_length > MAX_BODY && !head.path.starts_with("/api/ingest/") {
+        return Err(Reject::PayloadTooLarge);
+    }
     match (head.method.as_str(), head.path.as_str()) {
-        ("GET", "/") => Ok(page(token)),
+        // The page carries the token it was opened with, so a scoped
+        // token's user gets a console that speaks with that token.
+        ("GET", "/") => Ok(page(given)),
         ("GET", "/app.js") => Ok(asset(CT_JS, APP_JS)),
         ("GET", "/style.css") => Ok(asset(CT_CSS, STYLE_CSS)),
-        ("GET", "/api/catalog") => Ok(Action::Catalog),
-        ("GET", "/api/metrics") => Ok(Action::Metrics),
+        ("GET", "/api/catalog") if grant.sees_all() => Ok(Action::Catalog),
+        ("GET", "/api/metrics") if grant.sees_all() => Ok(Action::Metrics),
+        ("GET", "/api/catalog") | ("GET", "/api/metrics") => Err(Reject::Forbidden),
         ("POST", "/api/query") => {
             same_site_post(head, port, reach)?;
             // A cross-origin form cannot set this content type, and asking for
             // it is what forces a preflight the browser will refuse to send.
             match head.header("content-type") {
-                Some(v) if is_json_media_type(v) => Ok(Action::Query),
+                Some(v) if is_json_media_type(v) => Ok(Action::Query(grant)),
                 _ => Err(Reject::UnsupportedMediaType),
             }
         }
         ("POST", "/api/shutdown") => {
             same_site_post(head, port, reach)?;
+            if grant != Grant::Operator {
+                return Err(Reject::Forbidden);
+            }
             Ok(Action::Shutdown)
+        }
+        ("GET", p) if p.starts_with("/api/changes/") => {
+            let collection = &p["/api/changes/".len()..];
+            if collection.is_empty() || collection.contains('/') {
+                return Err(Reject::NotFound);
+            }
+            if !grant.reads(collection) {
+                return Err(Reject::Forbidden);
+            }
+            Ok(Action::Changes(collection.to_string()))
         }
         ("POST", p) if p.starts_with("/api/ingest/") => {
             same_site_post(head, port, reach)?;
             let collection = &p["/api/ingest/".len()..];
             if collection.is_empty() || collection.contains('/') {
                 return Err(Reject::NotFound);
+            }
+            if !grant.writes(collection) {
+                return Err(Reject::Forbidden);
             }
             match head.header("content-type") {
                 Some(v) if is_ndjson_media_type(v) || is_json_media_type(v) => {
@@ -2560,7 +2792,7 @@ fn write_soon(db: &RwLock<Db>, max: Duration) -> Option<RwLockWriteGuard<'_, Db>
 
 fn answer<W: Wire>(
     io: &mut W,
-    token: &str,
+    tokens: &Tokens<'_>,
     port: u16,
     reach: Reach,
     db: &RwLock<Db>,
@@ -2580,8 +2812,8 @@ fn answer<W: Wire>(
     // it and never gets a statement as far as the database. Every other route
     // ignores the body, and an ignored body is drained rather than left to make
     // the close an RST.
-    let action = dispatch_for(&head, token, port, reach);
-    if !matches!(action, Ok(Action::Query) | Ok(Action::Ingest(_))) {
+    let action = dispatch_for(&head, tokens, port, reach);
+    if !matches!(action, Ok(Action::Query(_)) | Ok(Action::Ingest(_))) {
         drain(io, head.content_length as u64);
     }
     let served = match action {
@@ -2601,10 +2833,11 @@ fn answer<W: Wire>(
         Ok(Action::Metrics) => {
             Served::keep(Response::new(200, "OK", CT_METRICS, metrics_text(&read(db))))
         }
-        Ok(Action::Query) => Served::keep(query_response(io, &head, db, dl.body)),
+        Ok(Action::Query(grant)) => Served::keep(query_response(io, &head, db, dl.body, &grant)),
         Ok(Action::Ingest(collection)) => {
             Served::keep(ingest_response(io, &head, &collection, db, dl.body))
         }
+        Ok(Action::Changes(collection)) => Served::keep(changes_response(&head, &collection, db)),
         Ok(Action::Shutdown) => Served::last(Response::json(ack_json("shutting down"))),
     };
     // A HEAD gets the head a GET would have got and not one byte of the body.
@@ -2624,15 +2857,26 @@ fn query_response<W: Wire>(
     head: &Head,
     db: &RwLock<Db>,
     deadline: Instant,
+    grant: &Grant,
 ) -> Response {
     let body = match read_body(io, head.content_length, deadline) {
         Ok(b) => b,
         Err(r) => return r.response(),
     };
-    match sql_from_body(&body) {
-        Ok(sql) => run_sql(db, &sql),
-        Err(r) => r.response(),
+    let sql = match sql_from_body(&body) {
+        Ok(sql) => sql,
+        Err(r) => return r.response(),
+    };
+    // A scoped token's statement is checked once parsed: a statement that
+    // does not parse is the parser's to refuse, as for the operator.
+    if let Grant::Scoped(scope) = grant {
+        if let Ok(stmt) = sql::parse(&sql, &[]) {
+            if !scope.allows(&stmt) {
+                return Reject::Forbidden.response();
+            }
+        }
     }
+    run_sql(db, &sql)
 }
 
 // ----------------------------------------------------------------- responses
@@ -2936,7 +3180,22 @@ pub(crate) fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
         }
         out.push_str(&jstr(t));
     }
-    out.push_str(r#"],"next_cursor":"#);
+    out.push_str(r#"],"facets":{"#);
+    for (i, (path, values)) in r.facets.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&jstr(path));
+        out.push_str(":[");
+        for (k, (value, n)) in values.iter().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{},{n}]", json::to_string(value)));
+        }
+        out.push(']');
+    }
+    out.push_str(r#"},"next_cursor":"#);
     match &r.next_cursor {
         Some(c) => out.push_str(&jstr(c)),
         None => out.push_str("null"),
@@ -3048,6 +3307,48 @@ fn note_statement(kind: usize, micros: u64, failed: bool) {
         }
     }
     COUNTERS.statement_buckets[kind][STATEMENT_BUCKETS.len()].fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// `GET /api/changes/<collection>?since=<ts>[&after=<cursor>][&limit=<n>]`:
+/// one page of the collection's change stream over the shards this node
+/// holds (`Db::changes_since`). `since` is the last round's `upto`, zero
+/// for everything; `after` the cursor the previous page gave; `limit` the
+/// rows a page carries, a thousand unless said. The answer's `changes` are
+/// the deletes still remembered after `since` (on a round's first page),
+/// then rows in key order, each with its instant; `next` is the cursor for
+/// the round's next page or null; `reset` says the stream starts over from
+/// nothing, because a compaction forgot a delete since `since`.
+fn changes_response(head: &Head, collection: &str, db: &RwLock<Db>) -> Response {
+    let num = |key: &str| query_param(&head.query, key).and_then(|v| v.parse::<u64>().ok());
+    let since = num("since").unwrap_or(0);
+    let limit = num("limit").map(|n| n as usize).unwrap_or(1000);
+    let after = query_param(&head.query, "after");
+    let page = match read(db).changes_since(collection, since, after, limit) {
+        Ok(p) => p,
+        Err(e) => return Response::json(error_json(&e.to_string())),
+    };
+    let mut out = format!(
+        r#"{{"ok":true,"kind":"changes","upto":{},"reset":{},"next":"#,
+        page.upto, page.reset
+    );
+    match &page.next {
+        Some(c) => out.push_str(&jstr(c)),
+        None => out.push_str("null"),
+    }
+    out.push_str(r#","changes":["#);
+    for (i, it) in page.items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let kind = if it.kind == crate::replication::SHIP_DELETE { "delete" } else { "insert" };
+        out.push_str(&format!(r#"{{"kind":"{kind}","key":{},"ts":{}"#, jstr(&it.key), it.ts));
+        if let Some(d) = &it.doc {
+            out.push_str(&format!(r#","doc":{}"#, json::to_string(d)));
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+    Response::json(out)
 }
 
 /// Documents an ingest writes in one statement: the console's own
@@ -3407,7 +3708,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            dispatch_for(&head, "0123456789abcdef", 8787, Reach::Network),
+            dispatch_for(&head, &Tokens::operator("0123456789abcdef"), 8787, Reach::Network),
             Ok(Action::Metrics)
         ));
     }
@@ -3489,7 +3790,7 @@ mod tests {
             (by_query("/app.js"), true),
             (by_query("/style.css"), true),
         ] {
-            let got = dispatch_for(&h, token, 8787, Reach::Network);
+            let got = dispatch_for(&h, &Tokens::operator(token), 8787, Reach::Network);
             assert_eq!(got.is_ok(), want_ok, "{} {}", h.method, h.path);
             if !want_ok {
                 assert!(matches!(got, Err(Reject::Unauthorized)));
@@ -3501,7 +3802,7 @@ mod tests {
             "GET /api/catalog?t={token} HTTP/1.1\r\nHost: localhost:8787\r\n\r\n"
         ))
         .unwrap();
-        assert!(dispatch_for(&local, token, 8787, Reach::Loopback).is_ok());
+        assert!(dispatch_for(&local, &Tokens::operator(token), 8787, Reach::Loopback).is_ok());
     }
 
     /// Refusals earn a wait that grows a step per refusal, caps at two
@@ -3639,9 +3940,15 @@ mod tests {
 
     /// The same, keeping the database and the caller's marching orders.
     fn serve_request(db: &mut Db, request: &str) -> (String, Next) {
+        serve_scoped(db, &[], request)
+    }
+
+    /// `serve_request` with scoped tokens beside the operator's `tok`.
+    fn serve_scoped(db: &mut Db, scoped: &[(String, Scope)], request: &str) -> (String, Next) {
         let mut io = Cursor::new(request.as_bytes());
         let shared = RwLock::new(std::mem::take(db));
-        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
+        let tokens = Tokens { operator: "tok", scoped };
+        let served = answer(&mut io, &tokens, PORT, Reach::Loopback, &shared, wide());
         *db = shared.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::new();
         served.response.write_to(&mut out).expect("a Vec never fails to be written to");
@@ -3719,22 +4026,22 @@ mod tests {
         let h = get("/api/catalog", "celastro-console:8787", Some("tok"));
         assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::Forbidden), "loopback refuses it");
         assert!(
-            dispatch_for(&h, "tok", PORT, Reach::Network).is_ok(),
+            dispatch_for(&h, &Tokens::operator("tok"), PORT, Reach::Network).is_ok(),
             "a network console serves it"
         );
         let wrong = get("/api/catalog", "celastro-console:8787", Some("nottok"));
         assert_eq!(
-            dispatch_for(&wrong, "tok", PORT, Reach::Network).err(),
+            dispatch_for(&wrong, &Tokens::operator("tok"), PORT, Reach::Network).err(),
             Some(Reject::Unauthorized)
         );
         let none = get("/api/catalog", "celastro-console:8787", None);
         assert_eq!(
-            dispatch_for(&none, "tok", PORT, Reach::Network).err(),
+            dispatch_for(&none, &Tokens::operator("tok"), PORT, Reach::Network).err(),
             Some(Reject::Unauthorized)
         );
         let no_host = head("GET /api/catalog HTTP/1.1\r\nX-Celastro-Token: tok\r\n");
         assert_eq!(
-            dispatch_for(&no_host, "tok", PORT, Reach::Network).err(),
+            dispatch_for(&no_host, &Tokens::operator("tok"), PORT, Reach::Network).err(),
             Some(Reject::Forbidden)
         );
         // A browser on a page the console served names the console's own
@@ -3745,10 +4052,20 @@ mod tests {
                  Origin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n"
             ))
         };
-        assert!(dispatch_for(&post("http://celastro-console:8787"), "tok", PORT, Reach::Network)
-            .is_ok());
-        assert!(dispatch_for(&post("HTTP://Celastro-Console:8787"), "tok", PORT, Reach::Network)
-            .is_ok());
+        assert!(dispatch_for(
+            &post("http://celastro-console:8787"),
+            &Tokens::operator("tok"),
+            PORT,
+            Reach::Network
+        )
+        .is_ok());
+        assert!(dispatch_for(
+            &post("HTTP://Celastro-Console:8787"),
+            &Tokens::operator("tok"),
+            PORT,
+            Reach::Network
+        )
+        .is_ok());
         for foreign in [
             "http://evil.example",
             "https://celastro-console:8787",
@@ -3756,7 +4073,7 @@ mod tests {
             "http://celastro-console:9000",
         ] {
             assert_eq!(
-                dispatch_for(&post(foreign), "tok", PORT, Reach::Network).err(),
+                dispatch_for(&post(foreign), &Tokens::operator("tok"), PORT, Reach::Network).err(),
                 Some(Reject::Forbidden),
                 "{foreign}"
             );
@@ -3922,15 +4239,35 @@ mod tests {
 
     #[test]
     fn an_oversized_content_length_is_refused_before_a_buffer_is_sized_from_it() {
-        assert_eq!(parse_content_length("1073741824"), Err(Reject::PayloadTooLarge));
-        // Too large to be a `u64` at all: over the cap by inspection, not a
+        // The declared length is a number, not a size to allocate: an ingest
+        // may declare a gigabyte and read it a line at a time. The bound is
+        // applied where a body is buffered, and at the route for every other
+        // path, before a byte is read.
+        assert_eq!(parse_content_length("1073741824"), Ok(1 << 30));
+        // Too large to be a `u64` at all: over any cap by inspection, not a
         // parse failure to be reported as a malformed request.
         let huge = "999999999999999999999999999";
         assert_eq!(parse_content_length(huge), Err(Reject::PayloadTooLarge));
-        assert_eq!(parse_content_length(&(MAX_BODY + 1).to_string()), Err(Reject::PayloadTooLarge));
-        // The cap is a limit, not an off-by-one: exactly MAX_BODY is accepted.
         assert_eq!(parse_content_length(&MAX_BODY.to_string()), Ok(MAX_BODY));
         assert_eq!(parse_content_length("11"), Ok(11));
+        let head = |path: &str| {
+            parse_head(&format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\nContent-Type: \
+                 application/json\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY + 1
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            dispatch_for(&head("/api/query"), &Tokens::operator("tok"), PORT, Reach::Loopback)
+                .err(),
+            Some(Reject::PayloadTooLarge),
+            "a statement's body over the bound is refused at the route"
+        );
+        assert!(
+            matches!(dispatch_for(&head("/api/ingest/items"), &Tokens::operator("tok"), PORT, Reach::Loopback), Ok(Action::Ingest(c)) if c == "items"),
+            "an ingest's body may be any length"
+        );
         // A length that is not a number is malformed rather than large.
         assert_eq!(parse_content_length("12x"), Err(Reject::BadRequest));
         assert_eq!(parse_content_length("-1"), Err(Reject::BadRequest));
@@ -4049,7 +4386,7 @@ mod tests {
         assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::NotFound));
         assert_eq!(Reject::NotFound.status().0, 404);
         assert_eq!(Reject::MethodNotAllowed("GET").status().0, 405);
-        assert!(matches!(dispatch(&post("/api/query"), "tok", PORT), Ok(Action::Query)));
+        assert!(matches!(dispatch(&post("/api/query"), "tok", PORT), Ok(Action::Query(_))));
         assert!(matches!(dispatch(&post("/api/shutdown"), "tok", PORT), Ok(Action::Shutdown)));
         let h = get("/api/shutdown", "localhost", Some("tok"));
         assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::MethodNotAllowed("POST")));
@@ -4086,7 +4423,8 @@ mod tests {
         let held = shared.write().unwrap();
         let mut io =
             Cursor::new("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n".as_bytes());
-        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
+        let served =
+            answer(&mut io, &Tokens::operator("tok"), PORT, Reach::Loopback, &shared, wide());
         drop(held);
         let text = String::from_utf8(rendered(&served.response)).unwrap();
         assert_eq!(status_line(&text), "HTTP/1.1 200 OK");
@@ -4891,7 +5229,8 @@ mod tests {
         let db = Db::in_memory();
         let mut io = Cursor::new(request.as_bytes());
         let shared = RwLock::new(db);
-        let served = answer(&mut io, "tok", PORT, Reach::Loopback, &shared, wide());
+        let served =
+            answer(&mut io, &Tokens::operator("tok"), PORT, Reach::Loopback, &shared, wide());
         assert_eq!(served.response.status, 401);
         assert_eq!(io.position() as usize, request.len(), "the refused body must be drained");
 
@@ -4947,9 +5286,9 @@ mod tests {
         let ours = format!("Origin: http://127.0.0.1:{}\r\n", PORT);
         // What the console's own page sends.
         let mine = format!("{ours}Sec-Fetch-Site: same-origin\r\n{json}");
-        assert!(matches!(dispatch(&post(&mine), "tok", PORT), Ok(Action::Query)));
+        assert!(matches!(dispatch(&post(&mine), "tok", PORT), Ok(Action::Query(_))));
         let local = format!("Origin: http://localhost:{}\r\n{json}", PORT);
-        assert!(matches!(dispatch(&post(&local), "tok", PORT), Ok(Action::Query)));
+        assert!(matches!(dispatch(&post(&local), "tok", PORT), Ok(Action::Query(_))));
         // What a page somewhere else sends.
         for origin in [
             "http://evil.example".to_string(),
@@ -5026,6 +5365,138 @@ mod tests {
         let (response, next) = serve_request(&mut db, &anonymous);
         assert_eq!(status_line(&response), "HTTP/1.1 401 Unauthorized");
         assert_eq!(next, Next::Serve, "an anonymous request must not stop the console");
+    }
+
+    /// A scoped token opens its collection -- reads, and writes unless
+    /// read-only, the ingest and the change stream of it -- and is answered
+    /// 403 for another collection, for the catalog whole without a `*`
+    /// scope, and for every administrative statement and route; the
+    /// operator's token does everything, as before.
+    #[test]
+    fn a_scoped_token_opens_its_collection_and_nothing_else() {
+        let mut db = Db::in_memory();
+        for sql in [
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY, n INT)",
+            "CREATE COLLECTION other (id TEXT PRIMARY KEY, src TEXT, dst TEXT)",
+        ] {
+            let (r, _) = serve_request(&mut db, &post_as("tok", "/api/query", &sql_body(sql)));
+            assert!(body_of(&r).starts_with(r#"{"ok":true"#), "{r}");
+        }
+        let scoped = parse_scoped_tokens(
+            "app-notes-token-0123456789=notes,reader-notes-token-01234567=notes:ro,\
+             everything-reader-token-0123=*:ro",
+        )
+        .unwrap();
+        let (rw, ro, all) = (
+            "app-notes-token-0123456789",
+            "reader-notes-token-01234567",
+            "everything-reader-token-0123",
+        );
+        let run = |db: &mut Db, token: &str, sql: &str| -> (String, String) {
+            let (r, _) = serve_scoped(db, &scoped, &post_as(token, "/api/query", &sql_body(sql)));
+            (status_line(&r).to_string(), body_of(&r).to_string())
+        };
+        let ok = |(status, body): &(String, String)| {
+            status == "HTTP/1.1 200 OK" && body.starts_with(r#"{"ok":true"#)
+        };
+        let forbidden = |(status, _): &(String, String)| status == "HTTP/1.1 403 Forbidden";
+        // Its rows, both ways; the read-only token reads.
+        assert!(ok(&run(&mut db, rw, r#"INSERT INTO notes VALUES ('{"id":"n1","n":1}')"#)));
+        assert!(ok(&run(&mut db, ro, "SELECT id FROM notes LIMIT 5")));
+        assert!(ok(&run(&mut db, rw, "SHOW CATALOG notes")));
+        assert!(ok(&run(&mut db, rw, "DELETE FROM notes WHERE id = 'n1'")));
+        assert!(forbidden(&run(&mut db, ro, r#"INSERT INTO notes VALUES ('{"id":"n2"}')"#)));
+        // Another collection, an edge collection it does not open, and
+        // administration are not its.
+        assert!(forbidden(&run(&mut db, rw, "SELECT id FROM other LIMIT 5")));
+        assert!(forbidden(&run(
+            &mut db,
+            rw,
+            "SELECT id FROM notes WHERE id WITHIN 1 HOP OF 'n1' VIA other LIMIT 5"
+        )));
+        assert!(forbidden(&run(&mut db, rw, "SHOW HEALTH")));
+        assert!(forbidden(&run(&mut db, rw, "SHOW CATALOG")));
+        assert!(forbidden(&run(&mut db, all, "CREATE COLLECTION more (id TEXT PRIMARY KEY)")));
+        assert!(forbidden(&run(&mut db, rw, "EXPLAIN SELECT id FROM other LIMIT 1")));
+        // A `*` scope reads everything, the catalog and the metrics too;
+        // a collection's scope sees neither whole.
+        assert!(ok(&run(&mut db, all, "SELECT id FROM other LIMIT 5")));
+        let get = |token: &str, path: &str| {
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: {token}\r\n\r\n")
+        };
+        let (r, _) = serve_scoped(&mut db, &scoped, &get(all, "/api/catalog"));
+        assert_eq!(status_line(&r), "HTTP/1.1 200 OK", "{r}");
+        let (r, _) = serve_scoped(&mut db, &scoped, &get(rw, "/api/catalog"));
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        let (r, _) = serve_scoped(&mut db, &scoped, &get(rw, "/api/metrics"));
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        // The change stream and the ingest of its collection, and not of
+        // another's; the stop is the operator's.
+        let (r, _) = serve_scoped(&mut db, &scoped, &get(ro, "/api/changes/notes?since=0"));
+        assert!(body_of(&r).starts_with(r#"{"ok":true,"kind":"changes""#), "{r}");
+        let (r, _) = serve_scoped(&mut db, &scoped, &get(rw, "/api/changes/other?since=0"));
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        let ingest = |token: &str, collection: &str| {
+            let body = r#"{"id":"i1","n":1}"#;
+            format!(
+                "POST /api/ingest/{collection} HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: {token}\r\n\
+                 Content-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let (r, _) = serve_scoped(&mut db, &scoped, &ingest(rw, "notes"));
+        assert!(body_of(&r).contains(r#""documents":1"#), "{r}");
+        let (r, _) = serve_scoped(&mut db, &scoped, &ingest(ro, "notes"));
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        let (r, _) = serve_scoped(&mut db, &scoped, &ingest(rw, "other"));
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        let stop = format!(
+            "POST /api/shutdown HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: {all}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let (r, next) = serve_scoped(&mut db, &scoped, &stop);
+        assert_eq!(status_line(&r), "HTTP/1.1 403 Forbidden", "{r}");
+        assert_eq!(next, Next::Serve);
+        // A token that is none of them, and the operator, unchanged.
+        let (r, _) =
+            serve_scoped(&mut db, &scoped, &get("no-such-token-0123456789ab", "/api/catalog"));
+        assert_eq!(status_line(&r), "HTTP/1.1 401 Unauthorized", "{r}");
+        let (r, _) =
+            serve_scoped(&mut db, &scoped, &post_as("tok", "/api/query", &sql_body("SHOW HEALTH")));
+        assert!(body_of(&r).starts_with(r#"{"ok":true"#), "{r}");
+    }
+
+    fn post_as(token: &str, path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: {token}\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn sql_body(sql: &str) -> String {
+        format!(r#"{{"sql":{}}}"#, jstr(sql))
+    }
+
+    /// The scoped-token list is checked entry by entry, and a bad one names
+    /// what is wrong.
+    #[test]
+    fn scoped_token_entries_are_checked() {
+        let good = parse_scoped_tokens(" a-token-0123456789abcdef=notes , b-token-0123456789abcdef=*:ro,c-token-0123456789abcdef=x_y:ro").unwrap();
+        assert_eq!(good.len(), 3);
+        assert_eq!(good[0].1, Scope { collection: Some("notes".into()), read_only: false });
+        assert_eq!(good[1].1, Scope { collection: None, read_only: true });
+        assert_eq!(good[2].1, Scope { collection: Some("x_y".into()), read_only: true });
+        for (bad, why) in [
+            ("short=notes", "printable ASCII"),
+            ("a-token-0123456789abcdef", "token=scope"),
+            ("a-token-0123456789abcdef=", "not a scope"),
+            ("a-token-0123456789abcdef=no/tes", "not a scope"),
+            ("a-token-0123456789abcdef=notes,a-token-0123456789abcdef=other", "twice"),
+        ] {
+            let e = parse_scoped_tokens(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        assert!(parse_scoped_tokens("").unwrap().is_empty());
     }
 
     /// A bulk ingest: NDJSON over the statement's body limit, written in

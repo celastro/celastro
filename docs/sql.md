@@ -255,6 +255,32 @@ key       | avg_words | n | topic   | words
 3 row(s)
 ```
 
+### Facets
+
+`FACET path[, path...] [TOP n]` after the trailing clauses answers, beside
+the rows, each path's top `n` values (ten unless said) by count over
+every row the predicate admits -- the candidate set, not the page -- the
+most first and equal counts by value; a row without the path counts as
+`null`. Each facet is one aggregate over the same shards, merged as a
+`GROUP BY` is, so it costs a pass over the predicate per path. Not
+beside an aggregate, which is already that count.
+
+```sql
+SELECT id FROM notes WHERE text_match(body, 'segments') LIMIT 2 FACET topic, kind TOP 3;
+```
+
+```
+key | id
+----+---
+n2  | n2
+n3  | n3
+2 row(s)
+facet topic: "storage" (2), "search" (1)
+facet kind: "note" (3)
+```
+
+The console's JSON carries them as `facets`: `{"topic":[["storage",2],["search",1]]}`.
+
 ### Paging
 
 `LIMIT n OFFSET m` on any ordering. `AFTER '<cursor>'` continues a

@@ -572,6 +572,10 @@ pub struct Select {
     /// `GROUP BY path`: one row per distinct value at the path, the
     /// aggregates in the list computed over each group's rows.
     pub group_by: Option<String>,
+    /// `FACET a, b TOP n`: each path's top `n` values by count over every
+    /// row the predicate admits, answered beside the rows.
+    pub facets: Vec<String>,
+    pub facet_top: usize,
     pub with: WithOpts,
 }
 

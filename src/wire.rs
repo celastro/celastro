@@ -74,7 +74,7 @@ pub const WIRE_VERSION: u8 = 4;
 /// at that address (the zombie fence's server half). A node sends 5 only
 /// to a peer whose hello said it accepts 5, and accepts 4 from anyone, so
 /// a rolling upgrade across the bump still talks in both directions.
-pub const WIRE_VERSION_MAX: u8 = 6;
+pub const WIRE_VERSION_MAX: u8 = 7;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 /// The port a node serves its shards on when none is given: `tcp://host`
@@ -1531,6 +1531,19 @@ impl ShardService for Remote {
             put_bool(&mut body, *asc);
         }
         put_frontiers(&mut body, req.frontiers);
+        // The facet, trailing, from wire version 7: a holder before it would
+        // read a plain scan and answer rows for a count, so it is refused by
+        // name instead.
+        let version = self.node.frame_version();
+        if version >= 7 {
+            put_opt_str(&mut body, req.facet);
+        } else if req.facet.is_some() {
+            return Err(Error::Plan(format!(
+                "a FACET needs every holder on wire version 7 or later; the holder of shard {} \
+                 of `{}` speaks {version}",
+                self.index, self.collection
+            )));
+        }
         let b = self.call(Call::Scan, &body)?;
         get_scan(&b, &mut 0)
     }
@@ -2376,8 +2389,16 @@ fn handle(
                         fields.push((get_string(body, &mut j)?, get_bool(body, &mut j)?));
                     }
                     let frontiers = get_frontiers(body, &mut j)?;
+                    let facet = if version >= 7 { get_opt(body, &mut j)? } else { None };
                     let sel = walk::bind_hops(&select_of(&sql, &params)?, &frontiers);
+                    // One facet's aggregate, built here from the statement the
+                    // coordinator built it from.
+                    let sel = match &facet {
+                        Some(f) => crate::plan::exec::facet_select(&sel, f, sel.facet_top),
+                        None => sel,
+                    };
                     let req = ScanRequest {
+                        facet: facet.as_deref(),
                         coll: &coll,
                         select: &sel,
                         ts,

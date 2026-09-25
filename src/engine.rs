@@ -6497,11 +6497,6 @@ impl Db {
     /// path as the statement -- this node's shards under the lock, the
     /// carry to other holders and the followers' confirmation as deferred
     /// work -- without a statement's text to parse.
-    /// `INSERT INTO collection VALUES ...` with the documents already
-    /// parsed: what the console's ingest endpoint runs per batch, the same
-    /// path as the statement -- this node's shards under the lock, the
-    /// carry to other holders and the followers' confirmation as deferred
-    /// work -- without a statement's text to parse.
     pub fn insert_documents(&mut self, collection: &str, docs: Vec<Value>) -> Result<Outcome> {
         self.refuse_if_directory_gone()?;
         let _deadline = self.arm_default_deadline();
@@ -6528,6 +6523,68 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    /// One page of a change stream over the shards of `collection` this
+    /// node holds: what changed after `since`, as a follower catching up is
+    /// shipped it -- the deletes still remembered, then the rows written
+    /// after `since` in key order, shard by shard, `limit` of them -- as of
+    /// `upto`, this node's read instant, pinned in the cursor so every page
+    /// of a round reads one snapshot. The next round starts from the
+    /// round's `upto`. A `since` before a shard's catch-up floor -- a
+    /// compaction there has since forgotten a delete -- cannot be served
+    /// exactly, so the page says `reset` and reads from the beginning: what
+    /// follows the stream rebuilds from it.
+    pub fn changes_since(
+        &self,
+        collection: &str,
+        since: Timestamp,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Changes> {
+        let shards = self.shards(collection)?;
+        let limit = limit.clamp(1, CHANGES_PAGE_MAX);
+        // The cursor: `<upto>|<shard>|<key>`, the key empty at a shard's start.
+        let (upto, start_shard, after) = match cursor {
+            Some(c) => {
+                let mut parts = c.splitn(3, '|');
+                let bad = || Error::Plan(format!("`{c}` is not a change stream cursor"));
+                let upto: Timestamp = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+                let shard: usize = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+                let key = parts.next().filter(|k| !k.is_empty()).map(String::from);
+                (upto, shard, key)
+            }
+            None => (self.read_ts(), 0, None),
+        };
+        let reset = cursor.is_none() && shards.iter().any(|s| since < s.catchup_floor);
+        let since = if reset { 0 } else { since };
+        let mut items = Vec::new();
+        // The deletes still remembered, on a round's first page, a replaced
+        // row's old version among them: what follows applies them in order.
+        // Not on a reset, which rebuilds from nothing.
+        if cursor.is_none() && !reset {
+            for s in shards.iter() {
+                items.extend(s.deletes_since(since));
+            }
+        }
+        let mut next = None;
+        let mut ordered: Vec<&Shard> = shards.iter().filter(|s| s.index >= start_shard).collect();
+        ordered.sort_by_key(|s| s.index);
+        for s in ordered {
+            let room = limit.saturating_sub(items.len());
+            if room == 0 {
+                next = Some(format!("{upto}|{}|", s.index));
+                break;
+            }
+            let after = if s.index == start_shard { after.as_deref() } else { None };
+            let (rows, more) = s.changes_since(since, after, upto, room)?;
+            items.extend(rows);
+            if let Some(k) = more {
+                next = Some(format!("{upto}|{}|{k}", s.index));
+                break;
+            }
+        }
+        Ok(Changes { upto, items, next, reset })
     }
 
     pub fn execute_with(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
@@ -8489,6 +8546,7 @@ impl Db {
             walks,
             cut_walks,
             walk_missing,
+            facet: None,
         })
     }
 
@@ -9092,6 +9150,24 @@ pub fn follower_status(
 
 /// What a write statement waits for before it is acknowledged: each shard
 /// it wrote, at the instant it wrote, confirmed by that shard's followers.
+/// The most rows a change stream's page carries.
+pub const CHANGES_PAGE_MAX: usize = 10_000;
+
+/// One page of a change stream: see [`Db::changes_since`].
+#[derive(Debug)]
+pub struct Changes {
+    /// The instant the round reads at; the next round's `since`.
+    pub upto: Timestamp,
+    /// Deletes (on the round's first page), then rows, as the followers are
+    /// shipped them.
+    pub items: Vec<crate::replication::ShipItem>,
+    /// The cursor for the round's next page, or none when the round is done.
+    pub next: Option<String>,
+    /// The stream could not be served from `since` and starts over from
+    /// nothing: what follows it rebuilds from this round.
+    pub reset: bool,
+}
+
 pub struct Confirmation {
     waits: Vec<(Arc<crate::replication::Shipper>, Timestamp)>,
     budget: Option<u64>,

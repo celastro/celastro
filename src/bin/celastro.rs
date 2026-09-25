@@ -974,6 +974,10 @@ fn serve(
             .as_str(),
         "0" | "off" | "false" | "no"
     );
+    let scoped = match celastro::serve::scoped_tokens_from_env() {
+        Ok(s) => s,
+        Err(e) => return fail(json, &e),
+    };
     let server = match bind {
         // The operator's token, or nothing: a per-run token is printed where
         // a client on the network cannot read it, and differs per node.
@@ -993,7 +997,8 @@ fn serve(
                     .with_tls(tls.clone())
                     .with_max_connections(connections)
                     .with_auto_compact(auto_compact)
-                    .with_group_commit(group_commit),
+                    .with_group_commit(group_commit)
+                    .with_scoped_tokens(scoped.clone()),
                 Err(e) => return fail(json, &format!("could not bind {ip}:{port}: {e}")),
             }
         }
@@ -1002,7 +1007,8 @@ fn serve(
                 .with_tls(tls.clone())
                 .with_max_connections(connections)
                 .with_auto_compact(auto_compact)
-                .with_group_commit(group_commit),
+                .with_group_commit(group_commit)
+                .with_scoped_tokens(scoped.clone()),
             Err(e) => return fail(json, &format!("could not bind 127.0.0.1:{port}: {e}")),
         },
     };
@@ -1316,6 +1322,23 @@ fn print_answer(doc: &Value) {
             r.truncated_prefixes = strings("truncated_prefixes");
             r.cut_walks = strings("cut_walks");
             r.next_cursor = text("next_cursor");
+            if let Some(Value::Object(fields)) = doc.get("facets") {
+                for (path, arr) in fields.iter() {
+                    let values = arr
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|pair| {
+                                    let p = pair.as_array()?;
+                                    let n = p.get(1).and_then(Value::as_i64).unwrap_or(0).max(0);
+                                    Some((p.first().cloned().unwrap_or(Value::Null), n as u64))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    r.facets.push((path.clone(), values));
+                }
+            }
             print_rows(&r);
         }
         "ack" => println!("{}", text("message").unwrap_or_default()),
@@ -2435,6 +2458,11 @@ fn render_rows(r: &QueryResult, out: &mut dyn Write) {
     // it always is.
     let _ = write!(out, "{}", truncation_report(r));
     let _ = writeln!(out, "{} row(s)", r.rows.len());
+    for (path, values) in &r.facets {
+        let list: Vec<String> =
+            values.iter().map(|(v, n)| format!("{} ({n})", celastro::json::to_string(v))).collect();
+        let _ = writeln!(out, "facet {path}: {}", list.join(", "));
+    }
     if let Some(c) = &r.next_cursor {
         let _ = writeln!(out, "next cursor: {}", c.replace('\u{1}', "/"));
     }

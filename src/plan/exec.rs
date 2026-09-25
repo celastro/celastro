@@ -105,10 +105,17 @@ pub struct Row {
 /// `#[non_exhaustive]` because this grew `truncated_prefixes` in a breaking
 /// release, and the next thing a query needs to tell its caller should not
 /// need another one.
+/// `FACET`'s answer: per path, its top values by count over the rows the
+/// predicate admits, the most first.
+pub type Facets = Vec<(String, Vec<(Value, u64)>)>;
+
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct QueryResult {
     pub rows: Vec<Row>,
+    /// `FACET`: per path, its top values by count over the rows the
+    /// predicate admits, the most first.
+    pub facets: Facets,
     pub explain: Option<Explain>,
     /// Tablets that did not answer. Non-empty only under `WITH partial_results`
     /// (§8.4).
@@ -144,6 +151,7 @@ impl QueryResult {
     pub fn of_rows(rows: Vec<Row>) -> QueryResult {
         QueryResult {
             rows,
+            facets: Vec::new(),
             explain: None,
             missing: Vec::new(),
             truncated_prefixes: Vec::new(),
@@ -303,6 +311,9 @@ pub struct ExecInput<'a> {
     /// Edge shards that did not answer during a walk, under
     /// `partial_results`, for `missing`.
     pub walk_missing: Vec<String>,
+    /// The facet this input computes, when it is one facet's aggregate
+    /// rather than the statement: what its scan requests carry.
+    pub facet: Option<String>,
 }
 
 /// Terms this statement needs global statistics for, per path. The coordinator
@@ -610,11 +621,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         if !sel.with.partial_results {
             deadline::check()?;
         }
+        let facets = facets_for(&input, &prefix, t0)?;
         let mut missing = input.walk_missing.clone();
         missing.extend(out.1);
         ex.missing = missing.clone();
         return Ok(QueryResult {
             rows,
+            facets,
             explain: if input.analyze { Some(ex) } else { None },
             missing,
             truncated_prefixes: cut,
@@ -830,14 +843,58 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     if !sel.with.partial_results {
         deadline::check()?;
     }
+    let facets = facets_for(&input, &prefix, t0)?;
     Ok(QueryResult {
         rows,
+        facets,
         explain: if input.analyze { Some(ex) } else { None },
         missing,
         truncated_prefixes: cut,
         cut_walks: input.cut_walks.clone(),
         next_cursor,
     })
+}
+
+/// The statement's facets, each one aggregate over the same shards: the
+/// path's values counted over every row the predicate admits -- the
+/// candidate set, not the page -- merged across shards and nodes as a
+/// `GROUP BY` is, the most first, the top `n`. Nothing for a statement
+/// without a `FACET`.
+fn facets_for(input: &ExecInput<'_>, prefix: &Option<String>, t0: Instant) -> Result<Facets> {
+    let sel = input.select;
+    let mut out = Vec::with_capacity(sel.facets.len());
+    for path in &sel.facets {
+        let fsel = facet_select(sel, path, sel.facet_top);
+        let finput = ExecInput {
+            shards: input.shards,
+            unreachable: input.unreachable,
+            coll: input.coll,
+            params: input.params,
+            select: &fsel,
+            ts: input.ts,
+            stats: input.stats,
+            analyze: false,
+            statement: input.statement.clone(),
+            frontiers: input.frontiers,
+            hop_sources: Vec::new(),
+            walks: Vec::new(),
+            cut_walks: Vec::new(),
+            walk_missing: Vec::new(),
+            facet: Some(path.clone()),
+        };
+        let r = aggregate_select(&finput, prefix, t0, Explain::default())?;
+        let values = r
+            .rows
+            .iter()
+            .map(|row| {
+                let v = row.doc.path("value").cloned().unwrap_or(Value::Null);
+                let n = row.doc.path("n").and_then(|x| x.as_i64()).unwrap_or(0).max(0) as u64;
+                (v, n)
+            })
+            .collect();
+        out.push((path.clone(), values));
+    }
+    Ok(out)
 }
 
 /// Apply the SELECT list to the rows, in place, as the last step of a query.
@@ -1142,6 +1199,7 @@ fn aggregate_select(
             statement: &input.statement,
             params: input.params,
             frontiers: input.frontiers,
+            facet: input.facet.as_deref(),
         };
         match shard.scan(&req) {
             Ok(a) => {
@@ -1269,6 +1327,7 @@ fn aggregate_select(
         missing: all_missing,
         truncated_prefixes: cut,
         cut_walks: input.cut_walks.clone(),
+        facets: Vec::new(),
         next_cursor: None,
     })
 }
@@ -2098,6 +2157,7 @@ fn scan(
             statement: &input.statement,
             params: input.params,
             frontiers: input.frontiers,
+            facet: input.facet.as_deref(),
         };
         match shard.scan(&req) {
             Ok(a) => {
@@ -2561,7 +2621,34 @@ pub fn select_for_delete(collection: &str, predicate: &Expr) -> Select {
         cursor: None,
         collapse: None,
         group_by: None,
+        facets: Vec::new(),
+        facet_top: 0,
         with: WithOpts::default(),
+    }
+}
+
+/// The aggregate one facet is: the path's value and a count over every row
+/// the statement's predicate admits, the most first and equal counts by
+/// value, the top `top` of them. What a holder builds from the statement
+/// it parsed when a scan request names a facet, and what the coordinator
+/// merges as it merges any aggregate.
+pub fn facet_select(base: &Select, path: &str, top: usize) -> Select {
+    Select {
+        projections: vec![
+            Projection::Path { path: path.to_string(), alias: Some("value".into()) },
+            Projection::Aggregate { func: AggFunc::Count, path: None, alias: Some("n".into()) },
+        ],
+        collection: base.collection.clone(),
+        predicate: base.predicate.clone(),
+        order: Some(OrderBy::Fields(vec![("n".into(), false), ("value".into(), true)])),
+        limit: Some(top.max(1)),
+        offset: 0,
+        cursor: None,
+        collapse: None,
+        group_by: Some(path.to_string()),
+        facets: Vec::new(),
+        facet_top: 0,
+        with: base.with.clone(),
     }
 }
 
