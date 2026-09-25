@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.81.0 — 2026-09-25
 
 **A holder keeps its shard through a raised term.** 0.80.0 made a
 changed follower list a new term, and a node that had missed the change
@@ -39,12 +39,19 @@ coordinator ignores it and an older holder sends none.
 
 **A forwarded batch is checked once.** The holder's whole-batch check
 validated, coerced and keyed every row, and the shard did it again; the
-shard now takes the rows as checked.
+shard now takes the rows as checked. With the copies below, a three-node
+ingest of 200,000 rows in four streams (two copies of each shard, the
+default, group commit on) went from 36-38,000 rows a second to
+42-47,000 on one box.
 
 **The copies a node follows land side by side.** A holder's batch was
 applied under the one lock of the followed copies, held across the
 copy's fsync, so every copy a node follows synced in turn; each copy has
-its lock now and the map's is held only to find it.
+its lock now and the map's is held only to find it. Three copies of each
+shard over three nodes take an ingest at about four fifths of two
+copies' rate (25-27,000 against 32-33,000 rows a second for 100,000
+rows); 0.80.0 could not be measured at three copies on that harness,
+since its `ALTER` demoted the holders (the fix above).
 
 ## 0.80.0 — 2026-09-25
 

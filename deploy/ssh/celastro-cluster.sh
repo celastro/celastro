@@ -26,7 +26,7 @@
 #
 #   CELASTRO_TOKEN         the console's token; at least sixteen bytes (required)
 #   CELASTRO_WIRE_TOKEN    the wire's, shared by the nodes (required for a cluster)
-#   CELASTRO_VERSION       the release to install                     (0.80.0)
+#   CELASTRO_VERSION       the release to install                     (0.81.0)
 #   CELASTRO_RELEASE_URL   where its files are                        (the GitHub release)
 #   CELASTRO_BINARY        a binary here to send instead of a release (none)
 #   CELASTRO_SSH_USER      when a host does not name one              (root)
@@ -47,7 +47,7 @@
 # `celastro install` takes everything else; see deploy/README.md.
 set -eu
 
-VERSION=${CELASTRO_VERSION:-0.80.0}
+VERSION=${CELASTRO_VERSION:-0.81.0}
 RELEASE_URL=${CELASTRO_RELEASE_URL:-https://github.com/celastro/celastro/releases/download/v$VERSION}
 BINARY=${CELASTRO_BINARY:-}
 SSH_USER=${CELASTRO_SSH_USER:-root}
