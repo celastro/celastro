@@ -74,7 +74,9 @@ impl Analyzer {
     }
 }
 
-fn split_words(text: &str) -> Vec<String> {
+/// The words of `text` as the analyzers see them, in order: what a
+/// snippet is cut from, so its words are the ones the positions count.
+pub(crate) fn split_words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for c in text.chars() {

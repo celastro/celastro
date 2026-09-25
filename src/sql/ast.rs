@@ -467,6 +467,14 @@ pub enum Projection {
         path: Option<String>,
         alias: Option<String>,
     },
+    /// `snippet(path, n)`: `n` words of the path's text around the terms the
+    /// statement's text query matched in it, those words marked -- why a
+    /// row matched, for a result list.
+    Snippet {
+        path: String,
+        words: usize,
+        alias: Option<String>,
+    },
 }
 
 impl Projection {

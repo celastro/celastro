@@ -160,6 +160,7 @@ const QUERIES: &[&str] = &[
     "SELECT id FROM items WHERE tenant = 't1' AND n > 40 LIMIT 50",
     "SELECT id FROM items ORDER BY hybrid(text_match(body, 'rank segment'), method => \
      'linear') LIMIT 8",
+    "SELECT id, snippet(body, 2) FROM items WHERE text_match(body, 'seg*') LIMIT 100",
 ];
 
 /// A coordinator holds no shards: a placement, a rebalance and a move never

@@ -892,6 +892,16 @@ impl<'a> Parser<'a> {
             } else if self.is_kw("distance") {
                 self.i += 1;
                 projections.push(Projection::Distance);
+            } else if self.is_kw("snippet")
+                && matches!(self.t.get(self.i + 1), Some(Tok::Punct(p)) if *p == "(")
+            {
+                self.i += 2;
+                let path = self.path()?;
+                self.expect_punct(",")?;
+                let words = self.usize_literal()?;
+                self.expect_punct(")")?;
+                let alias = if self.eat_kw("AS") { Some(self.ident()?) } else { None };
+                projections.push(Projection::Snippet { path, words, alias });
             } else if let Some(func) = self.aggregate_call() {
                 self.i += 2;
                 let path = if func == AggFunc::Count && self.eat_punct("*") {
@@ -942,6 +952,11 @@ impl<'a> Parser<'a> {
                     Projection::Score | Projection::Distance => {
                         return Err(Error::Sql(
                             "score and distance are per row; an aggregate has none".into(),
+                        ))
+                    }
+                    Projection::Snippet { .. } => {
+                        return Err(Error::Sql(
+                            "a snippet is of a row; an aggregate has none".into(),
                         ))
                     }
                 }

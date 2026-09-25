@@ -153,6 +153,24 @@ n3  | 0.706918 | n3
 next cursor: #3f34f899|2|n3
 ```
 
+`snippet(path, n)` in the select list is why a row matched: `n` of the
+field's words around the first the query matched, placed to cover as
+many matches as it can, each matched word in `<em>`, an ellipsis where
+the window cuts. A prefix marks the words it expanded to; a negated
+term marks nothing. The words are the index's -- what the analyzer
+split, without the punctuation between -- so it is for showing beside a
+result, not for quoting.
+
+```sql
+SELECT id, snippet(body, 6) FROM notes WHERE text_match(body, 'segment*');
+```
+
+```
+key | id | snippet(body)
+----+----+------------------------------------------------------
+n2  | n2 | … the <em>segments</em> a seal writes and the …
+```
+
 ### Vectors
 
 `path <=> [..]` is the distance in the index's metric: in `ORDER BY` it

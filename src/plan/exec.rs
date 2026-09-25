@@ -28,7 +28,7 @@
 //! candidates, never computes a rank, and returns nothing but
 //! `(primary_key, source, raw_score)`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use crate::bitmap::Bitmap;
@@ -606,7 +606,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         ex.notes.extend(cut.iter().cloned());
         ex.notes.extend(input.cut_walks.iter().cloned());
         let mut rows = out.0;
-        project(&input.select.projections, &mut rows);
+        project(&input, &mut rows);
         if !sel.with.partial_results {
             deadline::check()?;
         }
@@ -822,7 +822,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     let cut = truncated_prefixes(input.stats);
     ex.notes.extend(cut.iter().cloned());
     ex.notes.extend(input.cut_walks.iter().cloned());
-    project(&input.select.projections, &mut rows);
+    project(&input, &mut rows);
     // Strict at the end: a deadline that passed during the last unit's work
     // is a statement that did not finish in time, whatever the loop managed
     // to return. Under `partial_results` the shards that ran out are already
@@ -856,20 +856,140 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
 /// reads fields the list may not name: `COLLAPSE BY` its path, the cursor its
 /// sort key, the fetch the whole payload. The list used to be parsed and read
 /// nowhere, so every surface returned the whole document whatever was asked.
-fn project(projections: &[Projection], rows: &mut [Row]) {
+fn project(input: &ExecInput<'_>, rows: &mut [Row]) {
+    let projections = &input.select.projections;
     if projections.iter().any(|p| matches!(p, Projection::All)) {
         return;
     }
     for row in rows.iter_mut() {
         let mut fields: Vec<(String, Value)> = Vec::new();
         for p in projections {
-            let Projection::Path { path, alias } = p else { continue };
-            let name = alias.clone().unwrap_or_else(|| path.clone());
-            let value = row.doc.path(path).cloned().unwrap_or(Value::Null);
-            fields.push((name, value));
+            match p {
+                Projection::Path { path, alias } => {
+                    let name = alias.clone().unwrap_or_else(|| path.clone());
+                    let value = row.doc.path(path).cloned().unwrap_or(Value::Null);
+                    fields.push((name, value));
+                }
+                Projection::Snippet { path, words, alias } => {
+                    let name = alias.clone().unwrap_or_else(|| format!("snippet({path})"));
+                    let value = match row.doc.path(path) {
+                        Some(v) => snippet_of(input, path, v, *words),
+                        None => Value::Null,
+                    };
+                    fields.push((name, value));
+                }
+                _ => {}
+            }
         }
         row.doc = Value::obj(fields);
     }
+}
+
+/// `snippet(path, n)` for one row: `n` of the field's words around the
+/// first the statement's text query matched, the window placed to cover as
+/// many matches as it can, each matched word in `<em>`, an ellipsis at a
+/// cut end. The words are the analyzer's -- punctuation between them is
+/// not kept -- and a match is a word the index's analyzer would have
+/// indexed under one of the query's terms, or under one of its prefixes.
+/// A field the query did not name, or a query with no text match, gets
+/// the first `n` words with nothing marked; a field that is not text, or
+/// an array of it, is `null`.
+fn snippet_of(input: &ExecInput<'_>, path: &str, value: &Value, n: usize) -> Value {
+    let text = match value {
+        Value::Str(s) => s.clone(),
+        Value::Array(items) => {
+            let parts: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+            if parts.is_empty() {
+                return Value::Null;
+            }
+            parts.join(" ")
+        }
+        _ => return Value::Null,
+    };
+    let an = Analyzer::parse(input.coll.analyzer_for(path));
+    let (terms, prefixes) = snippet_terms(input.coll, input.select, path);
+    // A keyword analyzer indexes the whole field as one term at position
+    // zero: the snippet is the field, marked if it matched.
+    let words = match an {
+        Analyzer::Keyword => vec![text.trim().to_string()],
+        _ => crate::text::analyzer::split_words(&text),
+    };
+    let mut analyzed = Vec::new();
+    an.analyze(&text, 0, &mut analyzed);
+    let matched: BTreeSet<usize> = analyzed
+        .iter()
+        .filter(|(t, _)| {
+            terms.iter().any(|q| q == t) || prefixes.iter().any(|p| t.starts_with(p.as_str()))
+        })
+        .map(|(_, p)| *p as usize)
+        .filter(|p| *p < words.len())
+        .collect();
+    let n = n.max(1);
+    let start = match matched.iter().next() {
+        Some(&first) => {
+            // The window that begins at or before the first match and
+            // covers the most matches; the earliest of the best.
+            let lowest = first.saturating_sub(n - 1);
+            (lowest..=first)
+                .map(|s| (matched.range(s..s + n).count(), std::cmp::Reverse(s)))
+                .max()
+                .map(|(_, std::cmp::Reverse(s))| s)
+                .unwrap_or(first)
+        }
+        None => 0,
+    };
+    let end = (start + n).min(words.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str("… ");
+    }
+    for i in start..end {
+        if i > start {
+            out.push(' ');
+        }
+        if matched.contains(&i) {
+            out.push_str("<em>");
+            out.push_str(&words[i]);
+            out.push_str("</em>");
+        } else {
+            out.push_str(&words[i]);
+        }
+    }
+    if end < words.len() {
+        out.push_str(" …");
+    }
+    Value::Str(out)
+}
+
+/// The analyzed terms and prefixes the statement's text queries name on
+/// `path`, positive ones only: what a snippet marks.
+fn snippet_terms(coll: &Collection, sel: &Select, path: &str) -> (Vec<String>, Vec<String>) {
+    let an = Analyzer::parse(coll.analyzer_for(path));
+    let (mut terms, mut prefixes) = (Vec::new(), Vec::new());
+    let mut add = |p: &str, q: &str, negated: bool| {
+        if p != path || negated {
+            return;
+        }
+        if let Ok(tq) = TextQuery::parse(q, an) {
+            tq.leaf_terms(&mut terms);
+            let mut ps = Vec::new();
+            tq.leaf_prefixes(&mut ps);
+            prefixes.extend(ps.into_iter().filter(|(_, neg)| !neg).map(|(p, _)| p));
+        }
+    };
+    if let Some(e) = &sel.predicate {
+        walk_text_match(e, false, &mut |p, q, negated| add(p, q, negated));
+    }
+    if let Some(OrderBy::Hybrid(h)) = &sel.order {
+        for s in &h.sources {
+            if let HybridSource::Text { path: p, query } = s {
+                add(p, query, false);
+            }
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    (terms, prefixes)
 }
 
 /// The coordinator's half of an aggregate statement. Each shard answers a
