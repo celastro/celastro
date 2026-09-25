@@ -1153,6 +1153,14 @@ pub(crate) mod durable {
     }
 }
 
+/// The rotation number of a rotated log, from its name `wal.NNNNNN.log`.
+fn rotated_seq(p: &Path) -> Result<u64> {
+    p.file_name()
+        .and_then(|f| f.to_str())
+        .and_then(|f| f.strip_prefix("wal.")?.strip_suffix(".log")?.parse().ok())
+        .ok_or_else(|| Error::Storage(format!("{} is not a rotated log", p.display())))
+}
+
 /// fsync the directory `path` sits in, so the name is as durable as the bytes.
 fn sync_dir_of(path: &Path) -> Result<()> {
     // `Path::parent` of a bare file name is `Some("")`, which opens as nothing.
@@ -1831,6 +1839,9 @@ pub struct ShardOpts {
     /// The object store the `archived` tier lives in, and the key prefix.
     /// `None` keeps the local `archive/` directory as the stand-in.
     pub archive: Option<crate::objstore::ArchiveHandle>,
+    /// Where rotated write-ahead logs are copied as they are sealed, for a
+    /// restore to any instant; none archives nothing.
+    pub log_archive: Option<Arc<crate::backup::LogArchive>>,
     /// Encryption at rest, when the database has a key: every file this
     /// shard writes is framed under it and every read opens the frames.
     pub cipher: crate::cipher::Shared,
@@ -1861,6 +1872,12 @@ pub struct SealTicket {
     /// Where the build writes the segments, so the install under the lock
     /// does not: `None` for a shard in memory.
     disk: Option<SegmentDisk>,
+    /// Where the build archives the rotated logs, holding no lock, before
+    /// the install removes them; and what it needs to name them.
+    archive: Option<Arc<crate::backup::LogArchive>>,
+    index: usize,
+    cipher: crate::cipher::Shared,
+    log_id: String,
 }
 
 impl std::fmt::Debug for SealTicket {
@@ -2924,6 +2941,24 @@ impl Shard {
         }
     }
 
+    /// `BACKUP LOG`: the live log to the archive `a`, under the number its
+    /// rotation will have -- the rotation then replaces the copy with the
+    /// whole. The instants it spans, or none for an empty log.
+    pub(crate) fn archive_live_log(
+        &self,
+        a: &crate::backup::LogArchive,
+    ) -> Result<Option<(Timestamp, Timestamp)>> {
+        let Some(dir) = &self.dir else { return Ok(None) };
+        a.put_log(
+            &self.coll.name,
+            self.index,
+            self.wal_seq,
+            &dir.join("wal.log"),
+            &self.opts.cipher,
+            &self.file_id("wal.log"),
+        )
+    }
+
     /// Whether a seal must keep versions a newer one supersedes: a backup
     /// holds the horizon back, or a write is on a log and not yet synced, so
     /// readers are held below it and still read the version it replaced.
@@ -2996,6 +3031,10 @@ impl Shard {
             tally: std::mem::take(&mut self.unsealed),
             wals,
             disk: self.segment_disk(),
+            archive: self.opts.log_archive.clone(),
+            index: self.index,
+            cipher: self.opts.cipher.clone(),
+            log_id: self.file_id("wal.log"),
         });
         Ok(true)
     }
@@ -3012,6 +3051,14 @@ impl Shard {
     /// Build a ticket's segments. No lock, no shard: the ticket has the
     /// rows, the ids and the options, and this is the time the graph takes.
     pub(crate) fn seal_build(t: &SealTicket) -> Result<SealBuilt> {
+        // The rotated logs to the archive first, before the minutes a graph
+        // takes: an archive that is down fails the seal here, and the seal
+        // is tried again with the logs still on the disk.
+        if let Some(a) = &t.archive {
+            for p in &t.wals {
+                a.put_log(&t.coll.name, t.index, rotated_seq(p)?, p, &t.cipher, &t.log_id)?;
+            }
+        }
         let mut segments = Vec::new();
         for (id, layer) in (t.first_id..).zip(t.layers.iter().rev()) {
             crate::signal::check_stop()?;
@@ -3329,6 +3376,39 @@ impl Shard {
         // records the manifest already names, which is the ordinary
         // crash-between-the-two state and the one `Shard::open`'s replay
         // converges on rather than re-applying.
+        // With an archive, the logs this seal empties go to it first: the
+        // rotated ones under their numbers, the live one under the number
+        // its rotation would have had, which is then consumed and kept
+        // across a restart (`ARCHIVED`), so no number is ever reused.
+        if let Some(a) = self.opts.log_archive.clone() {
+            for p in &self.unsealed_wals {
+                a.put_log(
+                    &self.coll.name,
+                    self.index,
+                    rotated_seq(p)?,
+                    p,
+                    &self.opts.cipher,
+                    &self.file_id("wal.log"),
+                )?;
+            }
+            if let Some(dir) = &self.dir {
+                let live = dir.join("wal.log");
+                let seq = self.wal_seq;
+                if a.put_log(
+                    &self.coll.name,
+                    self.index,
+                    seq,
+                    &live,
+                    &self.opts.cipher,
+                    &self.file_id("wal.log"),
+                )?
+                .is_some()
+                {
+                    self.wal_seq += 1;
+                    atomic_write(&dir.join("ARCHIVED"), self.wal_seq.to_string().as_bytes())?;
+                }
+            }
+        }
         if let Some(w) = self.wal.as_mut() {
             w.truncate()?;
         }
@@ -3565,7 +3645,22 @@ impl Shard {
         opts: ShardOpts,
         dir: &Path,
     ) -> Result<Shard> {
-        Shard::open_inner(coll, clock, opts, dir, None)
+        Shard::open_inner(coll, clock, opts, dir, None, None)
+    }
+
+    /// Reopen from disk with the log's records outside `(floor, ceiling]`
+    /// dropped: what a restore to an instant does, the backup at `floor`
+    /// holding everything up to it and the archived logs replayed above
+    /// it up to `ceiling`.
+    pub(crate) fn open_between(
+        coll: Collection,
+        clock: Arc<Hlc>,
+        opts: ShardOpts,
+        dir: &Path,
+        floor: Timestamp,
+        ceiling: Timestamp,
+    ) -> Result<Shard> {
+        Shard::open_inner(coll, clock, opts, dir, Some(floor), Some(ceiling))
     }
 
     /// Reopen as it stood at `ceiling`: every log record above it is
@@ -3580,7 +3675,7 @@ impl Shard {
         dir: &Path,
         ceiling: Timestamp,
     ) -> Result<Shard> {
-        Shard::open_inner(coll, clock, opts, dir, Some(ceiling))
+        Shard::open_inner(coll, clock, opts, dir, None, Some(ceiling))
     }
 
     fn open_inner(
@@ -3588,6 +3683,7 @@ impl Shard {
         clock: Arc<Hlc>,
         opts: ShardOpts,
         dir: &Path,
+        floor: Option<Timestamp>,
         ceiling: Option<Timestamp>,
     ) -> Result<Shard> {
         let mut s = Shard::new(coll, clock, opts);
@@ -3688,11 +3784,25 @@ impl Shard {
                 s.wal_seq = s.wal_seq.max(seq + 1);
             }
         }
+        // A number an inline seal consumed for the archive, kept across
+        // restarts so no archived number is reused for another log.
+        if let Ok(t) = fs::read_to_string(dir.join("ARCHIVED")) {
+            if let Ok(n) = t.trim().parse::<u64>() {
+                s.wal_seq = s.wal_seq.max(n);
+            }
+        }
         let mut records = Vec::new();
         for p in &rotated {
             records.extend(Wal::replay(p, &s.opts.cipher, &s.file_id("wal.log"))?);
         }
         records.extend(Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?);
+        let before = records.len();
+        if let Some(f) = floor {
+            // A restore's base holds everything up to the floor: a record
+            // below it is a version the base has or superseded, or a
+            // delete already applied there, and must not be applied again.
+            records.retain(|r| r.ts > f);
+        }
         s.unsealed_wals = rotated;
         if let Some(c) = ceiling {
             for h in &s.segments {
@@ -3705,20 +3815,19 @@ impl Shard {
                     )));
                 }
             }
-            let before = records.len();
             records.retain(|r| r.ts <= c);
-            if records.len() < before {
-                // The log rewritten as the kept records, rotated logs folded
-                // in: what a replay of this directory finds from now on.
-                let w = s.wal.as_mut().expect("attached above");
-                w.truncate()?;
-                for r in &records {
-                    w.append(r)?;
-                }
-                w.sync()?;
-                for p in std::mem::take(&mut s.unsealed_wals) {
-                    let _ = fs::remove_file(&p);
-                }
+        }
+        if records.len() < before {
+            // The log rewritten as the kept records, rotated logs folded
+            // in: what a replay of this directory finds from now on.
+            let w = s.wal.as_mut().expect("attached above");
+            w.truncate()?;
+            for r in &records {
+                w.append(r)?;
+            }
+            w.sync()?;
+            for p in std::mem::take(&mut s.unsealed_wals) {
+                let _ = fs::remove_file(&p);
             }
         }
         for r in records {

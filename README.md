@@ -143,7 +143,8 @@ console and the wire (`CELASTRO_TLS_*`), encryption at rest
 (`CELASTRO_MASTER_KEY_FILE`; every example on this page writes its data
 in the clear unless it says otherwise), an
 S3-compatible store or a shared mount behind the `archived` tier and the
-backups (`CELASTRO_ARCHIVE_*`, `CELASTRO_BACKUP_DIR`), and the tunables in
+backups (`CELASTRO_ARCHIVE_*`, `CELASTRO_BACKUP_DIR`, `CELASTRO_LOG_ARCHIVE`),
+and the tunables in
 [docs/tuning.md](docs/tuning.md). What is not: one process per data
 directory (`LOCK`), one holder per shard, and every write on disk before it
 is acknowledged.
@@ -391,6 +392,7 @@ Signature Version 4 will do.
 ```sql
 BACKUP TO '/mnt/backups/nightly';          -- or 's3://bucket/prefix'
 RESTORE FROM '/mnt/backups/nightly';       -- into an empty --dir; AS OF <ts> for an older one
+BACKUP LOG TO '/mnt/backups/nightly';      -- the live logs, for AS OF any instant (CELASTRO_LOG_ARCHIVE)
 ```
 
 `BACKUP TO ... KEEP 7` removes this node's older backups at the destination

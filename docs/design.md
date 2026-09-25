@@ -385,7 +385,31 @@ outside its lock and without a deadline. A node given an instant observes
 it on its clock, so every commit from then on is after it and the cut is
 exact; an instant further ahead of its clock than `ATTACH` allows for skew
 is refused. The set restores with `RESTORE FROM ... AS OF <instant>` on
-each node. Per-shard read and write counters on the metrics page
+each node.
+
+A backup is exact at its instant, and since 0.78.0 an instant between
+backups is reachable too. With `CELASTRO_LOG_ARCHIVE` set, a seal's build
+copies the write-ahead log it rotated to the archive -- off the lock,
+before the install removes the file, and first, so an archive that
+refuses fails the seal with nothing written and the ticket goes back with
+the log still on the disk -- under `nodes/<node>/logs/<collection>/shard-
+NNNN/<rotation>-<first instant>-<last instant>.log`; an inline seal
+(`FLUSH`) archives the live log under the number its rotation would have
+taken and keeps that number consumed across restarts (`ARCHIVED` in the
+shard's directory), and `BACKUP LOG TO` copies the live logs under their
+next numbers, the rotation later replacing the copy with the whole. A
+restore `AS OF t` takes the newest backup at or before `t`, lists the
+shard's archived logs, claims them in sequence from the one that
+straddles the backup's instant (or the first, or the one after a log the
+backup holds whole) and stops at the first number missing, places them as
+rotated logs, and opens the shard with the records at or below the
+backup's instant and above `t` dropped. Its answer names the instant
+reached: `t` when a log covers it or a later log begins after it, the
+last log's end otherwise, which is where the archive ends or a gap is.
+The restored shard's next number is one past the archive's, so a run
+continued from a restore replaces nothing there; the logs of the run it
+left stay, which is why the docs say to take a backup after a restore.
+Per-shard read and write counters on the metrics page
 (`celastro_shard_reads_total`, `celastro_shard_writes_total`, by collection
 and shard) are what shows a hot shard, which range partitioning with fixed
 split keys can make.
@@ -2577,6 +2601,12 @@ guarantee:
 | the operator's token is not printed, and a per-run token still is | `serve::tests::a_network_bind_refuses_a_weak_token_and_keeps_the_one_it_is_given` (the URL carries neither `?t=` nor the token), `serve::tests::a_per_run_token_stays_in_the_url_it_is_the_only_way_to_learn_it` |
 | a backup's record carries a checksum per object; `VERIFY BACKUP` reads everything back, a restore checks as it writes, and a flipped byte is named and refused | `backup::verify_backup_reads_every_object_back_and_a_flipped_byte_is_named_and_refused` (`tests/backup.rs`: the verify's ack, a pool segment with one byte flipped named by VERIFY and refused by RESTORE with nothing adopted, a version-1 record verified by size with a note) |
 | a backup restores what was there at the pin, copies only what is new the second time, refuses a damaged destination before writing, offers an older instant, and runs its copy with the console's lock let go | `backup::*` (`tests/backup.rs`: the round trips on a directory, the pool's dedup counted in the ack, a pool file truncated then removed, `AS OF`, a bare name confined to `backup_dir`, and the console path through `celastro send`), `archive_s3::a_backup_to_a_bucket_restores_from_it` (`s3://` through the archive's endpoint, `ListObjectsV2` naming what is there), `archive_s3::the_archived_tier_on_a_directory_store_holds_the_segments_and_reopens_from_them`, `objstore::tests::a_directory_store_holds_objects_as_published_files` |
+| a restore reaches any instant the log archive covers -- the newest backup at or before it, the archived logs replayed up to it -- and its answer names the instant reached, the archive's end or a gap; a seal archives the log it rotated before the install removes it, and keeps it when the archive refuses | `pitr::a_restore_reaches_any_instant_the_archive_covers_and_says_where_it_stopped` (`tests/pitr.rs`: exactly the backup, an instant inside a rotated log, the rotation whole, the live log's copy with a delete in it, past the archive's end; a restored database's next log numbered past the archive's), `pitr::a_gap_in_the_archived_sequence_stops_the_restore_before_it`, `pitr::a_seal_archives_the_log_it_rotated_before_the_install_removes_it_and_keeps_it_when_the_archive_refuses` (the sealer's build under an archive made unwritable: the error, the ticket requeued with the log on the disk, the retry archiving before the install removes it, the restore applying only what the backup lacks) |
+| a facet counts each path's values over every row the predicate admits, `TOP n` of them, null for a missing path, on one node or three; beside an aggregate it is refused | `facets::*` (`tests/facets.rs`), `wire::a_collection_spread_over_three_nodes` (the `FACET` query in `QUERIES`, the facets compared across one process and three) |
+| a snippet is the field's words around the query's matches, the window placed to cover the most of them, the matches marked; a prefix marks what it expanded to; a keyword field is one word | `snippets::*` (`tests/snippets.rs`), `wire::a_collection_spread_over_three_nodes` (the `snippet` query in `QUERIES`) |
+| a change stream pages a collection's rows after an instant in key order over one snapshot, the deletes first, and resets when a compaction forgot a delete it would need; a bad cursor and a missing collection are refused | `changes::*` (`tests/changes.rs`) |
+| an ingest takes NDJSON of any length a thousand documents a statement and a bad line ends it with the count to resume at; a query body above the bound is refused before it is read | `serve::tests::an_ingest_writes_ndjson_in_batches_and_a_bad_line_ends_it_with_the_count_to_resume_at`, `serve::tests::an_oversized_content_length_is_refused_before_a_buffer_is_sized_from_it` |
+| a scoped token opens its collection and nothing else, read-only when said, its statement checked after the parse; a malformed entry refuses the start | `serve::tests::a_scoped_token_opens_its_collection_and_nothing_else`, `serve::tests::scoped_token_entries_are_checked` |
 | every parser that reads the network or a file answers `Ok` or `Err` to thousands of mutants of valid input, never panics or aborts | `fuzz::*` is the seeded mutator (`src/fuzz.rs`, tests only); the targets are `x509::tests::fuzz_certificate_parsing_never_panics`, `pem::tests::fuzz_pem_decoding_never_panics`, `tls13::tests::fuzz_handshake_message_parsing_never_panics` (hellos, Certificate, NewSessionTicket, and a mutated ticket never opens), `serve::tests::fuzz_request_heads_never_panic`, `objstore::tests::fuzz_store_responses_never_panic`, `wire::tests::fuzz_wire_answers_never_panic`, `shard::tests::fuzz_manifest_and_wal_never_panic`, `mvcc::tests::fuzz_delete_logs_and_ordinals_never_panic`, `engine::tests::fuzz_catalog_decoding_never_panics`, `segment::tests::fuzz_segment_and_component_decoding_never_panics`, `hnsw::tests::fuzz_graph_decoding_never_panics`, `quant::tests::fuzz_code_decoding_never_panics`, `variant::tests::fuzz_variant_decoding_never_panics`, `json::tests::fuzz_json_parsing_never_panics`, `parser::tests::fuzz_sql_parsing_never_panics`, `query::tests::fuzz_text_query_parsing_never_panics`. First run: the wire's answers and the manifest reserved a `Vec` for a count read from the input, and a count of 2^50 aborted the process on the allocation -- `codec::get_count` now refuses a count larger than the bytes left |
 | an aggregate is the fold over every admitted row, on one node or three, and refuses what it cannot mean | `aggregates::*` (`tests/aggregates.rs`: every function over a flushed segment and a memtable with a delete, nulls skipped, the empty fold, `GROUP BY` with `ORDER BY` an alias and a page, the null group, the refusals), `wire::an_aggregate_over_three_nodes_answers_what_one_process_answers`, `parser::tests::aggregates_parse_with_their_names_and_the_group_by_path` |
 | an encrypted database writes no plaintext anywhere and opens under its master only | `encryption::an_encrypted_database_holds_no_plaintext_and_opens_under_its_master_only` (a marker string grepped for under the directory, the store, a backup and an export after seals, a delete, a compaction and a tier move both ways; reopen through the WAL; no master and another master refused), `encryption::a_plain_database_with_data_is_not_encrypted_in_place`, `encryption::a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended`, `encryption::a_backup_restores_under_the_same_master_and_is_refused_without_it`, `encryption::an_import_crosses_key_regimes_which_is_how_a_database_takes_or_changes_a_key`, `encryption::a_key_file_makes_the_nodes_of_a_cluster_share_one_data_key_so_a_shard_moves`, `cipher::tests::*` (frames round-trip, a ranged read opens only its frames, the wrong key, index or identity fails, the wrapped key opens under its master only, a torn record log stops at the tear) |

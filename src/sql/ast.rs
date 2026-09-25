@@ -84,6 +84,12 @@ pub enum Statement {
     /// `BACKUP STATUS <instant>`: how a detached backup at that instant
     /// is going on this node -- running, done with its answer, failed with
     /// its error, or none started.
+    /// `BACKUP LOG TO '<dest>'`: copy every held shard's live write-ahead
+    /// log to the log archive at `dest`, where the rotated ones go as they
+    /// are sealed, so a restore `AS OF` reaches up to now.
+    BackupLog {
+        to: String,
+    },
     BackupStatus {
         ts: u64,
     },

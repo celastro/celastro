@@ -253,6 +253,11 @@ impl<'a> Parser<'a> {
                     ))),
                 };
             }
+            if self.eat_kw("LOG") {
+                self.expect_kw("TO")?;
+                let to = self.destination()?;
+                return Ok(Statement::BackupLog { to });
+            }
             let cluster = self.eat_kw("CLUSTER");
             self.expect_kw("TO")?;
             let to = self.destination()?;

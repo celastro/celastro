@@ -243,6 +243,12 @@ pub struct DbOpts {
     /// should not be a way to write anywhere on the node. Unset, only
     /// absolute paths and `s3://` destinations are taken.
     pub backup_dir: Option<PathBuf>,
+    /// Where every held shard's write-ahead log is copied as it is rotated
+    /// (`CELASTRO_LOG_ARCHIVE`: a directory or `s3://...`, resolved as a
+    /// backup destination is), so `RESTORE ... AS OF` reaches any instant
+    /// the archive covers; `BACKUP LOG TO` copies the live logs. None
+    /// archives nothing.
+    pub log_archive: Option<String>,
     /// How many documents of one `INSERT` a shard appends before it syncs
     /// the log: a statement of more is taken in chunks of this many, one
     /// `fdatasync` each. Larger means fewer disk round trips for a bulk
@@ -332,6 +338,7 @@ impl Default for DbOpts {
             statement_deadline_ms: Some(DEFAULT_STATEMENT_DEADLINE_MS),
             archive: crate::objstore::ArchiveOpts::default(),
             backup_dir: None,
+            log_archive: None,
             insert_batch: 1000,
             background_seal: false,
             group_commit: false,
@@ -1092,6 +1099,8 @@ pub struct Db {
     /// `DbOpts::archive` and the environment; `None` for an in-memory
     /// database and for one whose archive is the local directory.
     archive: Option<crate::objstore::ArchiveHandle>,
+    /// The log archive every shard held here writes to, when set.
+    log_archive: Option<Arc<crate::backup::LogArchive>>,
     /// Writes per collection, for the statistics cache: its refresh gate and
     /// its anchor compare against the collection whose statistics they guard,
     /// so traffic on an unrelated collection neither ages an entry nor
@@ -1204,6 +1213,7 @@ impl Db {
             published_catalog: None,
             writes: 0,
             archive: None,
+            log_archive: None,
             collection_writes: BTreeMap::new(),
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
@@ -1237,6 +1247,15 @@ impl Db {
         let archive = crate::objstore::ArchiveHandle::from_opts(&opts.archive)?;
         let mut db = Db::with_opts(opts);
         db.archive = archive;
+        if let Some(dest) = db.opts.log_archive.clone() {
+            let node = db.opts.node.clone().unwrap_or_default();
+            db.log_archive = Some(Arc::new(crate::backup::LogArchive::open(
+                &db.opts.archive,
+                db.opts.backup_dir.as_deref(),
+                &dest,
+                &node,
+            )?));
+        }
         fs::create_dir_all(dir)?;
         db.lock = Some(crate::dirlock::take(dir)?);
         db.dir = Some(dir.to_path_buf());
@@ -1318,6 +1337,17 @@ impl Db {
     /// replaying each WAL. The catalog entry is already in place; what this
     /// adds is the shards, with the statistics baseline they start from.
     fn attach_collection(&mut self, dir: &Path, name: &str) -> Result<bool> {
+        self.attach_collection_between(dir, name, None)
+    }
+
+    /// `attach_collection`, the held shards opened with the log's records
+    /// outside `(floor, ceiling]` dropped: a restore to an instant.
+    fn attach_collection_between(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        bounds: Option<(Timestamp, Timestamp)>,
+    ) -> Result<bool> {
         let db = self;
         let mut coll = db.catalog.get(name)?.clone();
         // What is already counted stays in the baseline; the shards start
@@ -1383,7 +1413,17 @@ impl Db {
                 )));
             }
             let (lo, hi) = read_range(&db.cipher, &sdir, i, name)?;
-            let mut sh = Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?;
+            let mut sh = match bounds {
+                Some((floor, ceiling)) => Shard::open_between(
+                    coll.clone(),
+                    db.clock.clone(),
+                    db.shard_opts(),
+                    &sdir,
+                    floor,
+                    ceiling,
+                )?,
+                None => Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?,
+            };
             sh.set_key_range(lo, hi);
             sh.index = i;
             shards.push(sh);
@@ -1411,6 +1451,7 @@ impl Db {
             residency: Some(self.residency.clone()),
             placement: self.opts.placement.clone(),
             archive: self.archive.clone(),
+            log_archive: self.log_archive.clone(),
             cipher: self.cipher.clone(),
         }
     }
@@ -1515,6 +1556,38 @@ impl Db {
         }
         let node = self.opts.node.clone().unwrap_or_default();
         Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls, keep)))
+    }
+
+    /// `BACKUP LOG TO '<dest>'`: every held shard's live write-ahead log to
+    /// the log archive at `dest`, under the number its rotation will take,
+    /// so a restore `AS OF` reaches the last record here rather than the
+    /// last seal. Under the lock, since the log grows under nothing else,
+    /// and a shard's log is at most a memtable's worth.
+    pub fn backup_log(&mut self, dest: &str) -> Result<Outcome> {
+        if self.dir.is_none() {
+            return Err(Error::Plan("BACKUP LOG needs a persistent database (--dir)".into()));
+        }
+        let node = self.opts.node.clone().unwrap_or_default();
+        let a = crate::backup::LogArchive::open(
+            &self.opts.archive,
+            self.opts.backup_dir.as_deref(),
+            dest,
+            &node,
+        )?;
+        let (mut shards, mut empty, mut reach) = (0usize, 0usize, 0u64);
+        for s in self.shards.values().flatten() {
+            match s.archive_live_log(&a)? {
+                Some((_, last)) => {
+                    shards += 1;
+                    reach = reach.max(last);
+                }
+                None => empty += 1,
+            }
+        }
+        Ok(Outcome::Ack(format!(
+            "archived the live log of {shards} shard(s) to {} ({empty} empty), reaching {reach}",
+            a.display()
+        )))
     }
 
     /// `BACKUP TO ... AS OF <instant> DETACHED`: the copy prepared as
@@ -1720,7 +1793,14 @@ impl Db {
         let target =
             crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), src)?;
         let here = self.opts.node.clone().unwrap_or_default();
-        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), as_of)?;
+        // `AS OF` an instant: the newest backup at or before it, and the
+        // archived logs from there up to it below. Exactly a backup's
+        // instant is that backup, as it was.
+        let base = match as_of {
+            Some(t) => crate::backup::newest_at_or_before(&target, node.unwrap_or(&here), t)?,
+            None => None,
+        };
+        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), base.or(as_of))?;
         // The backup's key regime has to be this database's: its files are
         // copied as they are, so an encrypted backup needs the master that
         // wraps its data key, and a plain one cannot land in an encrypted
@@ -1768,6 +1848,15 @@ impl Db {
         let mut shards_restored = 0usize;
         let mut bytes = 0u64;
         let mut elsewhere: Vec<String> = Vec::new();
+        let log_archive = crate::backup::LogArchive {
+            target: target.clone(),
+            slug: crate::backup::node_slug(node.unwrap_or(&here)),
+        };
+        let past = as_of.filter(|t| *t > fetched.ts);
+        let mut replayed = 0usize;
+        // The least instant a shard's archived logs reach, over the shards
+        // that had any.
+        let mut reach: Option<Timestamp> = None;
         for (name, shards) in &fetched.collections {
             let dest = dir.join("collections").join(name);
             if dest.exists() {
@@ -1782,6 +1871,38 @@ impl Db {
                 let sdir = tmp.join(format!("shard-{index:04}"));
                 bytes += crate::backup::write_shard(&target, &sdir, files)?;
                 shards_restored += 1;
+                // An instant past the backup: the archived logs after it, in
+                // sequence up to the instant or the first gap, placed as
+                // rotated logs the open replays -- above the backup's
+                // instant and up to the one asked, by the bounds below. The
+                // shard's next log takes a number the archive does not hold,
+                // so a run continued from here replaces nothing there.
+                let Some(t) = past else { continue };
+                let (logs, next) = log_archive.logs_after(name, *index, fetched.ts)?;
+                let (mut taken, mut here) = (0usize, fetched.ts);
+                for l in logs.iter().take_while(|l| l.first <= t) {
+                    fs::write(
+                        sdir.join(format!("wal.{:06}.log", l.seq)),
+                        log_archive.get(&l.key)?,
+                    )?;
+                    taken += 1;
+                    here = l.last.min(t);
+                }
+                // A log that begins after the instant: nothing happened
+                // between the one before it and the instant.
+                if taken < logs.len() {
+                    here = t;
+                }
+                replayed += taken;
+                if !logs.is_empty() {
+                    reach = Some(reach.map_or(here, |r| r.min(here)));
+                }
+                if next > 1 {
+                    crate::shard::atomic_write(
+                        &sdir.join("ARCHIVED"),
+                        next.to_string().as_bytes(),
+                    )?;
+                }
             }
             crate::shard::sync_dir(&tmp)?;
             fs::rename(&tmp, &dest)?;
@@ -1804,8 +1925,9 @@ impl Db {
         catalog.nodes = self.catalog.nodes.clone();
         self.catalog = catalog;
         let names: Vec<String> = self.catalog.collections.keys().cloned().collect();
+        let bounds = past.map(|t| (fetched.ts, t));
         for name in &names {
-            self.attach_collection(&dir, name)?;
+            self.attach_collection_between(&dir, name, bounds)?;
             self.absorb_shard_catalogs(name)?;
         }
         self.persist_catalog()?;
@@ -1816,6 +1938,13 @@ impl Db {
             target.display,
             names.len()
         );
+        if let Some(t) = past {
+            let reached = reach.unwrap_or(fetched.ts);
+            msg.push_str(&format!("; {replayed} archived log(s) replayed, reaching {reached}"));
+            if reached < t {
+                msg.push_str(&format!(" of the {t} asked: the archive ends there"));
+            }
+        }
         if !elsewhere.is_empty() {
             msg.push_str(&format!(
                 "; not in this backup, still placed where it was: {}",
@@ -7128,6 +7257,7 @@ impl Db {
                 }
             }
             Statement::BackupStatus { ts } => Ok(Outcome::Ack(self.backup_status(ts))),
+            Statement::BackupLog { to } => self.backup_log(&to),
             Statement::Restore { from, node, as_of } => self.restore(&from, node.as_deref(), as_of),
             Statement::VerifyBackup { from, node, as_of } => {
                 self.verify_backup(&from, node.as_deref(), as_of)
@@ -9602,6 +9732,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Flush { .. } => "FLUSH",
         Statement::Compact { .. } => "COMPACT",
         Statement::Backup { .. } => "BACKUP",
+        Statement::BackupLog { .. } => "BACKUP LOG",
         Statement::Restore { .. } => "RESTORE",
         Statement::SplitShard { .. } => "SPLIT SHARD",
         Statement::MergeShards { .. } => "MERGE SHARDS",

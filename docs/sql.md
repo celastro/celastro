@@ -439,6 +439,30 @@ backup 7331102771519565824 to /mnt/backups: 1 collection(s), 1 shard(s), ...; at
 `CELASTRO_BACKUP_DIR` makes a bare name resolve under it and refuses a
 path that leaves it.
 
+**Any instant.** A backup is exact at its instant. With
+`CELASTRO_LOG_ARCHIVE=<dir or s3://bucket/prefix>` every held shard's
+write-ahead log is copied there as a seal rotates it -- before the seal
+removes it, and a seal the archive refuses is tried again with the log
+still on the disk -- and `BACKUP LOG TO '<the same>'` copies the live
+logs now (a job every minute is a one-minute point). `RESTORE FROM '<the
+same>' AS OF <any instant>` then takes the newest backup at or before it,
+replays the archived logs up to it, and says how far it reached: the
+instant asked, or where the archive ends, or a gap where a log was never
+archived. The logs are under `nodes/<node>/logs/<collection>/shard-NNNN/`,
+named by their rotation number and the instants they span. Take a backup
+after a restore: it is the base every later instant is reached from, and
+the logs of the run the restore left behind stay in the archive.
+
+```sql
+BACKUP LOG TO '/mnt/backups';
+RESTORE FROM '/mnt/backups' AS OF 7331102771519565824;
+```
+
+```
+archived the live log of 1 shard(s) to /mnt/backups (0 empty), reaching 7331102771519565824
+restored backup 7331102761890652160 of node `local` from /mnt/backups: 1 collection(s), 1 shard(s), 3228 bytes; 2 archived log(s) replayed, reaching 7331102771519565824
+```
+
 ## Two or more nodes
 
 `ATTACH NODE` makes a peer known (or `CELASTRO_ATTACH` at start);

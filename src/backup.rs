@@ -34,6 +34,7 @@ use crate::crypto::sha2::sha256;
 use crate::engine::{handle_bytes, Deferred, ExportShard, Outcome};
 use crate::error::{Error, Result};
 use crate::objstore::{ArchiveOpts, DirStore, ObjectStore, S3Store};
+use crate::time::Timestamp;
 
 /// What `BACKUP` pinned: per collection, the shards this node holds by
 /// tablet index.
@@ -45,6 +46,7 @@ pub(crate) type ShardFiles = Vec<(String, String, u64, String)>;
 pub(crate) type BackupShards = Vec<(String, Vec<(usize, ShardFiles)>)>;
 
 /// Where a backup goes or comes from.
+#[derive(Clone)]
 pub(crate) struct Target {
     pub(crate) store: Arc<dyn ObjectStore>,
     /// Prepended to every key; empty or ending in `/`.
@@ -148,6 +150,133 @@ pub(crate) fn job(
     keep: Option<usize>,
 ) -> Deferred {
     Deferred::new(move || run(target, ts, node, catalog, key, colls, keep))
+}
+
+/// Where a node's write-ahead logs go as they are rotated, for a restore
+/// to any instant (`CELASTRO_LOG_ARCHIVE`, or `BACKUP LOG TO` for the
+/// live log now): under the node, per shard, each log named by its
+/// rotation's sequence and the instants it spans --
+/// `nodes/<node>/logs/<collection>/shard-NNNN/<seq>-<first>-<last>.log`.
+/// A restore `AS OF t` takes the newest backup at or before `t` and then
+/// the logs after it, in sequence, and stops at a gap in the sequence: a
+/// log that was never archived is a stretch the restore cannot claim.
+pub struct LogArchive {
+    pub(crate) target: Target,
+    pub(crate) slug: String,
+}
+
+/// One archived log, by name.
+pub(crate) struct ArchivedLog {
+    pub key: String,
+    pub seq: u64,
+    pub first: Timestamp,
+    pub last: Timestamp,
+}
+
+impl LogArchive {
+    pub(crate) fn open(
+        archive: &ArchiveOpts,
+        backup_dir: Option<&Path>,
+        dest: &str,
+        node: &str,
+    ) -> Result<LogArchive> {
+        Ok(LogArchive { target: target(archive, backup_dir, dest)?, slug: node_slug(node) })
+    }
+
+    pub(crate) fn display(&self) -> &str {
+        &self.target.display
+    }
+
+    fn prefix(&self, collection: &str, shard: usize) -> String {
+        format!("nodes/{}/logs/{collection}/shard-{shard:04}/", self.slug)
+    }
+
+    fn key(
+        &self,
+        collection: &str,
+        shard: usize,
+        seq: u64,
+        first: Timestamp,
+        last: Timestamp,
+    ) -> String {
+        format!("{}{seq:06}-{first:020}-{last:020}.log", self.prefix(collection, shard))
+    }
+
+    /// Copy one log under `seq`, as the bytes it is -- under the shard's
+    /// cipher when there is one, which the backup's KEY opens at a restore
+    /// -- replayed first for the instants it spans. Nothing for an empty
+    /// log. The same `seq` written again replaces what was there: a live
+    /// log's copy, then the rotated whole of it.
+    pub(crate) fn put_log(
+        &self,
+        collection: &str,
+        shard: usize,
+        seq: u64,
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        id: &str,
+    ) -> Result<Option<(Timestamp, Timestamp)>> {
+        let records = crate::shard::Wal::replay(path, cipher, id)?;
+        let (Some(first), Some(last)) =
+            (records.iter().map(|r| r.ts).min(), records.iter().map(|r| r.ts).max())
+        else {
+            return Ok(None);
+        };
+        let key = self.key(collection, shard, seq, first, last);
+        self.target.store.put_file(&self.target.key(&key), path)?;
+        Ok(Some((first, last)))
+    }
+
+    /// The archived logs of a shard past `covered` -- the instant a backup
+    /// holds everything up to -- in sequence, and the number the next log
+    /// archived for the shard must take so none already there is
+    /// replaced. The first log claimed straddles the instant, or is the
+    /// shard's first log, or follows one the backup holds whole; from
+    /// there the sequence runs unbroken and stops at the first number
+    /// missing: a log that was never archived is a stretch a restore
+    /// cannot claim.
+    pub(crate) fn logs_after(
+        &self,
+        collection: &str,
+        shard: usize,
+        covered: Timestamp,
+    ) -> Result<(Vec<ArchivedLog>, u64)> {
+        let prefix = self.target.key(&self.prefix(collection, shard));
+        let mut logs: Vec<ArchivedLog> = Vec::new();
+        for key in self.target.store.list(&prefix)? {
+            let name = key.rsplit('/').next().unwrap_or("");
+            let Some(stem) = name.strip_suffix(".log") else { continue };
+            let mut parts = stem.splitn(3, '-');
+            let seq = parts.next().and_then(|s| s.parse::<u64>().ok());
+            let first = parts.next().and_then(|s| s.parse::<Timestamp>().ok());
+            let last = parts.next().and_then(|s| s.parse::<Timestamp>().ok());
+            if let (Some(seq), Some(first), Some(last)) = (seq, first, last) {
+                logs.push(ArchivedLog { key: key.clone(), seq, first, last });
+            }
+        }
+        // One log per number, the one that reaches furthest: a live log's
+        // copy and the rotation of it share a number.
+        logs.sort_by_key(|l| (l.seq, std::cmp::Reverse(l.last)));
+        logs.dedup_by_key(|l| l.seq);
+        let next = logs.last().map_or(1, |l| l.seq + 1);
+        let held_whole = logs.iter().filter(|l| l.last <= covered).map(|l| l.seq).max();
+        let mut out: Vec<ArchivedLog> = Vec::new();
+        for l in logs.into_iter().filter(|l| l.last > covered) {
+            let claimed = match out.last() {
+                Some(prev) => l.seq == prev.seq + 1,
+                None => l.first <= covered || l.seq == 1 || held_whole == Some(l.seq - 1),
+            };
+            if !claimed {
+                break;
+            }
+            out.push(l);
+        }
+        Ok((out, next))
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.target.store.get(key)
+    }
 }
 
 /// What the last backup of this node recorded: object key to its size and
@@ -463,6 +592,13 @@ fn instants(target: &Target, mine: &str) -> Result<Vec<u64>> {
     out.sort_unstable();
     out.dedup();
     Ok(out)
+}
+
+/// The newest complete backup of `node` at or before `t`, for a restore to
+/// that instant; none when every backup there is after it.
+pub(crate) fn newest_at_or_before(target: &Target, node: &str, t: u64) -> Result<Option<u64>> {
+    let mine = format!("nodes/{}/", node_slug(node));
+    Ok(instants(target, &mine)?.into_iter().filter(|b| *b <= t).max())
 }
 
 /// The newest complete backup of `node` at the destination, or the one at
