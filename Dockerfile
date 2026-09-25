@@ -17,18 +17,18 @@
 # cross-linker there.
 #
 # The tag names both halves of the toolchain — the compiler version and the
-# Alpine it sits on — so a rebuild gets rustc 1.98 on Alpine 3.21 rather than
+# Alpine it sits on — so a rebuild gets rustc 1.98 on Alpine 3.24 rather than
 # whatever `latest` has become, and `--locked` below keeps working against a
 # lockfile this repository does not regenerate. A tag is not a digest: the
 # registry can repoint this one at a rebuilt image, so what it buys is a fixed
 # toolchain version, not a byte-identical base. Today it resolves to
-# rust@sha256:88a07cc2e9b783133cddf0ea84e759a1185eb6e7ff104deea18e985d84503af7;
+# rust@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f;
 # write that digest in here instead if you need the stronger property.
 #
 # Bumping the compiler here does not relax the declared MSRV: 1.75 is what the
 # library promises and what the msrv gate checks, and this only fixes which
 # newer compiler builds the shipped binary.
-FROM rust:1.98-alpine3.21 AS build
+FROM rust:1.98-alpine3.24 AS build
 
 # The musl crt objects and the linker the compiler drives.
 RUN apk add --no-cache musl-dev

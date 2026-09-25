@@ -11,7 +11,7 @@
 # copies and chmods, and an arm64 alpine could not run here without an
 # emulator. The final stage is Dockerfile's, line for line in effect.
 
-FROM --platform=$BUILDPLATFORM alpine:3.21 AS stage
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS stage
 COPY celastro /celastro
 COPY celastro-cli /celastro-cli
 COPY LICENSE /LICENSE

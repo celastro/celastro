@@ -199,12 +199,20 @@ run "move its shards away first" 'moved from' "$CEL" send $A "MOVE SHARD 2 OF no
 run "and the promoted one" 'moved from' "$CEL" send $A "MOVE SHARD 1 OF notes TO 'tcp://127.0.0.1:7877'"
 run "detach node" 'detached' "$CEL" send $A "DETACH NODE 'tcp://127.0.0.1:7879'"
 
-if command -v docker >/dev/null 2>&1 && docker image inspect ghcr.io/celastro/celastro:0.55.0 >/dev/null 2>&1; then
-  echo "== the image"
-  run "docker version" '^celastro 0' docker run --rm ghcr.io/celastro/celastro:0.55.0 version
-  run "docker demo" 'notes|hybrid|demo' docker run --rm ghcr.io/celastro/celastro:0.55.0 demo
+# The image of THIS version, as `scripts/image.sh build` tags it here or
+# a release pull did; a fixed tag written in once (0.55.0) matched nothing
+# after that release and the check ran nowhere.
+ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml" | head -1)
+image=""
+for tag in "ghcr.io/celastro/celastro:$ver-amd64" "ghcr.io/celastro/celastro:$ver"; do
+  if command -v docker >/dev/null 2>&1 && docker image inspect "$tag" >/dev/null 2>&1; then image=$tag; break; fi
+done
+if [[ -n $image ]]; then
+  echo "== the image ($image)"
+  run "docker version" "^celastro $ver" docker run --rm "$image" version
+  run "docker demo" 'notes|hybrid|demo' docker run --rm "$image" demo
 else
-  echo "== the image: skipped (no docker, or the image is not local)"
+  echo "== the image: skipped (no docker, or ghcr.io/celastro/celastro:$ver is not local)"
 fi
 
 if [[ $fail != 0 ]]; then
