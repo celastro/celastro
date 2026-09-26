@@ -380,8 +380,16 @@ pub fn https_request(
     let request = http_text(server_name, req);
     s.write_all(request.as_bytes()).map_err(Error::Io)?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw).map_err(Error::Io)?;
-    parse_response(&raw)
+    // A stream that ends without a close_notify is an error (0.87.0),
+    // with what came before it in `raw`: an answer the headers frame is
+    // whole whatever ended the stream; one framed by the end alone is
+    // taken only from a stream that ended properly.
+    let cut = match s.read_to_end(&mut raw) {
+        Ok(_) => false,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => true,
+        Err(e) => return Err(Error::Io(e)),
+    };
+    parse_response(&raw, cut)
 }
 
 /// How many TLS handshakes this process has served that resumed from a
@@ -404,7 +412,7 @@ pub fn http_request(
     sock.write_all(request.as_bytes()).map_err(Error::Io)?;
     let mut raw = Vec::new();
     sock.read_to_end(&mut raw).map_err(Error::Io)?;
-    parse_response(&raw)
+    parse_response(&raw, false)
 }
 
 fn dial(addr: &str, timeout: Duration) -> Result<TcpStream> {
@@ -441,7 +449,7 @@ fn http_text(host: &str, req: &HttpRequest<'_>) -> String {
     text
 }
 
-fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
+fn parse_response(raw: &[u8], cut: bool) -> Result<(u16, String)> {
     let text = String::from_utf8_lossy(raw).to_string();
     let (head, rest) = text
         .split_once("\r\n\r\n")
@@ -455,8 +463,47 @@ fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
         l.to_ascii_lowercase().starts_with("transfer-encoding:")
             && l.to_ascii_lowercase().contains("chunked")
     });
-    let body = if chunked { dechunk(rest) } else { rest.to_string() };
+    let content_length: Option<usize> = head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+    });
+    let body = if chunked {
+        if cut && !chunked_ended(rest) {
+            return Err(Error::Plan("the server's answer was cut before its last chunk".into()));
+        }
+        dechunk(rest)
+    } else if let Some(n) = content_length {
+        if rest.len() < n {
+            return Err(Error::Plan("the server's answer was cut short of its length".into()));
+        }
+        rest[..n].to_string()
+    } else if cut {
+        return Err(Error::Plan(
+            "the server's answer had no length and the connection was cut before it ended".into(),
+        ));
+    } else {
+        rest.to_string()
+    };
     Ok((status, body))
+}
+
+/// Whether a chunked body reached its last, empty chunk.
+fn chunked_ended(text: &str) -> bool {
+    let mut rest = text;
+    while let Some((size_line, after)) = rest.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or(""), 16)
+        else {
+            return false;
+        };
+        if size == 0 {
+            return true;
+        }
+        if after.len() < size {
+            return false;
+        }
+        rest = after[size..].strip_prefix("\r\n").unwrap_or("");
+    }
+    false
 }
 
 /// The pieces of a chunked body, joined.

@@ -841,7 +841,16 @@ fn connect(endpoint: &str, tls: Option<&ArchiveTls>) -> Result<Box<dyn crate::tl
 /// close of the connection (which the request asked for).
 fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Response> {
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    // Over TLS a stream that ends without a close_notify is an error
+    // (0.87.0), with what came before it in `raw`: a body the headers
+    // frame -- a content-length met, a chunked body's last chunk -- is
+    // whole whatever ended the stream; one framed by the end alone is
+    // taken only from a stream that ended properly.
+    let cut = match stream.read_to_end(&mut raw) {
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => true,
+        Err(e) => return Err(e.into()),
+    };
     let head_end = find(&raw, b"\r\n\r\n")
         .ok_or_else(|| Error::Storage("archive: response without a header block".into()))?;
     let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
@@ -873,6 +882,10 @@ fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Re
         rest.get(..n)
             .ok_or_else(|| Error::Storage("archive: the response body was cut short".into()))?
             .to_vec()
+    } else if cut {
+        return Err(Error::Storage(
+            "archive: the response had no length and the connection was cut before it ended".into(),
+        ));
     } else {
         rest.to_vec()
     };

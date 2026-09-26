@@ -798,7 +798,7 @@ impl Cipher {
                 break;
             }
             let f = Frame { id, scheme: Scheme::Legacy, index, last: false, log_id: None };
-            match self.open_frame(&key, f, frame) {
+            match self.open_frame(key, f, frame) {
                 Ok(p) => out.records.push(p),
                 Err(_) => break,
             }

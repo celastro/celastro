@@ -265,6 +265,10 @@ fn ticket_day() -> u64 {
 const TICKET_VERSION: u8 = 3;
 const TICKET_AAD: &[u8] = b"celastro tls ticket v3";
 
+/// What a ticket opens to: the PSK, and for a client the wire asked a
+/// certificate of, its names and when it expires.
+type OpenedTicket = (Secret<32>, Option<(Vec<String>, i64)>);
+
 /// A ticket as the server hands it out: `3 | nonce(12) | ciphertext |
 /// tag` over `psk(32) | issued_at(8) | age_add(4) | client(1)`, and when
 /// `client` is 1 -- the wire asked for a certificate -- `not_after(8)`
@@ -315,10 +319,7 @@ pub(super) fn seal_ticket(
 /// valid. `None` for anything else -- another node's key, another
 /// format, a tampered byte, an old ticket -- and the handshake goes on
 /// in full, which is what the protocol says happens.
-pub(super) fn open_ticket(
-    tkey: &[u8; 32],
-    ticket: &[u8],
-) -> Option<(Secret<32>, Option<(Vec<String>, i64)>)> {
+pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<OpenedTicket> {
     if ticket.len() < 1 + 12 + 45 + 16 || ticket[0] != TICKET_VERSION {
         return None;
     }
