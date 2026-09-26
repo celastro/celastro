@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.85.0 — 2026-09-26
 
 **Four deviations the TLS transcript already covered are refused and
 named.** A second ClientHello after a HelloRetryRequest that is not the

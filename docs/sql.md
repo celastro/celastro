@@ -491,9 +491,9 @@ SHOW HEALTH;
 node tcp://127.0.0.1:7878 attached
 collection `notes` created with 3 shard(s) on tcp://127.0.0.1:7877, tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
 index `notes_body` created on the active tier; and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
-this node: tcp://127.0.0.1:7877, data, celastro 0.84.1, 1 collection(s), 1 shard(s) held, directory present
-node tcp://127.0.0.1:7878: up, data, celastro 0.84.1, 0 ms, clock -0.0 s
-node tcp://127.0.0.1:7879: up, data, celastro 0.84.1, 0 ms, clock -0.0 s
+this node: tcp://127.0.0.1:7877, data, celastro 0.85.0, 1 collection(s), 1 shard(s) held, directory present
+node tcp://127.0.0.1:7878: up, data, celastro 0.85.0, 0 ms, clock -0.0 s
+node tcp://127.0.0.1:7879: up, data, celastro 0.85.0, 0 ms, clock -0.0 s
 shard 0 of `notes`: on tcp://127.0.0.1:7877, reachable
 shard 1 of `notes`: on tcp://127.0.0.1:7878, reachable
 shard 2 of `notes`: on tcp://127.0.0.1:7879, reachable
