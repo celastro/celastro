@@ -523,6 +523,87 @@ fn a_collection_spread_over_three_nodes_answers_what_one_process_answers() {
     }
 }
 
+/// Over three nodes, each source's list is its top `k'` over the collection
+/// whichever node holds it: a corpus far past `k'` whose best rows all sit
+/// on one node's shard answers, through the wire and from every node, what
+/// one process with ONE shard answers, bit for bit. The shard holding the
+/// top filled the depth it was asked for and was asked again at the full
+/// one, and the plan names it: the fusion compared shard by shard, at the
+/// default depth, where before 0.82.0 the answer moved with the shard count.
+#[test]
+fn a_ranked_statement_over_three_nodes_answers_what_one_shard_answers_at_default_depth() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("depth-a");
+    let b = Node::start("depth-b");
+    let c = Node::start("depth-c");
+    let one_dir = dir("depth-one");
+    let mut one = Db::open(&one_dir, DbOpts::default()).unwrap();
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    one.execute(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT) \
+         PARTITION BY (tenant)",
+    )
+    .unwrap();
+    for ix in INDEXES {
+        a.ack(ix);
+        one.execute(ix).unwrap();
+    }
+    // Tenant t0, shard 0 on `a`, holds the first 300 rows, and the score
+    // of every source falls with `i`: `alpha` repeats less, and the vector
+    // drifts from the query. The top 100 of both sources is t0's first
+    // hundred, on one node.
+    for i in 0..600usize {
+        let reps = 300usize.saturating_sub(i).max(1);
+        let x = i as f32 / 600.0;
+        let d = celastro::json::parse(&format!(
+            r#"{{"id":"doc-{i:03}","tenant":"t{}","n":{i},"body":"{} beta item {i}","embedding":[{x},{},0.1,1.0]}}"#,
+            if i < 300 { 0 } else { 1 + i % 2 },
+            vec!["alpha"; reps].join(" "),
+            1.0 - x,
+        ))
+        .unwrap();
+        [&a, &b, &c][i % 3].db.write().unwrap().insert("items", d.clone()).unwrap();
+        one.insert("items", d).unwrap();
+    }
+    assert_eq!((a.docs_here("items"), b.docs_here("items"), c.docs_here("items")), (300, 150, 150));
+    let sqls = [
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), \
+         embedding <=> [0.0, 1.0, 0.1, 1.0], method => 'rrf') LIMIT 20 WITH (exact, exact_scoring)",
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), \
+         embedding <=> [0.0, 1.0, 0.1, 1.0], method => 'linear') LIMIT 20 WITH (exact, exact_scoring)",
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), method => 'linear') \
+         LIMIT 20 WITH (exact_scoring)",
+        "SELECT id FROM items ORDER BY embedding <=> [0.0, 1.0, 0.1, 1.0] LIMIT 20 WITH (exact)",
+    ];
+    for sql in &sqls {
+        let want = shape(&one.query(sql).unwrap());
+        assert_eq!(want.len(), 20, "{sql}");
+        for n in [&a, &b, &c] {
+            assert_eq!(shape(&n.query(sql).unwrap()), want, "{sql} on {}", n.url);
+        }
+    }
+    // The plan, from a node that does not hold the top: three shards asked
+    // for 76 each for a top 100, and shard 0 asked again for all of it.
+    let plan = match b.exec(&format!("EXPLAIN ANALYZE {}", sqls[0])).unwrap() {
+        Outcome::Explain(t) => t,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        plan.contains(
+            "candidates: k'=76 per shard for each source's top 100 over the collection; asked \
+             again at 100: shard 0\n"
+        ),
+        "{plan}"
+    );
+    assert!(plan.contains("shard 0 (manifest") && plan.contains("shard 2 (manifest"), "{plan}");
+    for d in [&a.dir, &b.dir, &c.dir, &one_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// A node that stops answering is a deadline at the coordinator -- the same
 /// rule the simulator pinned -- so `partial_results` reports its shard and
 /// nothing else changes; a write to its shard is refused naming it; and a

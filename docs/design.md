@@ -52,7 +52,7 @@ test that pins it.
 | encryption at rest | `cipher`, `shard`, `engine` | ChaCha20-Poly1305 frames per file under a data key `KEY` holds wrapped under the master; `CELASTRO_MASTER_KEY_FILE` |
 | the console and its guards | `serve` | a token on every request, loopback or `--bind`, a thread per connection |
 | a seeded fault schedule on the shard boundary | `sim` | drops, restarts, reorder; "a fault can shorten an answer only by saying so" |
-| scatter-gather, query-then-fetch | `plan::exec` | shards return `(pk, source, raw score)` |
+| scatter-gather, query-then-fetch | `plan::exec`, `plan::service::scatter` | every shard at once, on a thread each; shards return `(pk, source, raw score)` |
 | global term statistics | `engine::Db::gather_stats` | cached approximate, or exact two-phase |
 | size-tiered compaction with a hard cap | `compaction` | dead-ratio, tier and format-upgrade triggers |
 | control plane | `engine::Db` | catalog, tablet map, statistics cache |
@@ -1323,14 +1323,66 @@ That un-prunes every tie in the unit -- the cost the earlier attempts refused
 to pay collection-wide -- and pays it only inside a memtable, whose size the
 flush thresholds bound.
 
-**`k'` truncation, not approximation, is what breaks shard-count identity.**
-`n` shards each return up to `k'` candidates where one shard returns `k'`, so
-the candidate union differs with the shard count and the fusion differs with it
-— even in exact mode, where ANN and statistics are removed as sources of
-variance. Bit-identical results across shard counts hold only at `k'` above the
-candidate count, which is what `exact_mode_is_bit_identical_across_shard_counts`
-pins. The statistics half of that claim holds on both paths, but for different
-reasons. The two-phase gather masks all three of `num_docs`, the length sum and
+**The scatter asks every shard at once.** A round trip to a shard on
+another node is the coordinator's unit of latency, and until 0.82.0 a
+statement paid one per shard in a row: the candidates, then the term
+statistics, the prefix expansion, the fetch of the winning rows, the
+unranked scan and its deferred documents, a walk's expansion and its
+liveness check, each a loop over the shards. Measured on twelve nodes, every
+shape's median grew with the shard count for that reason alone -- a hybrid
+over twenty-four shards cost 3.3 times its cost over three, a scan 2.7 --
+and the hybrid, whose per-shard call was the heaviest, led. Every one of
+those loops is `plan::service::scatter` now: a thread per shard for the
+length of the call, each arming what is left of the statement's deadline,
+the answers handed back in the order asked and merged as before, so nothing
+about an answer moves. No pool, because the thread costs less than the round
+trip it overlaps and the statement is on one thread again when the scatter
+returns, which the thread-local deadline assumes. The simulator's shards ask
+to be called one at a time (`ShardService::concurrent`), so a seed still
+reproduces its trace; every real shard is called beside the others. Measured
+on the same twelve nodes afterwards, every shape's median over twenty-four
+shards is its median over three -- the hybrid 79 ms to 16, the vector 45 to
+13, the scan 48 to 9 -- and the tails, 70-130 ms before, are the network's
+own 70-80 ms at every shard count. Shaping `k'` per shard (next paragraph)
+moved none of those numbers on that corpus, a thousand rows a shard: a
+shard's candidates cost well under a millisecond at either depth, and the
+merge of 864 candidates against 4,800 a fraction of one. What it is for
+is the answer's identity across shard counts and the candidates no longer
+growing with the shard count.
+
+**Each source's candidate list is its top `k'` over the collection,
+whichever shards hold it.** A shard cannot know which of its candidates
+stand in the collection's top `k'`, so the coordinator asks for more than
+its share and cuts the merge: `n` shards are each asked for a depth that a
+share of the top spread at random fits in with six standard deviations of
+room -- twice `k'/n` and eight more, never above `k'`
+(`plan::exec::shard_depth`; 76 each over three shards for a top 100, 18
+over twenty-four) -- the answers are merged in the coordinator's own order,
+score then key, and the merge is checked (`uncertified`): a shard that
+filled the depth asked, and whose last candidate stands inside the merged
+top `k'`, may hold more of it, and is asked again at the full `k'`, once,
+its second answer replacing its first. A shard that answered short has
+nothing more; a shard whose last stands at or past the `k'`-th of the merge
+has nothing that could stand before it, because it answers in the merge's
+own order. Then each source's merged list is cut to `k'`. What that makes
+the answer is the answer of one shard holding every row, at every shard
+count, for a source that answers exactly -- text, and a vector index under
+`WITH (exact)` -- and `a_ranked_statement_over_many_shards_answers_what_one_shard_answers_at_default_depth`
+pins it bit for bit at one, three and six shards with a corpus whose top sits
+on one of them, as its three-node twin in `tests/wire.rs` does through the
+wire; `EXPLAIN` says what each shard was asked for and which were asked
+again. An approximate index answers the top of what it found at the depth
+asked, and its second answer is not a longer first one: recall across shard
+counts stays the tolerance it was. What it costs is a second round where a
+top is not spread at random -- a range-partitioned collection whose best rows
+share a tenant is the case, and a statement scoped to that tenant prunes to
+its shards and asks each for the whole top. Before 0.82.0 every shard's top
+`k'` reached the fusion whole, so the union differed with the shard count
+and the fusion with it, even in exact mode; `k'` set above the candidate
+count was the only way to an identical answer, which is what
+`exact_mode_is_bit_identical_across_shard_counts` still pins. The
+statistics half of shard-count identity holds on both paths, but for
+different reasons. The two-phase gather masks all three of `num_docs`, the length sum and
 `doc_freq` by snapshot visibility on this query, so the triple is a function of
 the live corpus alone. The cached statistics the default path reads are the
 same masked sums, gathered at an instant the query pins and refreshed on a
@@ -2585,6 +2637,8 @@ guarantee:
 | reading the past is `WITH (exact_scoring)`, and the default path says so | `engine::tests::a_historical_timestamp_on_the_default_arm_is_a_caller_error_and_not_an_approximation` |
 | IDF is total: no statistics make it negative | `text::scorer::tests::idf_is_never_negative_however_incoherent_the_statistics` |
 | approximate mode within tolerance | `approximate_mode_across_shard_counts_stays_within_recall_tolerance` |
+| each source's list is its top `k'` over the collection at every shard count, and the shard holding the top is asked again | `a_ranked_statement_over_many_shards_answers_what_one_shard_answers_at_default_depth` (one, three and six shards, four shapes, bit for bit, the plan naming the depth and the shard asked again), `wire::a_ranked_statement_over_three_nodes_answers_what_one_shard_answers_at_default_depth` (the same through the wire, from every node), `plan::exec::tests::a_shard_that_filled_its_depth_inside_the_top_is_asked_again_and_no_other` (the check itself: short answers, the edge, ties by key, two sources, a walk's source), `plan::exec::tests::a_shards_depth_shrinks_with_the_shard_count_and_never_exceeds_k_prime` |
+| the scatter asks every shard at once and a fault in the second round is a missing shard like any other | `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (a statement whose shards fill their depth and are asked again, under drops and restarts), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (the serial schedule under the simulator), `engine::tests::a_scatter_carries_the_deadline_to_every_shard_it_asks_at_once` (a budget of nothing over three shards: every shape refused naming a shard, or every shard missing) |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |
 | filtered-search strategy selection prices the traversal that would run, and a visit budget binds knowingly | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed, filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them}` (the last asserts the visit count against the model's bound, and that a budget of 64 stops the walk at 64 and says so) |

@@ -8861,11 +8861,16 @@ impl Db {
                 // matching vocabulary, whose cost is exactly what the cap
                 // exists to refuse.
                 let mut union: BTreeSet<String> = BTreeSet::new();
-                for s in services {
-                    if unreachable.contains(&s.index()) {
-                        continue;
-                    }
-                    match s.prefix_terms(&path, &p, ts, cap + 1, part.as_deref()) {
+                let asked: Vec<&dyn ShardService> = services
+                    .iter()
+                    .filter(|s| !unreachable.contains(&s.index()))
+                    .map(|s| s.as_ref())
+                    .collect();
+                let answers = crate::plan::service::scatter(&asked, |s| {
+                    s.prefix_terms(&path, &p, ts, cap + 1, part.as_deref())
+                });
+                for (s, answer) in asked.iter().zip(answers) {
+                    match answer {
                         Ok(terms) => union.extend(terms),
                         Err(Error::Deadline(e)) => {
                             if !partial {
@@ -9282,12 +9287,17 @@ fn sum_term_stats(
 ) -> Result<(TermStats, bool)> {
     let mut sum = TermStats::default();
     let mut complete = true;
+    let mut asked: Vec<&dyn ShardService> = Vec::new();
     for s in services {
         if unreachable.contains(&s.index()) {
             complete = false;
             continue;
         }
-        match s.term_stats(path, terms, ts) {
+        asked.push(s.as_ref());
+    }
+    let answers = crate::plan::service::scatter(&asked, |s| s.term_stats(path, terms, ts));
+    for (s, answer) in asked.iter().zip(answers) {
+        match answer {
             Ok(t) => {
                 sum.num_docs += t.num_docs;
                 sum.total_doc_len += t.total_doc_len;
@@ -14467,6 +14477,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The deadline reaches every shard of a scatter: the shards are asked
+    /// on a thread each, the budget is thread-local, and a thread that did
+    /// not arm it would run its shard's half without one. Over three shards
+    /// and a budget of nothing, every shape is refused naming a shard, or
+    /// under `partial_results` answers with every shard missing.
+    #[test]
+    fn a_scatter_carries_the_deadline_to_every_shard_it_asks_at_once() {
+        let dir = tmp("deadline-scatter");
+        let opts = DbOpts { statement_deadline_ms: Some(0), ..Default::default() };
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute(
+            "CREATE COLLECTION notes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL) \
+             PARTITION BY (tenant) WITH (splits = ['t1', 't2'])",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english')",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (embedding) \
+             WITH (dims = 4, metric = 'cosine')",
+        )
+        .unwrap();
+        for i in 0..60 {
+            let d = crate::json::parse(&format!(
+                r#"{{"id":"n{i:02}","tenant":"t{}","body":"segments and postings {i}","embedding":[{},1.0,0.5,0.25]}}"#,
+                i % 3,
+                i as f32 / 60.0
+            ))
+            .unwrap();
+            db.insert("notes", d).unwrap();
+        }
+        let shapes = [
+            "SELECT id FROM notes LIMIT 5",
+            "SELECT id FROM notes WHERE text_match(body, 'segments') LIMIT 5",
+            "SELECT id FROM notes ORDER BY embedding <=> [1,0,0,0] LIMIT 5",
+            "SELECT id FROM notes ORDER BY hybrid(text_match(body, 'segments'), \
+             embedding <=> [1,0,0,0]) LIMIT 5",
+        ];
+        for sql in shapes {
+            match db.query(sql) {
+                Err(Error::Deadline(m)) => assert!(m.contains("shard "), "{sql}: {m}"),
+                other => panic!("{sql}: {other:?}"),
+            }
+            let r = db.query(&format!("{sql} WITH (partial_results)")).unwrap();
+            assert_eq!(r.missing, vec!["shard 0", "shard 1", "shard 2"], "{sql}");
+            assert!(r.rows.is_empty(), "{sql}: {} row(s) with every shard missing", r.rows.len());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A statement that cannot finish within its deadline is refused with the
     /// budget named and the two ways to change it, on every query shape, and
     /// by DEFAULT: this `Db` was given a budget of nothing and the statements
@@ -14724,7 +14786,10 @@ mod tests {
         let full = db.query("SELECT id FROM items LIMIT 100000").unwrap();
         assert_eq!(full.rows.len(), 600);
 
-        // Key order: decodes exactly the page, wherever the page is.
+        // Key order: decodes exactly the page, wherever the page is. The
+        // decode counter is this thread's, and the scatter runs each
+        // shard on its own; a fault-free schedule keeps every call here.
+        db.install_sim(crate::sim::Sim::new(1, crate::sim::Faults::new(0, 0, false)));
         let decoded = |db: &mut Db, sql: &str| {
             let before = documents_decoded();
             let r = db.query(sql).unwrap();

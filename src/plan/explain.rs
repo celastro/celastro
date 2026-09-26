@@ -97,7 +97,15 @@ pub struct ShardExplain {
 pub struct Explain {
     pub statement: String,
     pub snapshot_ts: u64,
+    /// Each source's depth over the collection: what its merged list is
+    /// cut to before the fusion.
     pub k_prime: usize,
+    /// The depth each shard was asked for per source in the first round
+    /// (`exec::shard_depth`); `k_prime` when nothing was shaped.
+    pub shard_depth: usize,
+    /// The shards asked again at the full depth, because their first
+    /// answer could not vouch for the top (`exec::uncertified`).
+    pub reasked: Vec<usize>,
     pub limit: usize,
     pub offset: usize,
     pub exact_mode: bool,
@@ -206,6 +214,26 @@ impl Explain {
                 String::new()
             }
         ));
+        if self.shard_depth > 0 && self.shard_depth < self.k_prime {
+            o.push_str(&format!(
+                "  candidates: k'={} per shard for each source's top {} over the collection{}\n",
+                self.shard_depth,
+                self.k_prime,
+                if self.reasked.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; asked again at {}: {}",
+                        self.k_prime,
+                        self.reasked
+                            .iter()
+                            .map(|s| format!("shard {s}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            ));
+        }
         o.push_str(&format!(
             "  term statistics: {}\n",
             if self.stats_exact { "exact (two-phase)" } else { "cached approximate" }

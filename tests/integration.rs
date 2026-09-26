@@ -1285,6 +1285,91 @@ fn exact_mode_is_bit_identical_across_shard_counts_under_updates_and_deletes() {
     assert_eq!(one, six, "1 shard vs 6 shards");
 }
 
+/// At the default depth, and with a corpus far past it whose best rows all
+/// sit on one shard: each source's list is its top `k'` over the collection
+/// whichever shards hold it, so the answer over three or six shards is the
+/// one-shard answer bit for bit -- the shard holding the top filled the
+/// depth it was asked for and was asked again at the full one, and the plan
+/// says so. Before 0.82.0 each shard's top `k'` reached the fusion whole,
+/// so the answer depended on the shard count as soon as `k'` bound.
+#[test]
+fn a_ranked_statement_over_many_shards_answers_what_one_shard_answers_at_default_depth() {
+    let dims = 4;
+    let doc = |i: usize| {
+        // Tenant t0 holds the first 300 rows, and the score of every source
+        // falls with `i`: the term `alpha` repeats less, and the vector
+        // drifts from the query. The top 100 of both is t0's first hundred.
+        let reps = 300usize.saturating_sub(i).max(1);
+        let alpha = vec!["alpha"; reps].join(" ");
+        let x = i as f32 / 900.0;
+        celastro::json::parse(&format!(
+            r#"{{"id":"doc-{i:05}","tenant_id":"t{}","body":"{alpha} beta item {i}","embedding":[{x},{},0.1,0.1]}}"#,
+            if i < 300 { 0 } else { 1 + i % 2 },
+            1.0 - x,
+        ))
+        .unwrap()
+    };
+    let sqls = [
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), \
+         embedding <=> [0.0, 1.0, 0.1, 0.1], method => 'rrf') LIMIT 20 WITH (exact, exact_scoring)",
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), \
+         embedding <=> [0.0, 1.0, 0.1, 0.1], method => 'linear') LIMIT 20 WITH (exact, exact_scoring)",
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'alpha'), method => 'linear') \
+         LIMIT 20 WITH (exact_scoring)",
+        "SELECT id FROM items ORDER BY embedding <=> [0.0, 1.0, 0.1, 0.1] LIMIT 20 WITH (exact)",
+    ];
+    let run = |splits: &[&str]| {
+        let mut db = Db::with_opts(opts(64));
+        setup(&mut db, dims, splits);
+        for i in 0..900 {
+            db.insert("items", doc(i)).unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        type Shape = Vec<(String, Option<u32>, Option<u32>)>;
+        let answers: Vec<Shape> = sqls
+            .iter()
+            .map(|sql| {
+                let r = db.query(sql).unwrap();
+                assert_eq!(r.rows.len(), 20, "{sql}");
+                r.rows
+                    .iter()
+                    .map(|x| {
+                        (x.key.clone(), x.score.map(f32::to_bits), x.distance.map(f32::to_bits))
+                    })
+                    .collect()
+            })
+            .collect();
+        let plan = match db.execute(&format!("EXPLAIN ANALYZE {}", sqls[0])).unwrap() {
+            Outcome::Explain(t) => t,
+            other => panic!("{other:?}"),
+        };
+        (answers, plan)
+    };
+    let (one, plan_one) = run(&[]);
+    let (three, plan_three) = run(&["t1", "t2"]);
+    let (six, plan_six) =
+        run(&["t0\u{1}doc-00150", "t1", "t1\u{1}doc-00600", "t2", "t2\u{1}doc-00600"]);
+    assert_eq!(one, three, "1 shard vs 3 shards");
+    assert_eq!(one, six, "1 shard vs 6 shards");
+    // One shard is asked for the whole top; three are asked for 76 each for
+    // a top 100 and the shard holding all of it is asked again; six are
+    // asked for 42 each, and so is the shard holding the rows just under
+    // the top, whose last stood inside a merge that had only 42 of it yet.
+    assert!(plan_one.contains("k'=100") && !plan_one.contains("candidates: k'="), "{plan_one}");
+    assert!(
+        plan_three.contains(
+            "candidates: k'=76 per shard for each source's top 100 over the collection; asked \
+             again at 100: shard 0\n"
+        ),
+        "{plan_three}"
+    );
+    assert!(
+        plan_six.contains("candidates: k'=42 per shard")
+            && plan_six.contains("asked again at 100: shard 0, shard 1\n"),
+        "{plan_six}"
+    );
+}
+
 #[test]
 fn approximate_mode_across_shard_counts_stays_within_recall_tolerance() {
     // The counterpart to the test above: with approximation on, results

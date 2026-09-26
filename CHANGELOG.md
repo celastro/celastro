@@ -6,6 +6,41 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A statement asks every shard at once.** The coordinator called the
+shards of a statement one after another -- for the candidates, the term
+statistics, a prefix's expansion, the winning rows, an unranked scan and
+its documents, a walk's hops -- so a statement over `n` shards on other
+nodes paid `n` round trips in a row, and every shape's median grew with
+the shard count for that reason alone: measured over twelve nodes, a
+hybrid over twenty-four shards cost 3.3 times its cost over three. Every
+one of those calls goes to every shard at once now, each under what is
+left of the statement's deadline, and the answers are merged as before:
+nothing about an answer moves, and a statement pays the slowest shard's
+round trip rather than the sum. Measured on the same twelve nodes, at
+the median over twenty-four shards: the hybrid 79 ms to 16, the vector
+45 to 13, a text match 38 to 12, a scan 48 to 9, a count 32 to 11 --
+each now what it costs over three shards.
+
+**A ranked statement answers the same at every shard count.** Each shard
+returned its own top `k'` per source and the fusion ranked the union, so
+an answer over `n` shards was not the answer over one as soon as `k'`
+bound, and `k'` grew with the shard count -- two sources over twenty-four
+shards brought 4,800 candidates to the coordinator for a top 100. Each
+source's list is now its top `k'` over the collection, whichever shards
+hold it: the shards are asked for a depth a random share of the top fits
+in (76 each over three shards for a top 100, 18 over twenty-four), the
+merge is checked, a shard that filled its depth inside the merged top is
+asked again at the full `k'`, and the merge is cut to `k'`. The answer
+over `n` shards is the answer over one, bit for bit, for a source that
+answers exactly. A hybrid whose fused order depended on a candidate
+beyond the `k'`-th of some source may order its page differently from
+0.81.0 on a collection of more than one shard; a collection of one
+answers as before. `EXPLAIN` says what each shard was asked for and
+which were asked again; `hybrid(..., k => N)` is a depth over the
+collection, as the docs already said.
+
 ## 0.81.0 — 2026-09-25
 
 **A holder keeps its shard through a raised term.** 0.80.0 made a

@@ -129,11 +129,20 @@ pub struct ShardScan {
 /// exactly as a shard that ran out of time in this process — refused, or
 /// under `WITH (partial_results)` reported in `missing` — so a slow shard and
 /// an unreachable one are one case.
-pub trait ShardService {
+///
+/// `Sync`, because the coordinator asks every shard of a statement at once
+/// ([`scatter`]), from a thread per shard borrowing the service.
+pub trait ShardService: Sync {
     /// The shard's position in its collection's tablet map. Answers are
     /// attributed by this, not by the order the services were handed over
     /// in, so that order can be anything.
     fn index(&self) -> usize;
+    /// Whether this shard may be called beside the others of a scatter, on
+    /// its own thread. Every real shard may; the simulator's says no, so
+    /// that its seeded schedule sees the calls in one order.
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn manifest_version(&self) -> u64;
     /// Whether the shard's key range can hold anything under `prefix` (a
     /// partition prefix or a whole key).
@@ -176,6 +185,52 @@ pub trait ShardService {
     /// this shard, sorted and distinct. How a walk tells a node from a
     /// dangling edge.
     fn present(&self, keys: &[String], ts: Timestamp) -> Result<Vec<String>>;
+}
+
+/// Every listed shard at once: `f` on each, under its own arming of what is
+/// left of the statement's deadline, the answers in the order the shards
+/// were given.
+///
+/// A round trip to a shard on another node is the coordinator's unit of
+/// latency, and a statement over `n` shards paid `n` of them one after
+/// another before 0.82.0 -- a hybrid over twenty-four shards cost 3.3 times
+/// what it cost over three, in round trips alone. It pays the slowest one
+/// now. One thread per shard for the length of the call and no pool: the
+/// thread costs less than the round trip it overlaps, and the statement is
+/// on one thread again when this returns, which is what the thread-local
+/// deadline assumes. A single shard is called directly, and so is every
+/// shard when one of them asks to be ([`ShardService::concurrent`]): the
+/// simulator decides each call's fate in call order from a seed, and a run
+/// has to reproduce from that seed. In that serial order a deadline that
+/// has passed before a shard's turn is that shard's `Deadline`, without
+/// the call, as the loops this replaced had it.
+pub fn scatter<R: Send>(
+    shards: &[&dyn ShardService],
+    f: impl Fn(&dyn ShardService) -> Result<R> + Sync,
+) -> Vec<Result<R>> {
+    if shards.len() < 2 || shards.iter().any(|s| !s.concurrent()) {
+        return shards
+            .iter()
+            .map(|s| match crate::deadline::passed() {
+                Some(ms) => Err(exec::shard_deadline(s.index(), ms)),
+                None => f(*s),
+            })
+            .collect();
+    }
+    let remaining = crate::deadline::remaining_ms();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = shards
+            .iter()
+            .map(|s| {
+                let f = &f;
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    f(*s)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a scatter thread panicked")).collect()
+    })
 }
 
 /// A shard in this process, answered by direct call.

@@ -198,7 +198,8 @@ n3  | 0.015268 | n3
 distance, a `hops(...)` walk -- with reciprocal rank fusion (`method =>
 'rrf'`, the default) or a weighted sum of normalised scores (`method =>
 'linear', weights => [...]`); `k => N` is how many candidates each
-source contributes.
+source contributes, over the whole collection whichever shards hold them
+(the default is four times the `LIMIT`, at least 100).
 
 ```sql
 SELECT id, topic FROM notes

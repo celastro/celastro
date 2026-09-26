@@ -32,7 +32,7 @@ use crate::deadline;
 use crate::error::{Error, Result};
 use crate::plan::exec;
 use crate::plan::explain::{HopExplain, UnitExplain, WalkExplain};
-use crate::plan::service::ShardService;
+use crate::plan::service::{self, ShardService};
 use crate::shard::{Searchable, Shard};
 use crate::sql::ast::{Expr, HybridSource, OrderBy, Select};
 use crate::time::Timestamp;
@@ -338,11 +338,13 @@ pub fn walk(
             hop,
         };
         let mut scanned = 0usize;
-        for s in edge_services {
-            if edge_unreachable.contains(&s.index()) {
-                continue;
-            }
-            match s.expand(&req) {
+        let asked: Vec<&dyn ShardService> = edge_services
+            .iter()
+            .filter(|s| !edge_unreachable.contains(&s.index()))
+            .map(|s| s.as_ref())
+            .collect();
+        for (s, answer) in asked.iter().zip(service::scatter(&asked, |s| s.expand(&req))) {
+            match answer {
                 Ok(x) => {
                     pairs.extend(x.pairs);
                     scanned += x.scanned;
@@ -396,19 +398,22 @@ pub fn walk(
         // reachable could confirm is absent.
         let t_check = Instant::now();
         let mut present: Vec<String> = Vec::new();
-        for s in node_services {
+        let asked: Vec<&dyn ShardService> = node_services
+            .iter()
+            .filter(|s| !node_unreachable.contains(&s.index()))
+            .filter(|s| !prune || new.iter().any(|k| s.may_hold(k)))
+            .map(|s| s.as_ref())
+            .collect();
+        let checks = service::scatter(&asked, |s| {
             let mine: Vec<String> = if prune {
                 new.iter().filter(|k| s.may_hold(k)).cloned().collect()
             } else {
                 new.clone()
             };
-            if mine.is_empty() {
-                continue;
-            }
-            if node_unreachable.contains(&s.index()) {
-                continue;
-            }
-            match s.present(&mine, ts) {
+            s.present(&mine, ts)
+        });
+        for (s, answer) in asked.iter().zip(checks) {
+            match answer {
                 Ok(p) => present = union(present, p),
                 Err(Error::Deadline(e)) => {
                     if !partial {

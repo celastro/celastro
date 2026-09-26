@@ -41,7 +41,7 @@ use crate::plan::explain::{
 };
 use crate::plan::fusion::{fuse, Candidate, Direction, Fused, SourceList};
 use crate::plan::service::{
-    CandidatesRequest, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
+    self, CandidatesRequest, ScanHit, ScanRequest, ShardCandidates, ShardScan, ShardService,
 };
 use crate::shard::{partition_prefix, Searchable, Shard};
 use crate::sql::ast::*;
@@ -89,6 +89,76 @@ fn candidate_depth(
         depth = depth.max(cursor_depth.saturating_add(k.saturating_mul(collapse_room)));
     }
     depth.min(MAX_K_PRIME)
+}
+
+/// How deep each of `shards` shards is asked to go per source in the first
+/// round, for a source's top `k_prime` over the collection: twice its even
+/// share of that top and eight more, never more than `k_prime`. A top
+/// spread over the shards at random puts about `k_prime / shards` of itself
+/// on each, and this depth is six standard deviations above that at every
+/// shard count, so the first round is the only round on such a spread. What
+/// it saves is the candidates growing with the shard count: two sources
+/// over twenty-four shards brought 4,800 candidates to the coordinator for a
+/// top 100 and bring 864 now. What it risks, where a top is not spread at
+/// random, the merge checks ([`uncertified`]) and a second round repairs.
+pub(crate) fn shard_depth(k_prime: usize, shards: usize) -> usize {
+    if shards < 2 {
+        return k_prime;
+    }
+    let share = k_prime.saturating_add(shards - 1) / shards;
+    share.saturating_mul(2).saturating_add(8).min(k_prime)
+}
+
+/// Which shards' first answers cannot vouch for a source's top `k_prime`
+/// over the collection: positions into `answers`, sorted, each a shard that
+/// filled the `depth` it was asked for -- so it may hold more -- and whose
+/// last candidate for some source stands inside that source's merged top
+/// `k_prime`, or whose merge has not reached `k_prime` at all -- so the
+/// next one it holds might stand there too. A shard that answered fewer
+/// than `depth` has nothing more; a shard whose last candidate stands at
+/// or past the `k_prime`-th of the merge has nothing more that could
+/// stand before it, since it answers in the merge's own order. A source
+/// with no direction is not the shards' (a walk), and never asks.
+///
+/// Every answer is its own list in the merge's order -- score, then key --
+/// so one round at the full depth for the shards named here settles the
+/// top `k_prime` exactly, for a source that answers exactly; an
+/// approximate index answers the top of what it found.
+pub(crate) fn uncertified(
+    dirs: &[Option<Direction>],
+    answers: &[&[Vec<Candidate>]],
+    depth: usize,
+    k_prime: usize,
+) -> Vec<usize> {
+    let mut again: Vec<usize> = Vec::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        let Some(dir) = dir else { continue };
+        let order = |a: &Candidate, b: &Candidate| {
+            cmp_dir(*dir, a.raw_score, b.raw_score).then(a.key.cmp(&b.key))
+        };
+        let mut merged: Vec<&Candidate> =
+            answers.iter().flat_map(|a| a.get(i).into_iter().flatten()).collect();
+        merged.sort_by(|a, b| order(a, b));
+        merged.dedup_by(|a, b| a.key == b.key);
+        let bar = merged.get(k_prime.saturating_sub(1)).copied();
+        for (p, a) in answers.iter().enumerate() {
+            let list = a.get(i).map(|l| l.as_slice()).unwrap_or(&[]);
+            if list.len() < depth || depth == 0 {
+                continue;
+            }
+            let last = &list[list.len() - 1];
+            let open = match bar {
+                None => true,
+                Some(bar) => order(last, bar) == std::cmp::Ordering::Less,
+            };
+            if open {
+                again.push(p);
+            }
+        }
+    }
+    again.sort_unstable();
+    again.dedup();
+    again
 }
 
 #[derive(Debug, Clone)]
@@ -604,7 +674,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     let k_prime = candidate_depth(k_prime, k, sel.offset, collapse_room, cursor_depth);
     if cursor_depth > 0 {
         ex.notes.push(format!(
-            "cursor at depth {cursor_depth}: candidate generation widened to k'={k_prime} per shard"
+            "cursor at depth {cursor_depth}: candidate generation widened to k'={k_prime}"
         ));
     }
     ex.k_prime = k_prime;
@@ -636,12 +706,21 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         });
     }
 
-    // --- Scatter: one round trip, every source evaluated in the same pass.
-    // Each shard answers through `ShardService::candidates` with identifiers
-    // and raw scores only -- no ranks, no documents -- in whatever order the
-    // services were handed over, since every merge below sorts. A shard that
-    // did not answer within the deadline, in this process or across the
-    // boundary, is refused or reported by one rule.
+    // --- Scatter: every shard at once, every source evaluated in the same
+    // pass. Each shard answers through `ShardService::candidates` with
+    // identifiers and raw scores only -- no ranks, no documents -- in
+    // whatever order the services were handed over, since every merge below
+    // sorts. A shard that did not answer within the deadline, in this
+    // process or across the boundary, is refused or reported by one rule.
+    //
+    // What the coordinator wants of each source is its top `k_prime` over
+    // the collection. Over `n` shards it asks each for the depth its share
+    // of that top fits in with room to spare (`shard_depth`), merges, and
+    // checks the merge (`uncertified`): a shard that filled the depth asked
+    // and whose last candidate stands inside the merged top may hold more
+    // of it, and is asked again at the full depth, once. Each source's list
+    // is then cut to `k_prime`, so the answer over `n` shards is the answer
+    // over one, which no depth per shard could promise before 0.82.0.
     let partial = sel.with.partial_results;
     let mut per_source: Vec<Vec<Candidate>> = vec![Vec::new(); sources.len()];
     // A hop source's candidates come from the coordinator's walk, not the
@@ -656,6 +735,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
         missing.push(shard_name(*si));
     }
+    let mut asked: Vec<&dyn ShardService> = Vec::new();
     for shard in input.shards {
         let si = shard.index();
         if input.unreachable.contains(&si) {
@@ -673,38 +753,35 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
                 continue;
             }
         }
-        if let Some(ms) = deadline::passed() {
-            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
-            missing.push(shard_name(si));
-            if partial {
-                continue;
-            }
-            return Err(shard_deadline(si, ms));
-        }
-        let req = CandidatesRequest {
-            coll: input.coll,
-            select: sel,
-            ts: input.ts,
-            prefix: prefix.as_deref(),
-            sources: &sources,
-            k_prime,
-            stats: input.stats,
-            analyze: input.analyze,
-            statement: &input.statement,
-            params: input.params,
-            frontiers: input.frontiers,
-        };
-        match shard.candidates(&req) {
+        asked.push(shard.as_ref());
+    }
+    let depth = shard_depth(k_prime, asked.len());
+    ex.shard_depth = depth;
+    let request = |depth: usize| CandidatesRequest {
+        coll: input.coll,
+        select: sel,
+        ts: input.ts,
+        prefix: prefix.as_deref(),
+        sources: &sources,
+        k_prime: depth,
+        stats: input.stats,
+        analyze: input.analyze,
+        statement: &input.statement,
+        params: input.params,
+        frontiers: input.frontiers,
+    };
+    // Every shard at once; the answers come back in the order asked. A
+    // shard that did not answer is `None` here and in `missing`.
+    let first = request(depth);
+    let mut answers: Vec<Option<ShardCandidates>> = Vec::with_capacity(asked.len());
+    for (shard, answer) in asked.iter().zip(service::scatter(&asked, |s| s.candidates(&first))) {
+        let si = shard.index();
+        match answer {
             Ok(a) => {
                 if a.timed_out {
                     missing.push(shard_name(si));
                 }
-                ex.shards.push(a.explain);
-                for (i, list) in a.per_source.into_iter().enumerate() {
-                    if let Some(p) = per_source.get_mut(i) {
-                        p.extend(list);
-                    }
-                }
+                answers.push(Some(a));
             }
             Err(Error::Deadline(e)) => {
                 if !partial {
@@ -712,9 +789,79 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
                 }
                 ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
                 missing.push(shard_name(si));
+                answers.push(None);
             }
             Err(e) => return Err(e),
         }
+    }
+    // The shards whose first answer cannot vouch for the top, asked again
+    // at the full depth, at once; the second answer replaces the first.
+    if depth < k_prime {
+        let dirs: Vec<Option<Direction>> = sources
+            .iter()
+            .map(|sp| match sp {
+                SourcePlan::Hops { .. } => None,
+                _ => Some(sp.direction()),
+            })
+            .collect();
+        let lists: Vec<&[Vec<Candidate>]> = answers
+            .iter()
+            .map(|a| a.as_ref().map(|a| a.per_source.as_slice()).unwrap_or(&[]))
+            .collect();
+        let again = uncertified(&dirs, &lists, depth, k_prime);
+        if !again.is_empty() {
+            let full = request(k_prime);
+            let shards: Vec<&dyn ShardService> = again.iter().map(|p| asked[*p]).collect();
+            let second = service::scatter(&shards, |s| s.candidates(&full));
+            for (p, answer) in again.iter().zip(second) {
+                let si = asked[*p].index();
+                ex.reasked.push(si);
+                match answer {
+                    Ok(a) => {
+                        if a.timed_out {
+                            missing.push(shard_name(si));
+                        }
+                        answers[*p] = Some(a);
+                    }
+                    Err(Error::Deadline(e)) => {
+                        if !partial {
+                            return Err(Error::Deadline(e));
+                        }
+                        // Its first answer could not stand on its own and
+                        // it gave no second: nothing of it reaches the
+                        // merge, as with any shard that did not answer.
+                        ex.shards.push(ShardExplain {
+                            index: si,
+                            timed_out: true,
+                            ..Default::default()
+                        });
+                        missing.push(shard_name(si));
+                        answers[*p] = None;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    for a in answers.into_iter().flatten() {
+        ex.shards.push(a.explain);
+        for (i, list) in a.per_source.into_iter().enumerate() {
+            if let Some(p) = per_source.get_mut(i) {
+                p.extend(list);
+            }
+        }
+    }
+    // Each source's list is its top `k_prime` over the collection now, and
+    // no deeper: what one shard holding every row would have answered.
+    for (i, sp) in sources.iter().enumerate() {
+        if matches!(sp, SourcePlan::Hops { .. }) {
+            continue;
+        }
+        let dir = sp.direction();
+        per_source[i]
+            .sort_by(|a, b| cmp_dir(dir, a.raw_score, b.raw_score).then(a.key.cmp(&b.key)));
+        per_source[i].dedup_by(|a, b| a.key == b.key);
+        per_source[i].truncate(k_prime);
     }
     ex.shards.sort_by_key(|s| s.index);
 
@@ -774,32 +921,41 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     if let Some(parent_path) = &sel.collapse {
         ex.collapse = Some((parent_path.clone(), COLLAPSE_AMPLIFICATION));
         let mut seen: Vec<Value> = Vec::new();
-        for (key, score, dist) in ranked.iter() {
+        // A page's worth of candidates at a time, each batch from its
+        // shards at once, until `want` parents are in hand: fetching one
+        // candidate at a time paid a round trip per candidate.
+        for batch in ranked.chunks(want.max(1)) {
             if rows.len() >= want {
                 break;
             }
-            let Some(doc) = fetch(input.shards, key, input.ts, partial, &mut missing)? else {
-                continue;
-            };
-            let parent = doc.path(parent_path).cloned().unwrap_or(Value::Null);
-            if !parent.is_null() && seen.contains(&parent) {
-                continue;
+            let keys: Vec<&str> = batch.iter().map(|(k, _, _)| k.as_str()).collect();
+            let docs = fetch_many(input.shards, &keys, input.ts, partial, &mut missing)?;
+            for ((key, score, dist), doc) in batch.iter().zip(docs) {
+                if rows.len() >= want {
+                    break;
+                }
+                let Some(doc) = doc else { continue };
+                let parent = doc.path(parent_path).cloned().unwrap_or(Value::Null);
+                if !parent.is_null() && seen.contains(&parent) {
+                    continue;
+                }
+                seen.push(parent);
+                rows.push(Row {
+                    key: key.clone(),
+                    doc,
+                    score: if dist.is_none() { Some(*score) } else { None },
+                    distance: *dist,
+                });
             }
-            seen.push(parent);
-            rows.push(Row {
-                key: key.clone(),
-                doc,
-                score: if dist.is_none() { Some(*score) } else { None },
-                distance: *dist,
-            });
         }
     } else {
-        // Fetch payloads from the winning shards only.
+        // Fetch payloads from the winning shards only, every shard at once.
         fetch_t = Instant::now();
-        for (key, score, dist) in ranked.iter().take(want) {
-            let Some(doc) = fetch(input.shards, key, input.ts, partial, &mut missing)? else {
-                continue;
-            };
+        let page: Vec<&(String, f32, Option<f32>)> = ranked.iter().take(want).collect();
+        let keys: Vec<&str> = page.iter().map(|(k, _, _)| k.as_str()).collect();
+        let docs = fetch_many(input.shards, &keys, input.ts, partial, &mut missing)?;
+        for ((key, score, dist), doc) in page.into_iter().zip(docs) {
+            let Some(doc) = doc else { continue };
             rows.push(Row {
                 key: key.clone(),
                 doc,
@@ -1112,20 +1268,15 @@ fn aggregate_select(
         let mut every = true;
         let mut ex_count = Vec::new();
         let mut missing_count = Vec::new();
-        for shard in input.shards {
+        let asked: Vec<&dyn ShardService> = input
+            .shards
+            .iter()
+            .filter(|s| !input.unreachable.contains(&s.index()))
+            .map(|s| s.as_ref())
+            .collect();
+        for (shard, answer) in asked.iter().zip(service::scatter(&asked, |s| s.count(input.ts))) {
             let si = shard.index();
-            if input.unreachable.contains(&si) {
-                continue;
-            }
-            if let Some(ms) = deadline::passed() {
-                if !partial {
-                    return Err(shard_deadline(si, ms));
-                }
-                ex_count.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
-                missing_count.push(shard_name(si));
-                continue;
-            }
-            match shard.count(input.ts) {
+            match answer {
                 Ok(Some(n)) => {
                     total += n;
                     ex_count.push(ShardExplain {
@@ -1161,6 +1312,7 @@ fn aggregate_select(
         }
     }
     let scanned: &[Box<dyn ShardService + '_>] = if counted.is_some() { &[] } else { input.shards };
+    let mut asked: Vec<&dyn ShardService> = Vec::new();
     for shard in scanned {
         let si = shard.index();
         if input.unreachable.contains(&si) {
@@ -1178,30 +1330,26 @@ fn aggregate_select(
                 continue;
             }
         }
-        if let Some(ms) = deadline::passed() {
-            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
-            missing.push(shard_name(si));
-            if partial {
-                continue;
-            }
-            return Err(shard_deadline(si, ms));
-        }
-        let req = ScanRequest {
-            coll: input.coll,
-            select: sel,
-            ts: input.ts,
-            prefix: prefix.as_deref(),
-            stats: input.stats,
-            analyze: input.analyze,
-            keep: usize::MAX,
-            after: None,
-            fields: &[],
-            statement: &input.statement,
-            params: input.params,
-            frontiers: input.frontiers,
-            facet: input.facet.as_deref(),
-        };
-        match shard.scan(&req) {
+        asked.push(shard.as_ref());
+    }
+    let req = ScanRequest {
+        coll: input.coll,
+        select: sel,
+        ts: input.ts,
+        prefix: prefix.as_deref(),
+        stats: input.stats,
+        analyze: input.analyze,
+        keep: usize::MAX,
+        after: None,
+        fields: &[],
+        statement: &input.statement,
+        params: input.params,
+        frontiers: input.frontiers,
+        facet: input.facet.as_deref(),
+    };
+    for (shard, answer) in asked.iter().zip(service::scatter(&asked, |s| s.scan(&req))) {
+        let si = shard.index();
+        match answer {
             Ok(a) => {
                 if a.timed_out {
                     missing.push(shard_name(si));
@@ -2119,6 +2267,7 @@ fn scan(
         ex.shards.push(ShardExplain { index: *si, timed_out: true, ..Default::default() });
         missing.push(shard_name(*si));
     }
+    let mut asked: Vec<&dyn ShardService> = Vec::new();
     for shard in input.shards {
         let si = shard.index();
         if input.unreachable.contains(&si) {
@@ -2136,30 +2285,26 @@ fn scan(
                 continue;
             }
         }
-        if let Some(ms) = deadline::passed() {
-            ex.shards.push(ShardExplain { index: si, timed_out: true, ..Default::default() });
-            missing.push(shard_name(si));
-            if partial {
-                continue;
-            }
-            return Err(shard_deadline(si, ms));
-        }
-        let req = ScanRequest {
-            coll: input.coll,
-            select: sel,
-            ts: input.ts,
-            prefix: prefix.as_deref(),
-            stats: input.stats,
-            analyze: input.analyze,
-            keep,
-            after: after.as_deref(),
-            fields: &fields,
-            statement: &input.statement,
-            params: input.params,
-            frontiers: input.frontiers,
-            facet: input.facet.as_deref(),
-        };
-        match shard.scan(&req) {
+        asked.push(shard.as_ref());
+    }
+    let req = ScanRequest {
+        coll: input.coll,
+        select: sel,
+        ts: input.ts,
+        prefix: prefix.as_deref(),
+        stats: input.stats,
+        analyze: input.analyze,
+        keep,
+        after: after.as_deref(),
+        fields: &fields,
+        statement: &input.statement,
+        params: input.params,
+        frontiers: input.frontiers,
+        facet: input.facet.as_deref(),
+    };
+    for (shard, answer) in asked.iter().zip(service::scatter(&asked, |s| s.scan(&req))) {
+        let si = shard.index();
+        match answer {
             Ok(a) => {
                 manifests.insert(si, a.explain.manifest_version);
                 if a.timed_out {
@@ -2203,12 +2348,21 @@ fn scan(
         }
     }
     let mut fetched: BTreeMap<(usize, usize, u32), Value> = BTreeMap::new();
-    for (si, handles) in wanted {
-        let Some(shard) = input.shards.iter().find(|s| s.index() == si) else { continue };
+    let asked: Vec<&dyn ShardService> = wanted
+        .keys()
+        .filter_map(|si| input.shards.iter().find(|s| s.index() == *si))
+        .map(|s| s.as_ref())
+        .collect();
+    let docs = service::scatter(&asked, |s| {
+        let si = s.index();
         let version = manifests.get(&si).copied().unwrap_or(0);
-        match shard.documents(version, input.ts, &handles) {
+        s.documents(version, input.ts, &wanted[&si])
+    });
+    for (shard, answer) in asked.iter().zip(docs) {
+        let si = shard.index();
+        match answer {
             Ok(docs) => {
-                for (h, d) in handles.iter().zip(docs) {
+                for (h, d) in wanted[&si].iter().zip(docs) {
                     fetched.insert((si, h.0, h.1), d);
                 }
             }
@@ -2652,24 +2806,55 @@ pub fn facet_select(base: &Select, path: &str, top: usize) -> Select {
     }
 }
 
-/// A payload by primary key, from the shards whose range can hold it. A
-/// shard that stops answering here is treated like one that stopped
-/// anywhere else: refused, or under `partial_results` reported and skipped.
-fn fetch(
+/// The payloads behind `keys`, in order, each from the shards whose range
+/// can hold it. The shards are asked at once, each for the keys it is
+/// the first to be able to hold; a key its first shard does not have is
+/// then tried on the next that could, one at a time, which a tablet map
+/// of disjoint ranges never needs. A shard that stops answering here is
+/// treated like one that stopped anywhere else: refused, or under
+/// `partial_results` reported and skipped, its keys absent.
+fn fetch_many(
     shards: &[Box<dyn ShardService + '_>],
-    key: &str,
+    keys: &[&str],
     ts: Timestamp,
     partial: bool,
     missing: &mut Vec<String>,
-) -> Result<Option<Value>> {
-    for s in shards {
-        let si = s.index();
-        if missing.contains(&shard_name(si)) || !s.may_hold(key) {
-            continue;
+) -> Result<Vec<Option<Value>>> {
+    // Per key, the positions of the shards that could hold it.
+    let holders: Vec<Vec<usize>> = keys
+        .iter()
+        .map(|key| {
+            shards
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !missing.contains(&shard_name(s.index())) && s.may_hold(key))
+                .map(|(p, _)| p)
+                .collect()
+        })
+        .collect();
+    let mut wanted: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ki, h) in holders.iter().enumerate() {
+        if let Some(&p) = h.first() {
+            wanted.entry(shards[p].index()).or_default().push(ki);
         }
-        match s.get(key, ts) {
-            Ok(Some(d)) => return Ok(Some(d)),
-            Ok(None) => {}
+    }
+    let asked: Vec<&dyn ShardService> = wanted
+        .keys()
+        .filter_map(|si| shards.iter().find(|s| s.index() == *si))
+        .map(|s| s.as_ref())
+        .collect();
+    let answers = service::scatter(&asked, |s| {
+        wanted[&s.index()].iter().map(|ki| s.get(keys[*ki], ts)).collect::<Result<Vec<_>>>()
+    });
+    let mut out: Vec<Option<Value>> = vec![None; keys.len()];
+    for (shard, answer) in asked.iter().zip(answers) {
+        let si = shard.index();
+        match answer {
+            Ok(docs) => {
+                for (ki, d) in wanted[&si].iter().zip(docs) {
+                    out[*ki] = d;
+                }
+            }
             Err(Error::Deadline(e)) => {
                 if !partial {
                     return Err(Error::Deadline(e));
@@ -2679,7 +2864,29 @@ fn fetch(
             Err(e) => return Err(e),
         }
     }
-    Ok(None)
+    // A key not on its first shard: the others that could hold it, in turn.
+    for (ki, h) in holders.iter().enumerate() {
+        for &p in h.iter().skip(1) {
+            if out[ki].is_some() {
+                break;
+            }
+            let s = &shards[p];
+            if missing.contains(&shard_name(s.index())) {
+                continue;
+            }
+            match s.get(keys[ki], ts) {
+                Ok(d) => out[ki] = d,
+                Err(Error::Deadline(e)) => {
+                    if !partial {
+                        return Err(Error::Deadline(e));
+                    }
+                    missing.push(shard_name(s.index()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `<sort value>|<depth>|<primary key>`. The depth is what lets the next page
@@ -2949,6 +3156,76 @@ mod tests {
             candidate_depth(MAX_K_PRIME, k, usize::MAX, COLLAPSE_AMPLIFICATION, 0),
             MAX_K_PRIME
         );
+    }
+
+    /// The depth each shard is asked for shrinks as the shards multiply,
+    /// never below what a shard's share of the top needs with six
+    /// deviations of room, and never above the top itself.
+    #[test]
+    fn a_shards_depth_shrinks_with_the_shard_count_and_never_exceeds_k_prime() {
+        assert_eq!(shard_depth(100, 1), 100, "one shard holds the whole top");
+        assert_eq!(shard_depth(100, 0), 100);
+        assert_eq!(shard_depth(100, 3), 76);
+        assert_eq!(shard_depth(100, 12), 26);
+        assert_eq!(shard_depth(100, 24), 18);
+        assert_eq!(shard_depth(100, 100), 10);
+        assert_eq!(shard_depth(400, 24), 42);
+        assert_eq!(shard_depth(10, 24), 10, "a shallow top is asked whole");
+        assert_eq!(shard_depth(0, 24), 0);
+        for shards in 1..200 {
+            for k in [1, 10, 100, 1000] {
+                let d = shard_depth(k, shards);
+                assert!(d <= k && d >= (k / shards).min(k), "k'={k} over {shards}: {d}");
+            }
+        }
+    }
+
+    /// Which shards are asked again: one that filled its depth with
+    /// candidates inside the merged top may hold more of it; one that
+    /// answered short, or whose last stands at or past the top's edge,
+    /// has nothing more that could.
+    #[test]
+    fn a_shard_that_filled_its_depth_inside_the_top_is_asked_again_and_no_other() {
+        let c = |k: &str, s: f32| Candidate { key: k.to_string(), raw_score: s };
+        let text = Some(Direction::HigherIsBetter);
+        // Depth 2 for a top 4. Shard 0 holds the whole top: its two answers
+        // lead the merge and its last (b, 9.0) stands before the 4th (d,
+        // 5.0). Shard 1 filled its depth with (d, 5.0) as its last: that is
+        // the 4th itself, so nothing more of shard 1 can stand before it.
+        // Shard 2 answered one, short of the depth: it has no more.
+        let s0 = [vec![c("a", 10.0), c("b", 9.0)]];
+        let s1 = [vec![c("c", 6.0), c("d", 5.0)]];
+        let s2 = [vec![c("e", 4.0)]];
+        assert_eq!(uncertified(&[text], &[&s0, &s1, &s2], 2, 4), vec![0]);
+        // A merge short of the top: every shard that filled its depth
+        // may hold the rest of it.
+        assert_eq!(uncertified(&[text], &[&s0, &s1, &s2], 2, 10), vec![0, 1]);
+        // A shard that did not answer at all is an empty answer: short.
+        let none: [Vec<Candidate>; 0] = [];
+        assert_eq!(uncertified(&[text], &[&s0, &none], 2, 4), vec![0]);
+        // A distance source counts the other way: the smaller leads.
+        let vector = Some(Direction::LowerIsBetter);
+        let v0 = [vec![c("a", 0.1), c("b", 0.2)]];
+        let v1 = [vec![c("c", 0.3), c("d", 0.4)]];
+        assert_eq!(uncertified(&[vector], &[&v0, &v1], 2, 4), vec![0]);
+        // With the merge short of the top, both may hold the rest of it.
+        assert_eq!(uncertified(&[vector], &[&v0, &v1], 2, 5), vec![0, 1]);
+        // Two sources: a shard is named once, for whichever source needs it.
+        let both = [vec![c("a", 10.0), c("b", 9.0)], vec![c("a", 0.1), c("b", 0.2)]];
+        let rest = [vec![c("c", 6.0), c("d", 5.0)], vec![c("c", 0.3), c("d", 0.4)]];
+        assert_eq!(uncertified(&[text, vector], &[&both, &rest], 2, 4), vec![0]);
+        // A walk's source is the coordinator's own list and asks nothing.
+        let hops = [vec![c("a", 10.0), c("b", 9.0)], vec![c("a", 1.0), c("b", 1.0)]];
+        assert_eq!(uncertified(&[None, None], &[&hops, &rest], 2, 4), Vec::<usize>::new());
+        // A tie at the edge is broken by key, in the merge's order: shard 0's
+        // last (b, 5.0) sorts before (d, 5.0), the 4th of the merge, so it
+        // is asked again; with keys the other way round it is not.
+        let t0 = [vec![c("a", 10.0), c("b", 5.0)]];
+        let t1 = [vec![c("c", 6.0), c("d", 5.0)]];
+        assert_eq!(uncertified(&[text], &[&t0, &t1], 2, 4), vec![0]);
+        let t0 = [vec![c("a", 10.0), c("d", 5.0)]];
+        let t1 = [vec![c("b", 6.0), c("c", 5.0)]];
+        assert_eq!(uncertified(&[text], &[&t0, &t1], 2, 4), vec![1]);
     }
 
     /// The cursor's score used to be written with `{:.9}` — nine decimal

@@ -35,7 +35,6 @@
 //! A [`Sim`] is installed on a [`crate::Db`] with [`crate::Db::install_sim`]
 //! and records every decision in a trace.
 
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
@@ -202,12 +201,12 @@ pub struct SimShard<'a> {
     /// The replacement after a crash: opened from the shard's directory,
     /// serving every later call of the statement. Dropped with the service,
     /// which is the end of the statement.
-    replacement: RefCell<Option<Shard>>,
+    replacement: Mutex<Option<Shard>>,
 }
 
 impl<'a> SimShard<'a> {
     pub(crate) fn new(sim: Arc<Sim>, index: usize, live: &'a Shard) -> SimShard<'a> {
-        SimShard { sim, index, live, replacement: RefCell::new(None) }
+        SimShard { sim, index, live, replacement: Mutex::new(None) }
     }
 
     fn restart(&self) -> Result<()> {
@@ -223,7 +222,7 @@ impl<'a> SimShard<'a> {
             dir,
         )?;
         fresh.key_range = self.live.key_range.clone();
-        *self.replacement.borrow_mut() = Some(fresh);
+        *self.replacement.lock().unwrap() = Some(fresh);
         self.sim.state.lock().unwrap().restarts += 1;
         Ok(())
     }
@@ -236,7 +235,7 @@ impl<'a> SimShard<'a> {
             Fate::Restarted => self.restart()?,
             Fate::Delivered => {}
         }
-        let replacement = self.replacement.borrow();
+        let replacement = self.replacement.lock().unwrap();
         let shard: &Shard = replacement.as_ref().unwrap_or(self.live);
         f(&Local { shard, index: self.index })
     }
@@ -245,6 +244,12 @@ impl<'a> SimShard<'a> {
 impl ShardService for SimShard<'_> {
     fn index(&self) -> usize {
         self.index
+    }
+
+    /// One call at a time, so the schedule's decisions fall in one order
+    /// and a seed reproduces its trace.
+    fn concurrent(&self) -> bool {
+        false
     }
 
     fn manifest_version(&self) -> u64 {
@@ -423,6 +428,12 @@ mod tests {
          hybrid(text_match(body, 'vector index'), embedding <=> [0.2, 0.2, 0.9, 1.0], \
          method => 'linear') LIMIT 5",
         "SELECT id FROM items WHERE text_match(body, 'seg* fus*') LIMIT 100",
+        // Every row matches and `k'` is under a shard's share of them, so
+        // the shards fill the depth they are asked for and some are asked
+        // again: the second round under the schedule's faults too.
+        "SELECT id FROM items ORDER BY hybrid(text_match(body, 'graph search vector index \
+         segment fusion rank'), embedding <=> [0.5, 0.5, 0.5, 1.0], method => 'rrf', k => 30) \
+         LIMIT 10",
         "SELECT id FROM items ORDER BY hybrid(text_match(body, 'rank segment'), method => \
          'linear') LIMIT 8",
     ];
