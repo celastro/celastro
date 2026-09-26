@@ -23,7 +23,7 @@ notice) with a `SHA256SUMS`: the same static binaries the image
 `ghcr.io/celastro/celastro:<version>` runs, taken out of it. On the host:
 
 ```sh
-v=0.83.0
+v=0.84.0
 curl -fsSL "https://github.com/celastro/celastro/releases/download/v$v/celastro-$v-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/').tar.gz" \
   | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN='a-long-random-token' celastro install

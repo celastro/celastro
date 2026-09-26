@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.84.0 — 2026-09-26
 
 **Every encrypted file is sealed under the collection it belongs to,
 every log under an id of its own, and a file that was cut says so.**
