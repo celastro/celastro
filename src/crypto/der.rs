@@ -148,7 +148,7 @@ mod tests {
         let mut zero_led = vec![0x30, 0x82, 0x00, 0x81];
         zero_led.extend(std::iter::repeat(0u8).take(0x81));
         assert!(read(&zero_led).is_err(), "a long form with a leading zero, its bytes all there");
-        assert!(read(&zero_led[1..]).is_err(), "and short of them");
+        assert!(read(&zero_led[..zero_led.len() - 1]).is_err(), "and short of its bytes");
         assert!(read(&[0x30, 0x81, 0x81]).is_err(), "a long form short of its bytes");
         assert!(expect(&outer, SET).is_err());
         assert_eq!(integer(&[0, 0, 5]), vec![0x02, 0x01, 0x05]);
