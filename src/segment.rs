@@ -113,7 +113,11 @@ pub enum SegmentSource {
     /// A source whose bytes are the frames of `crate::cipher`: every read is
     /// a ranged read of the frames covering it, opened under the file's
     /// key. Wraps a file, an archived file or an object alike.
-    Encrypted { inner: Box<SegmentSource>, cipher: Arc<crate::cipher::Cipher>, ids: crate::cipher::Ids },
+    Encrypted {
+        inner: Box<SegmentSource>,
+        cipher: Arc<crate::cipher::Cipher>,
+        ids: crate::cipher::Ids,
+    },
 }
 
 impl SegmentSource {

@@ -134,7 +134,7 @@ rollback possible through the first days on a new release, start it with
 the cost of what the newer fields carry, and lift the pin once the
 release is trusted. Encryption at rest has the same shape of pin,
 `CELASTRO_SEAL_IDENTITY=1`, for a release that changed what an encrypted
-file is sealed under (0.84.0 did; the changelog says when).
+file is sealed under (0.84.1 did; the changelog says when).
 
 Two limits worth knowing early, in every shape: a prefix such as
 `text_match(body, 'comp*')` expands to at most 512 dictionary terms and
@@ -327,7 +327,7 @@ Each release carries a static binary for amd64 and arm64
 binary installs itself as a systemd service:
 
 ```sh
-curl -fsSL https://github.com/celastro/celastro/releases/download/v0.84.0/celastro-0.84.0-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
+curl -fsSL https://github.com/celastro/celastro/releases/download/v0.84.1/celastro-0.84.1-linux-amd64.tar.gz | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN=... CELASTRO_WIRE_TOKEN=... celastro install --node 10.0.0.2 --attach 10.0.0.2,10.0.0.3,10.0.0.4
 ```
 

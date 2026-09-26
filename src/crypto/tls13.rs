@@ -276,7 +276,10 @@ pub(super) fn seal_ticket(
 /// when the ticket carries them. `None` for anything else -- another
 /// node's key, a tampered byte, an old ticket -- and the handshake goes
 /// on in full, which is what the protocol says happens.
-pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<([u8; 32], Option<Vec<String>>)> {
+pub(super) fn open_ticket(
+    tkey: &[u8; 32],
+    ticket: &[u8],
+) -> Option<([u8; 32], Option<Vec<String>>)> {
     let version = *ticket.first()?;
     if ticket.len() < 1 + 12 + 44 + 16 || !(version == 1 || version == 2) {
         return None;
@@ -977,7 +980,8 @@ impl TlsStream {
             let now = crate::time::now_micros() / 1_000_000;
             x509::chain_reaches_anchor(&chain, anchors, now)
                 .map_err(|e| err(format!("the peer's certificate: {e}")))?;
-            let mut names: Vec<String> = chain[0].dns_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            let mut names: Vec<String> =
+                chain[0].dns_names.iter().map(|n| n.to_ascii_lowercase()).collect();
             for ip in &chain[0].ip_addresses {
                 let text = match ip.len() {
                     4 => std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),

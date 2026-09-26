@@ -8,7 +8,7 @@
 //! the data key never leaves memory. A file is encrypted under a *file
 //! key* derived from the data key and the file's identity (its
 //! collection, shard directory and name, or its bare name at the root;
-//! before 0.84.0 the shard directory and name alone, which is still read),
+//! before 0.84.1 the shard directory and name alone, which is still read),
 //! so two files never share a key and a file cannot be moved to stand in
 //! for another -- see [`Ids`] for the two identities, and a frame's
 //! associated data (`Frame`, private) for what else the current scheme
@@ -58,7 +58,7 @@ pub struct Cipher {
     legacy_writes: bool,
 }
 
-/// A file's identity under the cipher: `current` as written since 0.84.0
+/// A file's identity under the cipher: `current` as written since 0.84.1
 /// -- the collection, the shard's directory and the file, so a file of one
 /// collection cannot stand in for the same-index shard's of another -- and
 /// `legacy`, the shard's directory and the file alone, as 0.83.0 and
@@ -141,7 +141,7 @@ impl std::fmt::Debug for Cipher {
 /// the current key first and the ring of previous ones after it.
 const KEY_MAGIC: &[u8; 5] = b"CELK1";
 const KEY_MAGIC_RING: &[u8; 5] = b"CELK2";
-/// The ring from 0.84.0: each entry's associated data carries its index and
+/// The ring from 0.84.1: each entry's associated data carries its index and
 /// the ring's count, so an entry cannot be moved to the current slot or a
 /// retired key spliced back by someone who can write `KEY` and has an old
 /// copy. `CELK2` rings are read as they are; a ring is written as `CELK3`
@@ -1468,7 +1468,7 @@ pub const HEAD_BYTES: usize = FRAME;
 ///
 /// The object key is `<prefix><collection>/<shard>/<id>.seg` and the seal
 /// identity is `<collection>/<shard>/<id>.seg` (`Shard::file_ids`), or
-/// `<shard>/<id>.seg` before 0.84.0, so both are read off the key and
+/// `<shard>/<id>.seg` before 0.84.1, so both are read off the key and
 /// neither has to be guessed from a manifest.
 pub fn archived_seal_id(object_key: &str) -> Option<(String, String, Ids)> {
     let mut parts = object_key.rsplitn(3, '/');

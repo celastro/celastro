@@ -1359,7 +1359,7 @@ pub(crate) struct Wal {
     cipher: crate::cipher::Shared,
     ids: crate::cipher::Ids,
     /// The log's own id, in every record's AAD, when it was written under
-    /// the current scheme; `None` for a log written before 0.84.0 (or with
+    /// the current scheme; `None` for a log written before 0.84.1 (or with
     /// writes pinned), which goes on as it was until it is rotated or
     /// truncated.
     log_id: Option<[u8; 16]>,
@@ -1411,7 +1411,12 @@ impl SegmentDisk {
     pub(crate) fn write(&self, seg: &Segment) -> Result<PathBuf> {
         let p = self.path(seg.id);
         let bytes = seg.encode()?;
-        write_content(&self.cipher, &self.prefix.join(&format!("{:016x}.seg", seg.id)), &p, &bytes)?;
+        write_content(
+            &self.cipher,
+            &self.prefix.join(&format!("{:016x}.seg", seg.id)),
+            &p,
+            &bytes,
+        )?;
         Ok(p)
     }
 }
@@ -1599,7 +1604,11 @@ impl Wal {
     /// a directory made durable before it named the log, so the first
     /// acknowledged insert is fdatasync'd into a file whose name a crash still
     /// takes. Recording the creation is what lets a test tell those apart.
-    pub(crate) fn open(path: &Path, cipher: crate::cipher::Shared, ids: crate::cipher::Ids) -> Result<Wal> {
+    pub(crate) fn open(
+        path: &Path,
+        cipher: crate::cipher::Shared,
+        ids: crate::cipher::Ids,
+    ) -> Result<Wal> {
         let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
         #[cfg(test)]
         durability_probe::note_create(path);
@@ -1648,7 +1657,11 @@ impl Wal {
     /// that an archive wrote ends with a trailer that says so, and one cut
     /// at a record boundary has lost it; a log under the legacy scheme
     /// cannot say. What a restore asks of each archived log it fetched.
-    pub(crate) fn complete(path: &Path, cipher: &crate::cipher::Shared, ids: &crate::cipher::Ids) -> Result<bool> {
+    pub(crate) fn complete(
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        ids: &crate::cipher::Ids,
+    ) -> Result<bool> {
         let Some(c) = cipher else { return Ok(true) };
         let Some(b) = read_optional(path)? else { return Ok(true) };
         let log = c.open_log(ids, &b);
@@ -1659,7 +1672,11 @@ impl Wal {
     /// and under the current scheme a trailer after its records that says
     /// the copy is whole, so a copy cut at a record boundary is refused
     /// rather than replayed short.
-    pub(crate) fn archived_bytes(path: &Path, cipher: &crate::cipher::Shared, ids: &crate::cipher::Ids) -> Result<Vec<u8>> {
+    pub(crate) fn archived_bytes(
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        ids: &crate::cipher::Ids,
+    ) -> Result<Vec<u8>> {
         let mut b = read_optional(path)?.unwrap_or_default();
         if let Some(c) = cipher {
             let log = c.open_log(ids, &b);
@@ -4577,7 +4594,7 @@ pub(crate) fn collect_from_handles(
 impl Shard {
     /// The identities a file of this shard is encrypted under: the
     /// collection, the shard's directory name and the file's (since
-    /// 0.84.0), and the shard's directory name and the file's alone (as
+    /// 0.84.1), and the shard's directory name and the file's alone (as
     /// written before), so a segment keeps its key whether it sits in
     /// `segments/`, `archive/` or the store, and a file cannot stand in for
     /// another -- not another collection's of the same shard index either.
@@ -4588,7 +4605,10 @@ impl Shard {
             .and_then(|d| d.file_name())
             .and_then(|f| f.to_str())
             .unwrap_or("shard");
-        crate::cipher::Ids::new(format!("{}/{shard}/{name}", self.coll.name), format!("{shard}/{name}"))
+        crate::cipher::Ids::new(
+            format!("{}/{shard}/{name}", self.coll.name),
+            format!("{shard}/{name}"),
+        )
     }
 
     fn segment_file_ids(&self, id: u64) -> crate::cipher::Ids {

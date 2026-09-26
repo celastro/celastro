@@ -2920,7 +2920,16 @@ mod tests {
                     }
                 }
                 let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, &m);
-                let _ = handle(&db, &moves, &followed, &held, &lease, &identity, Some(&["127.0.0.1".to_string()]), &m);
+                let _ = handle(
+                    &db,
+                    &moves,
+                    &followed,
+                    &held,
+                    &lease,
+                    &identity,
+                    Some(&["127.0.0.1".to_string()]),
+                    &m,
+                );
                 runs += 1;
             }
         }

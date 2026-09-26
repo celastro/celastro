@@ -2791,7 +2791,11 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         match v.trim() {
             "1" | "legacy" => celastro::cipher::pin_legacy_writes(true),
             "2" | "current" | "" => {}
-            other => return Err(format!("CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy) or 2 (current)")),
+            other => {
+                return Err(format!(
+                    "CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy) or 2 (current)"
+                ))
+            }
         }
     }
     if let Some(v) = var("CELASTRO_CATALOG_FORMAT") {

@@ -1958,7 +1958,7 @@ ClientHello included; a ticket that does not open is a full handshake, a
 binder that does not verify is a refusal; the server never accepts a PSK
 without a key share); no 0-RTT, and early data a client sends anyway is
 skipped; client certificates when the wire requires them (0.67.0,
-`CELASTRO_TLS_CLIENT_AUTH=required`, and since 0.84.0 the address a caller
+`CELASTRO_TLS_CLIENT_AUTH=required`, and since 0.84.1 the address a caller
 names itself by in a frame has to be among the certificate's names, DNS
 or IP, so the fence against an older process at an address cannot be
 pointed at a node by a token holder with a certificate of its own -- H5's
@@ -2030,7 +2030,7 @@ backup and an export carry `KEY`. The one path that crosses regimes is
 it under the database's, which is how a plain database takes a key and
 how one changes keys. A file's identity is its collection, its shard
 directory's name and its own (`docs/shard-0003/00000000000000a1.seg`,
-since 0.84.0; before it the shard and the file alone, and a file is read
+since 0.84.1; before it the shard and the file alone, and a file is read
 under both, the current first), the same in `segments/`, `archive/` and
 the store, so a file cannot stand in for another -- not for the
 same-index shard's of another collection either -- and a tier move needs
@@ -2040,7 +2040,7 @@ boundary does not open shorter (H5's F7); a ranged read knows the file's
 length and asks the same of the frame it reaches last. The WAL is
 length-prefixed frames, one per record, the record's ordinal in the AAD,
 so a torn tail ends the replay where the CRC would have; and since
-0.84.0 a log begins with a header record naming an id of its own, sixteen
+0.84.1 a log begins with a header record naming an id of its own, sixteen
 random bytes that every record after it carries in its AAD, so a record
 of one log cannot be replayed from another log of the shard -- a
 rotation's, a timeline's, an archived copy's, which all sealed as
@@ -2074,7 +2074,7 @@ lookups, BM25, vector, hybrid, the walk -- within noise: a segment's
 components are opened once into the residency cache, and the frames are
 opened on the way in.
 
-**The identity's rollback window.** The files 0.84.0 writes do not open
+**The identity's rollback window.** The files 0.84.1 writes do not open
 under 0.83.0 -- another identity, a header in each log, a `CELK3` ring
 -- so a node rolled back after its first write refuses its directory,
 as it does across a raised catalog format. `CELASTRO_SEAL_IDENTITY=1`

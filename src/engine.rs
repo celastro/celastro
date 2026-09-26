@@ -1274,7 +1274,11 @@ impl Db {
         // Absent is a fresh database. Unreadable is not: read as absent it
         // opened a database with no collections, and the next DDL published
         // that catalog over the real one.
-        if let Some(b) = crate::shard::read_content(&db.cipher, &crate::cipher::Ids::same("CATALOG"), &dir.join("CATALOG"))? {
+        if let Some(b) = crate::shard::read_content(
+            &db.cipher,
+            &crate::cipher::Ids::same("CATALOG"),
+            &dir.join("CATALOG"),
+        )? {
             db.catalog = Catalog::decode(&b)?;
         } else {
             // A directory with no catalog is a new one, and when it was
@@ -5753,7 +5757,10 @@ impl Db {
             // plaintext is compared by opening the cache.
             if let Some(w) = self.published_catalog.as_deref() {
                 let same = match &self.cipher {
-                    Some(c) => c.open_file(&crate::cipher::Ids::same("CATALOG"), w).map(|p| p == bytes).unwrap_or(false),
+                    Some(c) => c
+                        .open_file(&crate::cipher::Ids::same("CATALOG"), w)
+                        .map(|p| p == bytes)
+                        .unwrap_or(false),
                     None => w == bytes.as_slice(),
                 };
                 if same && crate::shard::still_published(&p, w) {
@@ -5763,7 +5770,12 @@ impl Db {
             // Not `fs::write`: that truncates in place, so a crash partway
             // through leaves a catalog that will not decode and a database
             // that will not open, with every segment file intact.
-            let written = crate::shard::write_content(&self.cipher, &crate::cipher::Ids::same("CATALOG"), &p, &bytes)?;
+            let written = crate::shard::write_content(
+                &self.cipher,
+                &crate::cipher::Ids::same("CATALOG"),
+                &p,
+                &bytes,
+            )?;
             self.published_catalog = Some(written);
         }
         Ok(())
@@ -9244,10 +9256,11 @@ fn read_range_at(
     name: &str,
 ) -> Result<(Option<String>, Option<String>)> {
     let i = dirname;
-    let ids = crate::cipher::Ids::new(format!("{name}/{dirname}/RANGE"), format!("{dirname}/RANGE"));
+    let ids =
+        crate::cipher::Ids::new(format!("{name}/{dirname}/RANGE"), format!("{dirname}/RANGE"));
     let bytes = crate::shard::read_content(cipher, &ids, &sdir.join("RANGE"))
-            .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?
-            .ok_or_else(|| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE is missing")))?;
+        .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?
+        .ok_or_else(|| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE is missing")))?;
     let ranges = String::from_utf8_lossy(&bytes).to_string();
     let parts: Vec<&str> = ranges.split('\n').collect();
     if parts.len() != 2 {

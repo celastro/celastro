@@ -6,7 +6,10 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## 0.84.0 — 2026-09-26
+## 0.84.1 — 2026-09-26
+
+(0.84.0 was tagged and never published: its tree failed the format gate on
+the clean clone. 0.84.1 is that tree formatted, and nothing else.)
 
 **Every encrypted file is sealed under the collection it belongs to,
 every log under an id of its own, and a file that was cut says so.**
