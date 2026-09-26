@@ -2,7 +2,7 @@
 # deploy/ssh/celastro-cluster.sh and of a flag of `celastro install`.
 # Override them in group_vars, host_vars or the play; the two tokens and
 # any key belong in a vault.
-celastro_version: "0.86.0"
+celastro_version: "0.87.0"
 celastro_release_url: "https://github.com/celastro/celastro/releases/download/v{{ celastro_version }}"
 # A binary on the controller to send instead of fetching a release.
 celastro_binary: ""

@@ -1,7 +1,7 @@
 # Copy to group_vars/celastro.yml and encrypt the tokens with
 # `ansible-vault encrypt_string`, or the whole file with `ansible-vault
 # encrypt`. Every other setting is in roles/celastro/defaults/main.yml.
-celastro_version: "0.86.0"
+celastro_version: "0.87.0"
 celastro_token: !vault |
   $ANSIBLE_VAULT;1.1;AES256
   ...the console's token, at least sixteen bytes...
