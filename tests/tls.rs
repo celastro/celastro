@@ -157,6 +157,79 @@ fn the_wire_serves_tls_and_a_node_without_the_ca_cannot_attach() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A peer that connects to a TLS wire and says nothing for longer than the
+/// serve loop's idle poll, then sends a plain frame carrying the token, is
+/// not answered: the handshake runs first under its own timeout and a
+/// failed one leaves the stream dead. Before 0.83.0 the poll's timeout
+/// failed the handshake, the loop took the timeout for an idle
+/// connection, and the frame was read and answered in the clear.
+#[test]
+fn a_peer_silent_past_the_idle_poll_is_not_served_in_the_clear() {
+    let _turn = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let tls = material();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("tcp://localhost:{port}");
+    let mut opts = DbOpts::default();
+    opts.node = Some(url.clone());
+    opts.tls = Some(tls.clone());
+    let db = Arc::new(RwLock::new(Db::with_opts(opts)));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (d, s, t) = (db.clone(), stop.clone(), tls.clone());
+        std::thread::spawn(move || {
+            celastro::wire::serve(listener, d, "wire-tls-token".to_string(), s, Some(t)).unwrap()
+        });
+    }
+    // A plain hello frame with the right token, as a node without TLS
+    // would send it, captured by sending one into a listener of our own.
+    // The sender is not waited for: a hello is a read, and a read whose
+    // connection was closed under it is dialled again, for as long as
+    // the wire's own timeouts allow; the thread ends with the process.
+    let capture = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cport = capture.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let plain = celastro::wire::Node::new(
+            &format!("tcp://127.0.0.1:{cport}"),
+            Some("wire-tls-token"),
+            None,
+        )
+        .unwrap();
+        let _ = plain.hello();
+    });
+    let (mut from_plain, _) = capture.accept().unwrap();
+    from_plain.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut frame = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let n = from_plain.read(&mut chunk).unwrap();
+    frame.extend_from_slice(&chunk[..n]);
+    drop(from_plain);
+    drop(capture);
+    assert!(frame.len() > 8, "a frame was captured: {} byte(s)", frame.len());
+
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    raw.write_all(&frame).unwrap();
+    raw.flush().unwrap();
+    // Whatever comes back is a TLS alert or nothing, never a wire answer:
+    // a wire answer to a hello starts with a zero status byte after the
+    // length and carries this node's url; an alert record starts 0x15.
+    let mut back = Vec::new();
+    let _ = raw.read_to_end(&mut back);
+    assert!(
+        back.is_empty() || back[0] == 0x15,
+        "answered in the clear: {} byte(s), first {:?}",
+        back.len(),
+        &back[..back.len().min(8)]
+    );
+    assert!(
+        !String::from_utf8_lossy(&back).contains("localhost"),
+        "the answer carried this node's url in the clear"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[test]
 fn certificates_are_all_three_or_none_and_a_bad_file_is_named() {
     let _turn = ENV.lock().unwrap_or_else(|p| p.into_inner());

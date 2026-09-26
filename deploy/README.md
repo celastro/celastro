@@ -121,6 +121,39 @@ what is worth taking from the script is the little it does per host --
 one `celastro install` -- and the address list it builds; a role or a
 manifest around that command will be shorter than this file.
 
+## Ansible
+
+[ansible/](ansible/) is the same install as a role and a playbook, for a
+fleet that already has an inventory: `roles/celastro` does per host what
+the ssh script does -- the release binary checked against the release's
+sums (or a binary sent from the controller), the TLS set and the keys
+staged and taken away again, then one `celastro install` with the node's
+own address and the list of every node in the group -- and `site.yml`
+runs it host by host (`serial: 1`) and then asks every node whether it
+has verified every other.
+
+```sh
+cp ansible/inventory.example.ini inventory.ini        # the hosts, their wire addresses
+cp ansible/group_vars/celastro.example.yml ansible/group_vars/celastro.yml
+ansible-vault encrypt ansible/group_vars/celastro.yml # the two tokens live there
+ansible-playbook -i inventory.ini ansible/site.yml --ask-vault-pass
+```
+
+The tokens reach each host in the install task's environment, never in
+a command line; the task is `no_log`. Every setting of the ssh script
+has a variable of the same meaning (`roles/celastro/defaults/main.yml`
+lists them: `celastro_version`, `celastro_binary`, `celastro_tls_dir`
+and `celastro_client_auth`, `celastro_master_key` and
+`celastro_data_key`, `celastro_role`, `celastro_env`, the ports and the
+directory), and `celastro_wire_addr` per host in the inventory is the
+address the other nodes use when it is not the one the controller
+connects to. A run with a newer `celastro_version` is the rolling
+upgrade, one with changed settings the rolling change, and a run with
+nothing new does nothing: the role keeps a mark of what it installed
+and installs again only when that would differ (`celastro_force: true`
+to install regardless, as every run of the ssh script does). Needs
+Ansible on the controller and curl, tar and systemd on the hosts.
+
 ## podman quadlet
 
 [quadlet/celastro.container](quadlet/celastro.container) runs the

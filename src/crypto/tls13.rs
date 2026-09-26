@@ -1,13 +1,18 @@
 //! TLS 1.3, RFC 8446, the subset a cluster needs and a stock client
 //! speaks: one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one group
-//! (X25519), one signature scheme (Ed25519), server authentication only. No
-//! resumption, no 0-RTT, no client certificates, no HelloRetryRequest, no
-//! renegotiation of keys after the handshake. A client that offers none of
-//! these is answered with an alert naming why.
+//! (X25519), Ed25519 to sign with (RSA-PSS and ECDSA P-256 verified),
+//! server authentication and, when the wire requires it, the client's
+//! certificate too; resumption from a ticket with a fresh key share,
+//! HelloRetryRequest for a client that offered no share, KeyUpdate both
+//! ways. No 0-RTT: early data a client sends anyway is skipped. A client
+//! that offers none of what is needed is answered with an alert naming why.
 //!
 //! The record layer, the key schedule and both sides of the handshake are
 //! here; [`TlsStream`] wraps a `TcpStream` and completes the handshake on
-//! first use, so a listener's accept loop never blocks on a peer.
+//! first use, or when asked ([`TlsStream::handshake`]), so a listener's
+//! accept loop never blocks on a peer. A handshake that failed stays
+//! failed: every later read or write of the stream is an error, never a
+//! record in the clear.
 
 use crate::cipher::Secret;
 use std::collections::HashMap;
@@ -369,6 +374,11 @@ pub struct TlsStream {
     /// Bytes of the socket read ahead of a record boundary.
     inbuf: Vec<u8>,
     closed: bool,
+    /// The handshake failed, and the stream is dead for good: without keys
+    /// a read would hand up a record in the clear and a write would send
+    /// one, and a listener that treats a timeout as idle would come back
+    /// for more.
+    failed: bool,
     /// Whether the handshake resumed from a ticket.
     resumed: bool,
     /// Whether the handshake went through a HelloRetryRequest.
@@ -427,6 +437,7 @@ impl TlsStream {
             pending_at: 0,
             inbuf: Vec::new(),
             closed: false,
+            failed: false,
             resumed: false,
             retried: false,
             read_secret: None,
@@ -479,8 +490,15 @@ impl TlsStream {
     }
 
     /// Complete the handshake if it has not been done. An error here is
-    /// the peer's alert or our own, and the socket is left as it is.
+    /// the peer's alert or our own, and the socket is left as it is -- and
+    /// the stream is dead from then on: a failed handshake used to leave
+    /// it usable without keys, so a listener that took the failure for an
+    /// idle timeout and read again was handed the next record in the
+    /// clear, and answered in the clear.
     pub fn handshake(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(err("the handshake failed; the connection is dead"));
+        }
         let Some(role) = self.role.take() else { return Ok(()) };
         let r = match role {
             Role::Server { chain_der, key, client_anchors } => {
@@ -491,6 +509,8 @@ impl TlsStream {
             }
         };
         if let Err(e) = &r {
+            self.failed = true;
+            self.closed = true;
             // Tell the peer, once, and never mind if that fails too.
             let desc = alert_for(e);
             let _ = self.send_alert(desc);
@@ -1912,6 +1932,61 @@ mod tests {
             crate::crypto::hex(&offer.binder),
             "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
         );
+    }
+
+    /// A handshake that failed stays failed: every later read and write
+    /// of the stream is an error, whatever the peer sends next. Without
+    /// it the stream was usable without keys -- a read handed up the next
+    /// record's body as application data and a write went out as one --
+    /// and a listener that took the failure for a timeout read on.
+    #[test]
+    fn a_handshake_that_failed_leaves_the_stream_dead() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The peer: silence past the server's read timeout, then a record
+        // of application data in the clear, as a peer without TLS sends
+        // its frames, and then whatever comes back.
+        let peer = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let mut record = vec![CT_APPLICATION_DATA, 3, 3, 0, 5];
+            record.extend_from_slice(b"hello");
+            let _ = c.write_all(&record);
+            let mut back = Vec::new();
+            let _ = c.read_to_end(&mut back);
+            back
+        });
+        let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut s = TlsStream::server(
+            sock,
+            ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+        );
+        let first = s.handshake();
+        assert!(first.is_err(), "the handshake must time out on a silent peer");
+        // Now the peer's plaintext record is on the socket. No read of it
+        // is answered with its bytes, and no write goes out in the clear.
+        s.sock.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let mut buf = [0u8; 64];
+        let r = s.read(&mut buf);
+        assert!(r.is_err(), "a read after a failed handshake answered {r:?}");
+        assert!(s.handshake().is_err(), "the handshake is not run again");
+        let w = s.write_all(b"secret");
+        assert!(w.is_err(), "a write after a failed handshake went out: {w:?}");
+        let _ = s.close_notify();
+        drop(s);
+        let back = peer.join().unwrap();
+        // The peer got an alert, in the clear, and nothing else -- not the
+        // record it sent and not the word written.
+        assert!(back.is_empty() || back[0] == CT_ALERT, "{back:?}");
+        assert!(!back.windows(6).any(|w| w == b"secret"), "{back:?}");
+        assert!(!back.windows(5).any(|w| w == b"hello"), "{back:?}");
     }
 
     /// The record layer end to end, under a proxy that damages one byte

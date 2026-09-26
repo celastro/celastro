@@ -1,0 +1,43 @@
+# The role's settings, each the counterpart of an environment variable of
+# deploy/ssh/celastro-cluster.sh and of a flag of `celastro install`.
+# Override them in group_vars, host_vars or the play; the two tokens and
+# any key belong in a vault.
+celastro_version: "0.82.0"
+celastro_release_url: "https://github.com/celastro/celastro/releases/download/v{{ celastro_version }}"
+# A binary on the controller to send instead of fetching a release.
+celastro_binary: ""
+celastro_port: 8787
+celastro_bind: "0.0.0.0"
+celastro_wire_port: 7876
+celastro_dir: /var/lib/celastro
+# "coordinator" for a node that holds no shards.
+celastro_role: ""
+# Several hosts are a cluster; one is a single node unless others will
+# join it later, which is what makes it serve its wire.
+celastro_cluster: "{{ (groups['celastro'] | default([inventory_hostname])) | length > 1 }}"
+# The address the other nodes reach this one at, when it is not the one
+# the controller connects to: set per host in the inventory.
+celastro_wire_addr: "{{ ansible_host | default(inventory_hostname) }}"
+# A directory on the controller with tls.crt, tls.key and ca.crt, the set
+# `celastro tls init` made; and whether the wire requires a peer's
+# certificate.
+celastro_tls_dir: ""
+celastro_client_auth: false
+# Files on the controller, for encryption at rest (`celastro key master`,
+# `celastro key init`), given at the first install of every node.
+celastro_master_key: ""
+celastro_data_key: ""
+# Further settings, NAME: VALUE, anything from docs/tuning.md.
+celastro_env: {}
+# The console's token (at least sixteen bytes) and the wire's, shared by
+# the nodes: required, from a vault, never a command line.
+celastro_token: ""
+celastro_wire_token: ""
+# How long to wait for a node to have verified every other, after all
+# are installed.
+celastro_health_retries: 45
+celastro_health_delay: 2
+# Install even when nothing changed: the binary is replaced, the settings
+# rewritten and the service restarted, as every run of the ssh script
+# does. Off, a second run with the same version and settings does nothing.
+celastro_force: false

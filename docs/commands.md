@@ -374,8 +374,9 @@ written under the root; nothing started
 ```
 
 [deploy/](../deploy/README.md) has the install as a cloud-init file, a
-script that runs it over ssh on one host after another, and a podman
-quadlet.
+script that runs it over ssh on one host after another, an Ansible role
+and playbook that do the same for a fleet with an inventory, and a
+podman quadlet.
 
 ## The console's HTTP API
 

@@ -120,7 +120,7 @@ other nodes; the sections that follow have each option's details.
 |---|---|---|---|---|
 | **one process** | `cargo install celastro` (Rust 1.75 or later, no dependencies outside `std`), then `celastro --dir ./data serve` | `./data` | `--url http://127.0.0.1:8787` with the token `serve` printed | loopback only unless `--bind`; `run <file>` runs a script of statements with no server, `exec "<SQL>"` one statement, `demo` a guided tour in memory |
 | **a container** | `docker run ... ghcr.io/celastro/celastro:latest --dir /data serve --bind 0.0.0.0` with `CELASTRO_TOKEN` | a volume at `/data` | the published port, `CELASTRO_TOKEN` | `FROM scratch`, static binary, not root, handles SIGTERM; [docs/container.md](docs/container.md) |
-| **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, a script that does it over ssh and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
+| **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, an Ansible role and playbook, a script that does it over ssh and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
 | **Kubernetes** | `helm install celastro deploy/chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](deploy/chart/celastro/README.md) |
 
 Upgrades roll one node at a time: two releases with one wire version
@@ -338,8 +338,9 @@ NAME=VALUE` carry the rest; the same command from a newer binary, one
 host at a time, is the upgrade. The tokens come from the environment,
 never from a flag. [deploy/](deploy/README.md) has the same install as a
 cloud-init file for a machine's first boot, a shell script that runs it
-over ssh on one host after another, and a podman quadlet that runs the
-image under systemd instead.
+over ssh on one host after another, an Ansible role and playbook that
+do the same for a fleet with an inventory, and a podman quadlet that
+runs the image under systemd instead.
 
 ## Kubernetes and containers
 
@@ -442,7 +443,9 @@ codes and full-precision rerank, runtime choice between brute force,
 post-filter and filter-aware vector search, and a deterministic simulator
 that puts partitions, crashes and reordering on the coordinator-to-shard
 boundary. The whole of it, with its measurements and the map from each
-guarantee to the test that pins it, is in [docs/design.md](docs/design.md).
+guarantee to the test that pins it, is in [docs/design.md](docs/design.md);
+[docs/architecture.md](docs/architecture.md) draws one node and one
+cluster, every box naming the module behind it.
 
 ## Tuning
 

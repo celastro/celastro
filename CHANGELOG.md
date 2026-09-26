@@ -6,6 +6,51 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A failed TLS handshake leaves the connection dead.** A stream whose
+handshake had failed was left without keys and usable, and the wire's
+serve loop, which takes a read timeout for an idle poll, read on: a peer
+that connected to a wire with `CELASTRO_TLS_CLIENT_AUTH=required`,
+stayed silent for half a second and then sent a plain frame carrying
+the token was answered in the clear, with no certificate asked of it.
+The failure is sticky now -- every later read or write of the stream
+is an error -- and the wire runs the handshake before its first read,
+under a ten-second timeout of its own, dropping the connection on a
+failure. A peer with the token could bypass the client-certificate
+requirement and the encryption before this; upgrade for it wherever
+the wire serves TLS. Found by the H5 review (2026-09-26).
+
+**A hostile certificate is refused before it is verified.** An RSA
+exponent past 32 bits and a chain of more than eight certificates are
+refused on sight: a verification costs a modular multiplication per
+bit of the exponent and a chain a verification per link, both the
+peer's to choose, and a peer is not yet anyone when its certificate is
+read. Every real exponent is 65537. The wire also reads only the first
+kilobyte of a request frame before its token has to match, rather than
+the whole of the length a peer declared, and a token guess exactly 256
+bytes longer than the token no longer compares equal (every byte of
+the token was still needed; the fold of the length difference was a
+byte).
+
+**The steward renews leases with every peer at once.** In turn, a peer
+that did not answer held the others' renewals for its five seconds,
+and two such peers held them past the lease.
+
+**An Ansible role and playbook.** `deploy/ansible/` installs a cluster
+the way the ssh script does, host by host: the release binary checked
+against the release's sums (or one sent from the controller), the TLS
+set and the keys staged and taken away again, one `celastro install`
+per host with its own address and the list of every node, then every
+node asked whether it has verified every other. The tokens travel in
+the install task's environment. A run with a newer version is the
+rolling upgrade, one with changed settings the rolling change, and a
+run with nothing new does nothing.
+
+**Two diagrams of the architecture.** `docs/architecture.md` draws one
+node and one cluster, every box naming the module behind it, with a
+paragraph per diagram on what is deliberately not on it.
+
 ## 0.82.0 — 2026-09-26
 
 **A statement asks every shard at once.** The coordinator called the

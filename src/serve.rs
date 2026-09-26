@@ -2410,13 +2410,28 @@ fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
             )
         };
         if is_steward {
-            for (url, node) in &peers {
-                if stop.load(AtomicOrdering::Acquire) {
-                    return;
-                }
-                let _deadline = crate::deadline::arm(Some(5_000));
-                match node.lease(&me, 0) {
-                    Ok(_) => grants.note(url),
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            // Every peer at once: renewed in turn, a peer that did not
+            // answer held the others' renewals for its whole five seconds,
+            // and two such peers held them past the lease.
+            let answers: Vec<(String, crate::Result<()>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = peers
+                    .iter()
+                    .map(|(url, node)| {
+                        let (url, node, me) = (url.clone(), node.clone(), me.clone());
+                        scope.spawn(move || {
+                            let _deadline = crate::deadline::arm(Some(5_000));
+                            (url, node.lease(&me, 0).map(|_| ()))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            for (url, r) in answers {
+                match r {
+                    Ok(()) => grants.note(&url),
                     Err(e) => crate::log::warn(
                         "lease_not_renewed",
                         &[("node", url.clone()), ("error", e.to_string())],

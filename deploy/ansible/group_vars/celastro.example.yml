@@ -1,0 +1,16 @@
+# Copy to group_vars/celastro.yml and encrypt the tokens with
+# `ansible-vault encrypt_string`, or the whole file with `ansible-vault
+# encrypt`. Every other setting is in roles/celastro/defaults/main.yml.
+celastro_version: "0.82.0"
+celastro_token: !vault |
+  $ANSIBLE_VAULT;1.1;AES256
+  ...the console's token, at least sixteen bytes...
+celastro_wire_token: !vault |
+  $ANSIBLE_VAULT;1.1;AES256
+  ...the wire's token, shared by the nodes...
+# celastro_tls_dir: /path/on/the/controller/tls     # tls.crt, tls.key, ca.crt from `celastro tls init`
+# celastro_client_auth: true
+# celastro_master_key: /path/on/the/controller/master.key
+# celastro_data_key: /path/on/the/controller/data.key
+# celastro_env:
+#   CELASTRO_AUTO_FAILOVER: "on"

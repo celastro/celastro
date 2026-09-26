@@ -363,6 +363,46 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// How much of a request frame is read before its token has to match:
+/// the version and the token stand at its head, and a peer that has not
+/// shown the token is not read past this, whatever length it declared.
+const FRAME_HEAD: usize = 1024;
+
+/// A request frame, its token checked at the head before the rest is
+/// read: a peer without the token used to have the whole of a frame it
+/// declared read into memory, up to the wire's limit, before the token
+/// was looked at. A frame whose head does not carry the token comes back
+/// as its head alone and `false`: `handle` refuses it naming the token,
+/// as it always has, and the connection is then dropped, the rest of the
+/// frame unread. `handle` checks the token again over an admitted frame.
+fn read_request_frame(r: &mut impl Read, identity: &Identity) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME as usize {
+        return Err(std::io::Error::new(ErrorKind::InvalidData, "wire: frame too large"));
+    }
+    let head = n.min(FRAME_HEAD);
+    let mut buf = vec![0u8; head];
+    r.read_exact(&mut buf)?;
+    let admitted = (|| {
+        let mut i = 0;
+        let _version = get_u8(&buf, &mut i).ok()?;
+        let given = get_string(&buf, &mut i).ok()?;
+        Some(
+            token_matches(&identity.token, &given)
+                || identity.also.as_deref().is_some_and(|a| token_matches(a, &given)),
+        )
+    })()
+    .unwrap_or(false);
+    if !admitted {
+        return Ok((buf, false));
+    }
+    buf.resize(n, 0);
+    r.read_exact(&mut buf[head..])?;
+    Ok((buf, true))
+}
+
 // ------------------------------------------------------------------ codecs
 
 fn put_bool(out: &mut Vec<u8>, b: bool) {
@@ -1882,6 +1922,11 @@ pub fn serve(
 /// The idle wait between checks of `stop`, so a stopped node lets go of its
 /// open connections rather than serving them until the process ends.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+/// How long a peer has to complete the TLS handshake once it has
+/// connected, before the connection is dropped. Its own timeout, apart
+/// from the idle poll: a handshake cut off by the poll used to be taken
+/// for an idle connection and read again, without keys (0.83.0).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
 
@@ -1912,6 +1957,14 @@ fn serve_connection(
     idle: Option<Duration>,
 ) {
     let _ = s.set_nodelay(true);
+    // The handshake first, under its own timeout, and nothing after a
+    // failure: the stream is dead then, and a read of it is an error, but
+    // the loop below would not have known a timeout from an idle poll.
+    let _ = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    if let Err(e) = s.handshake() {
+        crate::log::warn("wire_handshake_failed", &[("error", e.to_string())]);
+        return;
+    }
     let _ = s.set_read_timeout(Some(IDLE_POLL));
     let mut last_frame = Instant::now();
     loop {
@@ -1922,7 +1975,7 @@ fn serve_connection(
         if stop.load(Ordering::Relaxed) || crate::signal::shutdown_requested() {
             return;
         }
-        let frame = match read_frame(&mut s) {
+        let (frame, admitted) = match read_request_frame(&mut s, identity) {
             Ok(f) => {
                 last_frame = Instant::now();
                 f
@@ -1953,13 +2006,21 @@ fn serve_connection(
         if write_frame(&mut s, &resp).is_err() {
             return;
         }
+        // Refused at the head: the peer has its answer, and what it had
+        // still to send is not read.
+        if !admitted {
+            return;
+        }
     }
 }
 
 /// Compare without leaking where the first difference is.
 fn token_matches(expected: &str, given: &str) -> bool {
     let (a, b) = (expected.as_bytes(), given.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    // A length difference is a difference whatever its size: folded to a
+    // byte, one of 256 vanished, and a guess 256 bytes longer than the
+    // token, padded with what the loop pads with, compared equal.
+    let mut diff = (a.len() != b.len()) as u8;
     for i in 0..a.len().max(b.len()) {
         diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
@@ -2642,6 +2703,116 @@ fn select_of(sql: &str, params: &[Value]) -> Result<Select> {
 
 #[cfg(test)]
 mod tests {
+    /// A peer whose ClientHello comes after the serve loop's idle poll is
+    /// still served: the wire runs the handshake before its first read,
+    /// under a timeout of its own, rather than letting the poll's timeout
+    /// fail it. (A failed handshake is dead either way; this is the
+    /// other half, that a slow peer is not failed.)
+    #[test]
+    fn a_peer_whose_hello_comes_after_the_idle_poll_is_still_served() {
+        use crate::crypto::tls13::{ClientSide, TlsStream};
+        use crate::crypto::{pem, x509};
+        // The material in hand, never through the environment: another
+        // test's `CELASTRO_TLS_*` would otherwise be read here.
+        let m = x509::make(
+            "localhost",
+            &["localhost".to_string()],
+            &["127.0.0.1".parse().unwrap()],
+            30,
+        )
+        .unwrap();
+        let tls = Arc::new(
+            crate::tls::Tls::from_texts(
+                ("cert", &m.cert),
+                ("key", &m.key),
+                ("ca", &m.ca_cert),
+                false,
+            )
+            .unwrap(),
+        );
+        let anchors =
+            vec![x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap()];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("tcp://localhost:{}", addr.port());
+        let mut opts = crate::engine::DbOpts::default();
+        opts.node = Some(url.clone());
+        opts.tls = Some(tls.clone());
+        let db = Arc::new(crate::lock::RwLock::new(crate::engine::Db::with_opts(opts)));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let (d, s, t) = (db.clone(), stop.clone(), tls.clone());
+            std::thread::spawn(move || {
+                serve(listener, d, "slow-hello-token".to_string(), s, Some(t)).unwrap()
+            });
+        }
+        // Connected, then silent for longer than the idle poll, then the
+        // handshake and a hello frame as a node would send them.
+        let sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::sleep(IDLE_POLL + Duration::from_millis(300));
+        let mut s = TlsStream::client(
+            sock,
+            ClientSide { anchors: &anchors, host: "localhost", chain_der: None, key: None },
+        );
+        s.handshake().expect("a peer slower than the idle poll completes its handshake");
+        let node = Node::new(&url, Some("slow-hello-token"), None).unwrap();
+        let req = node.request(Call::Hello, "", 0, &[]);
+        write_frame(&mut s, &req).unwrap();
+        let resp = read_frame(&mut s).unwrap();
+        assert_eq!(resp.first(), Some(&0), "the hello was answered: {resp:?}");
+        assert!(String::from_utf8_lossy(&resp).contains("localhost"), "{resp:?}");
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// A request frame is read only as far as its token has to be seen:
+    /// one that declares more than the head and does not carry the token
+    /// comes back as its head and `false`, the rest never read (a reader
+    /// with fewer bytes than declared would otherwise end the read
+    /// short); one that carries it comes back whole and `true`.
+    #[test]
+    fn a_frame_refused_at_its_head_is_answered_and_the_rest_not_read() {
+        let identity = Identity {
+            node: None,
+            role: crate::engine::Role::Data,
+            epoch: 0,
+            region: None,
+            token: "the-token".to_string(),
+            also: Some("the-next-token".to_string()),
+        };
+        let frame_with = |token: &str, declared: usize, present: usize| -> Vec<u8> {
+            let mut body = vec![WIRE_VERSION];
+            put_str(&mut body, token);
+            body.resize(present, 7);
+            let mut out = Vec::new();
+            put_u32(&mut out, declared as u32);
+            out.extend_from_slice(&body);
+            out
+        };
+        // Declared 100,000, only 2,000 present, no token: the head alone.
+        let bytes = frame_with("neither", 100_000, 2_000);
+        let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+        assert!(!admitted);
+        assert_eq!(frame.len(), FRAME_HEAD);
+        // The token, or the rotation's second one, and the whole frame.
+        for t in ["the-token", "the-next-token"] {
+            let bytes = frame_with(t, 3_000, 3_000);
+            let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+            assert!(admitted, "{t}");
+            assert_eq!(frame.len(), 3_000);
+        }
+        // Admitted but short of what it declared: the read ends short,
+        // as it always did.
+        let bytes = frame_with("the-token", 3_000, 2_000);
+        assert!(read_request_frame(&mut &bytes[..], &identity).is_err());
+        // A frame smaller than the head, refused: all of it comes back.
+        let bytes = frame_with("neither", 40, 40);
+        let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+        assert!(!admitted);
+        assert_eq!(frame.len(), 40);
+    }
+
     /// A batch's stop keeps its kind across the wire, so a holder's
     /// deadline is a deadline at the coordinator; a holder before 0.81.0
     /// sends no kind, which reads as a `Plan`, as it always did.
@@ -2795,5 +2966,10 @@ mod tests {
         assert!(!token_matches("abc", "abd"));
         assert!(!token_matches("abc", "ab"));
         assert!(!token_matches("", "a"));
+        // A guess 256 bytes longer, padded with the byte the loop pads
+        // with: the length difference folded to a byte was zero.
+        assert!(!token_matches("abc", &format!("abc{}", "\0".repeat(256))));
+        assert!(!token_matches("abc", &format!("abc{}", "\0".repeat(512))));
+        assert!(!token_matches(&"\0".repeat(256), ""));
     }
 }

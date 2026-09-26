@@ -63,6 +63,13 @@ pub trait Stream: Read + Write + Send {
     /// Say the sending is over: a close-notify when encrypted, then the
     /// write half of the socket.
     fn shutdown_write(&mut self) -> io::Result<()>;
+    /// Complete the handshake, when the stream has one, under whatever
+    /// read timeout is set: a listener runs it before its first read,
+    /// with a timeout of its own, and stops at a failure rather than
+    /// reading on. Nothing to do on a plain socket.
+    fn handshake(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Stream for TcpStream {
@@ -154,39 +161,11 @@ impl Tls {
     /// given; the CA file may hold several certificates.
     pub fn from_env() -> Result<Option<Tls>> {
         let Some((cert, key, ca)) = names_from_env()? else { return Ok(None) };
-        use crate::crypto::{pem, x509};
         let read = |what: &str, path: &str| -> Result<String> {
             std::fs::read_to_string(path).map_err(|e| read_err(what, path, e))
         };
-        let chain_der = pem::decode_all(&read("certificate", &cert)?, "CERTIFICATE")
-            .map_err(|e| read_err("certificate", &cert, e))?;
-        if chain_der.is_empty() {
-            return Err(read_err("certificate", &cert, "no certificate in the file"));
-        }
-        let leaf = x509::parse(&chain_der[0]).map_err(|e| read_err("certificate", &cert, e))?;
-        let key_text = read("key", &key)?;
-        let key_der =
-            pem::decode_all(&key_text, "PRIVATE KEY").map_err(|e| read_err("key", &key, e))?;
-        let Some(key_der) = key_der.first() else {
-            return Err(read_err("key", &key, "no PRIVATE KEY block (PKCS#8) in the file"));
-        };
-        let pair = x509::KeyPair::from_pkcs8_der(key_der).map_err(|e| read_err("key", &key, e))?;
-        if leaf.ed25519_key() != Some(&pair.public) {
-            return Err(Error::Plan(
-                "the TLS certificate and key do not go together: the certificate's key must be the \
-                 Ed25519 key given (a chain another issuer signed may be RSA or P-256 above it)"
-                    .into(),
-            ));
-        }
-        let ca_text = read("CA", &ca)?;
-        let mut anchors = Vec::new();
-        for der in pem::decode_all(&ca_text, "CERTIFICATE").map_err(|e| read_err("CA", &ca, e))? {
-            anchors.push(x509::parse(&der).map_err(|e| read_err("CA", &ca, e))?);
-        }
-        if anchors.is_empty() {
-            return Err(read_err("CA", &ca, "no certificate in the file"));
-        }
-        let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
+        let (cert_text, key_text, ca_text) =
+            (read("certificate", &cert)?, read("key", &key)?, read("CA", &ca)?);
         let client_auth = match std::env::var(CLIENT_AUTH_ENV).ok().filter(|v| !v.is_empty()) {
             None => false,
             Some(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -199,9 +178,51 @@ impl Tls {
                 }
             },
         };
-        check_client_purpose(&leaf, &cert, client_auth)?;
+        Tls::from_texts((&cert, &cert_text), (&key, &key_text), (&ca, &ca_text), client_auth)
+            .map(Some)
+    }
+
+    /// The material as text, each with the name its errors carry (a file's
+    /// path, or whatever the caller has): what `from_env` does once the
+    /// files are read, for a caller that has the PEMs in hand and no
+    /// environment to speak of.
+    pub(crate) fn from_texts(
+        (cert, cert_text): (&str, &str),
+        (key, key_text): (&str, &str),
+        (ca, ca_text): (&str, &str),
+        client_auth: bool,
+    ) -> Result<Tls> {
+        use crate::crypto::{pem, x509};
+        let chain_der = pem::decode_all(cert_text, "CERTIFICATE")
+            .map_err(|e| read_err("certificate", cert, e))?;
+        if chain_der.is_empty() {
+            return Err(read_err("certificate", cert, "no certificate in the file"));
+        }
+        let leaf = x509::parse(&chain_der[0]).map_err(|e| read_err("certificate", cert, e))?;
+        let key_der =
+            pem::decode_all(key_text, "PRIVATE KEY").map_err(|e| read_err("key", key, e))?;
+        let Some(key_der) = key_der.first() else {
+            return Err(read_err("key", key, "no PRIVATE KEY block (PKCS#8) in the file"));
+        };
+        let pair = x509::KeyPair::from_pkcs8_der(key_der).map_err(|e| read_err("key", key, e))?;
+        if leaf.ed25519_key() != Some(&pair.public) {
+            return Err(Error::Plan(
+                "the TLS certificate and key do not go together: the certificate's key must be the \
+                 Ed25519 key given (a chain another issuer signed may be RSA or P-256 above it)"
+                    .into(),
+            ));
+        }
+        let mut anchors = Vec::new();
+        for der in pem::decode_all(ca_text, "CERTIFICATE").map_err(|e| read_err("CA", ca, e))? {
+            anchors.push(x509::parse(&der).map_err(|e| read_err("CA", ca, e))?);
+        }
+        if anchors.is_empty() {
+            return Err(read_err("CA", ca, "no certificate in the file"));
+        }
+        let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
+        check_client_purpose(&leaf, cert, client_auth)?;
         let serves_as_client = leaf.fit_for(crate::crypto::x509::Purpose::ClientAuth).is_ok();
-        Ok(Some(Tls {
+        Ok(Tls {
             chain_der,
             key: pair,
             anchors,
@@ -209,7 +230,7 @@ impl Tls {
             anchors_not_after,
             client_auth,
             serves_as_client,
-        }))
+        })
     }
 
     /// Whether the wire requires a peer's certificate.
@@ -287,6 +308,9 @@ impl Stream for crate::crypto::tls13::TlsStream {
     }
     fn shutdown_write(&mut self) -> io::Result<()> {
         self.close_notify()
+    }
+    fn handshake(&mut self) -> io::Result<()> {
+        crate::crypto::tls13::TlsStream::handshake(self)
     }
 }
 

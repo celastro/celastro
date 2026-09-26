@@ -1,0 +1,50 @@
+# A celastro cluster on the hosts of the `celastro` group, one host at a
+# time: the release binary, then `celastro install` with the node's own
+# address and the list of every node. The install returns once its node
+# answers, so the cluster stays up through the run. A first run installs;
+# the same run with a newer `celastro_version` is the rolling upgrade,
+# with changed settings the rolling change; a run with nothing new does
+# nothing. Then every node is asked whether it has verified every other.
+#
+#   ansible-playbook -i inventory.ini site.yml --ask-vault-pass
+#
+# The two tokens (and any key file) come from a vault; see
+# roles/celastro/defaults/main.yml for every setting and deploy/README.md
+# for the whole of it.
+- name: celastro, host by host
+  hosts: celastro
+  become: true
+  serial: 1
+  roles:
+    - celastro
+
+- name: Every node has verified every other
+  hosts: celastro
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ask each node, waiting for the ones installed last
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/celastro
+          - health
+          - --port
+          - "{{ celastro_port | default(8787) }}"
+          - --attached
+          - "{{ (groups['celastro'] | length) - 1 }}"
+      # The probe verifies a TLS console the way a client does, with the
+      # set the install copied into place.
+      environment: >-
+        {{ {'CELASTRO_TLS_CERT': '/etc/celastro/tls/tls.crt',
+            'CELASTRO_TLS_KEY': '/etc/celastro/tls/tls.key',
+            'CELASTRO_TLS_CA': '/etc/celastro/tls/ca.crt'}
+           if (celastro_tls_dir | default('')) != '' else {} }}
+      register: celastro_health
+      until: celastro_health.rc == 0
+      retries: "{{ celastro_health_retries | default(45) }}"
+      delay: "{{ celastro_health_delay | default(2) }}"
+      changed_when: false
+      when: (groups['celastro'] | length) > 1
+    - name: What it said
+      ansible.builtin.debug:
+        msg: "{{ celastro_health.stdout | default('one node, nothing to verify') }}"

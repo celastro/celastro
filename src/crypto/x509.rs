@@ -16,6 +16,10 @@ const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+/// The most certificates a peer's chain may carry, the leaf included. A
+/// real chain is two to four; every link past the leaf is a signature
+/// check on a key the peer chose.
+const MAX_CHAIN: usize = 8;
 /// `subjectKeyIdentifier` and `authorityKeyIdentifier`: what lets a
 /// client that keeps two CAs under one name -- a rotation's middle step
 /// -- pick the one that signed a leaf. The identifier is the leading 160
@@ -280,8 +284,16 @@ fn public_key(spki: &[u8]) -> Result<PublicKey> {
             let (e, _) = der::expect(seq_rest, INTEGER)?;
             let n = Big::from_be_bytes(n);
             let e = Big::from_be_bytes(e);
-            if n.bits() < 2048 || n.bits() > 8192 || e.is_zero() {
-                return Err(bad("an RSA key outside 2048 to 8192 bits, or with no exponent"));
+            // The exponent is bounded too: a verification costs a modular
+            // multiplication per bit of it, and a certificate an attacker
+            // made can carry one as long as the modulus -- minutes of a
+            // core per signature, before any token is seen. Every real
+            // exponent fits in 32 bits (65537 is the one in use).
+            if n.bits() < 2048 || n.bits() > 8192 || e.is_zero() || e.bits() > 32 {
+                return Err(bad(
+                    "an RSA key outside 2048 to 8192 bits, or with no exponent, or with one \
+                     past 32 bits",
+                ));
             }
             Ok(PublicKey::Rsa(rsa::PublicKey { n, e }))
         }
@@ -484,6 +496,15 @@ pub fn chain_reaches_anchor_for(
         return Err(refuse(format!("the certificate is not valid at this time ({now})")));
     }
     leaf.fit_for(purpose)?;
+    // A chain is walked a signature check per link, and a peer chooses how
+    // many links it sends: bounded, so a message of thousands of
+    // certificates is refused at once rather than verified for hours.
+    if chain.len() > MAX_CHAIN {
+        return Err(refuse(format!(
+            "a chain of {} certificates; at most {MAX_CHAIN} are read",
+            chain.len()
+        )));
+    }
     let mut current = leaf;
     for depth in 0..chain.len().max(1) {
         if anchors.iter().any(|a| current.signed_by(a) && a.valid_at(now)) {
@@ -900,5 +921,62 @@ mod tests {
         let ecdsa = pem::base64_decode(pki("ecdsa.sig.b64").trim()).unwrap();
         assert!(ec_pub.verify_sha256_der(&msg, &ecdsa));
         assert!(!ec_pub.verify_sha256_der(b"another message", &ecdsa));
+    }
+
+    /// One DER element: a tag, a length in the short or the long form, a
+    /// body. For building a key nobody would issue.
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let n = body.len();
+        if n < 128 {
+            out.push(n as u8);
+        } else if n < 256 {
+            out.extend_from_slice(&[0x81, n as u8]);
+        } else {
+            out.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// An RSA exponent is refused past 32 bits, and a chain past eight
+    /// certificates, before any signature is checked: each is a cost the
+    /// peer chooses -- a modular multiplication per bit of the exponent, a
+    /// verification per link -- and a peer is not yet anyone when its
+    /// certificate is read.
+    #[test]
+    fn a_wide_exponent_and_a_long_chain_are_refused_before_they_are_verified() {
+        let spki_der = pem::decode_all(&pki("rsa-pub.pem"), "PUBLIC KEY").unwrap().remove(0);
+        let (spki, _) = der::expect(&spki_der, SEQUENCE).unwrap();
+        let (alg, key_rest) = der::expect(spki, SEQUENCE).unwrap();
+        let (bits, _) = der::expect(key_rest, BIT_STRING).unwrap();
+        let (seq, _) = der::expect(&bits[1..], SEQUENCE).unwrap();
+        let (n, _) = der::expect(seq, INTEGER).unwrap();
+        // The same modulus, with an exponent of the given bytes.
+        let with_e = |e: &[u8]| -> Vec<u8> {
+            let inner = tlv(SEQUENCE, &[tlv(INTEGER, n), tlv(INTEGER, e)].concat());
+            let mut bit_body = vec![0u8];
+            bit_body.extend_from_slice(&inner);
+            [tlv(SEQUENCE, alg), tlv(BIT_STRING, &bit_body)].concat()
+        };
+        assert!(public_key(&with_e(&[1, 0, 1])).is_ok(), "65537 is the exponent in use");
+        assert!(public_key(&with_e(&[0, 0xff, 0xff, 0xff, 0xff])).is_ok(), "32 bits");
+        let e = public_key(&with_e(&[1, 0, 0, 0, 1])).unwrap_err().to_string();
+        assert!(e.contains("past 32 bits"), "33 bits: {e}");
+        let e = public_key(&with_e(&[0x7f; 256])).unwrap_err().to_string();
+        assert!(e.contains("past 32 bits"), "an exponent as wide as the modulus: {e}");
+
+        let now = crate::time::now_micros() / 1_000_000;
+        let ca = parse(&pem::decode_all(&pki("rsa-ca.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
+        let leaf =
+            parse(&pem::decode_all(&pki("leaf-by-rsa.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
+        let anchors = std::slice::from_ref(&ca);
+        // Eight are read: the leaf reaches the anchor at the first link and
+        // the rest are never looked at. Nine are refused unread.
+        let eight: Vec<Certificate> = std::iter::repeat(leaf.clone()).take(8).collect();
+        verify_chain(&eight, anchors, "localhost", now).unwrap();
+        let nine: Vec<Certificate> = std::iter::repeat(leaf.clone()).take(9).collect();
+        let e = verify_chain(&nine, anchors, "localhost", now).unwrap_err().to_string();
+        assert!(e.contains("a chain of 9 certificates"), "{e}");
     }
 }

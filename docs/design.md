@@ -1,7 +1,9 @@
 # Design
 
 How celastro is built and why, for someone reading the code. The
-[README](../README.md) covers what it is and how to run it.
+[README](../README.md) covers what it is and how to run it;
+[architecture.md](architecture.md) draws one node and one cluster, each box
+naming the module behind it, as a way into the sections below.
 
 ---
 
@@ -1954,8 +1956,22 @@ the client keeps one ticket per name, address and anchor set for a day;
 the binder is pinned to RFC 8448's resumed trace, the truncation of the
 ClientHello included; a ticket that does not open is a full handshake, a
 binder that does not verify is a refusal; the server never accepts a PSK
-without a key share), but no 0-RTT, client certificates,
-key update; HelloRetryRequest from 0.66.0, for a client whose first share is of another group. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
+without a key share); no 0-RTT, and early data a client sends anyway is
+skipped; client certificates when the wire requires them (0.67.0,
+`CELASTRO_TLS_CLIENT_AUTH=required`); KeyUpdate both ways; HelloRetryRequest
+from 0.66.0, for a client whose first share is of another group. A
+handshake that failed leaves the stream dead, every later read or write of
+it an error (0.83.0): before that a failure left the stream without keys
+and usable, and the wire's serve loop, which takes a read timeout for an
+idle poll, read on after a peer that stayed silent past the poll and was
+handed the next frame in the clear -- a token holder could bypass the
+client-certificate requirement and the encryption by waiting half a
+second; the wire now runs the handshake before its first read, under a
+timeout of its own. An RSA exponent past 32 bits and a chain past eight
+certificates are refused before any signature is checked (0.83.0): a
+verification costs a multiplication per exponent bit and a chain a
+verification per link, both the peer's to choose, and neither is seen
+before the token is. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
 is wider than signing: chains and CertificateVerify from RSA (PKCS#1 v1.5
 and PSS, SHA-256) and ECDSA P-256 are accepted (0.29.0; `bignum`, `rsa`,
 `p256`, public-key operations only, so no timing concern), which is what
@@ -2639,6 +2655,9 @@ guarantee:
 | approximate mode within tolerance | `approximate_mode_across_shard_counts_stays_within_recall_tolerance` |
 | each source's list is its top `k'` over the collection at every shard count, and the shard holding the top is asked again | `a_ranked_statement_over_many_shards_answers_what_one_shard_answers_at_default_depth` (one, three and six shards, four shapes, bit for bit, the plan naming the depth and the shard asked again), `wire::a_ranked_statement_over_three_nodes_answers_what_one_shard_answers_at_default_depth` (the same through the wire, from every node), `plan::exec::tests::a_shard_that_filled_its_depth_inside_the_top_is_asked_again_and_no_other` (the check itself: short answers, the edge, ties by key, two sources, a walk's source), `plan::exec::tests::a_shards_depth_shrinks_with_the_shard_count_and_never_exceeds_k_prime` |
 | the scatter asks every shard at once and a fault in the second round is a missing shard like any other | `sim::tests::a_partial_answer_names_every_shard_that_did_not_answer_and_carries_only_real_rows` (a statement whose shards fill their depth and are asked again, under drops and restarts), `engine::tests::a_scan_under_a_small_limit_decodes_the_page_and_answers_like_a_full_one` (the serial schedule under the simulator), `engine::tests::a_scatter_carries_the_deadline_to_every_shard_it_asks_at_once` (a budget of nothing over three shards: every shape refused naming a shard, or every shard missing) |
+| a failed TLS handshake leaves the stream dead, and the wire runs it before its first read | `crypto::tls13::tests::a_handshake_that_failed_leaves_the_stream_dead` (a silent peer past the read timeout, then a plaintext record: no read answers it, no write goes out, the peer sees an alert and nothing else), `tls::a_peer_silent_past_the_idle_poll_is_not_served_in_the_clear` (the same through the wire's serve loop, with a real frame carrying the token), `wire::tests::a_peer_whose_hello_comes_after_the_idle_poll_is_still_served` (the other half: a ClientHello later than the poll is served, under the handshake's own timeout) |
+| a hostile certificate is refused before it is verified | `crypto::x509::tests::a_wide_exponent_and_a_long_chain_are_refused_before_they_are_verified` (33 bits refused, 32 admitted, an exponent as wide as the modulus refused; eight certificates read, nine refused unread) |
+| a token guess of another length never compares equal | `wire::tests` (the length difference folded to a boolean: a guess 256 and 512 bytes longer than the token, padded with NULs) |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |
 | filtered-search strategy selection prices the traversal that would run, and a visit budget binds knowingly | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed, filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them}` (the last asserts the visit count against the model's bound, and that a budget of 64 stops the walk at 64 and says so) |
