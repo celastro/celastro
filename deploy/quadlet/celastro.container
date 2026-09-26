@@ -14,7 +14,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/celastro/celastro:0.85.0
+Image=ghcr.io/celastro/celastro:0.86.0
 ContainerName=celastro
 # The host's network: the console on 8787 and the wire on 7876 are the
 # machine's own ports, as they would be for the binary installed directly,

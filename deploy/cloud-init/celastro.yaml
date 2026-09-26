@@ -19,7 +19,7 @@ write_files:
   - path: /root/celastro-install.env
     permissions: "0600"
     content: |
-      CELASTRO_VERSION=0.85.0
+      CELASTRO_VERSION=0.86.0
       # The token every client presents: at least sixteen printable bytes,
       # the same on every node of a cluster.
       CELASTRO_TOKEN=change-this-to-a-long-random-token
