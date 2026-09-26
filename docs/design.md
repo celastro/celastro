@@ -1962,7 +1962,13 @@ skipped; client certificates when the wire requires them (0.67.0,
 names itself by in a frame has to be among the certificate's names, DNS
 or IP, so the fence against an older process at an address cannot be
 pointed at a node by a token holder with a certificate of its own -- H5's
-F10); KeyUpdate both ways; HelloRetryRequest
+F10); KeyUpdate both ways; the four deviations the transcript covers
+refused and named since 0.85.0 rather than passed over -- a second
+ClientHello that is not the first but for what the retry asked, a
+`pre_shared_key` extension not last, a ChangeCipherSpec of another byte,
+a handshake message past 256 KiB (refused on its header), and on the
+client a retry that does not echo the session id or names another suite
+or version (H5's F9); HelloRetryRequest
 from 0.66.0, for a client whose first share is of another group. A
 handshake that failed leaves the stream dead, every later read or write of
 it an error (0.83.0): before that a failure left the stream without keys
@@ -2693,6 +2699,7 @@ guarantee:
 | a token guess of another length never compares equal | `wire::tests` (the length difference folded to a boolean: a guess 256 and 512 bytes longer than the token, padded with NULs) |
 | a file is sealed under its collection, a log under an id of its own, an archived copy says it is whole, the ring binds its entries, and everything written before is read as written | `cipher::tests::a_file_cannot_stand_in_for_another_collections_nor_open_shorter`, `cipher::tests::a_log_record_does_not_open_in_another_log_and_a_copy_says_it_is_whole`, `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back`, `cipher::tests::files_round_trip_whole_and_by_range_and_frames_cannot_move` (both schemes), the encryption, backup and PITR suites unchanged over the new identity, and `do/h6/migrate.sh` (a volume written by 0.83.0 opened, written, reopened and checked by the new binary; the pin keeping one 0.83.0 still opens; a rotation re-sealing it) |
 | a caller's claimed address is its certificate's to claim, and the wire's request handler never panics on a damaged frame | `tls::a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_has`, `wire::tests::fuzz_wire_requests_never_panic_the_handler` (every request a node sends, damaged, cut, stretched, with a length aimed past the end, with and without certificate names) |
+| a deviation the TLS transcript covers is refused and named, not passed over | `crypto::tls13::tests::a_deviation_the_transcript_covers_is_refused_and_named` (a second ClientHello with another random, a retry naming another suite or session id, a ChangeCipherSpec of another byte, a handshake message declaring more than the cap; and the handshake as before with every hook off), `crypto::tls13::tests::a_pre_shared_key_extension_that_is_not_last_is_refused` |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |
 | filtered-search strategy selection prices the traversal that would run, and a visit budget binds knowingly | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed, filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them}` (the last asserts the visit count against the model's bound, and that a budget of 64 stops the walk at 64 and says so) |

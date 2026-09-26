@@ -6,6 +6,24 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Four deviations the TLS transcript already covered are refused and
+named.** A second ClientHello after a HelloRetryRequest that is not the
+first (its random, session id, suites, versions, signature algorithms,
+groups or PSK modes moved, or early data still offered); a
+`pre_shared_key` extension anywhere but last, whose binders would not
+cover what follows; a ChangeCipherSpec of any byte but the one the
+protocol allows; and a handshake message longer than 256 KiB, refused
+on its header before it is read whole. On the client, a
+HelloRetryRequest that does not echo this side's session id, names a
+suite it did not offer or does not select TLS 1.3 is refused. Each of
+these was accepted in silence before: the transcript hash would have
+ended the handshake at Finished for a peer that changed the bytes, so
+nothing could be forged, but a peer probing got no answer naming what
+it did, and a handshake message could be as long as the record layer
+let it. From the H5 review's notes.
+
 ## 0.84.1 — 2026-09-26
 
 (0.84.0 was tagged and never published: its tree failed the format gate on

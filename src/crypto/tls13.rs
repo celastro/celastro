@@ -36,6 +36,11 @@ const LEGACY_VERSION: u16 = 0x0303;
 const MAX_PLAINTEXT: usize = 1 << 14;
 
 const CT_CHANGE_CIPHER_SPEC: u8 = 20;
+/// The most a handshake message may be: what a peer not yet authenticated
+/// can make this side hold. A Certificate message for a chain of eight
+/// fits many times over.
+const MAX_HANDSHAKE_MESSAGE: usize = 256 * 1024;
+
 const CT_ALERT: u8 = 21;
 const CT_HANDSHAKE: u8 = 22;
 const CT_APPLICATION_DATA: u8 = 23;
@@ -434,6 +439,18 @@ pub struct TlsStream {
     /// A test's hook: offer early data and send a record of it after the
     /// ClientHello, as a misbehaving client would; the server skips it.
     pub(crate) send_junk_early_data: bool,
+    /// A test's hook, client: the second ClientHello after a retry with
+    /// another random, as a client that was not asked would send.
+    pub(crate) change_second_hello: bool,
+    /// A test's hook, client: a ChangeCipherSpec of another byte.
+    pub(crate) bad_ccs: bool,
+    /// A test's hook, client: a handshake message that declares this many
+    /// bytes, sent before the ClientHello, for the message cap.
+    pub(crate) oversized_hello: usize,
+    /// A test's hook, server: a HelloRetryRequest that names another
+    /// suite, or echoes another session id.
+    pub(crate) hrr_wrong_suite: bool,
+    pub(crate) hrr_wrong_session: bool,
     /// Bytes of early data this server may still skip: records that fail
     /// to open under the client's handshake key while a client that
     /// offered early data has not yet been read past it.
@@ -486,6 +503,11 @@ impl TlsStream {
             write_secret: None,
             omit_first_share: false,
             send_junk_early_data: false,
+            change_second_hello: false,
+            bad_ccs: false,
+            oversized_hello: 0,
+            hrr_wrong_suite: false,
+            hrr_wrong_session: false,
             skip_early: 0,
             res_master: None,
             store_key: None,
@@ -586,7 +608,11 @@ impl TlsStream {
             Some(keys) => {
                 if ctype == CT_CHANGE_CIPHER_SPEC {
                     // Middlebox compatibility: a plaintext CCS may arrive
-                    // between the hellos and the encrypted flight. Ignored.
+                    // between the hellos and the encrypted flight. Ignored
+                    // -- when it is the one byte the protocol allows.
+                    if body != [1] {
+                        return Err(err("a ChangeCipherSpec that is not the one byte allowed"));
+                    }
                     return Ok((CT_CHANGE_CIPHER_SPEC, body));
                 }
                 if ctype != CT_APPLICATION_DATA || len < 16 {
@@ -716,6 +742,12 @@ impl TlsStream {
             if hs_buf.len() >= 4 {
                 let len =
                     ((hs_buf[1] as usize) << 16) | ((hs_buf[2] as usize) << 8) | hs_buf[3] as usize;
+                // Bounded before it is read whole: a peer chooses how long
+                // a handshake message is, and until it is authenticated it
+                // is nobody. A chain of eight certificates fits many times.
+                if len > MAX_HANDSHAKE_MESSAGE {
+                    return Err(err("a handshake message longer than this side accepts"));
+                }
                 if hs_buf.len() >= 4 + len {
                     let msg: Vec<u8> = hs_buf.drain(..4 + len).collect();
                     transcript.extend_from_slice(&msg);
@@ -724,8 +756,16 @@ impl TlsStream {
             }
             let (ctype, body) = self.read_record()?;
             match ctype {
-                CT_HANDSHAKE => hs_buf.extend_from_slice(&body),
-                CT_CHANGE_CIPHER_SPEC => continue,
+                CT_HANDSHAKE => {
+                    if hs_buf.len() + body.len() > MAX_HANDSHAKE_MESSAGE + 4 {
+                        return Err(err("a handshake message longer than this side accepts"));
+                    }
+                    hs_buf.extend_from_slice(&body)
+                }
+                CT_CHANGE_CIPHER_SPEC if body == [1] => continue,
+                CT_CHANGE_CIPHER_SPEC => {
+                    return Err(err("a ChangeCipherSpec that is not the one byte allowed"))
+                }
                 CT_ALERT => return Err(alert_error(&body)),
                 _ => return Err(err("an unexpected record during the handshake")),
             }
@@ -779,9 +819,15 @@ impl TlsStream {
             let mut hrr = Vec::new();
             hrr.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
             hrr.extend_from_slice(&HRR_RANDOM);
-            hrr.push(hello.session_id.len() as u8);
-            hrr.extend_from_slice(&hello.session_id);
-            hrr.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
+            if self.hrr_wrong_session {
+                hrr.push(32);
+                hrr.extend_from_slice(&[0x42; 32]);
+            } else {
+                hrr.push(hello.session_id.len() as u8);
+                hrr.extend_from_slice(&hello.session_id);
+            }
+            let suite = if self.hrr_wrong_suite { 0x1301u16 } else { SUITE_CHACHA };
+            hrr.extend_from_slice(&suite.to_be_bytes());
             hrr.push(0);
             let mut exts = Vec::new();
             extension(&mut exts, EXT_SUPPORTED_VERSIONS, &VERSION_13.to_be_bytes());
@@ -794,6 +840,7 @@ impl TlsStream {
             }
             self.retried = true;
             ch_start = transcript.len();
+            let first = hello;
             let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
             if ty != HS_CLIENT_HELLO {
                 return Err(err("expected the client's second ClientHello"));
@@ -801,6 +848,21 @@ impl TlsStream {
             hello = parse_client_hello(&body)?;
             if hello.x25519_share.is_none() {
                 return Err(err("the client's second ClientHello still has no X25519 key share"));
+            }
+            // The same hello, but for what the retry asked to change (RFC
+            // 8446 §4.1.2): the key share, a cookie, the binders, and
+            // early data withdrawn. Anything else moved is a different
+            // client, or one probing, and was accepted before 0.85.0.
+            if hello.random != first.random
+                || hello.session_id != first.session_id
+                || hello.suites != first.suites
+                || hello.versions != first.versions
+                || hello.sig_algs != first.sig_algs
+                || hello.groups != first.groups
+                || hello.psk_dhe != first.psk_dhe
+                || hello.early_data
+            {
+                return Err(err("the client's second ClientHello differs from its first"));
             }
         }
         let Some(client_share) = hello.x25519_share else {
@@ -1137,6 +1199,7 @@ impl TlsStream {
             if junk_early {
                 extension(&mut exts, EXT_EARLY_DATA, &[]);
             }
+
             if let Some(t) = &ticket {
                 // PSK with (EC)DHE only -- the key share above stays -- and
                 // the offer last, its binder computed over everything
@@ -1175,6 +1238,15 @@ impl TlsStream {
             ch
         };
         let first_share = if self.omit_first_share { None } else { Some(&our_share) };
+        if self.oversized_hello > 0 {
+            // A handshake message that declares more than the cap, its
+            // first fragments only: the server refuses on the header.
+            let n = self.oversized_hello;
+            let mut msg = vec![HS_CLIENT_HELLO];
+            msg.extend_from_slice(&(n as u32).to_be_bytes()[1..]);
+            msg.extend_from_slice(&vec![0u8; n.min(8192)]);
+            self.write_record(CT_HANDSHAKE, &msg)?;
+        }
         let ch = build(first_share, None, &[]);
         self.write_handshake(HS_CLIENT_HELLO, &ch, &mut transcript)?;
         if junk_early {
@@ -1193,6 +1265,18 @@ impl TlsStream {
             // A HelloRetryRequest: for the X25519 share this side did not
             // send (a test's first flight), or a cookie to echo; a group
             // this build lacks, or a share it already sent, is a refusal.
+            // And it echoes this side's session id and names the suite
+            // and version the ServerHello will, or it is not a retry of
+            // this hello (RFC 8446 §4.1.4; accepted unchecked before 0.85.0).
+            if sh.session_id != session_id {
+                return Err(err("the HelloRetryRequest does not echo this side's session id"));
+            }
+            if sh.suite != SUITE_CHACHA {
+                return Err(err("the HelloRetryRequest names a suite this side did not offer"));
+            }
+            if sh.version != Some(VERSION_13) {
+                return Err(err("the HelloRetryRequest does not select TLS 1.3"));
+            }
             match sh.retry_group {
                 Some(GROUP_X25519) if first_share.is_some() => {
                     return Err(err("the server asked again for the X25519 key share it was sent"))
@@ -1217,7 +1301,10 @@ impl TlsStream {
             transcript.extend_from_slice(&ch1_hash);
             transcript.extend_from_slice(&hrr_msg);
             self.retried = true;
-            let ch2 = build(Some(&our_share), sh.cookie.as_deref(), &transcript);
+            let mut ch2 = build(Some(&our_share), sh.cookie.as_deref(), &transcript);
+            if self.change_second_hello {
+                ch2[2] ^= 0xff;
+            }
             self.write_handshake(HS_CLIENT_HELLO, &ch2, &mut transcript)?;
             let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
             if ty != HS_SERVER_HELLO {
@@ -1338,7 +1425,7 @@ impl TlsStream {
         let mut s_ap = Secret::<32>::zero();
         derive_secret_into(&master, "s ap traffic", &th_server_fin, &mut s_ap);
         // Middlebox compatibility: a CCS before our first encrypted record.
-        self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
+        self.write_record(CT_CHANGE_CIPHER_SPEC, &[if self.bad_ccs { 2 } else { 1 }])?;
         if let Some(context) = request_context {
             let mut cert = vec![context.len() as u8];
             cert.extend_from_slice(&context);
@@ -1530,6 +1617,7 @@ impl<'a> Reader<'a> {
 }
 
 struct ClientHello {
+    random: [u8; 32],
     session_id: Vec<u8>,
     suites: Vec<u16>,
     versions: Vec<u16>,
@@ -1558,7 +1646,8 @@ struct PskOffer {
 fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let mut r = Reader::new(body);
     let _legacy_version = r.u16()?;
-    let _random = r.bytes(32)?;
+    let mut random = [0u8; 32];
+    random.copy_from_slice(r.bytes(32)?);
     let session_id = r.vec8()?.to_vec();
     let suites_bytes = r.vec16()?;
     let suites: Vec<u16> =
@@ -1596,6 +1685,12 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
                     let binders_at = body.len() - 2 - binders.len();
                     psk = Some(PskOffer { identity, binder, binders_at });
                 }
+                // The protocol puts it last, because its binders cover
+                // everything before them; anywhere else it is malformed,
+                // and was passed over in silence before 0.85.0.
+                EXT_PRE_SHARED_KEY => {
+                    return Err(err("the pre_shared_key extension is not the last"));
+                }
                 EXT_SUPPORTED_VERSIONS => {
                     let list = d.vec8()?;
                     versions =
@@ -1630,6 +1725,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
         }
     }
     Ok(ClientHello {
+        random,
         session_id,
         suites,
         versions,
@@ -1643,6 +1739,7 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
 }
 
 struct ServerHello {
+    session_id: Vec<u8>,
     suite: u16,
     version: Option<u16>,
     x25519_share: Option<[u8; 32]>,
@@ -1659,7 +1756,7 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
     let _legacy_version = r.u16()?;
     let random = r.bytes(32)?;
     let retry = random == HRR_RANDOM;
-    let _session_id = r.vec8()?;
+    let session_id = r.vec8()?.to_vec();
     let suite = r.u16()?;
     let _compression = r.u8()?;
     let mut version = None;
@@ -1692,7 +1789,16 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
             }
         }
     }
-    Ok(ServerHello { suite, version, x25519_share, selected_psk, retry, retry_group, cookie })
+    Ok(ServerHello {
+        session_id,
+        suite,
+        version,
+        x25519_share,
+        selected_psk,
+        retry,
+        retry_group,
+        cookie,
+    })
 }
 
 fn parse_certificate_message(body: &[u8]) -> io::Result<Vec<Certificate>> {
@@ -2005,6 +2111,146 @@ mod tests {
             crate::crypto::hex(&offer.binder),
             "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"
         );
+    }
+
+    /// One handshake over loopback with the hooks each side asks for: what
+    /// the client's handshake said, and the server's.
+    fn hooked(
+        client_hooks: impl FnOnce(&mut TlsStream),
+        server_hooks: impl FnOnce(&mut TlsStream) + Send + 'static,
+    ) -> (io::Result<()>, io::Result<()>) {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // Generous: a full suite runs many tests beside this one on
+            // the box's four cores, and a read that times out would be a
+            // refusal for the wrong reason.
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            let mut s = TlsStream::server(
+                sock,
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+            );
+            server_hooks(&mut s);
+            let r = s.handshake();
+            if r.is_ok() {
+                let mut buf = [0u8; 8];
+                let _ = s.read(&mut buf);
+            }
+            r
+        });
+        let sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+        let mut c = TlsStream::client(
+            sock,
+            ClientSide {
+                anchors: std::slice::from_ref(&anchor),
+                host: "127.0.0.1",
+                chain_der: None,
+                key: None,
+            },
+        );
+        client_hooks(&mut c);
+        let r = c.handshake();
+        if r.is_ok() {
+            let _ = c.write_all(b"hi");
+        }
+        let _ = c.close_notify();
+        (r, server.join().unwrap())
+    }
+
+    /// The four tightenings of 0.85.0, each a refusal where the transcript
+    /// already covered the deviation and nothing said so: a second
+    /// ClientHello that is not the first, a retry that does not echo the
+    /// hello, a ChangeCipherSpec of another byte, and a handshake message
+    /// past the cap -- and, with the hooks off, the handshake as before.
+    #[test]
+    fn a_deviation_the_transcript_covers_is_refused_and_named() {
+        let (c, s) = hooked(|_| {}, |_| {});
+        assert!(c.is_ok() && s.is_ok(), "{c:?} {s:?}");
+
+        let (c, s) = hooked(
+            |c| {
+                c.omit_first_share = true;
+                c.change_second_hello = true;
+            },
+            |_| {},
+        );
+        let e = s.expect_err("a second hello with another random was accepted").to_string();
+        assert!(e.contains("second ClientHello differs"), "{e}");
+        assert!(c.is_err());
+
+        let (c, _) = hooked(|c| c.omit_first_share = true, |s| s.hrr_wrong_suite = true);
+        let e = c.expect_err("a retry naming another suite was accepted").to_string();
+        assert!(e.contains("names a suite this side did not offer"), "{e}");
+        let (c, _) = hooked(|c| c.omit_first_share = true, |s| s.hrr_wrong_session = true);
+        let e = c.expect_err("a retry echoing another session id was accepted").to_string();
+        assert!(e.contains("does not echo this side's session id"), "{e}");
+
+        // The client's CCS goes out with its Finished, after its handshake
+        // is done on its side: the refusal is the server's, and the client
+        // hears it on its next read.
+        let (_c, s) = hooked(|c| c.bad_ccs = true, |_| {});
+        let e = s.expect_err("a ChangeCipherSpec of another byte was skipped").to_string();
+        assert!(e.contains("ChangeCipherSpec that is not the one byte"), "{e}");
+
+        let (c, s) = hooked(|c| c.oversized_hello = MAX_HANDSHAKE_MESSAGE + 1, |_| {});
+        let e = s.expect_err("a message past the cap was read").to_string();
+        assert!(e.contains("longer than this side accepts"), "{e}");
+        assert!(c.is_err());
+        // Just under the cap declares fine (and then fails as a hello
+        // that never arrives whole, which is the timeout's business).
+    }
+
+    /// A pre_shared_key extension anywhere but last is refused, not
+    /// passed over: its binders cover everything before them.
+    #[test]
+    fn a_pre_shared_key_extension_that_is_not_last_is_refused() {
+        let hello = |psk_last: bool| -> Vec<u8> {
+            let mut ch = Vec::new();
+            ch.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
+            ch.extend_from_slice(&[7u8; 32]);
+            ch.push(0);
+            ch.extend_from_slice(&2u16.to_be_bytes());
+            ch.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
+            ch.push(1);
+            ch.push(0);
+            let mut exts = Vec::new();
+            let mut versions = vec![2u8];
+            versions.extend_from_slice(&VERSION_13.to_be_bytes());
+            let mut psk = Vec::new();
+            let mut identities = Vec::new();
+            identities.extend_from_slice(&3u16.to_be_bytes());
+            identities.extend_from_slice(b"abc");
+            identities.extend_from_slice(&0u32.to_be_bytes());
+            psk.extend_from_slice(&(identities.len() as u16).to_be_bytes());
+            psk.extend_from_slice(&identities);
+            psk.extend_from_slice(&33u16.to_be_bytes());
+            psk.push(32);
+            psk.extend_from_slice(&[0u8; 32]);
+            if psk_last {
+                extension(&mut exts, EXT_SUPPORTED_VERSIONS, &versions);
+                extension(&mut exts, EXT_PRE_SHARED_KEY, &psk);
+            } else {
+                extension(&mut exts, EXT_PRE_SHARED_KEY, &psk);
+                extension(&mut exts, EXT_SUPPORTED_VERSIONS, &versions);
+            }
+            ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            ch.extend_from_slice(&exts);
+            ch
+        };
+        let ok = parse_client_hello(&hello(true)).unwrap();
+        assert!(ok.psk.is_some());
+        let e = match parse_client_hello(&hello(false)) {
+            Ok(_) => panic!("a pre_shared_key that is not last parsed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("pre_shared_key extension is not the last"), "{e}");
     }
 
     /// A handshake that failed stays failed: every later read and write
