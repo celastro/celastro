@@ -2077,9 +2077,22 @@ random bytes that every record after it carries in its AAD, so a record
 of one log cannot be replayed from another log of the shard -- a
 rotation's, a timeline's, an archived copy's, which all sealed as
 `wal.log` with ordinals from nought before (H5's F3). An archived copy
-of a log ends with a trailer, an empty record whose AAD says it is the
-last, and a restore refuses a copy without one: a copy cut at a record
-boundary was a rollback nothing detected. A log written before has no
+of a log ends with a trailer, a record whose AAD says it is the last,
+and a restore refuses a copy without one: a copy cut at a record
+boundary was a rollback nothing detected. Since 0.88.0 the trailer's
+plaintext is the copy's place -- its timeline, its number and the
+instants it spans, what the copy's name says -- and a restore refuses a
+copy standing under another name: the same log put at the next number
+to be replayed twice, or in another timeline's slot (H8's R9). The
+`BACKUP` record of an encrypted backup is sealed under the backup's data
+key with the object's key as its identity (0.88.0), so the list of
+objects and their hashes cannot be rewritten to name others, nor an
+older record moved to a newer instant, by whoever can write the bucket;
+a record in the clear, what every backup wrote before, is still read.
+What no seal closes: an older backup put back whole, `LATEST` and all,
+is a rollback only a clock outside the bucket detects -- `LATEST` stays
+in the clear for that reason, a hash of the record in it would bind
+nothing against a hand that can rewrite both. A log written before has no
 header and is read as it was written; a live one is continued as it was
 until it is rotated or truncated, when the fresh file gets a header. The
 data key is per database, drawn at the first open of an empty directory
@@ -2804,6 +2817,8 @@ guarantee:
 | a header-only log and a rotated log pass the check and the rotation | `cipher::tests::a_header_only_log_and_a_rotated_log_pass_the_check_and_the_rotation` |
 | an object of exactly one frame is opened as its own last frame | `cipher::tests::an_object_of_exactly_one_frame_is_opened_as_what_it_is` |
 | one key wraps as a `CELK3` ring of one; `CELK1`/`CELK2` still read and are marked for rewriting | `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back` |
+| an encrypted backup's record is sealed; a byte changed refuses the restore; a record in the clear still restores | `encryption::a_backup_record_is_sealed_and_a_changed_one_is_refused` |
+| an archived log copied to another number is refused by name; put back, the restore is whole | `pitr::a_restore_refuses_an_archived_log_moved_to_another_slot` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

@@ -267,6 +267,59 @@ fn a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// An encrypted backup's record is sealed under its data key with the
+/// object's key as its identity: it does not read in the clear, a byte
+/// changed in it refuses the restore, and a record in the clear -- what
+/// every backup wrote before 0.88.0 -- still restores.
+#[test]
+fn a_backup_record_is_sealed_and_a_changed_one_is_refused() {
+    let src = dir("record-src");
+    let backups = dir("record-backups");
+    let o = opts(Some(master(7)));
+    let mut db = Db::open(&src, o.clone()).unwrap();
+    setup(&mut db, 20);
+    let before = ids(&mut db, "SELECT id FROM items LIMIT 200");
+    ack(&mut db, &format!("BACKUP TO '{}'", backups.display()));
+    drop(db);
+    let instants = backups.join("nodes/local/backups");
+    let ts_dir = std::fs::read_dir(&instants).unwrap().map(|e| e.unwrap().path()).next().unwrap();
+    let record_path = ts_dir.join("BACKUP");
+    let sealed = std::fs::read(&record_path).unwrap();
+    assert!(!sealed.starts_with(b"celastro backup"), "the record is not in the clear");
+    let restore = |tag: &str| -> celastro::Result<String> {
+        let d = dir(tag);
+        let mut db = Db::open(&d, o.clone())?;
+        let r = db
+            .execute(&format!("RESTORE FROM '{}'", backups.display()))
+            .and_then(|out| out.finished())
+            .map(|out| format!("{out:?}"));
+        let same = r.is_ok() && ids(&mut db, "SELECT id FROM items LIMIT 200") == before;
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        r.map(|m| format!("{m} rows-same={same}"))
+    };
+    assert!(restore("record-ok").unwrap().contains("rows-same=true"));
+    // A byte of the record changed: refused, naming the record.
+    let mut changed = sealed.clone();
+    let mid = changed.len() / 2;
+    changed[mid] ^= 1;
+    std::fs::write(&record_path, &changed).unwrap();
+    let e = restore("record-changed").unwrap_err().to_string();
+    assert!(e.contains("BACKUP does not open"), "{e}");
+    // The record in the clear, as before 0.88.0: still read.
+    let key = std::fs::read(ts_dir.join("KEY")).unwrap();
+    let cipher = celastro::cipher::Cipher::unwrap(&key, &master(7)).unwrap();
+    let ts_name = ts_dir.file_name().unwrap().to_string_lossy().to_string();
+    let identity = format!("nodes/local/backups/{ts_name}/BACKUP");
+    let plain = cipher.open_file(&celastro::cipher::Ids::same(&identity), &sealed).unwrap();
+    assert!(plain.starts_with(b"celastro backup\nversion 2\n"));
+    std::fs::write(&record_path, &plain).unwrap();
+    assert!(restore("record-plain").unwrap().contains("rows-same=true"));
+    for p in [&src, &backups] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 #[test]
 fn a_backup_restores_under_the_same_master_and_is_refused_without_it() {
     let src = dir("restore-src");

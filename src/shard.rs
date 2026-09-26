@@ -1171,6 +1171,28 @@ pub(crate) fn trim_log(
     w.sync()
 }
 
+/// An archived log's place as its trailer carries it: `timeline | seq |
+/// first | last`, big-endian, 32 bytes.
+pub(crate) fn place_bytes(timeline: u64, seq: u64, first: Timestamp, last: Timestamp) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, v) in [timeline, seq, first, last].iter().enumerate() {
+        out[8 * i..8 * i + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// The place a trailer's plaintext names, if it is one.
+pub(crate) fn place_of(plain: &[u8]) -> Option<[u64; 4]> {
+    if plain.len() != 32 {
+        return None;
+    }
+    let mut out = [0u64; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u64::from_be_bytes(plain[8 * i..8 * i + 8].try_into().ok()?);
+    }
+    Some(out)
+}
+
 /// The rotation number of a rotated log, from its name `wal.NNNNNN.log`.
 fn rotated_seq(p: &Path) -> Result<u64> {
     p.file_name()
@@ -1683,6 +1705,7 @@ impl Wal {
         path: &Path,
         cipher: &crate::cipher::Shared,
         ids: &crate::cipher::Ids,
+        place: &[u8],
     ) -> Result<Vec<u8>> {
         let mut b = read_optional(path)?.unwrap_or_default();
         if let Some(c) = cipher {
@@ -1690,12 +1713,31 @@ impl Wal {
             if let Some(log_id) = &log.log_id {
                 b.truncate(log.opened);
                 if !log.complete {
+                    // The trailer says the copy is whole, and under the
+                    // current form where it belongs: its timeline, its
+                    // number and the instants it spans, so a copy moved to
+                    // another name is refused by the restore that reads it.
+                    let plain: &[u8] = if c.writes_current_form() { place } else { &[] };
                     let index = 1 + log.records.len() as u64;
-                    b.extend_from_slice(&c.seal_record(ids, Some(log_id), index, &[], true)?);
+                    b.extend_from_slice(&c.seal_record(ids, Some(log_id), index, plain, true)?);
                 }
             }
         }
         Ok(b)
+    }
+
+    /// The place an archived copy's trailer names, when it names one:
+    /// `[timeline, seq, first, last]`. `None` for a plain log, a legacy
+    /// one, a copy that is not whole, or a trailer from before 0.88.0.
+    pub(crate) fn trailer_place(
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        ids: &crate::cipher::Ids,
+    ) -> Result<Option<[u64; 4]>> {
+        let Some(c) = cipher else { return Ok(None) };
+        let Some(b) = read_optional(path)? else { return Ok(None) };
+        let log = c.open_log(ids, &b);
+        Ok(if log.complete { place_of(&log.trailer) } else { None })
     }
 
     /// The sync a writer that appended just now settles outside the lock:

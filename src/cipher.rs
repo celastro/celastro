@@ -147,6 +147,11 @@ pub struct Log {
     pub records: Vec<Vec<u8>>,
     pub log_id: Option<LogId>,
     pub complete: bool,
+    /// The trailer's plaintext, when the log ends with one: empty from a
+    /// copy archived before 0.88.0, and since then the log's place --
+    /// `timeline | seq | first | last`, 32 bytes -- which a restore holds
+    /// against the name the copy stands under.
+    pub trailer: Vec<u8>,
     pub opened: usize,
 }
 
@@ -388,6 +393,18 @@ impl Cipher {
 
     pub fn writes_legacy(&self) -> bool {
         self.legacy_writes
+    }
+
+    /// Whether writes go under the current form -- no pin at all: what
+    /// decides a sealed backup record and a placed trailer (0.88.0).
+    pub fn writes_current_form(&self) -> bool {
+        !self.legacy_writes && self.keyed_logs
+    }
+
+    /// Seal a log's records under a key per log, or under the file's key
+    /// as 0.86.0 reads (tests; the binary pins through the environment).
+    pub fn set_keyed_logs(&mut self, on: bool) {
+        self.keyed_logs = on;
     }
 
     /// The identity and scheme a write goes under.
@@ -749,6 +766,7 @@ impl Cipher {
             records: Vec::new(),
             log_id: Some(LogId { id: log_id, keyed }),
             complete: false,
+            trailer: Vec::new(),
             opened: 4 + len,
         };
         let mut i = 4 + len;
@@ -772,9 +790,9 @@ impl Cipher {
                         last: true,
                         log_id: Some(&log_id),
                     };
-                    if self.open_frame(&key, trailer, frame).map(|p| p.is_empty()).unwrap_or(false)
-                    {
+                    if let Ok(p) = self.open_frame(&key, trailer, frame) {
                         out.complete = true;
+                        out.trailer = p;
                         out.opened = i + 4 + len;
                     }
                     break;

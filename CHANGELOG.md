@@ -6,6 +6,27 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The backup record sealed, and the archived log's place in its
+trailer (H9).** An encrypted backup's `BACKUP` record -- the list of
+objects and their hashes -- was in the clear, and an archived log's
+trailer said the copy was whole but not where it belonged: with write
+access to the bucket, the record could be rewritten to name other
+objects, an older record moved to a newer instant, and a log copied to
+another number or another timeline's slot to be replayed there. The
+record is now sealed under the backup's data key with the object's key
+as its identity, and the trailer carries the copy's timeline, number
+and instants, which a restore holds against the name; a copy standing
+under another name is refused, naming what it was archived as. Records
+and copies written before read as they were. What no seal closes: an
+older backup put back whole, `LATEST` and all, is a rollback only a
+clock outside the bucket detects. A restore of an encrypted backup
+needs the master key before it reads the record (it needed it before
+the first file anyway). `CELASTRO_SEAL_IDENTITY=2` writes both as
+0.87.0 did, for a rollback window; a backup 0.88.0 wrote without the
+pin restores on 0.88.0 or later.
+
 ## 0.87.0 — 2026-09-26
 
 **The cryptography reviewed again and hardened (H8).** Four readers

@@ -1573,7 +1573,16 @@ impl Db {
             colls.push((name, shards));
         }
         let node = self.opts.node.clone().unwrap_or_default();
-        Ok(Outcome::Deferred(crate::backup::job(target, ts, node, catalog, key, colls, keep)))
+        Ok(Outcome::Deferred(crate::backup::job(
+            target,
+            ts,
+            node,
+            catalog,
+            key,
+            colls,
+            keep,
+            self.cipher.clone(),
+        )))
     }
 
     /// `BACKUP LOG TO '<dest>'`: every held shard's live write-ahead log to
@@ -1780,7 +1789,12 @@ impl Db {
         let target =
             crate::backup::target(&self.opts.archive, self.opts.backup_dir.as_deref(), src)?;
         let here = self.opts.node.clone().unwrap_or_default();
-        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), as_of)?;
+        let fetched = crate::backup::fetch(
+            &target,
+            node.unwrap_or(&here),
+            as_of,
+            self.opts.master_key.as_deref(),
+        )?;
         let slug = crate::backup::node_slug(node.unwrap_or(&here));
         Ok(Outcome::Deferred(crate::backup::verify_job(target, slug, fetched)))
     }
@@ -1818,7 +1832,12 @@ impl Db {
             Some(t) => crate::backup::newest_at_or_before(&target, node.unwrap_or(&here), t)?,
             None => None,
         };
-        let fetched = crate::backup::fetch(&target, node.unwrap_or(&here), base.or(as_of))?;
+        let fetched = crate::backup::fetch(
+            &target,
+            node.unwrap_or(&here),
+            base.or(as_of),
+            self.opts.master_key.as_deref(),
+        )?;
         // The backup's key regime has to be this database's: its files are
         // copied as they are, so an encrypted backup needs the master that
         // wraps its data key, and a plain one cannot land in an encrypted
@@ -1918,6 +1937,19 @@ impl Db {
                              what was archived",
                             l.key
                         )));
+                    }
+                    // A copy archived since 0.88.0 says where it belongs;
+                    // one standing under another name -- another number,
+                    // another timeline, other instants -- is not the log
+                    // its name says it is, and is refused.
+                    if let Some(place) = crate::shard::Wal::trailer_place(&p, &self.cipher, &ids)? {
+                        if place != [l.timeline, l.seq, l.first, l.last] {
+                            return Err(Error::Storage(format!(
+                                "the archived log {} was archived as timeline {}, log {}, instants \
+                                 {} to {}: it is not the log its name says, and is refused",
+                                l.key, place[0], place[1], place[2], place[3]
+                            )));
+                        }
                     }
                     if l.cut {
                         crate::shard::trim_log(&p, &self.cipher, &ids, l.last)?;

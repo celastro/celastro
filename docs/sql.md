@@ -399,7 +399,9 @@ recall@2 on notes.embedding: mean 1.0000, worst 1.0000 over 2 sample(s) (0 repla
 `BACKUP TO '<dir or s3://bucket/prefix>'` pins every shard this node
 holds at one instant and copies it, with the lock let go; a second
 backup copies only new segments. `KEEP n` removes older backups after
-the copy. `VERIFY BACKUP` reads every object back against the record.
+the copy. `VERIFY BACKUP` reads every object back against the record. An
+encrypted backup's record is sealed under its data key (0.88.0), so a
+restore of it needs the master key before it can read what to restore.
 `RESTORE FROM` into an empty `--dir` takes the newest complete backup,
 or the one `AS OF` the instant a backup reported; `NODE '<address>'`
 takes another node's.

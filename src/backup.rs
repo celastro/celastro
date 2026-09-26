@@ -141,6 +141,7 @@ pub(crate) fn node_slug(node: &str) -> String {
 }
 
 /// The work `BACKUP` leaves for after the lock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn job(
     target: Target,
     ts: u64,
@@ -149,8 +150,34 @@ pub(crate) fn job(
     key: Option<Vec<u8>>,
     colls: Exported,
     keep: Option<usize>,
+    cipher: crate::cipher::Shared,
 ) -> Deferred {
-    Deferred::new(move || run(target, ts, node, catalog, key, colls, keep))
+    Deferred::new(move || run(target, ts, node, catalog, key, colls, keep, cipher))
+}
+
+/// Whether record bytes are a record in the clear: what every backup
+/// wrote before 0.88.0, and a plain database's still.
+fn plain_record(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"celastro backup\n")
+}
+
+/// A record as the store holds it, in the clear: sealed under the
+/// backup's data key with the object's key as its identity, so a record
+/// rewritten to name other objects, or moved from another instant, does
+/// not open -- or as it was written before 0.88.0, in the clear.
+fn open_record(bytes: &[u8], cipher: Option<&crate::cipher::Cipher>, key: &str) -> Result<Vec<u8>> {
+    if plain_record(bytes) {
+        return Ok(bytes.to_vec());
+    }
+    let Some(c) = cipher else {
+        return Err(Error::Storage(format!("{key} is sealed, and there is no key to open it")));
+    };
+    c.open_file(&crate::cipher::Ids::same(key), bytes).map_err(|e| {
+        Error::Storage(format!(
+            "{key} does not open: {e} (the record is damaged, was rewritten, or was moved from \
+             another backup)"
+        ))
+    })
 }
 
 /// Where a node's write-ahead logs go as they are rotated, for a restore
@@ -304,7 +331,8 @@ impl LogArchive {
         // log, since a store takes a path.
         match cipher {
             Some(_) => {
-                let bytes = crate::shard::Wal::archived_bytes(path, cipher, ids)?;
+                let place = crate::shard::place_bytes(timeline, seq, first, last);
+                let bytes = crate::shard::Wal::archived_bytes(path, cipher, ids, &place)?;
                 let tmp = path.with_extension("archive.part");
                 std::fs::write(&tmp, &bytes)?;
                 let put = self.target.store.put_file(&self.target.key(&key), &tmp);
@@ -477,6 +505,7 @@ fn record_entries(record: &[u8], whose: &str) -> Result<Vec<(String, u64, String
 fn previous_hashes(
     target: &Target,
     mine: &str,
+    cipher: &crate::cipher::Shared,
 ) -> std::collections::HashMap<String, (u64, String)> {
     let mut out = std::collections::HashMap::new();
     let Ok(latest) = target.store.get(&target.key(&format!("{mine}LATEST"))) else {
@@ -485,8 +514,11 @@ fn previous_hashes(
     let Ok(ts) = String::from_utf8_lossy(&latest).trim().parse::<u64>() else {
         return out;
     };
-    let Ok(record) = target.store.get(&target.key(&format!("{mine}backups/{}/BACKUP", ts_key(ts))))
-    else {
+    let record_key = format!("{mine}backups/{}/BACKUP", ts_key(ts));
+    let Ok(record) = target.store.get(&target.key(&record_key)) else {
+        return out;
+    };
+    let Ok(record) = open_record(&record, cipher.as_deref(), &record_key) else {
         return out;
     };
     // A record that cannot be read is a record whose hashes are not used;
@@ -500,6 +532,7 @@ fn previous_hashes(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     target: Target,
     ts: u64,
@@ -508,6 +541,7 @@ fn run(
     key: Option<Vec<u8>>,
     colls: Exported,
     keep: Option<usize>,
+    cipher: crate::cipher::Shared,
 ) -> Result<Outcome> {
     let mine = format!("nodes/{}/", node_slug(&node));
     let own = format!("{mine}backups/{}/", ts_key(ts));
@@ -515,7 +549,7 @@ fn run(
     let (mut copied, mut present, mut bytes, mut shards) = (0usize, 0usize, 0u64, 0usize);
     // What the last backup of this node already knows, so a segment that is
     // in the pool at its size is not read again to fill in its hash.
-    let known = previous_hashes(&target, &mine);
+    let known = previous_hashes(&target, &mine, &cipher);
     let mut recalled = 0usize;
     let put = |key: String, data: &[u8], files: &mut Vec<(String, u64, String)>| -> Result<()> {
         target.store.put(&target.key(&key), data)?;
@@ -620,7 +654,21 @@ fn run(
     for (key, len, hash) in &files {
         record.push_str(&format!("{key}\t{len}\t{hash}\n"));
     }
-    target.store.put(&target.key(&format!("{own}BACKUP")), record.as_bytes())?;
+    // An encrypted backup's record is sealed under its data key with the
+    // object's key as its identity (0.88.0): the list of objects and their
+    // hashes cannot be rewritten to name others, nor an older record moved
+    // to a newer instant, by whoever can write the bucket. What no seal
+    // closes: an older backup put back whole, `LATEST` and all, is a
+    // rollback only a clock outside the bucket detects. Under a pin the
+    // record is written in the clear, as every release reads it.
+    let record_key = format!("{own}BACKUP");
+    let record_bytes = match (&cipher, &key) {
+        (Some(c), Some(_)) if c.writes_current_form() => {
+            c.seal_file(&crate::cipher::Ids::same(&record_key), record.as_bytes())?
+        }
+        _ => record.into_bytes(),
+    };
+    target.store.put(&target.key(&record_key), &record_bytes)?;
     target.store.put(&target.key(&format!("{mine}LATEST")), format!("{ts}\n").as_bytes())?;
     let mut ack = format!(
         "backup {ts} to {}: {} collection(s), {shards} shard(s), {copied} segment(s) copied \
@@ -766,7 +814,12 @@ pub(crate) fn has_record(target: &Target, node: &str, ts: u64) -> bool {
     target.store.get(&key).is_ok()
 }
 
-pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<Fetched> {
+pub(crate) fn fetch(
+    target: &Target,
+    node: &str,
+    as_of: Option<u64>,
+    master: Option<&[u8; 32]>,
+) -> Result<Fetched> {
     let slug = node_slug(node);
     let mine = format!("nodes/{slug}/");
     let ts = match as_of {
@@ -805,6 +858,31 @@ pub(crate) fn fetch(target: &Target, node: &str, as_of: Option<u64>) -> Result<F
                 target.display
             )));
         }
+    };
+    // A sealed record (an encrypted backup from 0.88.0 on) opens under
+    // the backup's own data key, which its `KEY` object holds under the
+    // master: read before the record, since the record is what names
+    // everything else.
+    let record = if plain_record(&record) {
+        record
+    } else {
+        let wrapped = target.store.get(&target.key(&format!("{own}KEY"))).map_err(|e| {
+            Error::Storage(format!(
+                "backup {ts} at {} is damaged: its record is sealed and its KEY is not there: {e}",
+                target.display
+            ))
+        })?;
+        let Some(master) = master else {
+            return Err(Error::Storage(
+                "the backup is encrypted (its record is sealed); set CELASTRO_MASTER_KEY_FILE \
+                 (or CELASTRO_MASTER_KEY) to the master key that wraps its data key"
+                    .into(),
+            ));
+        };
+        let cipher = crate::cipher::Cipher::unwrap(&wrapped, master).map_err(|e| {
+            Error::Storage(format!("the backup's KEY does not open under this master key: {e}"))
+        })?;
+        open_record(&record, Some(&cipher), &format!("{own}BACKUP"))?
     };
     let files = record_entries(&record, &format!("{own}BACKUP at {}", target.display))?;
     // Every object at its recorded size, before anything is written.

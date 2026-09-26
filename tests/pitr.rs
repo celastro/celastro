@@ -267,6 +267,60 @@ fn a_seal_archives_the_log_it_rotated_before_the_install_removes_it_and_keeps_it
 /// the same backup, to an instant after the fork -- follows the chain of
 /// timelines: the old run to the fork, the new one after, and none of
 /// what the old run wrote past the fork.
+/// Under a cipher an archived copy's trailer names its place -- the
+/// timeline, the number, the instants -- so a copy standing under another
+/// name (the same log put at the next number, say, to be replayed twice,
+/// or in another timeline's slot) is refused by a restore, naming what it
+/// was archived as, rather than replayed where it was put.
+#[test]
+fn a_restore_refuses_an_archived_log_moved_to_another_slot() {
+    let dest = dir("moved-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let data = dir("moved-data");
+    let master: [u8; 32] = [0x6b; 32];
+    let with = |d: &Path| {
+        let mut o = DbOpts::default();
+        o.log_archive = Some(d.display().to_string());
+        o.master_key = Some(master.into());
+        o
+    };
+    let mut db = Db::open(&data, with(&dest)).unwrap();
+    ack(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    insert(&mut db, 0, 10);
+    ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    insert(&mut db, 10, 30);
+    let t30 = db.now_ts();
+    ack(&mut db, &format!("BACKUP LOG TO '{}'", dest.display()));
+    drop(db);
+    let logs = dest.join("nodes/local/logs/items/shard-0000");
+    let names = archived(&dest);
+    assert_eq!(names.len(), 1, "{names:?}");
+    let name = &names[0];
+    // `000001-<first>-<last>.log`: the same copy at the next number.
+    let (seq, rest) = name.split_once('-').unwrap();
+    assert_eq!(seq, "000001", "{name}");
+    let moved = logs.join(format!("000002-{rest}"));
+    std::fs::copy(logs.join(name), &moved).unwrap();
+    let fresh = dir("moved-fresh");
+    let mut r = Db::open(&fresh, with(&dest)).unwrap();
+    let e = r
+        .execute(&format!("RESTORE FROM '{}' AS OF {t30}", dest.display()))
+        .and_then(|o| o.finished())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("was archived as") && e.contains("log 1"), "{e}");
+    // Put back where it was archived, the restore is whole.
+    std::fs::remove_file(&moved).unwrap();
+    let again = dir("moved-again");
+    let mut r = Db::open(&again, with(&dest)).unwrap();
+    ack(&mut r, &format!("RESTORE FROM '{}' AS OF {t30}", dest.display()));
+    assert_eq!(ids(&mut r), expected(0..30));
+    drop(r);
+    for p in [&dest, &data, &fresh, &again] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 /// Under a cipher an archived copy of a log ends with a trailer that says
 /// the copy is whole: a copy cut at a record boundary -- the newest records
 /// gone, nothing torn -- is refused by a restore, naming the log, rather
