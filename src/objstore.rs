@@ -198,8 +198,12 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, String, bool)> {
     if host_port.is_empty() {
         return Err(Error::Storage(format!("archive: `{endpoint}` names no host")));
     }
+    // `[::1]:9000` is an IPv6 literal with a port; a bare `::1` has none.
     let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => {
+        Some((h, p))
+            if p.chars().all(|c| c.is_ascii_digit())
+                && (!h.contains(':') || (h.starts_with('[') && h.ends_with(']'))) =>
+        {
             (h.to_string(), Some(p.to_string()))
         }
         _ => (host_port.to_string(), None),
@@ -247,7 +251,9 @@ fn archive_anchors(ca: Option<&std::path::Path>) -> Result<Vec<crate::crypto::x5
     };
     let mut anchors = Vec::new();
     for der in crate::crypto::pem::decode_all(&pem, "CERTIFICATE")? {
-        if let Ok(c) = crate::crypto::x509::parse(&der) {
+        // As anchors: a system root's own signature (SHA-384, most of
+        // them) is never verified, so it need not be one this build has.
+        if let Ok(c) = crate::crypto::x509::parse_anchor(&der) {
             anchors.push(c);
         }
     }
@@ -269,6 +275,8 @@ impl S3Store {
         let (dial, host_header, https) = parse_endpoint(&endpoint)?;
         let tls = if https {
             let host = host_header.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_header);
+            // An IPv6 literal's brackets are the URL's, not the name's.
+            let host = host.trim_start_matches('[').trim_end_matches(']');
             Some(Arc::new(ArchiveTls {
                 anchors: archive_anchors(opts.ca.as_deref())?,
                 host: host.to_string(),
@@ -946,11 +954,22 @@ pub(crate) mod sigv4 {
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
             hex(&sha256(canonical.as_bytes()))
         );
-        let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-        let k_region = hmac_sha256(&k_date, region.as_bytes());
-        let k_service = hmac_sha256(&k_region, service.as_bytes());
-        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        // The secret with its prefix, and each key derived from it, is a
+        // copy of the secret's strength: built in place and wiped, not
+        // formatted into a string the allocator hands on.
+        let mut prefixed = Vec::with_capacity(4 + secret_key.len());
+        prefixed.extend_from_slice(b"AWS4");
+        prefixed.extend_from_slice(secret_key.as_bytes());
+        let mut k_date = hmac_sha256(&prefixed, date.as_bytes());
+        crate::cipher::wipe(&mut prefixed);
+        let mut k_region = hmac_sha256(&k_date, region.as_bytes());
+        crate::cipher::wipe(&mut k_date);
+        let mut k_service = hmac_sha256(&k_region, service.as_bytes());
+        crate::cipher::wipe(&mut k_region);
+        let mut k_signing = hmac_sha256(&k_service, b"aws4_request");
+        crate::cipher::wipe(&mut k_service);
         let signature = hex(&hmac_sha256(&k_signing, to_sign.as_bytes()));
+        crate::cipher::wipe(&mut k_signing);
         format!(
             "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
         )

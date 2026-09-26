@@ -84,8 +84,11 @@ impl Sha256 {
             self.buf.extend_from_slice(&data[..take]);
             data = &data[take..];
             if self.buf.len() == 64 {
-                let block = std::mem::take(&mut self.buf);
-                compress(&mut self.h, &block);
+                // Compressed in place and cleared, not taken: a taken
+                // block is a freed, unwiped copy of the message.
+                compress(&mut self.h, &self.buf);
+                crate::cipher::wipe(&mut self.buf);
+                self.buf.clear();
             }
         }
         let mut chunks = data.chunks_exact(64);
@@ -160,6 +163,9 @@ fn compress(h: &mut [u32; 8], block: &[u8]) {
         for (i, v) in [a, b, c, d, e, f, g, hh].iter().enumerate() {
             h[i] = h[i].wrapping_add(*v);
         }
+        // The schedule holds the block's words: over a key block, the key.
+        w = [0u32; 64];
+        std::hint::black_box(&w);
     }
 }
 
@@ -259,6 +265,11 @@ const K512: [u64; 80] = [
 ];
 
 /// SHA-512 of `msg`.
+/// SHA-512, one shot, hashing from the caller's slice: the message is not
+/// copied, the tail (the last partial block, the padding and the length)
+/// is built on the stack, and the tail, the schedule and the state are
+/// wiped before this returns, since the seed and the nonce prefix of an
+/// Ed25519 key come through here.
 pub fn sha512(msg: &[u8]) -> [u8; 64] {
     let mut h: [u64; 8] = [
         0x6a09e667f3bcc908,
@@ -270,51 +281,66 @@ pub fn sha512(msg: &[u8]) -> [u8; 64] {
         0x1f83d9abfb41bd6b,
         0x5be0cd19137e2179,
     ];
-    let mut data = msg.to_vec();
-    let bit_len = (msg.len() as u128).wrapping_mul(8);
-    data.push(0x80);
-    while data.len() % 128 != 112 {
-        data.push(0);
+    let mut chunks = msg.chunks_exact(128);
+    for block in &mut chunks {
+        compress512(&mut h, block);
     }
-    data.extend_from_slice(&bit_len.to_be_bytes());
-    for block in data.chunks(128) {
-        let mut w = [0u64; 80];
-        for i in 0..16 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&block[8 * i..8 * i + 8]);
-            w[i] = u64::from_be_bytes(b);
-        }
-        for i in 16..80 {
-            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..80 {
-            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (i, v) in [a, b, c, d, e, f, g, hh].iter().enumerate() {
-            h[i] = h[i].wrapping_add(*v);
-        }
+    let rem = chunks.remainder();
+    let mut tail = [0u8; 256];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    // The 128-bit length ends the block after the 0x80 and the zeros: one
+    // block when the remainder leaves room for it, two otherwise.
+    let tail_len = if rem.len() < 112 { 128 } else { 256 };
+    let bit_len = (msg.len() as u128).wrapping_mul(8);
+    tail[tail_len - 16..tail_len].copy_from_slice(&bit_len.to_be_bytes());
+    for block in tail[..tail_len].chunks(128) {
+        compress512(&mut h, block);
     }
     let mut out = [0u8; 64];
     for (i, v) in h.iter().enumerate() {
         out[8 * i..8 * i + 8].copy_from_slice(&v.to_be_bytes());
     }
+    h = [0u64; 8];
+    std::hint::black_box(&h);
+    crate::cipher::wipe(&mut tail);
     out
+}
+
+fn compress512(h: &mut [u64; 8], block: &[u8]) {
+    let mut w = [0u64; 80];
+    for i in 0..16 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&block[8 * i..8 * i + 8]);
+        w[i] = u64::from_be_bytes(b);
+    }
+    for i in 16..80 {
+        let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+        let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for i in 0..80 {
+        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (i, v) in [a, b, c, d, e, f, g, hh].iter().enumerate() {
+        h[i] = h[i].wrapping_add(*v);
+    }
+    w = [0u64; 80];
+    std::hint::black_box(&w);
 }
 
 #[cfg(test)]

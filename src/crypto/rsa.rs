@@ -54,11 +54,22 @@ impl PublicKey {
     /// `rsa_pss_rsae_sha256` in TLS 1.3 is defined.
     pub fn verify_pss_sha256(&self, msg: &[u8], sig: &[u8]) -> bool {
         let Some(em) = self.encoded(sig) else { return false };
-        let em_bits = self.n.bits() - 1;
-        let em_len = em_bits.div_ceil(8);
-        // The encoding is emLen bytes; a modulus one bit past a byte
-        // boundary leaves a leading zero to drop.
-        let em = &em[em.len() - em_len..];
+        pss_verify_sha256(&em, self.n.bits() - 1, msg)
+    }
+}
+
+/// RFC 8017 §9.1.2 over `em`, the `k` bytes of `s^e mod n`, for a modulus
+/// of `em_bits + 1` bits: the encoding is `emLen = ceil(em_bits / 8)`
+/// bytes, and a modulus one bit past a byte boundary leaves a leading
+/// byte, which must be zero (step 2.c: an integer too large is not a
+/// signature, whatever follows it).
+fn pss_verify_sha256(em: &[u8], em_bits: usize, msg: &[u8]) -> bool {
+    let em_len = em_bits.div_ceil(8);
+    if em.len() < em_len || em[..em.len() - em_len].iter().any(|&b| b != 0) {
+        return false;
+    }
+    let em = &em[em.len() - em_len..];
+    {
         let (h_len, s_len) = (32, 32);
         if em_len < h_len + s_len + 2 || em[em_len - 1] != 0xbc {
             return false;
@@ -98,4 +109,55 @@ fn mgf1(seed: &[u8], len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 8017 §9.1.1 with a chosen salt: an encoding needs no key, so a
+    /// test can make one for any modulus size.
+    fn pss_encode(msg: &[u8], em_bits: usize, salt: &[u8; 32]) -> Vec<u8> {
+        let em_len = em_bits.div_ceil(8);
+        let mut m_prime = vec![0u8; 8];
+        m_prime.extend_from_slice(&sha256(msg));
+        m_prime.extend_from_slice(salt);
+        let h = sha256(&m_prime);
+        let db_len = em_len - 32 - 1;
+        let mut db = vec![0u8; db_len - 32 - 1];
+        db.push(1);
+        db.extend_from_slice(salt);
+        let mask = mgf1(&h, db_len);
+        let mut masked: Vec<u8> = db.iter().zip(&mask).map(|(a, b)| a ^ b).collect();
+        let top_bits = 8 * em_len - em_bits;
+        if top_bits > 0 {
+            masked[0] &= 0xff >> top_bits;
+        }
+        let mut em = masked;
+        em.extend_from_slice(&h);
+        em.push(0xbc);
+        em
+    }
+
+    /// A modulus one bit past a byte boundary: `s^e mod n` is one byte
+    /// longer than the encoding, and that byte must be zero -- an encoding
+    /// under a leading byte of anything else is an integer past the
+    /// encoding's range, which the standard says is not a signature.
+    #[test]
+    fn a_pss_encoding_under_a_nonzero_leading_byte_is_refused() {
+        let msg = b"a CertificateVerify";
+        let em_bits = 2048; // a 2049-bit modulus
+        let em = pss_encode(msg, em_bits, &[0x5a; 32]);
+        assert_eq!(em.len(), 256);
+        let mut k_bytes = vec![0u8];
+        k_bytes.extend_from_slice(&em);
+        assert!(pss_verify_sha256(&k_bytes, em_bits, msg), "a valid encoding verifies");
+        k_bytes[0] = 1;
+        assert!(!pss_verify_sha256(&k_bytes, em_bits, msg), "the dropped byte is checked");
+        // And on a byte-aligned modulus nothing is dropped: the same bytes
+        // with nothing before them verify, and a flipped salt does not.
+        let em = pss_encode(msg, 2047, &[0x5a; 32]);
+        assert!(pss_verify_sha256(&em, 2047, msg));
+        assert!(!pss_verify_sha256(&em, 2047, b"another message"));
+    }
 }

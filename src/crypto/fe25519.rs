@@ -5,7 +5,7 @@
 const MASK51: u64 = (1 << 51) - 1;
 
 /// A field element; limbs are kept below 2^52 after every operation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Fe(pub [u64; 5]);
 
 impl Fe {

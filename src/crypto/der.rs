@@ -38,7 +38,10 @@ pub fn read(input: &[u8]) -> Result<(u8, &[u8], &[u8])> {
         for &b in &rest[..n] {
             len = (len << 8) | b as usize;
         }
-        if len < 0x80 {
+        // DER's length is the shortest that holds it: a value under 0x80
+        // belongs in the short form, and a leading zero byte is a longer
+        // form than the value needs.
+        if len < 0x80 || rest[0] == 0 {
             return Err(bad("a length not minimally encoded"));
         }
         (len, &rest[n..])
@@ -142,6 +145,8 @@ mod tests {
         assert!(read(&[0x30, 0x05, 0x01]).is_err(), "contents short");
         assert!(read(&[0x30, 0x80]).is_err(), "indefinite length");
         assert!(read(&[0x30, 0x81, 0x05, 0, 0, 0, 0, 0]).is_err(), "non-minimal length");
+        assert!(read(&[0x30, 0x82, 0x00, 0x81]).is_err(), "a long form with a leading zero");
+        assert!(read(&[0x30, 0x81, 0x81]).is_err(), "a long form short of its bytes");
         assert!(expect(&outer, SET).is_err());
         assert_eq!(integer(&[0, 0, 5]), vec![0x02, 0x01, 0x05]);
         assert_eq!(integer(&[]), vec![0x02, 0x01, 0x00]);

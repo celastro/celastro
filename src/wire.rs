@@ -333,7 +333,7 @@ pub fn token_from_env() -> Option<String> {
 /// and still accepts the old, then the old is dropped.
 pub const TOKEN_ALSO_ENV: &str = "CELASTRO_WIRE_TOKEN_ALSO";
 
-fn token_also_from_env() -> Option<String> {
+pub fn token_also_from_env() -> Option<String> {
     std::env::var(TOKEN_ALSO_ENV).ok().filter(|t| !t.is_empty())
 }
 
@@ -1817,6 +1817,20 @@ pub fn serve(
     stop: Arc<AtomicBool>,
     tls: Option<Arc<Tls>>,
 ) -> Result<()> {
+    serve_with_also(listener, db, token, token_also_from_env(), stop, tls)
+}
+
+/// `serve` with the rotation's second token given rather than read from
+/// the environment here: what lets the binary forget the environment's
+/// secrets before this thread would have read them.
+pub fn serve_with_also(
+    listener: TcpListener,
+    db: Arc<RwLock<Db>>,
+    token: String,
+    also: Option<String>,
+    stop: Arc<AtomicBool>,
+    tls: Option<Arc<Tls>>,
+) -> Result<()> {
     listener.set_nonblocking(true)?;
     // The catch-ups' driver: every half second, the next chunk of each
     // follower that is catching up is cut under the lock and left for the
@@ -1856,7 +1870,7 @@ pub fn serve(
                 epoch: g.epoch(),
                 region: g.own_region(),
                 token,
-                also: token_also_from_env(),
+                also,
             }),
         )
     };
@@ -1942,6 +1956,15 @@ struct Identity {
     /// The wire token, and the second one a rotation accepts.
     token: String,
     also: Option<String>,
+}
+
+impl Drop for Identity {
+    fn drop(&mut self) {
+        crate::cipher::wipe_string(&mut self.token);
+        if let Some(a) = &mut self.also {
+            crate::cipher::wipe_string(a);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

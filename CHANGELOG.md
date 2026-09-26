@@ -6,6 +6,67 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The cryptography reviewed again and hardened (H8).** Four readers
+over the primitives, the TLS 1.3 stack, X.509 and the encryption at
+rest; every finding checked by hand. One high: a certificate's validity
+time was checked for UTF-8 and then sliced by byte, so a multibyte
+character in it was a panic, and the process (this crate aborts on a
+panic), from any peer presenting a certificate before it was verified.
+Fixed: the time is digits and a `Z`, checked byte by byte, and its
+fields are in the calendar. Mediums, fixed: **a log's records now go
+under a key per log** (`CWL2`: HKDF of the data key, the identity and
+the log's id) -- every record is a frame with a random nonce, and a
+shard's log lived under one key for the data key's life, so a shard at
+twenty thousand records a second reached the random-nonce bound in
+days; logs written before read as they were and continue in their own
+kind, and `CELASTRO_SEAL_IDENTITY=2` writes what 0.86.0 reads (see
+the tuning notes) for a rollback window; **a TLS stream that ends
+between records without a close_notify is an error** to its reader,
+not a quiet end, so an HTTPS body framed by the close (what `celastro
+tls secret`, `send` and the archive client read) cannot be cut short
+by whoever can cut the TCP stream; **`key rotate` no longer refuses a
+shard whose log holds its header and no record** (a fresh or just
+truncated shard), and **`check` and `key rotate` name a rotated log as
+the shard sealed it** rather than reporting it damaged; **one key is
+wrapped as a `CELK3` ring of one entry**, whose AAD names its place, so
+two old one-key files cannot be composed into a ring naming a retired
+key current; a `CELK1`/`CELK2` file is rewritten as `CELK3` at the next
+open. Lows, fixed: a handshake is bounded in time (thirty seconds, four
+records carrying nothing per message) so a peer that trickles cannot
+hold a connection thread for good; a ServerHello must echo the session
+id; a hello with an extension twice or bytes after its extensions is
+refused; a NewSessionTicket sent to a server and a KeyUpdate longer
+than its byte are refused; a ticket (format 3) carries the client
+certificate's expiry and is keyed by the anchors, so it resumes past
+neither, and its format byte is under its seal; an RSA exponent is odd
+and at least 3; RSA-PSS checks the byte it drops on a modulus one bit
+past a byte boundary; a DER length with a leading zero, an extension
+given twice and a BOOLEAN not `0x00`/`0xff` are refused; an address
+literal matches iPAddress entries only and a wildcard one whole
+non-empty label; an archived object of exactly one frame is resealed
+rather than passed over; a WAL's torn tail is cut before records are
+appended past it; a collection made through the library API is held
+to the statement's naming rule. Secret hygiene: SHA-512 hashes from
+the caller's slice and wipes its state (the Ed25519 seed and nonce
+prefix went through a heap copy), every copy of the Ed25519 expansion
+is wiped, a key is drawn from the kernel in place, the ticket's
+plaintext, the TLS key file's text and DER, the SigV4 signing key's
+derivation, the master key's hex and file bytes, the wire's tokens and
+four stack copies of file keys are wiped; the node removes
+`CELASTRO_MASTER_KEY`, `CELASTRO_TOKEN`, `CELASTRO_WIRE_TOKEN(_ALSO)` and
+`CELASTRO_SCOPED_TOKENS` from its environment once read, so a browser
+it opens or `/proc/<pid>/environ` shows none. Compatibility: a system
+root self-signed with an algorithm this build does not verify (SHA-384,
+most of them) now anchors a chain for the archive's `https://`
+endpoint, since an anchor's own signature is never verified; an IPv6
+endpoint (`https://[::1]:9000`) is dialled; `tls init` writes
+keyCertSign on the CA; a key file that is encrypted or not Ed25519 is
+refused by name. Tests: PKCS#1 v1.5 against every Wycheproof vector;
+the tickets a client-auth server issued before this release do not
+open (a full handshake follows, once).
+
 ## 0.86.0 — 2026-09-26
 
 **`SHOW HEALTH` dials every peer at once.** The hellos went out one

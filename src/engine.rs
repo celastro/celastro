@@ -2613,6 +2613,19 @@ impl Db {
     /// `(partition_key, primary_key)`.
     pub fn create_collection(&mut self, mut coll: Collection, splits: &[String]) -> Result<()> {
         let _deadline = self.arm_default_deadline();
+        // The statement's lexer allows an identifier; a library caller is
+        // held to the same, since the name is a directory and a seal
+        // identity's first part.
+        let mut chars = coll.name.chars();
+        let named = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !named {
+            return Err(Error::Plan(format!(
+                "`{}` is not a collection name: letters, digits and underscores, starting with \
+                 a letter or an underscore",
+                coll.name
+            )));
+        }
         if coll.replicas == 0 {
             coll.replicas = DEFAULT_REPLICAS as u8;
         }
@@ -9218,7 +9231,14 @@ fn open_key(dir: &Path, opts: &DbOpts) -> Result<crate::cipher::Shared> {
     let key_file = crate::shard::read_optional(&key_path)?;
     match (key_file, &opts.master_key) {
         (Some(wrapped), Some(master)) => {
-            Ok(Some(Arc::new(crate::cipher::Cipher::unwrap(&wrapped, master)?)))
+            let cipher = crate::cipher::Cipher::unwrap(&wrapped, master)?;
+            // A ring in a form from before 0.87.0 is rewritten in the one
+            // whose entries name their place, once the key is in hand.
+            if crate::cipher::Cipher::ring_is_old(&wrapped) && !cipher.writes_legacy() {
+                crate::shard::atomic_write(&key_path, &cipher.wrap(master)?)?;
+                crate::log::info("key_ring_rewritten", &[("path", key_path.display().to_string())]);
+            }
+            Ok(Some(Arc::new(cipher)))
         }
         (Some(_), None) => Err(Error::Storage(format!(
             "{} is encrypted; set CELASTRO_MASTER_KEY_FILE (or CELASTRO_MASTER_KEY) to open it",
@@ -10347,6 +10367,26 @@ mod tests {
                 "shard {i}: {regs:?}"
             );
         }
+    }
+
+    /// A collection made through the library is named by the statement's
+    /// rule: a name with a `/` would be a path, and a seal identity, of
+    /// another shape than every walk expects.
+    #[test]
+    fn a_collection_name_that_is_not_an_identifier_is_refused() {
+        let dir = std::env::temp_dir().join(format!("celastro-collname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        for bad in ["a/b", "", "1abc", "a-b", "a b"] {
+            let e = db
+                .create_collection(crate::catalog::Collection::new(bad, "id", None), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("not a collection name"), "{bad:?}: {e}");
+        }
+        db.create_collection(crate::catalog::Collection::new("ok_1", "id", None), &[]).unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The steward's replacement goes where the collection's regions ask:

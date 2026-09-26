@@ -10,14 +10,20 @@ use crate::error::{Error, Result};
 /// worse than no key.
 pub fn bytes(n: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; n];
+    fill(&mut out)?;
+    Ok(out)
+}
+
+/// `buf` filled from the kernel, in place: what a key is drawn through,
+/// so no freed copy of it is left on the way.
+pub fn fill(buf: &mut [u8]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        if fill_getrandom(&mut out)? {
-            return Ok(out);
+        if fill_getrandom(buf)? {
+            return Ok(());
         }
     }
-    fill_urandom(&mut out)?;
-    Ok(out)
+    fill_urandom(buf)
 }
 
 /// `buf` filled by `getrandom(2)`; `Ok(false)` on a kernel without it
@@ -59,9 +65,8 @@ fn fill_urandom(buf: &mut [u8]) -> Result<()> {
 }
 
 pub fn array32() -> Result<[u8; 32]> {
-    let v = bytes(32)?;
     let mut a = [0u8; 32];
-    a.copy_from_slice(&v);
+    fill(&mut a)?;
     Ok(a)
 }
 

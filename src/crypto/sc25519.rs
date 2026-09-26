@@ -88,6 +88,12 @@ pub fn muladd(a: &[u64; 4], b: &[u64; 4], c: &[u64; 4]) -> [u64; 4] {
     reduce_512(&bytes)
 }
 
+/// Zero a scalar that held a secret, in a way the compiler keeps.
+pub fn wipe(a: &mut [u64; 4]) {
+    *a = [0u64; 4];
+    std::hint::black_box(a);
+}
+
 pub fn to_bytes(a: &[u64; 4]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..4 {

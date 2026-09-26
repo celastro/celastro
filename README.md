@@ -133,8 +133,9 @@ rollback possible through the first days on a new release, start it with
 `CELASTRO_CATALOG_FORMAT=<previous>`, which pins the written format at
 the cost of what the newer fields carry, and lift the pin once the
 release is trusted. Encryption at rest has the same shape of pin,
-`CELASTRO_SEAL_IDENTITY=1`, for a release that changed what an encrypted
-file is sealed under (0.84.1 did; the changelog says when).
+`CELASTRO_SEAL_IDENTITY`, for a release that changed what an encrypted
+file is sealed under: `1` writes what 0.83.0 reads, `2` what 0.86.0
+reads (0.84.1 and 0.87.0 changed it; the changelog says when).
 
 Two limits worth knowing early, in every shape: a prefix such as
 `text_match(body, 'comp*')` expands to at most 512 dictionary terms and

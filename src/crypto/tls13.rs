@@ -81,6 +81,11 @@ const PSK_DHE_KE: u8 = 1;
 /// The server refuses one older than this by its own clock; the client
 /// stops offering one at the lifetime the ticket named.
 const TICKET_LIFETIME_SECS: u64 = 86_400;
+/// How long a handshake may take from its first byte to its last, whatever
+/// the socket's timeout per read: a peer that trickles is cut off.
+const HANDSHAKE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Records carrying no handshake bytes allowed per message read.
+const MAX_EMPTY_HANDSHAKE_RECORDS: u32 = 4;
 
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
@@ -163,7 +168,11 @@ impl Keys {
         for (i, b) in self.seq.to_be_bytes().iter().enumerate() {
             n[4 + i] ^= b;
         }
-        self.seq += 1;
+        // 2^64 records under one key would wrap the counter into a nonce
+        // already used (RFC 8446 §5.5 has the connection end first).
+        // Unreachable in any life of a connection; refused rather than
+        // wrapped, and a KeyUpdate resets it.
+        self.seq = self.seq.checked_add(1).expect("a TLS sequence number past 2^64 - 1");
         n
     }
 }
@@ -218,17 +227,29 @@ fn now_secs() -> u64 {
 /// same on every node that serves the same certificate, so a ticket from
 /// one pod resumes at another behind the same Service, and gone with the
 /// key. Never written anywhere. A wire that requires client certificates
-/// seals under another key, so a ticket from before the requirement (a
-/// resumed handshake shows no certificate) does not resume past it. The
-/// day is in the derivation: a server seals under today's key and opens
-/// under today's or yesterday's (a ticket lives a day), so a TLS key that
-/// leaks opens the tickets of two days, not of its whole life.
-fn ticket_key(key: &KeyPair, client_auth: bool, day: u64) -> Secret<32> {
-    let salt: &[u8] =
-        if client_auth { b"celastro tls ticket v1 mtls" } else { b"celastro tls ticket v1" };
-    let mut ikm = [0u8; 40];
+/// seals under another key, mixed with the anchors it requires them from,
+/// so a ticket from before the requirement (a resumed handshake shows no
+/// certificate) does not resume past it, and neither does one from before
+/// a change of CA. The day is in the derivation: a server seals under
+/// today's key and opens under today's or yesterday's (a ticket lives a
+/// day), so a TLS key that leaks opens the tickets of two days, not of
+/// its whole life.
+fn ticket_key(key: &KeyPair, client_anchors: Option<&[Certificate]>, day: u64) -> Secret<32> {
+    let salt: &[u8] = if client_anchors.is_some() {
+        b"celastro tls ticket v3 mtls"
+    } else {
+        b"celastro tls ticket v3"
+    };
+    let mut ikm = [0u8; 72];
     ikm[..32].copy_from_slice(&key.seed);
-    ikm[32..].copy_from_slice(&day.to_be_bytes());
+    ikm[32..40].copy_from_slice(&day.to_be_bytes());
+    if let Some(anchors) = client_anchors {
+        let mut ders = Vec::new();
+        for a in anchors {
+            ders.extend_from_slice(&a.der);
+        }
+        ikm[40..].copy_from_slice(&sha256(&ders));
+    }
     let out = hkdf::extract(salt, &ikm);
     crate::cipher::wipe(&mut ikm);
     out
@@ -239,37 +260,49 @@ fn ticket_day() -> u64 {
     now_secs() / 86_400
 }
 
-const TICKET_AAD: &[u8] = b"celastro tls ticket v1";
+/// The ticket format: the first byte of a ticket, and in the AAD of its
+/// seal, so a ticket of one format is not opened as another.
+const TICKET_VERSION: u8 = 3;
+const TICKET_AAD: &[u8] = b"celastro tls ticket v3";
 
-/// A ticket as the server hands it out: `1 | nonce(12) | ciphertext | tag`
-/// over `psk(32) | issued_at(8) | age_add(4)`. Opaque to the client.
+/// A ticket as the server hands it out: `3 | nonce(12) | ciphertext |
+/// tag` over `psk(32) | issued_at(8) | age_add(4) | client(1)`, and when
+/// `client` is 1 -- the wire asked for a certificate -- `not_after(8)`
+/// and the certificate's names, `count(1)` then `len(1) | name` each.
+/// Opaque to the client. The names are how a resumed connection, which
+/// presents no certificate, still knows whose it is; the expiry is when
+/// that certificate stops being one, and the ticket with it.
 pub(super) fn seal_ticket(
     tkey: &[u8; 32],
     psk: &[u8; 32],
     issued_at: u64,
     age_add: u32,
-    names: Option<&[String]>,
+    client: Option<(&[String], i64)>,
 ) -> io::Result<Vec<u8>> {
-    let nonce: [u8; 12] =
-        random::bytes(12).map_err(|e| err(e.to_string()))?.try_into().expect("twelve bytes");
-    let mut plain = Vec::with_capacity(44);
+    let mut nonce = [0u8; 12];
+    random::fill(&mut nonce).map_err(|e| err(e.to_string()))?;
+    let mut plain = Vec::with_capacity(64);
     plain.extend_from_slice(psk);
     plain.extend_from_slice(&issued_at.to_be_bytes());
     plain.extend_from_slice(&age_add.to_be_bytes());
-    // Version 2: the names of the client's certificate, so a resumed
-    // connection -- which presents no certificate -- still knows whose
-    // it is. Each name at most 255 bytes, at most 255 of them.
-    if let Some(names) = names {
-        plain.push(names.len().min(255) as u8);
-        for n in names.iter().take(255) {
-            let b = n.as_bytes();
-            plain.push(b.len().min(255) as u8);
-            plain.extend_from_slice(&b[..b.len().min(255)]);
+    match client {
+        None => plain.push(0),
+        Some((names, not_after)) => {
+            plain.push(1);
+            plain.extend_from_slice(&not_after.to_be_bytes());
+            // Each name at most 255 bytes, at most 255 of them.
+            plain.push(names.len().min(255) as u8);
+            for n in names.iter().take(255) {
+                let b = n.as_bytes();
+                plain.push(b.len().min(255) as u8);
+                plain.extend_from_slice(&b[..b.len().min(255)]);
+            }
         }
     }
-    let tag = aead::seal(tkey, &nonce, TICKET_AAD, &mut plain);
+    let aad = [&[TICKET_VERSION][..], TICKET_AAD].concat();
+    let tag = aead::seal(tkey, &nonce, &aad, &mut plain);
     let mut out = Vec::with_capacity(1 + 12 + plain.len() + 16);
-    out.push(if names.is_some() { 2 } else { 1 });
+    out.push(TICKET_VERSION);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&plain);
     out.extend_from_slice(&tag);
@@ -278,50 +311,69 @@ pub(super) fn seal_ticket(
 
 /// The PSK a ticket stands for, if this server sealed it and it is not
 /// older than the lifetime, and the names of the client's certificate
-/// when the ticket carries them. `None` for anything else -- another
-/// node's key, a tampered byte, an old ticket -- and the handshake goes
-/// on in full, which is what the protocol says happens.
+/// when the ticket carries them -- while that certificate is still
+/// valid. `None` for anything else -- another node's key, another
+/// format, a tampered byte, an old ticket -- and the handshake goes on
+/// in full, which is what the protocol says happens.
 pub(super) fn open_ticket(
     tkey: &[u8; 32],
     ticket: &[u8],
-) -> Option<([u8; 32], Option<Vec<String>>)> {
-    let version = *ticket.first()?;
-    if ticket.len() < 1 + 12 + 44 + 16 || !(version == 1 || version == 2) {
-        return None;
-    }
-    if version == 1 && ticket.len() != 1 + 12 + 44 + 16 {
+) -> Option<(Secret<32>, Option<(Vec<String>, i64)>)> {
+    if ticket.len() < 1 + 12 + 45 + 16 || ticket[0] != TICKET_VERSION {
         return None;
     }
     let nonce: [u8; 12] = ticket[1..13].try_into().ok()?;
     let mut data = ticket[13..ticket.len() - 16].to_vec();
     let tag: [u8; 16] = ticket[ticket.len() - 16..].try_into().ok()?;
-    if !aead::open(tkey, &nonce, TICKET_AAD, &mut data, &tag) {
+    let aad = [&[TICKET_VERSION][..], TICKET_AAD].concat();
+    if !aead::open(tkey, &nonce, &aad, &mut data, &tag) {
         return None;
     }
-    let psk: [u8; 32] = data[..32].try_into().ok()?;
+    // Read out, then wiped before any verdict: the PSK is a secret
+    // whichever way the checks go.
+    let psk: Secret<32> = <[u8; 32]>::try_from(&data[..32]).ok()?.into();
     let issued_at = u64::from_be_bytes(data[32..40].try_into().ok()?);
+    let parsed = (|| -> Option<Option<(Vec<String>, i64)>> {
+        let mut i = 44usize;
+        let has_client = *data.get(i)?;
+        i += 1;
+        match has_client {
+            0 => return if i == data.len() { Some(None) } else { None },
+            1 => {}
+            _ => return None,
+        }
+        let not_after = i64::from_be_bytes(data.get(i..i + 8)?.try_into().ok()?);
+        i += 8;
+        let count = *data.get(i)? as usize;
+        i += 1;
+        let mut names = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = *data.get(i)? as usize;
+            i += 1;
+            let b = data.get(i..i + len)?;
+            names.push(String::from_utf8_lossy(b).to_string());
+            i += len;
+        }
+        if i != data.len() {
+            return None;
+        }
+        Some(Some((names, not_after)))
+    })();
+    crate::cipher::wipe(&mut data);
+    let client = parsed?;
     let now = now_secs();
     if now < issued_at.saturating_sub(60) || now > issued_at + TICKET_LIFETIME_SECS {
         return None;
     }
-    if version == 1 {
-        return Some((psk, None));
+    match client {
+        None => Some((psk, None)),
+        Some((names, not_after)) => {
+            if now as i64 > not_after {
+                return None;
+            }
+            Some((psk, Some((names, not_after))))
+        }
     }
-    let mut names = Vec::new();
-    let mut i = 44usize;
-    let count = *data.get(i)? as usize;
-    i += 1;
-    for _ in 0..count {
-        let len = *data.get(i)? as usize;
-        i += 1;
-        let b = data.get(i..i + len)?;
-        names.push(String::from_utf8_lossy(b).to_string());
-        i += len;
-    }
-    if i != data.len() {
-        return None;
-    }
-    Some((psk, Some(names)))
 }
 
 /// The PSK a resumption master secret and a ticket nonce make.
@@ -413,13 +465,22 @@ pub struct TlsStream {
     /// Decrypted application data not yet handed to the reader.
     pending: Vec<u8>,
     pending_at: usize,
-    /// Bytes of the socket read ahead of a record boundary.
-    inbuf: Vec<u8>,
     closed: bool,
+    /// Which side this is: a server refuses a NewSessionTicket, which
+    /// only a server sends.
+    server: bool,
+    /// When the handshake began, while it runs: a peer that trickles it
+    /// -- a byte, a ChangeCipherSpec, an empty fragment every few seconds
+    /// -- is cut off at `HANDSHAKE_LIMIT`, whatever the socket's own
+    /// timeout, so it cannot hold a connection thread for good.
+    hs_started: Option<std::time::Instant>,
     /// The names of the peer's certificate, when this side asked for one
     /// and verified it: its DNS names lowercased and its IP addresses as
     /// text. What the wire holds a caller's claimed address against.
     peer_names: Option<Vec<String>>,
+    /// When the peer's certificate expires, as the ticket that resumed
+    /// this connection carried it: what the next ticket carries on.
+    peer_expiry: Option<i64>,
     /// The handshake failed, and the stream is dead for good: without keys
     /// a read would hand up a record in the clear and a write would send
     /// one, and a listener that treats a timeout as idle would come back
@@ -451,6 +512,16 @@ pub struct TlsStream {
     /// suite, or echoes another session id.
     pub(crate) hrr_wrong_suite: bool,
     pub(crate) hrr_wrong_session: bool,
+    /// A test's hook, server: a ServerHello that echoes another session id.
+    pub(crate) sh_wrong_session: bool,
+    /// A test's hook, client: this many ChangeCipherSpec records before
+    /// the ClientHello, this many milliseconds apart -- a peer trickling.
+    pub(crate) trickle_ccs: (u32, u64),
+    /// A test's hook, client: a handshake record sent after the handshake.
+    pub(crate) post_handshake_junk: Option<Vec<u8>>,
+    /// How long this side gives the handshake; `HANDSHAKE_LIMIT` but for a
+    /// test that cannot wait that long.
+    pub(crate) handshake_limit: std::time::Duration,
     /// Bytes of early data this server may still skip: records that fail
     /// to open under the client's handshake key while a client that
     /// offered early data has not yet been read past it.
@@ -486,6 +557,7 @@ impl TlsStream {
     }
 
     fn new(sock: TcpStream, role: Role) -> TlsStream {
+        let server = matches!(role, Role::Server { .. });
         TlsStream {
             sock,
             role: Some(role),
@@ -493,9 +565,11 @@ impl TlsStream {
             write_keys: None,
             pending: Vec::new(),
             pending_at: 0,
-            inbuf: Vec::new(),
             closed: false,
+            server,
+            hs_started: None,
             peer_names: None,
+            peer_expiry: None,
             failed: false,
             resumed: false,
             retried: false,
@@ -508,6 +582,10 @@ impl TlsStream {
             oversized_hello: 0,
             hrr_wrong_suite: false,
             hrr_wrong_session: false,
+            sh_wrong_session: false,
+            trickle_ccs: (0, 0),
+            post_handshake_junk: None,
+            handshake_limit: HANDSHAKE_LIMIT,
             skip_early: 0,
             res_master: None,
             store_key: None,
@@ -571,6 +649,7 @@ impl TlsStream {
             return Err(err("the handshake failed; the connection is dead"));
         }
         let Some(role) = self.role.take() else { return Ok(()) };
+        self.hs_started = Some(std::time::Instant::now());
         let r = match role {
             Role::Server { chain_der, key, client_anchors } => {
                 self.server_handshake(&chain_der, &key, client_anchors.as_deref())
@@ -579,6 +658,7 @@ impl TlsStream {
                 self.client_handshake(&anchors, &host, chain_der.as_deref(), key.as_ref())
             }
         };
+        self.hs_started = None;
         if let Err(e) = &r {
             self.failed = true;
             self.closed = true;
@@ -594,6 +674,18 @@ impl TlsStream {
     /// One record from the socket: its type and its plaintext, decrypted
     /// when the read keys are on.
     fn read_record(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        // Early data this server did not accept is skipped record by
+        // record, in a loop: a recursion here would be as deep as the peer
+        // cared to send.
+        loop {
+            if let Some(r) = self.read_record_once()? {
+                return Ok(r);
+            }
+        }
+    }
+
+    /// One record, or `None` for a record of skipped early data.
+    fn read_record_once(&mut self) -> io::Result<Option<(u8, Vec<u8>)>> {
         let mut header = [0u8; 5];
         self.read_exact_from_sock(&mut header, false)?;
         let ctype = header[0];
@@ -604,7 +696,7 @@ impl TlsStream {
         let mut body = vec![0u8; len];
         self.read_exact_from_sock(&mut body, true)?;
         match &mut self.read_keys {
-            None => Ok((ctype, body)),
+            None => Ok(Some((ctype, body))),
             Some(keys) => {
                 if ctype == CT_CHANGE_CIPHER_SPEC {
                     // Middlebox compatibility: a plaintext CCS may arrive
@@ -613,7 +705,7 @@ impl TlsStream {
                     if body != [1] {
                         return Err(err("a ChangeCipherSpec that is not the one byte allowed"));
                     }
-                    return Ok((CT_CHANGE_CIPHER_SPEC, body));
+                    return Ok(Some((CT_CHANGE_CIPHER_SPEC, body)));
                 }
                 if ctype != CT_APPLICATION_DATA || len < 16 {
                     return Err(err("an unencrypted record after the keys were set"));
@@ -631,7 +723,7 @@ impl TlsStream {
                         if self.skip_early == 0 {
                             return Err(err("more early data than the protocol allows"));
                         }
-                        return self.read_record();
+                        return Ok(None);
                     }
                     return Err(err("a record failed authentication"));
                 }
@@ -644,26 +736,26 @@ impl TlsStream {
                     return Err(err("a record with no content type"));
                 }
                 let inner = data[end - 1];
-                Ok((inner, data[..end - 1].to_vec()))
+                Ok(Some((inner, data[..end - 1].to_vec())))
             }
         }
     }
 
-    /// `buf` filled from what was read ahead and the socket. A connection
-    /// that ends before a record starts is the peer's close (an
-    /// `UnexpectedEof`, which the reader takes as the end of the stream);
-    /// one that ends inside a record's header or body is a truncation --
-    /// a middlebox or an attacker cutting the stream where no close_notify
-    /// was -- and is an error, never a quiet end.
+    /// `buf` filled from the socket. A connection that ends before a record
+    /// starts is an `UnexpectedEof`; one that ends inside a record's header
+    /// or body is a truncation. Neither is a close: the peer's close is a
+    /// close_notify alert, and a stream that ends without one was cut --
+    /// by the peer's process going, a middlebox, or an attacker cutting it
+    /// where the peer had more to say -- so the reader hears an error
+    /// either way, never a quiet end.
     fn read_exact_from_sock(&mut self, buf: &mut [u8], inside_record: bool) -> io::Result<()> {
         let mut filled = 0;
-        let take = self.inbuf.len().min(buf.len());
-        if take > 0 {
-            buf[..take].copy_from_slice(&self.inbuf[..take]);
-            self.inbuf.drain(..take);
-            filled = take;
-        }
         while filled < buf.len() {
+            if let Some(started) = self.hs_started {
+                if started.elapsed() > self.handshake_limit {
+                    return Err(err("the handshake took longer than this side allows"));
+                }
+            }
             match self.sock.read(&mut buf[filled..]) {
                 Ok(0) if filled == 0 && !inside_record => {
                     return Err(io::Error::new(
@@ -738,6 +830,11 @@ impl TlsStream {
         hs_buf: &mut Vec<u8>,
         transcript: &mut Vec<u8>,
     ) -> io::Result<(u8, Vec<u8>)> {
+        // Records that bring no handshake bytes -- a ChangeCipherSpec, an
+        // empty fragment -- are allowed a few per message (the protocol
+        // needs at most one), not a stream of them nine seconds apart that
+        // outlives every timeout.
+        let mut empty = 0u32;
         loop {
             if hs_buf.len() >= 4 {
                 let len =
@@ -755,6 +852,12 @@ impl TlsStream {
                 }
             }
             let (ctype, body) = self.read_record()?;
+            if body.is_empty() || ctype == CT_CHANGE_CIPHER_SPEC {
+                empty += 1;
+                if empty > MAX_EMPTY_HANDSHAKE_RECORDS {
+                    return Err(err("too many handshake records carrying nothing"));
+                }
+            }
             match ctype {
                 CT_HANDSHAKE => {
                     if hs_buf.len() + body.len() > MAX_HANDSHAKE_MESSAGE + 4 {
@@ -875,12 +978,11 @@ impl TlsStream {
         // the certificate flight is skipped. Anything short of that -- no
         // offer, another node's ticket, a stale one -- is a full handshake,
         // for which the client has to accept our signature.
-        let tkey: Secret<32> = ticket_key(key, client_anchors.is_some(), ticket_day());
-        let psk: Option<[u8; 32]> = match &hello.psk {
+        let tkey: Secret<32> = ticket_key(key, client_anchors, ticket_day());
+        let psk: Option<Secret<32>> = match &hello.psk {
             Some(offer) if hello.psk_dhe => {
                 match open_ticket(&tkey, &offer.identity).or_else(|| {
-                    let yesterday =
-                        ticket_key(key, client_anchors.is_some(), ticket_day().saturating_sub(1));
+                    let yesterday = ticket_key(key, client_anchors, ticket_day().saturating_sub(1));
                     open_ticket(&yesterday, &offer.identity)
                 }) {
                     // A ticket this side sealed while asking for a client
@@ -889,6 +991,8 @@ impl TlsStream {
                     // said, since a resumed connection shows no certificate.
                     Some((_, None)) if client_anchors.is_some() => None,
                     Some((psk, names)) => {
+                        self.peer_expiry = names.as_ref().map(|n| n.1);
+                        let names = names.map(|n| n.0);
                         let truncated = sha256(&transcript[..ch_start + 4 + offer.binders_at]);
                         if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
                             return Err(err("the PSK binder does not verify"));
@@ -911,7 +1015,7 @@ impl TlsStream {
         let eph: Secret<32> = (random::array32().map_err(|e| err(e.to_string()))?).into();
         let our_share = x25519::public_key(&eph);
         let shared: Secret<32> = x25519::x25519(&eph, &client_share);
-        if *shared == [0u8; 32] {
+        if super::ct_eq(&shared[..], &[0u8; 32]) {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
         let server_random = random::array32().map_err(|e| err(e.to_string()))?;
@@ -919,8 +1023,13 @@ impl TlsStream {
         let mut sh = Vec::new();
         sh.extend_from_slice(&LEGACY_VERSION.to_be_bytes());
         sh.extend_from_slice(&server_random);
-        sh.push(hello.session_id.len() as u8);
-        sh.extend_from_slice(&hello.session_id);
+        if self.sh_wrong_session {
+            sh.push(32);
+            sh.extend_from_slice(&[0x24; 32]);
+        } else {
+            sh.push(hello.session_id.len() as u8);
+            sh.extend_from_slice(&hello.session_id);
+        }
         sh.extend_from_slice(&SUITE_CHACHA.to_be_bytes());
         sh.push(0);
         let mut exts = Vec::new();
@@ -1027,6 +1136,7 @@ impl TlsStream {
         // transcript so far. A peer with nothing to show is refused here,
         // before the token. Its Finished then covers those messages too.
         let mut th_fin = th_server_fin;
+        let mut client_not_after: Option<i64> = None;
         let (mut ty, mut body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         if let (Some(anchors), true) = (client_anchors, psk.is_none()) {
             if ty != HS_CERTIFICATE {
@@ -1057,6 +1167,7 @@ impl TlsStream {
                 names.push(text);
             }
             self.peer_names = Some(names);
+            client_not_after = Some(chain[0].not_after);
             let th_before_cv = sha256(&transcript);
             (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
             if ty != HS_CERTIFICATE_VERIFY {
@@ -1091,9 +1202,16 @@ impl TlsStream {
             random::bytes(4).map_err(|e| err(e.to_string()))?.try_into().expect("four bytes"),
         );
         // The names of the client's certificate ride in the ticket when
-        // this side asked for one, so a resumed connection keeps them.
-        let names = if client_anchors.is_some() { self.peer_names.as_deref() } else { None };
-        let ticket = seal_ticket(&tkey, &psk_next, now_secs(), age_add, names)?;
+        // this side asked for one, so a resumed connection keeps them, and
+        // its expiry, so it does not resume past it. On a resumed
+        // handshake they are the ticket's, carried on; the expiry too.
+        let client = if client_anchors.is_some() {
+            let not_after = client_not_after.or(self.peer_expiry).unwrap_or(0);
+            self.peer_names.as_deref().map(|n| (n, not_after))
+        } else {
+            None
+        };
+        let ticket = seal_ticket(&tkey, &psk_next, now_secs(), age_add, client)?;
         let mut nst = Vec::with_capacity(ticket.len() + 16);
         nst.extend_from_slice(&(TICKET_LIFETIME_SECS as u32).to_be_bytes());
         nst.extend_from_slice(&age_add.to_be_bytes());
@@ -1205,7 +1323,7 @@ impl TlsStream {
                 // the offer last, its binder computed over everything
                 // before it.
                 extension(&mut exts, EXT_PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
-                let age_ms = (now - t.received).saturating_mul(1000) as u32;
+                let age_ms = now.saturating_sub(t.received).saturating_mul(1000) as u32;
                 let obfuscated = age_ms.wrapping_add(t.age_add);
                 let mut psk = Vec::new();
                 let mut identities = Vec::new();
@@ -1238,6 +1356,10 @@ impl TlsStream {
             ch
         };
         let first_share = if self.omit_first_share { None } else { Some(&our_share) };
+        for _ in 0..self.trickle_ccs.0 {
+            self.write_record(CT_CHANGE_CIPHER_SPEC, &[1])?;
+            std::thread::sleep(std::time::Duration::from_millis(self.trickle_ccs.1));
+        }
         if self.oversized_hello > 0 {
             // A handshake message that declares more than the cap, its
             // first fragments only: the server refuses on the header.
@@ -1321,6 +1443,9 @@ impl TlsStream {
             (None, _) => None,
         };
         self.resumed = psk.is_some();
+        if sh.session_id != session_id {
+            return Err(err("the ServerHello does not echo this side's session id"));
+        }
         if sh.version != Some(VERSION_13) {
             return Err(err("the server did not select TLS 1.3"));
         }
@@ -1331,7 +1456,7 @@ impl TlsStream {
             return Err(err("the server sent no X25519 key share"));
         };
         let shared: Secret<32> = x25519::x25519(&eph, &server_share);
-        if *shared == [0u8; 32] {
+        if super::ct_eq(&shared[..], &[0u8; 32]) {
             return Err(err("the key share is a low-order point: the shared secret would be zero"));
         }
         let early: Secret<32> =
@@ -1465,6 +1590,9 @@ impl TlsStream {
         self.write_secret = Some(c_ap);
         let th_client_fin = sha256(&transcript);
         self.res_master = Some(derive_secret(&master, "res master", &th_client_fin));
+        if let Some(junk) = self.post_handshake_junk.take() {
+            self.write_record(CT_HANDSHAKE, &junk)?;
+        }
         Ok(())
     }
 
@@ -1652,7 +1780,9 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let suites_bytes = r.vec16()?;
     let suites: Vec<u16> =
         suites_bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-    let _compression = r.vec8()?;
+    if r.vec8()? != [0] {
+        return Err(err("a ClientHello offering compression (TLS 1.3 has none)"));
+    }
     let mut versions = Vec::new();
     let mut sig_algs = Vec::new();
     let mut x25519_share = None;
@@ -1662,9 +1792,18 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let mut psk_dhe = false;
     if !r.done() {
         let exts = r.vec16()?;
+        if !r.done() {
+            return Err(err("bytes after the ClientHello's extensions"));
+        }
         let mut e = Reader::new(exts);
+        let mut seen: Vec<u16> = Vec::new();
         while !e.done() {
             let ty = e.u16()?;
+            // RFC 8446 §4.2: an extension type once per message.
+            if seen.contains(&ty) {
+                return Err(err("an extension given twice in the ClientHello"));
+            }
+            seen.push(ty);
             let data = e.vec16()?;
             let last = e.done();
             let mut d = Reader::new(data);
@@ -1758,7 +1897,9 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
     let retry = random == HRR_RANDOM;
     let session_id = r.vec8()?.to_vec();
     let suite = r.u16()?;
-    let _compression = r.u8()?;
+    if r.u8()? != 0 {
+        return Err(err("a ServerHello naming compression (TLS 1.3 has none)"));
+    }
     let mut version = None;
     let mut x25519_share = None;
     let mut selected_psk = None;
@@ -1766,9 +1907,17 @@ fn parse_server_hello(body: &[u8]) -> io::Result<ServerHello> {
     let mut cookie = None;
     if !r.done() {
         let exts = r.vec16()?;
+        if !r.done() {
+            return Err(err("bytes after the ServerHello's extensions"));
+        }
         let mut e = Reader::new(exts);
+        let mut seen: Vec<u16> = Vec::new();
         while !e.done() {
             let ty = e.u16()?;
+            if seen.contains(&ty) {
+                return Err(err("an extension given twice in the ServerHello"));
+            }
+            seen.push(ty);
             let data = e.vec16()?;
             let mut d = Reader::new(data);
             match ty {
@@ -1836,14 +1985,11 @@ impl Read for TlsStream {
             if self.closed {
                 return Ok(0);
             }
-            let (ctype, body) = match self.read_record() {
-                Ok(r) => r,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    self.closed = true;
-                    return Ok(0);
-                }
-                Err(e) => return Err(e),
-            };
+            // A stream that ends between records without a close_notify
+            // was cut, not closed: the error stands (until 0.87.0 it read
+            // as the end, and an HTTP body framed by the close was cut
+            // short in silence).
+            let (ctype, body) = self.read_record()?;
             match ctype {
                 CT_APPLICATION_DATA => {
                     self.pending = body;
@@ -1868,13 +2014,17 @@ impl Read for TlsStream {
                             return Err(err("a torn post-handshake message"));
                         };
                         match body[i] {
+                            HS_NEW_SESSION_TICKET if self.server => {
+                                return Err(err("a NewSessionTicket sent to a server"))
+                            }
                             HS_NEW_SESSION_TICKET => self.take_ticket(msg)?,
                             HS_KEY_UPDATE => {
                                 // The peer's next generation of keys, and
-                                // ours if it asked (RFC 8446 §4.6.3).
-                                match msg.first().copied() {
-                                    Some(0) => self.next_read_keys()?,
-                                    Some(1) => {
+                                // ours if it asked (RFC 8446 §4.6.3): the
+                                // one byte, and nothing after it.
+                                match (msg.len(), msg.first().copied()) {
+                                    (1, Some(0)) => self.next_read_keys()?,
+                                    (1, Some(1)) => {
                                         self.next_read_keys()?;
                                         self.update_keys(false)?;
                                     }
@@ -1959,7 +2109,7 @@ mod tests {
         cert.extend_from_slice(&list);
         let key =
             KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
-        let tkey = ticket_key(&key, false, ticket_day());
+        let tkey = ticket_key(&key, None, ticket_day());
         let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7, None).unwrap();
         let mut nst = Vec::new();
         nst.extend_from_slice(&86_400u32.to_be_bytes());
@@ -2119,6 +2269,16 @@ mod tests {
         client_hooks: impl FnOnce(&mut TlsStream),
         server_hooks: impl FnOnce(&mut TlsStream) + Send + 'static,
     ) -> (io::Result<()>, io::Result<()>) {
+        let (c, s, _) = hooked_read(client_hooks, server_hooks);
+        (c, s)
+    }
+
+    /// `hooked`, with what the server's first read after its handshake
+    /// said: what a hook that sends something after the handshake asks.
+    fn hooked_read(
+        client_hooks: impl FnOnce(&mut TlsStream),
+        server_hooks: impl FnOnce(&mut TlsStream) + Send + 'static,
+    ) -> (io::Result<()>, io::Result<()>, io::Result<usize>) {
         let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
         let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
         let key =
@@ -2138,11 +2298,13 @@ mod tests {
             );
             server_hooks(&mut s);
             let r = s.handshake();
-            if r.is_ok() {
+            let read = if r.is_ok() {
                 let mut buf = [0u8; 8];
-                let _ = s.read(&mut buf);
-            }
-            r
+                s.read(&mut buf)
+            } else {
+                Ok(0)
+            };
+            (r, read)
         });
         let sock = TcpStream::connect(addr).unwrap();
         sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
@@ -2161,7 +2323,142 @@ mod tests {
             let _ = c.write_all(b"hi");
         }
         let _ = c.close_notify();
-        (r, server.join().unwrap())
+        let (s, read) = server.join().unwrap();
+        (r, s, read)
+    }
+
+    /// The handshake ends in bounded time whatever the peer sends: a peer
+    /// trickling ChangeCipherSpecs is cut off by the cap on records that
+    /// carry nothing, and one trickling slowly by the clock -- so a
+    /// connection thread is never held for good by a handshake that never
+    /// finishes. And the ServerHello, like the retry, echoes the session id.
+    #[test]
+    fn a_handshake_that_trickles_or_never_ends_is_cut_off() {
+        let (c, s) = hooked(|c| c.trickle_ccs = (6, 0), |_| {});
+        let e = s.expect_err("six records carrying nothing").to_string();
+        assert!(e.contains("carrying nothing"), "{e}");
+        assert!(c.is_err());
+        let (c, s) = hooked(
+            |c| c.trickle_ccs = (3, 250),
+            |s| s.handshake_limit = std::time::Duration::from_millis(300),
+        );
+        let e = s.expect_err("a handshake past its limit").to_string();
+        assert!(e.contains("took longer"), "{e}");
+        assert!(c.is_err());
+        let (c, s) = hooked(|_| {}, |s| s.sh_wrong_session = true);
+        let e = c.expect_err("a ServerHello echoing another session id").to_string();
+        assert!(e.contains("does not echo"), "{e}");
+        assert!(s.is_err());
+    }
+
+    /// After the handshake, a server refuses a NewSessionTicket (only a
+    /// server sends one) and either side a KeyUpdate that is not its one
+    /// byte; the connection ends there, not in a guess.
+    #[test]
+    fn a_ticket_sent_to_a_server_and_a_malformed_key_update_are_refused() {
+        let (c, s, read) = hooked_read(
+            |c| c.post_handshake_junk = Some(vec![HS_NEW_SESSION_TICKET, 0, 0, 1, 0]),
+            |_| {},
+        );
+        assert!(c.is_ok() && s.is_ok(), "{c:?} {s:?}");
+        let e = read.expect_err("a ticket sent to a server").to_string();
+        assert!(e.contains("sent to a server"), "{e}");
+        let (_, _, read) = hooked_read(
+            |c| c.post_handshake_junk = Some(vec![HS_KEY_UPDATE, 0, 0, 2, 0, 0]),
+            |_| {},
+        );
+        let e = read.expect_err("a KeyUpdate of two bytes").to_string();
+        assert!(e.contains("malformed KeyUpdate"), "{e}");
+        // (A KeyUpdate of its one byte is taken: the tests of KeyUpdate
+        // both ways send one through `update_keys`, keys and all.)
+    }
+
+    /// A stream that ends between records without a close_notify was cut,
+    /// not closed: the reader hears an error, with what came before it
+    /// intact, and a close_notify is the end it hears as an end. What
+    /// keeps a body framed by the close from being cut short in silence.
+    #[test]
+    fn a_stream_cut_without_a_close_notify_is_an_error_not_an_end() {
+        for notify in [false, true] {
+            let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+            let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+            let key = KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+            let anchor =
+                x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                );
+                s.write_all(b"the whole answer").unwrap();
+                if notify {
+                    s.close_notify().unwrap();
+                }
+                // Dropped: the socket closes, with or without the alert.
+            });
+            let sock = TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: None,
+                    key: None,
+                },
+            );
+            let mut got = Vec::new();
+            let r = c.read_to_end(&mut got);
+            assert_eq!(got, b"the whole answer", "what came before the end is intact");
+            if notify {
+                r.expect("a close_notify is the end");
+            } else {
+                let e = r.expect_err("a cut is not the end");
+                assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+            }
+            server.join().unwrap();
+        }
+    }
+
+    /// A ticket carries the client certificate's expiry and does not open
+    /// past it; its key takes the anchors in, so a change of CA is a
+    /// change of key; its format byte is under the seal, so another
+    /// format's ticket is not opened as this one.
+    #[test]
+    fn a_ticket_expires_with_the_certificate_and_changes_key_with_the_anchors() {
+        let m = x509::make("a", &[], &[], 30).unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let ca_a = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let other = x509::make("b", &[], &[], 30).unwrap();
+        let ca_b =
+            x509::parse(&pem::decode_all(&other.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let day = ticket_day();
+        let plain = ticket_key(&key, None, day);
+        let under_a = ticket_key(&key, Some(std::slice::from_ref(&ca_a)), day);
+        let under_b = ticket_key(&key, Some(std::slice::from_ref(&ca_b)), day);
+        assert!(!plain.ct_eq(&under_a) && !under_a.ct_eq(&under_b));
+        let now = now_secs();
+        let names = vec!["node-1".to_string()];
+        let live =
+            seal_ticket(&under_a, &[9u8; 32], now, 7, Some((&names, now as i64 + 3600))).unwrap();
+        let (psk, client) = open_ticket(&under_a, &live).expect("a live ticket opens");
+        assert_eq!(*psk, [9u8; 32]);
+        assert_eq!(client, Some((names.clone(), now as i64 + 3600)));
+        assert!(open_ticket(&under_b, &live).is_none(), "another CA is another key");
+        let expired =
+            seal_ticket(&under_a, &[9u8; 32], now, 7, Some((&names, now as i64 - 1))).unwrap();
+        assert!(open_ticket(&under_a, &expired).is_none(), "past the certificate's expiry");
+        let bare = seal_ticket(&plain, &[8u8; 32], now, 7, None).unwrap();
+        assert_eq!(open_ticket(&plain, &bare).map(|(_, c)| c), Some(None));
+        let mut relabelled = bare.clone();
+        relabelled[0] = 2;
+        assert!(open_ticket(&plain, &relabelled).is_none(), "the format byte is under the seal");
     }
 
     /// The four tightenings of 0.85.0, each a refusal where the transcript

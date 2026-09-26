@@ -6,10 +6,11 @@
 use super::fe25519::Fe;
 use super::sc25519;
 use super::sha2::sha512;
+use crate::cipher::wipe;
 
 /// A point in extended coordinates `(X : Y : Z : T)` with `x = X/Z`,
 /// `y = Y/Z`, `xy = T/Z`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct Point {
     x: Fe,
     y: Fe,
@@ -124,8 +125,12 @@ fn decode(b: &[u8; 32]) -> Option<Point> {
 }
 
 /// The expanded secret: the clamped scalar and the nonce prefix.
+/// The expanded secret: the clamped scalar and the nonce prefix. Both are
+/// the seed's, and every copy made on the way to them and from them is
+/// wiped: the scalar signs, the prefix makes every nonce, and a nonce
+/// recovered from a core dump gives the scalar back from any signature.
 fn expand(seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let h = sha512(seed);
+    let mut h = sha512(seed);
     let mut a = [0u8; 32];
     a.copy_from_slice(&h[..32]);
     a[0] &= 248;
@@ -133,30 +138,44 @@ fn expand(seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     a[31] |= 64;
     let mut prefix = [0u8; 32];
     prefix.copy_from_slice(&h[32..]);
+    wipe(&mut h);
     (a, prefix)
 }
 
 /// The public key of a 32-byte seed.
 pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
-    let (a, _) = expand(seed);
-    base().mul(&a).encode()
+    let (mut a, mut prefix) = expand(seed);
+    let pk = base().mul(&a).encode();
+    wipe(&mut a);
+    wipe(&mut prefix);
+    pk
 }
 
 /// A signature over `msg` by `seed`.
 pub fn sign(seed: &[u8; 32], msg: &[u8]) -> [u8; 64] {
-    let (a, prefix) = expand(seed);
+    let (mut a, mut prefix) = expand(seed);
     let pk = base().mul(&a).encode();
     let mut rm = Vec::with_capacity(32 + msg.len());
     rm.extend_from_slice(&prefix);
     rm.extend_from_slice(msg);
-    let r = sc25519::reduce_512(&sha512(&rm));
-    let rb = base().mul(&sc25519::to_bytes(&r)).encode();
+    let mut rh = sha512(&rm);
+    wipe(&mut rm);
+    let mut r = sc25519::reduce_512(&rh);
+    wipe(&mut rh);
+    let mut r_bytes = sc25519::to_bytes(&r);
+    let rb = base().mul(&r_bytes).encode();
+    wipe(&mut r_bytes);
     let mut km = Vec::with_capacity(64 + msg.len());
     km.extend_from_slice(&rb);
     km.extend_from_slice(&pk);
     km.extend_from_slice(msg);
     let k = sc25519::reduce_512(&sha512(&km));
-    let s = sc25519::muladd(&k, &sc25519::reduce_256(&a), &r);
+    let mut a_scalar = sc25519::reduce_256(&a);
+    let s = sc25519::muladd(&k, &a_scalar, &r);
+    sc25519::wipe(&mut a_scalar);
+    sc25519::wipe(&mut r);
+    wipe(&mut a);
+    wipe(&mut prefix);
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&rb);
     sig[32..].copy_from_slice(&sc25519::to_bytes(&s));

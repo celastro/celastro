@@ -1972,7 +1972,18 @@ ClientHello that is not the first but for what the retry asked, a
 `pre_shared_key` extension not last, a ChangeCipherSpec of another byte,
 a handshake message past 256 KiB (refused on its header), and on the
 client a retry that does not echo the session id or names another suite
-or version (H5's F9); HelloRetryRequest
+or version (H5's F9); and since 0.87.0 (H8) a stream that ends between
+records without a close_notify is an error to its reader, never a quiet
+end -- until then an HTTPS body framed by the close could be cut short
+by anyone who could cut the TCP stream -- a handshake ends within thirty
+seconds and four records carrying nothing per message whatever the
+socket's timeout per read, a ServerHello echoes the session id as the
+retry must, a hello with an extension twice or bytes after its
+extensions is refused, a NewSessionTicket sent to a server and a
+KeyUpdate of more than its byte are refused, and a ticket (format 3,
+its format byte under its seal) carries the client certificate's
+expiry and is keyed by the anchors as well as the day, so it resumes
+past neither the certificate nor a change of CA; HelloRetryRequest
 from 0.66.0, for a client whose first share is of another group. A
 handshake that failed leaves the stream dead, every later read or write of
 it an error (0.83.0): before that a failure left the stream without keys
@@ -1982,7 +1993,18 @@ handed the next frame in the clear -- a token holder could bypass the
 client-certificate requirement and the encryption by waiting half a
 second; the wire now runs the handshake before its first read, under a
 timeout of its own. An RSA exponent past 32 bits and a chain past eight
-certificates are refused before any signature is checked (0.83.0): a
+certificates are refused before any signature is checked (0.83.0), and
+since 0.87.0 a validity time is digits and a `Z` checked byte by byte
+before it is sliced (a multibyte character passed the UTF-8 check and
+the slice through it was a panic -- with `panic = "abort"`, the process
+-- from any certificate a peer presented, before verification: H8's one
+high), an RSA exponent is odd and at least 3, an extension given twice
+and a BOOLEAN that is not `0x00` or `0xff` are refused, an address
+literal matches the certificate's addresses only and a wildcard one
+whole non-empty label, a DER length with a leading zero is not minimal,
+RSA-PSS checks the byte it drops on a modulus one bit past a byte
+boundary, and a system root self-signed with an algorithm this build
+does not verify still anchors a chain (its own signature never is): a
 verification costs a multiplication per exponent bit and a chain a
 verification per link, both the peer's to choose, and neither is seen
 before the token is. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
@@ -2061,14 +2083,27 @@ boundary was a rollback nothing detected. A log written before has no
 header and is read as it was written; a live one is continued as it was
 until it is rotated or truncated, when the fresh file gets a header. The
 data key is per database, drawn at the first open of an empty directory
-and kept in `KEY` wrapped under the master (`CELK1 | nonce | ciphertext
-| tag` for one key; a ring of several as `CELK3 | count | entries`, each
-entry's AAD carrying its index and the count, so an entry cannot be
-moved to the current slot or a retired key spliced back from an old copy
-of the file (H5's F4); a `CELK2` ring from before reads as it was
-written); per-file keys are HKDF of it and the identity; the master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes
-or 64 hex digits, or `CELASTRO_MASTER_KEY`) is never written, and `key
-rekey` rewraps `KEY` under a new one without touching a data file. A
+and kept in `KEY` wrapped under the master as a `CELK3 | count |
+entries` ring -- of one entry for one key, since 0.87.0 -- each entry's
+AAD carrying its index and the count, so an entry cannot be moved to
+the current slot or a retired key spliced back from an old copy of the
+file (H5's F4), nor two old one-key files composed into a ring that
+names a retired key current (H8); a `CELK1` or `CELK2` file from before
+reads as it was written and is rewritten as `CELK3` at the next open.
+What no format closes: whoever can write `KEY` can put an old copy of it
+back whole, and the ring with it -- the rotation's guarantee is against
+a key that leaked, not against a hand on the volume. Per-file keys are
+HKDF of the data key and the identity; a log's records go under a key
+per log, HKDF of the data key, the identity and the log's id (0.87.0,
+`CWL2`): a segment's frames are 64 KiB and a file's nonces number in
+the thousands, but a log is a frame per record and a shard's log --
+through every rotation and truncation -- lives as long as the data key,
+so under one key a shard at twenty thousand records a second would have
+reached the random-nonce bound (2^32, RFC 8439's) in days (H8). The
+master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes or 64 hex digits, or
+`CELASTRO_MASTER_KEY`, which the node removes from its environment once
+read, as it does the tokens) is never written, and `key rekey` rewraps
+`KEY` under a new one without touching a data file. A
 directory with `KEY` and no master is refused, and so is a plain
 directory with data offered a master: encrypting in place would be a
 rewrite of every file behind a running database's back, and the export
@@ -2086,13 +2121,15 @@ opened on the way in.
 
 **The identity's rollback window.** The files 0.84.1 writes do not open
 under 0.83.0 -- another identity, a header in each log, a `CELK3` ring
--- so a node rolled back after its first write refuses its directory,
-as it does across a raised catalog format. `CELASTRO_SEAL_IDENTITY=1`
-pins the writes to what 0.83.0 reads (reads are always both), for the
-first days on the release; lifted, new files go under the current
-identity and a `celastro key rotate` re-seals the old ones. What the pin
-costs is the three substitutions the identity closes, for as long as it
-is set.
+-- and the logs 0.87.0 writes do not open under 0.86.0 -- a key per
+log -- so a node rolled back after its first write refuses its
+directory, as it does across a raised catalog format.
+`CELASTRO_SEAL_IDENTITY=1` pins the writes to what 0.83.0 reads and `2`
+to what 0.86.0 reads (reads are always every form), for the first days
+on the release; lifted, new files go under the current form and a
+`celastro key rotate` re-seals the old ones. What `1` costs is the three
+substitutions the identity closes, and `2` the bound on a busy shard's
+log, for as long as it is set.
 
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
@@ -2752,6 +2789,21 @@ guarantee:
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
 | `SHOW HEALTH` dials every peer at once: two peers that accept and never answer cost one statement deadline between them, and each line says how long its dial was waited on | `wire::show_health_dials_every_peer_at_once_and_a_hanging_peer_costs_one_deadline` |
+| a validity time of anything but digits and a `Z` is refused, not sliced into a panic; a month past twelve is refused | `x509::tests::a_validity_time_of_anything_but_digits_is_refused_not_a_crash` |
+| an extension given twice and a BER BOOLEAN are refused | `x509::tests::a_repeated_extension_and_a_ber_boolean_are_refused` |
+| an address literal matches iPAddress only; a wildcard one whole non-empty label | `x509::tests::an_address_literal_and_a_wildcard_match_what_rfc_6125_says` |
+| an anchor self-signed with an unknown algorithm still anchors; a leaf of it is refused by name | `x509::tests::an_anchor_signed_with_an_unknown_algorithm_still_anchors` |
+| an RSA exponent under 3 or even is refused | `x509::tests::a_wide_exponent_and_a_long_chain_are_refused_before_they_are_verified` |
+| RSA-PSS on a modulus one bit past a byte boundary checks the byte it drops | `rsa::tests::a_pss_encoding_under_a_nonzero_leading_byte_is_refused` |
+| PKCS#1 v1.5 against every Wycheproof vector (BER paddings, a missing NULL, short padding, wrong lengths) | `wycheproof::rsa_pkcs1_agrees_with_wycheproof_on_every_vector` |
+| a TLS stream cut without a close_notify is an error, with what came before intact; a close_notify is the end | `tls13::tests::a_stream_cut_without_a_close_notify_is_an_error_not_an_end` |
+| a handshake trickling ChangeCipherSpecs is cut off by the record cap, a slow one by the clock; a ServerHello echoes the session id | `tls13::tests::a_handshake_that_trickles_or_never_ends_is_cut_off` |
+| a NewSessionTicket sent to a server and a KeyUpdate of two bytes are refused | `tls13::tests::a_ticket_sent_to_a_server_and_a_malformed_key_update_are_refused` |
+| a ticket expires with the client certificate, changes key with the anchors, and its format byte is under the seal | `tls13::tests::a_ticket_expires_with_the_certificate_and_changes_key_with_the_anchors` |
+| a log's records are under a key per log; a record under the file's key does not open in it; an older log reads and is appended to in its kind | `cipher::tests::a_logs_records_are_under_a_key_of_their_own_and_an_older_log_still_reads` |
+| a header-only log and a rotated log pass the check and the rotation | `cipher::tests::a_header_only_log_and_a_rotated_log_pass_the_check_and_the_rotation` |
+| an object of exactly one frame is opened as its own last frame | `cipher::tests::an_object_of_exactly_one_frame_is_opened_as_what_it_is` |
+| one key wraps as a `CELK3` ring of one; `CELK1`/`CELK2` still read and are marked for rewriting | `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

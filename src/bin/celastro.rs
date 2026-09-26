@@ -945,6 +945,21 @@ fn health(port: u16, attached: Option<u64>, tls: Option<&Arc<Tls>>, json: bool) 
     }
 }
 
+/// The secrets the environment carried, removed from it: read once at
+/// start into the process, they have no business in the environment a
+/// child inherits or `/proc` shows.
+fn forget_secrets() {
+    for v in [
+        "CELASTRO_MASTER_KEY",
+        celastro::serve::TOKEN_ENV,
+        celastro::serve::SCOPED_TOKENS_ENV,
+        celastro::wire::TOKEN_ENV,
+        celastro::wire::TOKEN_ALSO_ENV,
+    ] {
+        std::env::remove_var(v);
+    }
+}
+
 fn serve(
     db: &mut Db,
     port: u16,
@@ -1051,6 +1066,15 @@ fn serve(
              stop the server when you are done."
         );
     }
+    // Everything that reads a secret from the environment has read it by
+    // now -- the master key at open, the console's token and the scoped
+    // ones above, the wire's here -- so they are forgotten before the
+    // browser below or anything else this process starts could inherit
+    // them, and `/proc/<pid>/environ` shows none. (The bucket credentials
+    // stay: `BACKUP TO s3://` reads them at the statement.)
+    let wire_token = celastro::wire::token_from_env();
+    let wire_also = celastro::wire::token_also_from_env();
+    forget_secrets();
     if open {
         // Not fatal: the URL is already printed, so a desktop without an opener
         // costs a copy and paste rather than the session.
@@ -1066,7 +1090,7 @@ fn serve(
     let shared = Arc::new(RwLock::new(std::mem::replace(db, Db::in_memory())));
     let stop = Arc::new(AtomicBool::new(false));
     if let Some(bind) = shard_bind {
-        let Some(token) = celastro::wire::token_from_env() else {
+        let Some(token) = wire_token else {
             return fail(
                 json,
                 &format!("--shard-bind needs {} in the environment", celastro::wire::TOKEN_ENV),
@@ -1088,7 +1112,9 @@ fn serve(
         );
         let (wire_db, wire_stop, wire_tls) = (shared.clone(), stop.clone(), tls.clone());
         std::thread::spawn(move || {
-            if let Err(e) = celastro::wire::serve(listener, wire_db, token, wire_stop, wire_tls) {
+            if let Err(e) = celastro::wire::serve_with_also(
+                listener, wire_db, token, wire_also, wire_stop, wire_tls,
+            ) {
                 eprintln!("celastro: the wire stopped: {e}");
             }
         });
@@ -2790,10 +2816,13 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     if let Some(v) = var("CELASTRO_SEAL_IDENTITY") {
         match v.trim() {
             "1" | "legacy" => celastro::cipher::pin_legacy_writes(true),
-            "2" | "current" | "" => {}
+            // What 0.86.0 reads: a log's records under the file's key.
+            "2" => celastro::cipher::pin_file_keyed_logs(true),
+            "3" | "current" | "" => {}
             other => {
                 return Err(format!(
-                    "CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy) or 2 (current)"
+                    "CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy), 2 (what 0.86.0 reads) \
+                     or 3 (current)"
                 ))
             }
         }

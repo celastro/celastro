@@ -9,9 +9,10 @@
 //! What "constant-time" means here, stated once: nothing branches on, or
 //! indexes memory by, a secret. Field and scalar arithmetic run the same
 //! instructions whatever the values; a conditional on a secret bit is a
-//! mask; comparisons of secrets fold every byte before deciding. The
-//! compiler is not asked to keep that promise — there is no `black_box` in
-//! the MSRV's `std` — so the code keeps it by having no branch to remove.
+//! mask; comparisons of secrets fold every byte before deciding. The code
+//! keeps that promise by having no branch to remove, and where a fold or
+//! a mask ends in a value the compiler could turn back into a branch, the
+//! value passes through `std::hint::black_box` first.
 //!
 //! This is unaudited. It is here because the crate carries no dependency,
 //! by decision, and the README says so.

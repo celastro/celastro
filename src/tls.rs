@@ -19,7 +19,8 @@ use crate::error::{Error, Result};
 
 /// The node's certificate chain, PEM, leaf first.
 pub const CERT_ENV: &str = "CELASTRO_TLS_CERT";
-/// The node's private key, PEM (PKCS#8, PKCS#1 or SEC1).
+/// The node's private key, PEM: a `PRIVATE KEY` block holding an Ed25519
+/// key in PKCS#8, as `celastro tls init`, openssl and cert-manager write it.
 pub const KEY_ENV: &str = "CELASTRO_TLS_KEY";
 /// The CA every node's certificate chains to, PEM; what a peer is verified
 /// against.
@@ -169,7 +170,7 @@ impl Tls {
         let read = |what: &str, path: &str| -> Result<String> {
             std::fs::read_to_string(path).map_err(|e| read_err(what, path, e))
         };
-        let (cert_text, key_text, ca_text) =
+        let (cert_text, mut key_text, ca_text) =
             (read("certificate", &cert)?, read("key", &key)?, read("CA", &ca)?);
         let client_auth = match std::env::var(CLIENT_AUTH_ENV).ok().filter(|v| !v.is_empty()) {
             None => false,
@@ -183,8 +184,11 @@ impl Tls {
                 }
             },
         };
-        Tls::from_texts((&cert, &cert_text), (&key, &key_text), (&ca, &ca_text), client_auth)
-            .map(Some)
+        let tls =
+            Tls::from_texts((&cert, &cert_text), (&key, &key_text), (&ca, &ca_text), client_auth);
+        // The key file's text is a copy of the seed too.
+        crate::cipher::wipe_string(&mut key_text);
+        tls.map(Some)
     }
 
     /// The material as text, each with the name its errors carry (a file's
@@ -204,12 +208,26 @@ impl Tls {
             return Err(read_err("certificate", cert, "no certificate in the file"));
         }
         let leaf = x509::parse(&chain_der[0]).map_err(|e| read_err("certificate", cert, e))?;
-        let key_der =
+        let mut key_der =
             pem::decode_all(key_text, "PRIVATE KEY").map_err(|e| read_err("key", key, e))?;
-        let Some(key_der) = key_der.first() else {
-            return Err(read_err("key", key, "no PRIVATE KEY block (PKCS#8) in the file"));
+        let Some(key_der_first) = key_der.first() else {
+            let what = if key_text.contains("ENCRYPTED PRIVATE KEY") {
+                "an encrypted private key, which this build does not read: decrypt it first"
+            } else if key_text.contains("RSA PRIVATE KEY") || key_text.contains("EC PRIVATE KEY") {
+                "an RSA or EC key; the node's key must be Ed25519, in a PKCS#8 PRIVATE KEY block"
+            } else {
+                "no PRIVATE KEY block (PKCS#8) in the file"
+            };
+            return Err(read_err("key", key, what));
         };
-        let pair = x509::KeyPair::from_pkcs8_der(key_der).map_err(|e| read_err("key", key, e))?;
+        let pair =
+            x509::KeyPair::from_pkcs8_der(key_der_first).map_err(|e| read_err("key", key, e));
+        // The seed came through the PEM text and its DER: both copies
+        // wiped before they are freed, whatever the parse said.
+        for d in key_der.iter_mut() {
+            crate::cipher::wipe(d);
+        }
+        let pair = pair?;
         if leaf.ed25519_key() != Some(&pair.public) {
             return Err(Error::Plan(
                 "the TLS certificate and key do not go together: the certificate's key must be the \
@@ -219,7 +237,7 @@ impl Tls {
         }
         let mut anchors = Vec::new();
         for der in pem::decode_all(ca_text, "CERTIFICATE").map_err(|e| read_err("CA", ca, e))? {
-            anchors.push(x509::parse(&der).map_err(|e| read_err("CA", ca, e))?);
+            anchors.push(x509::parse_anchor(&der).map_err(|e| read_err("CA", ca, e))?);
         }
         if anchors.is_empty() {
             return Err(read_err("CA", ca, "no certificate in the file"));
@@ -349,7 +367,7 @@ pub fn https_request(
     use crate::crypto::{pem, x509};
     let mut anchors = Vec::new();
     for der in pem::decode_all(ca_pem, "CERTIFICATE")? {
-        anchors.push(x509::parse(&der)?);
+        anchors.push(x509::parse_anchor(&der)?);
     }
     if anchors.is_empty() {
         return Err(Error::Plan("no certificate in the CA given".into()));

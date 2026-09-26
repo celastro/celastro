@@ -1362,7 +1362,7 @@ pub(crate) struct Wal {
     /// the current scheme; `None` for a log written before 0.84.1 (or with
     /// writes pinned), which goes on as it was until it is rotated or
     /// truncated.
-    log_id: Option<[u8; 16]>,
+    log_id: Option<crate::cipher::LogId>,
     records: u64,
 }
 
@@ -1616,6 +1616,13 @@ impl Wal {
             Some(c) => match read_optional(path)? {
                 Some(b) if !b.is_empty() => {
                     let log = c.open_log(&ids, &b);
+                    // A torn or foreign tail ends the replay; what would
+                    // be appended after it would be unreadable until the
+                    // next flush, so the tail is cut here and the log
+                    // goes on from what opened.
+                    if log.opened < b.len() {
+                        file.set_len(log.opened as u64)?;
+                    }
                     (log.records.len() as u64, log.log_id)
                 }
                 // A fresh log: its header first, under the current scheme.
@@ -4929,6 +4936,52 @@ mod tests {
             fs::write(&mutant, b).unwrap();
             let _ = Wal::replay(&mutant, &None, &"t/wal.log".into());
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Under a cipher a torn or foreign tail ends the replay; the log is
+    /// cut back to what opened before records are appended past it, so a
+    /// record acknowledged after a restart is not behind the tear -- and
+    /// lost at the next -- but where the next replay reads.
+    #[test]
+    fn a_record_appended_after_a_torn_tail_is_replayed() {
+        let dir = std::env::temp_dir().join(format!("celastro-torn-tail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let cipher: crate::cipher::Shared =
+            Some(Arc::new(crate::cipher::Cipher::with_previous([3u8; 32], Vec::new())));
+        let ids: crate::cipher::Ids = "t/wal.log".into();
+        let rec = |i: u64| WalRecord {
+            kind: 0,
+            key: format!("k{i}"),
+            ts: 100 + i,
+            doc: None,
+            supersedes: false,
+            segment_id: 0,
+        };
+        {
+            let mut w = Wal::open(&log, cipher.clone(), ids.clone()).unwrap();
+            w.append(&rec(0)).unwrap();
+            w.append(&rec(1)).unwrap();
+            w.sync().unwrap();
+        }
+        // A tear: the last record's tag with a byte flipped, and part of
+        // a frame after it.
+        let mut torn = fs::read(&log).unwrap();
+        let mid = torn.len() - 8;
+        torn[mid] ^= 0xff;
+        torn.extend_from_slice(&[0u8; 20]);
+        fs::write(&log, &torn).unwrap();
+        let before = Wal::replay(&log, &cipher, &ids).unwrap();
+        assert_eq!(before.len(), 1, "the replay ends at the tear");
+        {
+            let mut w = Wal::open(&log, cipher.clone(), ids.clone()).unwrap();
+            w.append(&rec(2)).unwrap();
+            w.sync().unwrap();
+        }
+        let after = Wal::replay(&log, &cipher, &ids).unwrap();
+        assert_eq!(after.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["k0", "k2"]);
         let _ = fs::remove_dir_all(&dir);
     }
     use super::*;

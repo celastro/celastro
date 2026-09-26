@@ -120,7 +120,7 @@ fn hkdf_sha256_agrees_with_wycheproof_on_every_vector() {
         let okm = unhex(text(&t, "okm"));
         if text(&t, "result") != "valid" {
             // The one invalid shape is a size past 255 blocks, which the
-            // expander refuses by returning short.
+            // expander refuses with a panic (`hkdf.rs`); it is not asked.
             assert!(size > 255 * 32, "{}", name(&t));
             continue;
         }
@@ -146,6 +146,36 @@ fn ecdsa_p256_agrees_with_wycheproof_on_every_vector() {
         checked += 1;
     }
     assert!(checked >= 450, "{checked} vectors");
+}
+
+/// PKCS#1 v1.5 over SHA-256 is what an X.509 chain another issuer signed
+/// carries: every vector, the BER paddings, the missing NULL, the short
+/// padding strings and the wrong-length signatures among them. The one
+/// vector marked acceptable is skipped, as its verdict is the library's.
+#[test]
+fn rsa_pkcs1_agrees_with_wycheproof_on_every_vector() {
+    use super::bignum::Big;
+    let (mut checked, mut skipped) = (0, 0);
+    for (g, t) in tests(include_str!("../../tests/wycheproof/rsa_signature_2048_sha256_test.json"))
+    {
+        let key = g.get("publicKey").unwrap();
+        let pk = rsa::PublicKey {
+            n: Big::from_be_bytes(&unhex(text(key, "modulus"))),
+            e: Big::from_be_bytes(&unhex(text(key, "publicExponent"))),
+        };
+        let msg = unhex(text(&t, "msg"));
+        let sig = unhex(text(&t, "sig"));
+        match text(&t, "result") {
+            "valid" => assert!(pk.verify_pkcs1_sha256(&msg, &sig), "{}", name(&t)),
+            "invalid" => assert!(!pk.verify_pkcs1_sha256(&msg, &sig), "{}", name(&t)),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 250 && skipped <= 2, "{checked} vectors, {skipped} skipped");
 }
 
 #[test]

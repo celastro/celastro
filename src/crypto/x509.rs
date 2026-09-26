@@ -56,10 +56,25 @@ pub enum SigAlg {
     Ed25519,
     RsaSha256,
     EcdsaSha256,
+    /// A trust anchor's, when it is not one of the three: never verified,
+    /// so never matched by `signed_by`.
+    Unverified,
 }
 
 fn bad(what: &str) -> Error {
     Error::Plan(format!("certificate: {what}"))
+}
+
+/// An optional DER BOOLEAN: absent is false, and present it is the one
+/// byte `0x00` or `0xff` (X.690 §11.1) -- any other value is BER, which
+/// a DER certificate does not carry, and validators disagree on.
+fn der_bool(flag: Option<&[u8]>) -> Result<bool> {
+    match flag {
+        None => Ok(false),
+        Some([0x00]) => Ok(false),
+        Some([0xff]) => Ok(true),
+        Some(_) => Err(bad("a BOOLEAN that is not 0x00 or 0xff")),
+    }
 }
 
 /// What a certificate says, as far as verification reads it.
@@ -87,8 +102,21 @@ pub struct Certificate {
     pub ext_key_usage: Option<ExtKeyUsage>,
 }
 
-/// Parse a DER certificate whose keys and signature are Ed25519.
+/// Parse a DER certificate: one whose signature this build can verify.
 pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
+    parse_as(der_bytes, false)
+}
+
+/// Parse a trust anchor. An anchor's own signature is never verified --
+/// it is trusted by being in the list -- so the algorithm it was signed
+/// with need not be one this build has: a system root self-signed with
+/// SHA-384 (most of them) still anchors a chain whose links are SHA-256.
+/// Its key must still be one this build verifies with.
+pub fn parse_anchor(der_bytes: &[u8]) -> Result<Certificate> {
+    parse_as(der_bytes, true)
+}
+
+fn parse_as(der_bytes: &[u8], anchor: bool) -> Result<Certificate> {
     let (cert, rest) = der::expect(der_bytes, SEQUENCE)?;
     if !rest.is_empty() {
         return Err(bad("bytes after the certificate"));
@@ -97,7 +125,11 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     let tbs_len = cert.len() - after_tbs.len();
     let tbs = cert[..tbs_len].to_vec();
     let (sig_alg_der, after_alg) = der::expect(after_tbs, SEQUENCE)?;
-    let sig_alg = signature_algorithm(sig_alg_der)?;
+    let sig_alg = match signature_algorithm(sig_alg_der) {
+        Ok(a) => a,
+        Err(_) if anchor => SigAlg::Unverified,
+        Err(e) => return Err(e),
+    };
     let (sig_bits, after_sig) = der::expect(after_alg, BIT_STRING)?;
     if !after_sig.is_empty() {
         return Err(bad("bytes after the signature"));
@@ -120,7 +152,10 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     }
     let (_serial, rest) = der::expect(rest, INTEGER)?;
     let (tbs_alg, rest) = der::expect(rest, SEQUENCE)?;
-    if signature_algorithm(tbs_alg)? != sig_alg {
+    // The same AlgorithmIdentifier inside and out (RFC 5280 §4.1.1.2),
+    // compared as bytes, so it holds for an anchor's algorithm this build
+    // does not name too.
+    if tbs_alg != sig_alg_der {
         return Err(bad("the signed part names another signature algorithm than the signature"));
     }
     let (_, issuer_body, after_issuer) = der::read(rest)?;
@@ -144,12 +179,21 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
     let (extensions, _) = der::optional(rest, 0xa3)?;
     if let Some(ext_wrapper) = extensions {
         let (mut exts, _) = der::expect(ext_wrapper, SEQUENCE)?;
+        let mut seen: Vec<&[u8]> = Vec::new();
         while !exts.is_empty() {
             let (ext, rest) = der::expect(exts, SEQUENCE)?;
             exts = rest;
             let (oid, ext_rest) = der::expect(ext, OID)?;
+            // RFC 5280 §4.2: an extension appears once. Twice, two
+            // validators may read two certificates (the first cA=TRUE and
+            // the second cA=FALSE, say), so the certificate is refused
+            // rather than read one way.
+            if seen.contains(&oid) {
+                return Err(bad(&format!("an extension given twice ({})", super::hex(oid))));
+            }
+            seen.push(oid);
             let (critical, ext_rest) = der::optional(ext_rest, BOOLEAN)?;
-            let critical = critical.is_some_and(|c| c.first().copied().unwrap_or(0) != 0);
+            let critical = der_bool(critical)?;
             let (value, _) = der::expect(ext_rest, OCTET_STRING)?;
             if oid == OID_KEY_USAGE {
                 // A BIT STRING: the unused-bit count, then the bits from the
@@ -184,9 +228,8 @@ pub fn parse(der_bytes: &[u8]) -> Result<Certificate> {
                 }
             } else if oid == OID_BASIC_CONSTRAINTS {
                 let (bc, _) = der::expect(value, SEQUENCE)?;
-                if let (Some(flag), _) = der::optional(bc, BOOLEAN)? {
-                    is_ca = flag.first().copied().unwrap_or(0) != 0;
-                }
+                let (flag, _) = der::optional(bc, BOOLEAN)?;
+                is_ca = der_bool(flag)?;
             } else if critical && oid != OID_SKID && oid != OID_AKID {
                 // RFC 5280 §4.2: an extension marked critical that this
                 // parser does not understand -- name or policy constraints,
@@ -289,10 +332,19 @@ fn public_key(spki: &[u8]) -> Result<PublicKey> {
             // made can carry one as long as the modulus -- minutes of a
             // core per signature, before any token is seen. Every real
             // exponent fits in 32 bits (65537 is the one in use).
-            if n.bits() < 2048 || n.bits() > 8192 || e.is_zero() || e.bits() > 32 {
+            // And it is odd and at least 3: with `e = 1` the "signature"
+            // is the encoding itself, and an even exponent is no
+            // permutation at all -- neither is a key, only a key-shaped
+            // way to make every well-formed encoding verify.
+            let e_small = if e.bits() > 32 {
+                0
+            } else {
+                e.to_be_bytes(4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+            };
+            if n.bits() < 2048 || n.bits() > 8192 || e_small < 3 || e_small % 2 == 0 {
                 return Err(bad(
-                    "an RSA key outside 2048 to 8192 bits, or with no exponent, or with one \
-                     past 32 bits",
+                    "an RSA key outside 2048 to 8192 bits, or with an exponent that is even, \
+                     under 3 or past 32 bits",
                 ));
             }
             Ok(PublicKey::Rsa(rsa::PublicKey { n, e }))
@@ -314,23 +366,38 @@ fn public_key(spki: &[u8]) -> Result<PublicKey> {
 /// as seconds since the epoch.
 fn time(input: &[u8]) -> Result<(i64, &[u8])> {
     let (tag, body, rest) = der::read(input)?;
-    let s = std::str::from_utf8(body).map_err(|_| bad("a time that is not ASCII"))?;
+    // Digits and a final `Z`, checked byte by byte before anything is
+    // sliced: the check used to be "valid UTF-8", which a multibyte
+    // character passes, and a slice through the middle of one is a panic
+    // -- in a release build, the process -- reachable by any peer that
+    // presents a certificate, before it is verified (fixed in 0.87.0).
+    // A sign or a space is not a digit either, whatever `parse` makes of it.
+    let (digits, z) = match body.split_last() {
+        Some((&b'Z', digits)) if digits.iter().all(u8::is_ascii_digit) => (digits, true),
+        _ => (body, false),
+    };
+    if !z {
+        return Err(bad("a validity time that is not digits ending in Z"));
+    }
+    let s = std::str::from_utf8(digits).map_err(|_| bad("a time that is not ASCII"))?;
     let (year, tail) = match tag {
-        der::UTC_TIME if s.len() == 13 => {
+        der::UTC_TIME if s.len() == 12 => {
             let yy: i64 = s[..2].parse().map_err(|_| bad("a bad UTCTime"))?;
             (if yy < 50 { 2000 + yy } else { 1900 + yy }, &s[2..])
         }
-        der::GENERALIZED_TIME if s.len() == 15 => {
+        der::GENERALIZED_TIME if s.len() == 14 => {
             (s[..4].parse().map_err(|_| bad("a bad GeneralizedTime"))?, &s[4..])
         }
         _ => return Err(bad("a validity time in a form this build does not read")),
     };
-    if !tail.ends_with('Z') {
-        return Err(bad("a validity time not in UTC"));
-    }
     let num =
         |a: usize, b: usize| -> Result<u32> { tail[a..b].parse().map_err(|_| bad("a bad time")) };
     let (m, d, hh, mm, ss) = (num(0, 2)?, num(2, 4)?, num(4, 6)?, num(6, 8)?, num(8, 10)?);
+    // A month, day or time of day outside the calendar is not a time the
+    // arithmetic below can be trusted with (a leap second, 60, is allowed).
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return Err(bad("a validity time outside the calendar"));
+    }
     let days = crate::time::days_from_civil(year, m, d);
     Ok((days * 86_400 + hh as i64 * 3600 + mm as i64 * 60 + ss as i64, rest))
 }
@@ -417,29 +484,32 @@ impl Certificate {
     /// names `a.example.com`, not `example.com` or `a.b.example.com`, as RFC
     /// 6125 has it), or an IP address literal.
     pub fn names(&self, host: &str) -> bool {
-        let lower = host.to_ascii_lowercase();
-        if self.dns_names.contains(&lower) {
-            return true;
-        }
-        if host.parse::<std::net::IpAddr>().is_err() {
-            if let Some((_, parent)) = lower.split_once('.') {
-                if !parent.is_empty()
-                    && parent.contains('.')
-                    && self
-                        .dns_names
-                        .iter()
-                        .any(|n| n.strip_prefix("*.").is_some_and(|rest| rest == parent))
-                {
-                    return true;
-                }
-            }
-        }
+        // An address literal is matched against the certificate's
+        // addresses and nothing else: a dNSName spelt like one is not it
+        // (RFC 6125 §1.7.2), whatever an issuer put there.
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             let bytes: Vec<u8> = match ip {
                 std::net::IpAddr::V4(v) => v.octets().to_vec(),
                 std::net::IpAddr::V6(v) => v.octets().to_vec(),
             };
             return self.ip_addresses.contains(&bytes);
+        }
+        let lower = host.to_ascii_lowercase();
+        if self.dns_names.contains(&lower) {
+            return true;
+        }
+        // A wildcard stands for one whole, non-empty leftmost label.
+        if let Some((first, parent)) = lower.split_once('.') {
+            if !first.is_empty()
+                && !parent.is_empty()
+                && parent.contains('.')
+                && self
+                    .dns_names
+                    .iter()
+                    .any(|n| n.strip_prefix("*.").is_some_and(|rest| rest == parent))
+            {
+                return true;
+            }
         }
         false
     }
@@ -635,6 +705,10 @@ pub fn issue(
             true,
             der::sequence(&[&der::tlv(BOOLEAN, &[0xff])]),
         ));
+        // keyCertSign and cRLSign, critical: RFC 5280 §4.2.1.3 has a CA
+        // name its usage, and a validator that requires it would refuse
+        // the CA without.
+        extensions.push(ext(OID_KEY_USAGE, true, der::tlv(BIT_STRING, &[1, 0x06])));
     } else {
         extensions.push(ext(OID_BASIC_CONSTRAINTS, true, der::sequence(&[])));
         extensions.push(ext(
@@ -775,6 +849,11 @@ mod tests {
         let ca = parse(&ca_der).unwrap();
         let leaf = parse(&leaf_der).unwrap();
         assert!(ca.is_ca && !leaf.is_ca);
+        assert_eq!(
+            ca.key_usage,
+            Some(KeyUsage { digital_signature: false, key_cert_sign: true }),
+            "a CA names keyCertSign (RFC 5280 §4.2.1.3)"
+        );
         // The leaf names its issuer's key, and the CA its own, so a client
         // holding two CAs under one name picks the right one.
         let ca_id = key_identifier(ca.ed25519_key().unwrap());
@@ -816,13 +895,23 @@ mod tests {
         let kp = KeyPair::from_pkcs8_der(&key_der).unwrap();
         assert_eq!(Some(&kp.public), leaf.ed25519_key());
         // A certificate of another algorithm is refused by name: the same
-        // leaf with its key's OID changed to one this build does not read.
-        let mut other_alg = leaf_der.clone();
+        // leaf with its signature algorithm's OID (in the signed part and
+        // outside it) changed to one this build does not verify. Changed
+        // in one place only, the two disagree, which is refused first.
         let ed = [0x06, 0x03, 0x2b, 0x65, 0x70];
-        let pos = other_alg.windows(5).position(|w| w == ed).unwrap();
-        other_alg[pos..pos + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
-        let e = parse(&other_alg).unwrap_err();
-        assert!(e.to_string().contains("not one this build"), "{e}");
+        let at: Vec<usize> =
+            leaf_der.windows(5).enumerate().filter(|(_, w)| *w == ed).map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 3, "the signature algorithm twice and the key's once");
+        let mut other_alg = leaf_der.clone();
+        for i in [at[0], at[2]] {
+            other_alg[i..i + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
+        }
+        let e = parse(&other_alg).unwrap_err().to_string();
+        assert!(e.contains("not one this build"), "{e}");
+        let mut disagree = leaf_der.clone();
+        disagree[at[0]..at[0] + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
+        let e = parse(&disagree).unwrap_err().to_string();
+        assert!(e.contains("another signature algorithm"), "{e}");
     }
 
     fn pki(name: &str) -> String {
@@ -965,6 +1054,13 @@ mod tests {
         assert!(e.contains("past 32 bits"), "33 bits: {e}");
         let e = public_key(&with_e(&[0x7f; 256])).unwrap_err().to_string();
         assert!(e.contains("past 32 bits"), "an exponent as wide as the modulus: {e}");
+        // And under 3 or even it is not a permutation: with 1 the encoding
+        // is its own signature, so every well-formed one would verify.
+        for e in [&[1u8][..], &[2u8][..], &[0x01, 0x00, 0x00][..]] {
+            let msg = public_key(&with_e(e)).unwrap_err().to_string();
+            assert!(msg.contains("even, under 3"), "{e:?}: {msg}");
+        }
+        assert!(public_key(&with_e(&[3])).is_ok(), "3 is odd and a permutation");
 
         let now = crate::time::now_micros() / 1_000_000;
         let ca = parse(&pem::decode_all(&pki("rsa-ca.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
@@ -978,5 +1074,134 @@ mod tests {
         let nine: Vec<Certificate> = std::iter::repeat(leaf.clone()).take(9).collect();
         let e = verify_chain(&nine, anchors, "localhost", now).unwrap_err().to_string();
         assert!(e.contains("a chain of 9 certificates"), "{e}");
+    }
+
+    /// A validity time is digits and a `Z`, checked before anything is
+    /// sliced: a multibyte character in a thirteen-byte body is valid UTF-8
+    /// and used to be sliced through, which is a panic -- and in a release
+    /// build the process -- from any peer presenting a certificate. A sign
+    /// where `parse` would take one, and a month past twelve, are refused.
+    #[test]
+    fn a_validity_time_of_anything_but_digits_is_refused_not_a_crash() {
+        let t = |body: &[u8]| -> Result<i64> { time(&tlv(der::UTC_TIME, body)).map(|(s, _)| s) };
+        let mut multibyte = b"0\xc3\xa9".to_vec(); // "0é", three bytes
+        multibyte.extend_from_slice(b"0926120000");
+        assert_eq!(multibyte.len(), 13);
+        let e = t(&multibyte).unwrap_err().to_string();
+        assert!(e.contains("digits ending in Z"), "{e}");
+        let e = t(b"+10926120000Z").unwrap_err().to_string();
+        assert!(e.contains("digits ending in Z"), "{e}");
+        assert!(t(b"260926120000").is_err(), "no Z");
+        assert!(t(b"26092612000Z").is_err(), "short");
+        let e = t(b"261326120000Z").unwrap_err().to_string();
+        assert!(e.contains("outside the calendar"), "month 13: {e}");
+        assert!(t(b"260932120000Z").is_err(), "day 32");
+        assert!(t(b"260926250000Z").is_err(), "hour 25");
+        let secs = t(b"260926120000Z").unwrap();
+        assert_eq!(secs, crate::time::days_from_civil(2026, 9, 26) * 86_400 + 12 * 3600);
+        let g = tlv(der::GENERALIZED_TIME, b"20260926120000Z");
+        let (secs2, rest) = time(&g).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(secs, secs2, "the two forms agree on an instant");
+        let g = tlv(der::GENERALIZED_TIME, b"2026092612000\xc3\xa9Z");
+        assert!(time(&g).is_err());
+    }
+
+    /// A certificate whose signature nobody will check, for the parser's
+    /// rules about extensions: `exts` in its extension block, a zero
+    /// signature.
+    fn unsigned_cert(exts: &[Vec<u8>]) -> Vec<u8> {
+        let kp = KeyPair::generate().unwrap();
+        let spki = der::sequence(&[&der::ed25519_algorithm(), &der::bit_string(&kp.public)]);
+        let ext_refs: Vec<&[u8]> = exts.iter().map(|p| p.as_slice()).collect();
+        let tbs = der::sequence(&[
+            &der::tlv(0xa0, &der::integer(&[2])),
+            &der::integer(&[7]),
+            &der::ed25519_algorithm(),
+            &name("x"),
+            &der::sequence(&[&time_der(1_700_000_000), &time_der(1_900_000_000)]),
+            &name("x"),
+            &spki,
+            &der::tlv(0xa3, &der::sequence(&ext_refs)),
+        ]);
+        der::sequence(&[&tbs, &der::ed25519_algorithm(), &der::bit_string(&[0u8; 64])])
+    }
+
+    /// An extension given twice is refused (RFC 5280 §4.2 has each once;
+    /// two readers would take two certificates from it), and a BOOLEAN is
+    /// `0x00` or `0xff`, not the BER `0x01` validators disagree on.
+    #[test]
+    fn a_repeated_extension_and_a_ber_boolean_are_refused() {
+        let bc = |flag: &[u8]| -> Vec<u8> {
+            der::sequence(&[
+                &der::tlv(OID, OID_BASIC_CONSTRAINTS),
+                &der::tlv(BOOLEAN, &[0xff]),
+                &der::tlv(OCTET_STRING, &der::sequence(&[&der::tlv(BOOLEAN, flag)])),
+            ])
+        };
+        let c = parse(&unsigned_cert(&[bc(&[0xff])])).unwrap();
+        assert!(c.is_ca);
+        let c = parse(&unsigned_cert(&[bc(&[0x00])])).unwrap();
+        assert!(!c.is_ca);
+        let e = parse(&unsigned_cert(&[bc(&[0xff]), bc(&[0x00])])).unwrap_err().to_string();
+        assert!(e.contains("given twice"), "{e}");
+        let e = parse(&unsigned_cert(&[bc(&[0x01])])).unwrap_err().to_string();
+        assert!(e.contains("not 0x00 or 0xff"), "{e}");
+        // The critical flag is a BOOLEAN too.
+        let ber_critical = der::sequence(&[
+            &der::tlv(OID, OID_BASIC_CONSTRAINTS),
+            &der::tlv(BOOLEAN, &[0x01]),
+            &der::tlv(OCTET_STRING, &der::sequence(&[])),
+        ]);
+        let e = parse(&unsigned_cert(&[ber_critical])).unwrap_err().to_string();
+        assert!(e.contains("not 0x00 or 0xff"), "{e}");
+    }
+
+    /// An address literal matches the certificate's addresses only -- a
+    /// dNSName spelt like one is not it -- and a wildcard stands for one
+    /// whole, non-empty label.
+    #[test]
+    fn an_address_literal_and_a_wildcard_match_what_rfc_6125_says() {
+        let names = vec!["127.0.0.1".to_string(), "*.example.com".to_string()];
+        let m = make("x", &names, &[], 30).unwrap();
+        let leaf = parse(&pem::decode_all(&m.cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        assert!(!leaf.names("127.0.0.1"), "a dNSName is not an address");
+        assert!(leaf.names("a.example.com") && leaf.names("A.Example.COM"));
+        assert!(!leaf.names(".example.com"), "an empty label is no label");
+        assert!(!leaf.names("example.com") && !leaf.names("a.b.example.com"));
+        assert!(!leaf.names("aexample.com") && !leaf.names("example.com."));
+        let m = make("x", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let leaf = parse(&pem::decode_all(&m.cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        assert!(leaf.names("127.0.0.1") && !leaf.names("127.0.0.2") && !leaf.names("::1"));
+    }
+
+    /// A trust anchor self-signed with an algorithm this build does not
+    /// have still anchors a chain: its own signature is never verified,
+    /// and the links to it are. As a leaf or an intermediate the same
+    /// certificate is refused by name.
+    #[test]
+    fn an_anchor_signed_with_an_unknown_algorithm_still_anchors() {
+        let m = make("ca", &["localhost".to_string()], &[], 30).unwrap();
+        let mut ca_der = pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap().remove(0);
+        let leaf = parse(&pem::decode_all(&m.cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        // The Ed25519 OID stands three times in a self-signed CA: the
+        // signature algorithm in the signed part, the key's, the outer
+        // one. The first and the last become an OID nobody verifies.
+        let ed = [0x06, 0x03, 0x2b, 0x65, 0x70];
+        let at: Vec<usize> =
+            ca_der.windows(5).enumerate().filter(|(_, w)| *w == ed).map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 3, "{at:?}");
+        for i in [at[0], at[2]] {
+            ca_der[i..i + 5].copy_from_slice(&[0x06, 0x03, 0x2b, 0x65, 0x6f]);
+        }
+        let e = parse(&ca_der).unwrap_err().to_string();
+        assert!(e.contains("not one this build"), "{e}");
+        let anchor = parse_anchor(&ca_der).unwrap();
+        assert_eq!(anchor.sig_alg, SigAlg::Unverified);
+        assert!(!anchor.signed_by(&anchor), "its own signature is never verified");
+        assert!(leaf.signed_by(&anchor));
+        let now = crate::time::now_micros() / 1_000_000;
+        verify_chain(std::slice::from_ref(&leaf), std::slice::from_ref(&anchor), "localhost", now)
+            .unwrap();
     }
 }

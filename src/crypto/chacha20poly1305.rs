@@ -54,6 +54,13 @@ fn quarter(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 /// XOR `data` with the keystream from `counter` on: encryption and
 /// decryption are the same call.
 pub fn chacha20(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
+    // The counter is 32 bits: past it the keystream would repeat. No
+    // caller comes near (frames are 64 KiB, records 16 KiB); a call that
+    // did is a bug, not a wrap.
+    assert!(
+        data.len().div_ceil(64) <= (u32::MAX - counter) as usize + 1,
+        "chacha20 called over more data than one nonce's keystream"
+    );
     for (i, chunk) in data.chunks_mut(64).enumerate() {
         let ks = block(key, counter.wrapping_add(i as u32), nonce);
         for (b, k) in chunk.iter_mut().zip(ks.iter()) {
