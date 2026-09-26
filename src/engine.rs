@@ -2277,10 +2277,11 @@ impl Db {
 
     /// How many collections the catalog holds. What a health probe asks,
     /// because answering it means the catalog is there to be read.
-    /// `SHOW HEALTH`: this node, every attached node dialled once with the
-    /// wire's timeout, and every collection's shards with their holder and
-    /// whether that holder answered -- what an operator asks first when a
-    /// statement is refused naming a shard. One line each, a summary last.
+    /// `SHOW HEALTH`: this node, every known node dialled at once under
+    /// what is left of the statement's deadline, and every collection's
+    /// shards with their holder and whether that holder answered -- what an
+    /// operator asks first when a statement is refused naming a shard. One
+    /// line each, a summary last.
     pub fn show_health(&self) -> String {
         let here = self.opts.node.clone().unwrap_or_else(|| "local".to_string());
         let mut out = String::new();
@@ -2371,14 +2372,38 @@ impl Db {
                 }
             }
         }
-        let mut peers = 0usize;
-        for url in &known {
-            if *url == here {
-                continue;
-            }
-            peers += 1;
+        let peers: Vec<&String> = known.iter().filter(|url| **url != here).collect();
+        // Every peer at once, as the scatter asks shards: a hello costs its
+        // round trip and a peer that hangs costs the deadline, and in turn
+        // a hundred of them were a hundred round trips while one that hung
+        // held the report for a deadline per peer. Each thread arms what is
+        // left of the statement's deadline, which is thread-local; the
+        // answers come back in the order asked, with what each dial took.
+        let remaining = crate::deadline::remaining_ms();
+        let dial = |url: &String| {
             let started = std::time::Instant::now();
             let answer = self.node_conn(url).and_then(|n| n.hello());
+            (started.elapsed().as_millis(), answer)
+        };
+        let answers: Vec<(u128, Result<crate::wire::Hello>)> = if peers.len() < 2 {
+            peers.iter().map(|url| dial(url)).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = peers
+                    .iter()
+                    .map(|url| {
+                        let dial = &dial;
+                        scope.spawn(move || {
+                            let _deadline = crate::deadline::arm(remaining);
+                            dial(url)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("a health dial panicked")).collect()
+            })
+        };
+        for (url, (took, answer)) in peers.iter().zip(answers) {
+            let url = *url;
             match answer {
                 Ok(h) => {
                     up.insert(url.clone());
@@ -2395,11 +2420,10 @@ impl Db {
                     };
                     let older = notes.iter().any(|n| n.starts_with("an older process"));
                     out.push_str(&format!(
-                        "node {url}: up, {}, celastro {}{}, {} ms{clock}{}{}\n",
+                        "node {url}: up, {}, celastro {}{}, {took} ms{clock}{}{}\n",
                         h.role.name(),
                         h.version,
                         h.region.as_deref().map(|r| format!(", region {r}")).unwrap_or_default(),
-                        started.elapsed().as_millis(),
                         if older { ", AN OLDER PROCESS ANSWERS HERE TOO" } else { "" },
                         if notes.iter().any(|n| n.contains(" restarted at ")) {
                             ", restarted since last seen"
@@ -2408,9 +2432,10 @@ impl Db {
                         }
                     ));
                 }
-                Err(e) => out.push_str(&format!("node {url}: DOWN: {e}\n")),
+                Err(e) => out.push_str(&format!("node {url}: DOWN after {took} ms: {e}\n")),
             }
         }
+        let peers = peers.len();
         let mut unreachable = 0usize;
         for (name, tablets) in &self.catalog.placement {
             for (i, t) in tablets.iter().enumerate() {

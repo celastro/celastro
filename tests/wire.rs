@@ -277,6 +277,77 @@ fn show_health_names_every_node_and_shard_and_a_lost_node_is_down() {
     let _ = std::fs::remove_dir_all(&c_dir);
 }
 
+/// `SHOW HEALTH` dials every peer at once: two peers that accept and never
+/// answer cost one statement deadline between them, not one each, and each
+/// line says how long its dial was waited on.
+#[test]
+fn show_health_dials_every_peer_at_once_and_a_hanging_peer_costs_one_deadline() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("health-at-once-a");
+    let b = Node::start("health-at-once-b");
+    let c = Node::start("health-at-once-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    let peers = [b.url.clone(), c.url.clone()];
+    let dirs = [b.dir.clone(), c.dir.clone()];
+    drop(b);
+    drop(c);
+    settle();
+    // Listeners that accept and never answer take both ports: a hello to
+    // either waits out what is left of the deadline.
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding: Vec<_> = peers
+        .iter()
+        .map(|url| {
+            let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+            let hole = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            hole.set_nonblocking(true).unwrap();
+            let plug = plug.clone();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                while plug.load(Ordering::Relaxed) {
+                    if let Ok((s, _)) = hole.accept() {
+                        held.push(s);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                drop(held);
+            })
+        })
+        .collect();
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(1500);
+    let t0 = std::time::Instant::now();
+    let text = a.ack("SHOW HEALTH");
+    let took = t0.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(2800),
+        "two hanging peers cost {took:?}, more than one deadline: {text}"
+    );
+    // Both were waited on for the deadline: dialled at once, not the second
+    // after the first had spent it.
+    for url in &peers {
+        let head = format!("node {url}: DOWN after ");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&head))
+            .unwrap_or_else(|| panic!("no DOWN line for {url}: {text}"));
+        let ms: u64 = line[head.len()..].split(' ').next().unwrap().parse().unwrap();
+        assert!(ms >= 1000, "{url} was not waited on for the deadline: {line}");
+    }
+    assert!(text.ends_with("1 of 3 node(s) answer; 0 shard(s) unreachable"), "{text}");
+    plug.store(false, Ordering::Relaxed);
+    for h in holding {
+        h.join().unwrap();
+    }
+    let a_dir = a.dir.clone();
+    drop(a);
+    settle();
+    for d in dirs.iter().chain(std::iter::once(&a_dir)) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// An aggregate over shards on three nodes is the aggregate over the rows:
 /// each holder folds its own, the coordinator merges the partials, and
 /// every node answers what one process answers.

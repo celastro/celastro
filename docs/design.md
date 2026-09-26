@@ -351,7 +351,11 @@ and adding one is a wire version. `Db::pretend` lets a test, or a drill,
 claim an epoch or a clock offset. The sweep dials sixteen peers at a time,
 outside the lock: an unreachable peer costs its connect timeout, and a
 hundred of them one after another was a sweep of many minutes during which
-a split that had healed stayed unreconciled.
+a split that had healed stayed unreconciled. `SHOW HEALTH` dials every peer at
+once (0.86.0), each dial under what is left of the statement's deadline:
+a hundred hellos cost the slowest of them, a peer that hangs costs one
+deadline rather than one per peer, and each node's line says what its
+dial took, answered or not.
 
 A retry is the other thing a client does to a cluster. The contract
 (`tests/retry.rs`) is that every statement delivered twice with nothing
@@ -2747,6 +2751,7 @@ guarantee:
 | a holder lost: its follower is promoted and answers every acknowledged row at the next term; writes flow through it; the old holder back hears the term at its attach, demotes its copy, follows, and is confirmed on again | `wire::a_follower_is_promoted_and_the_old_holder_demotes_when_it_returns` |
 | a peer whose clock is more than five seconds off is refused at ATTACH naming both clocks; one under that is attached and `SHOW HEALTH` shows its offset and flags it past half a second | `wire::a_peer_whose_clock_is_off_is_refused_or_named` |
 | a hello with a newer epoch is a restart, said once; an older epoch after it is a second process at the address, said on every `SHOW HEALTH` that sees it | `wire::an_older_process_answering_at_an_attached_address_is_named` |
+| `SHOW HEALTH` dials every peer at once: two peers that accept and never answer cost one statement deadline between them, and each line says how long its dial was waited on | `wire::show_health_dials_every_peer_at_once_and_a_hanging_peer_costs_one_deadline` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

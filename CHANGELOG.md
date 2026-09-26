@@ -6,6 +6,16 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**`SHOW HEALTH` dials every peer at once.** The hellos went out one
+after another, so the report over a hundred peers cost a hundred round
+trips, and a peer that hung held it for a statement deadline per peer.
+They go out together now, each under what is left of the statement's
+deadline, and the report costs its slowest dial. A node that did not
+answer says how long it was waited on (`DOWN after 1500 ms: ...`), as an
+answering node's line already said its round trip.
+
 ## 0.85.0 — 2026-09-26
 
 **Four deviations the TLS transcript already covered are refused and
