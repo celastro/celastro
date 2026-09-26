@@ -686,9 +686,12 @@ fn recode_tree(
     src: &crate::cipher::Shared,
     dst: &crate::cipher::Shared,
 ) -> Result<()> {
+    // The collection's name, for the identity its files are under.
+    let coll = from.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string();
     fn walk(
         from: &Path,
         to: &Path,
+        coll: &str,
         shard: Option<&str>,
         src: &crate::cipher::Shared,
         dst: &crate::cipher::Shared,
@@ -704,20 +707,22 @@ fn recode_tree(
                 } else {
                     shard
                 };
-                walk(&entry.path(), &dest, shard, src, dst)?;
+                walk(&entry.path(), &dest, coll, shard, src, dst)?;
                 continue;
             }
             let mut bytes = fs::read(entry.path())?;
             if src.is_some() || dst.is_some() {
-                let id = match shard {
-                    Some(s) => format!("{s}/{name}"),
-                    None => name.clone(),
+                let ids = match shard {
+                    Some(s) => {
+                        crate::cipher::Ids::new(format!("{coll}/{s}/{name}"), format!("{s}/{name}"))
+                    }
+                    None => crate::cipher::Ids::same(&name),
                 };
                 if let Some(c) = src {
-                    bytes = c.open_file(&id, &bytes)?;
+                    bytes = c.open_file(&ids, &bytes)?;
                 }
                 if let Some(c) = dst {
-                    bytes = c.seal_file(&id, &bytes)?;
+                    bytes = c.seal_file(&ids, &bytes)?;
                 }
             }
             crate::shard::atomic_write(&dest, &bytes)?;
@@ -725,7 +730,7 @@ fn recode_tree(
         crate::shard::sync_dir(to)?;
         Ok(())
     }
-    walk(from, to, None, src, dst)
+    walk(from, to, &coll, None, src, dst)
 }
 
 /// Thirty seconds: long enough that no statement the quick start or the demo
@@ -1269,7 +1274,7 @@ impl Db {
         // Absent is a fresh database. Unreadable is not: read as absent it
         // opened a database with no collections, and the next DDL published
         // that catalog over the real one.
-        if let Some(b) = crate::shard::read_content(&db.cipher, "CATALOG", &dir.join("CATALOG"))? {
+        if let Some(b) = crate::shard::read_content(&db.cipher, &crate::cipher::Ids::same("CATALOG"), &dir.join("CATALOG"))? {
             db.catalog = Catalog::decode(&b)?;
         } else {
             // A directory with no catalog is a new one, and when it was
@@ -1842,7 +1847,7 @@ impl Db {
                 (None, None) => None,
             };
         let catalog_bytes = match &self.cipher {
-            Some(c) => c.open_file("CATALOG", &fetched.catalog)?,
+            Some(c) => c.open_file(&crate::cipher::Ids::same("CATALOG"), &fetched.catalog)?,
             None => fetched.catalog.clone(),
         };
         let mut catalog = Catalog::decode(&catalog_bytes)?;
@@ -1893,12 +1898,25 @@ impl Db {
                 let upto = past.unwrap_or(fetched.ts);
                 let replay = log_archive.logs_after(name, *index, fetched.ts, upto)?;
                 let (mut taken, mut here) = (0usize, fetched.ts);
-                let id = format!("shard-{index:04}/wal.log");
+                let ids = crate::cipher::Ids::new(
+                    format!("{name}/shard-{index:04}/wal.log"),
+                    format!("shard-{index:04}/wal.log"),
+                );
                 for l in &replay.logs {
                     let p = sdir.join(format!("wal.{:06}.log", taken + 1));
                     fs::write(&p, log_archive.get(&l.key)?)?;
+                    // An archived copy under the current scheme ends with
+                    // a trailer; one without it was cut at a record
+                    // boundary, and is refused rather than replayed short.
+                    if !crate::shard::Wal::complete(&p, &self.cipher, &ids)? {
+                        return Err(Error::Storage(format!(
+                            "the archived log {} is cut: its trailer is missing, so its end is not \
+                             what was archived",
+                            l.key
+                        )));
+                    }
                     if l.cut {
-                        crate::shard::trim_log(&p, &self.cipher, &id, l.last)?;
+                        crate::shard::trim_log(&p, &self.cipher, &ids, l.last)?;
                     }
                     taken += 1;
                     here = l.last.min(upto);
@@ -2001,7 +2019,7 @@ impl Db {
         let bytes = fs::read(from.join("CATALOG"))
             .map_err(|e| Error::Storage(format!("{}: CATALOG: {e}", from.display())))?;
         let bytes = match &src {
-            Some(c) => c.open_file("CATALOG", &bytes)?,
+            Some(c) => c.open_file(&crate::cipher::Ids::same("CATALOG"), &bytes)?,
             None => bytes,
         };
         let exported = Catalog::decode(&bytes)?;
@@ -2691,7 +2709,7 @@ impl Db {
                         if let Some(d) = f.shard.dir().map(|d| d.to_path_buf()) {
                             crate::shard::write_content(
                                 &self.cipher,
-                                &format!("shard-{i:04}/RANGE"),
+                                &shard_file_ids(collection, &format!("shard-{i:04}"), "RANGE"),
                                 &d.join("RANGE"),
                                 format!(
                                     "{}\n{}",
@@ -2722,7 +2740,7 @@ impl Db {
                 fs::create_dir_all(&fdir)?;
                 crate::shard::write_content(
                     &self.cipher,
-                    &format!("shard-{i:04}/RANGE"),
+                    &shard_file_ids(collection, &format!("shard-{i:04}"), "RANGE"),
                     &fdir.join("RANGE"),
                     format!(
                         "{}\n{}",
@@ -3478,7 +3496,7 @@ impl Db {
                 // about.
                 crate::shard::write_content(
                     &self.cipher,
-                    &format!("shard-{i:04}/RANGE"),
+                    &shard_file_ids(&coll.name, &format!("shard-{i:04}"), "RANGE"),
                     &sdir.join("RANGE"),
                     format!("{}\n{}", lo.unwrap_or_default(), hi.unwrap_or_default()).as_bytes(),
                 )?;
@@ -4206,23 +4224,23 @@ impl Db {
                         }
                     }
                     (MoveFile::Path(p), Some(_)) => {
-                        let plain = crate::shard::read_content(&self.cipher, &s.file_id(base), p)?
+                        let plain = crate::shard::read_content(&self.cipher, &s.file_ids(base), p)?
                             .ok_or_else(|| {
                                 Error::Storage(format!("{}: gone under the split", p.display()))
                             })?;
                         crate::shard::write_content(
                             &self.cipher,
-                            &format!("{new_id}/{base}"),
+                            &shard_file_ids(&s.coll.name, &new_id, base),
                             &dest,
                             &plain,
                         )?;
                     }
                     (MoveFile::Bytes(b), None) => crate::shard::atomic_write(&dest, b)?,
                     (MoveFile::Bytes(b), Some(c)) => {
-                        let plain = c.open_file(&s.file_id(base), b)?;
+                        let plain = c.open_file(&s.file_ids(base), b)?;
                         crate::shard::write_content(
                             &self.cipher,
-                            &format!("{new_id}/{base}"),
+                            &shard_file_ids(&s.coll.name, &new_id, base),
                             &dest,
                             &plain,
                         )?;
@@ -4234,7 +4252,7 @@ impl Db {
         };
         crate::shard::write_content(
             &self.cipher,
-            &format!("{new_id}/RANGE"),
+            &shard_file_ids(collection, &new_id, "RANGE"),
             &incoming.join("RANGE"),
             format!("{at}\n{hi_text}").as_bytes(),
         )?;
@@ -4247,7 +4265,7 @@ impl Db {
         }
         crate::shard::write_content(
             &self.cipher,
-            &format!("shard-{shard:04}/RANGE"),
+            &shard_file_ids(collection, &format!("shard-{shard:04}"), "RANGE"),
             &cdir.join(format!("shard-{shard:04}")).join("RANGE"),
             format!("{}\n{at}", t.lo.clone().unwrap_or_default()).as_bytes(),
         )?;
@@ -4440,7 +4458,7 @@ impl Db {
         let cdir = dir.join("collections").join(collection);
         crate::shard::write_content(
             &self.cipher,
-            &format!("shard-{a:04}/RANGE"),
+            &shard_file_ids(collection, &format!("shard-{a:04}"), "RANGE"),
             &cdir.join(format!("shard-{a:04}")).join("RANGE"),
             format!("{lo_text}\n{hi_text}").as_bytes(),
         )?;
@@ -5680,7 +5698,7 @@ impl Db {
     /// when there is one.
     fn seal_root(&self, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
         match &self.cipher {
-            Some(c) => c.seal_file(name, plain),
+            Some(c) => c.seal_file(&crate::cipher::Ids::same(name), plain),
             None => Ok(plain.to_vec()),
         }
     }
@@ -5735,7 +5753,7 @@ impl Db {
             // plaintext is compared by opening the cache.
             if let Some(w) = self.published_catalog.as_deref() {
                 let same = match &self.cipher {
-                    Some(c) => c.open_file("CATALOG", w).map(|p| p == bytes).unwrap_or(false),
+                    Some(c) => c.open_file(&crate::cipher::Ids::same("CATALOG"), w).map(|p| p == bytes).unwrap_or(false),
                     None => w == bytes.as_slice(),
                 };
                 if same && crate::shard::still_published(&p, w) {
@@ -5745,7 +5763,7 @@ impl Db {
             // Not `fs::write`: that truncates in place, so a crash partway
             // through leaves a catalog that will not decode and a database
             // that will not open, with every segment file intact.
-            let written = crate::shard::write_content(&self.cipher, "CATALOG", &p, &bytes)?;
+            let written = crate::shard::write_content(&self.cipher, &crate::cipher::Ids::same("CATALOG"), &p, &bytes)?;
             self.published_catalog = Some(written);
         }
         Ok(())
@@ -9200,6 +9218,14 @@ fn shard_index(dir: Option<&Path>, name: &str) -> Result<usize> {
         .ok_or_else(|| Error::Storage(format!("a shard of `{name}` has no directory to name it")))
 }
 
+/// The identities of a file of a shard directory of a collection, as
+/// [`Shard::file_ids`] gives them, for a caller that has no `Shard` in
+/// hand: the collection, the directory's name and the file's, and the
+/// legacy pair without the collection.
+fn shard_file_ids(collection: &str, dirname: &str, name: &str) -> crate::cipher::Ids {
+    crate::cipher::Ids::new(format!("{collection}/{dirname}/{name}"), format!("{dirname}/{name}"))
+}
+
 fn read_range(
     cipher: &crate::cipher::Shared,
     sdir: &Path,
@@ -9218,8 +9244,8 @@ fn read_range_at(
     name: &str,
 ) -> Result<(Option<String>, Option<String>)> {
     let i = dirname;
-    let bytes =
-        crate::shard::read_content(cipher, &format!("{dirname}/RANGE"), &sdir.join("RANGE"))
+    let ids = crate::cipher::Ids::new(format!("{name}/{dirname}/RANGE"), format!("{dirname}/RANGE"));
+    let bytes = crate::shard::read_content(cipher, &ids, &sdir.join("RANGE"))
             .map_err(|e| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE: {e}")))?
             .ok_or_else(|| Error::Storage(format!("shard-{i:04} of `{name}`: RANGE is missing")))?;
     let ranges = String::from_utf8_lossy(&bytes).to_string();

@@ -70,6 +70,11 @@ pub trait Stream: Read + Write + Send {
     fn handshake(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// The names of the peer's certificate, when the stream asked for one
+    /// and verified it; nothing on a plain socket.
+    fn peer_names(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -311,6 +316,9 @@ impl Stream for crate::crypto::tls13::TlsStream {
     }
     fn handshake(&mut self) -> io::Result<()> {
         crate::crypto::tls13::TlsStream::handshake(self)
+    }
+    fn peer_names(&self) -> Option<Vec<String>> {
+        crate::crypto::tls13::TlsStream::peer_names(self).map(<[String]>::to_vec)
     }
 }
 

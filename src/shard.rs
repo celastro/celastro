@@ -651,12 +651,12 @@ impl Manifest {
 /// move bytes as they lie.
 pub(crate) fn write_content(
     cipher: &crate::cipher::Shared,
-    id: &str,
+    ids: &crate::cipher::Ids,
     path: &Path,
     plain: &[u8],
 ) -> Result<Vec<u8>> {
     let bytes = match cipher {
-        Some(c) => c.seal_file(id, plain)?,
+        Some(c) => c.seal_file(ids, plain)?,
         None => plain.to_vec(),
     };
     atomic_write(path, &bytes)?;
@@ -667,12 +667,12 @@ pub(crate) fn write_content(
 /// `atomic_write`.
 pub(crate) fn publish_content(
     cipher: &crate::cipher::Shared,
-    id: &str,
+    ids: &crate::cipher::Ids,
     path: &Path,
     plain: &[u8],
 ) -> Result<Vec<u8>> {
     let bytes = match cipher {
-        Some(c) => c.seal_file(id, plain)?,
+        Some(c) => c.seal_file(ids, plain)?,
         None => plain.to_vec(),
     };
     publish(path, &bytes)?;
@@ -683,13 +683,13 @@ pub(crate) fn publish_content(
 /// `None` when the file is absent.
 pub(crate) fn read_content(
     cipher: &crate::cipher::Shared,
-    id: &str,
+    ids: &crate::cipher::Ids,
     path: &Path,
 ) -> Result<Option<Vec<u8>>> {
     let Some(bytes) = read_optional(path)? else { return Ok(None) };
     match cipher {
         Some(c) => c
-            .open_file(id, &bytes)
+            .open_file(ids, &bytes)
             .map(Some)
             .map_err(|e| Error::Storage(format!("{}: {e}", path.display()))),
         None => Ok(Some(bytes)),
@@ -1159,11 +1159,11 @@ pub(crate) mod durable {
 pub(crate) fn trim_log(
     path: &Path,
     cipher: &crate::cipher::Shared,
-    id: &str,
+    ids: &crate::cipher::Ids,
     ceiling: Timestamp,
 ) -> Result<()> {
-    let records = Wal::replay(path, cipher, id)?;
-    let mut w = Wal::open(path, cipher.clone(), id.to_string())?;
+    let records = Wal::replay(path, cipher, ids)?;
+    let mut w = Wal::open(path, cipher.clone(), ids.clone())?;
     w.truncate()?;
     for r in records.iter().filter(|r| r.ts <= ceiling) {
         w.append(r)?;
@@ -1357,7 +1357,12 @@ pub(crate) struct Wal {
     /// under the log's key with its ordinal in the AAD; `records` counts
     /// the frames in the file, so the next one continues the sequence.
     cipher: crate::cipher::Shared,
-    id: String,
+    ids: crate::cipher::Ids,
+    /// The log's own id, in every record's AAD, when it was written under
+    /// the current scheme; `None` for a log written before 0.84.0 (or with
+    /// writes pinned), which goes on as it was until it is rotated or
+    /// truncated.
+    log_id: Option<[u8; 16]>,
     records: u64,
 }
 
@@ -1392,8 +1397,8 @@ fn truncate_file(path: &Path) -> Result<fs::File> {
 pub(crate) struct SegmentDisk {
     dir: PathBuf,
     cipher: crate::cipher::Shared,
-    /// The shard's file-id prefix: `Shard::file_id` of an empty name.
-    prefix: String,
+    /// The shard's file-identity prefixes: `Shard::file_ids` of an empty name.
+    prefix: crate::cipher::Ids,
 }
 
 impl SegmentDisk {
@@ -1406,7 +1411,7 @@ impl SegmentDisk {
     pub(crate) fn write(&self, seg: &Segment) -> Result<PathBuf> {
         let p = self.path(seg.id);
         let bytes = seg.encode()?;
-        write_content(&self.cipher, &format!("{}{:016x}.seg", self.prefix, seg.id), &p, &bytes)?;
+        write_content(&self.cipher, &self.prefix.join(&format!("{:016x}.seg", seg.id)), &p, &bytes)?;
         Ok(p)
     }
 }
@@ -1594,19 +1599,79 @@ impl Wal {
     /// a directory made durable before it named the log, so the first
     /// acknowledged insert is fdatasync'd into a file whose name a crash still
     /// takes. Recording the creation is what lets a test tell those apart.
-    pub(crate) fn open(path: &Path, cipher: crate::cipher::Shared, id: String) -> Result<Wal> {
-        let file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
+    pub(crate) fn open(path: &Path, cipher: crate::cipher::Shared, ids: crate::cipher::Ids) -> Result<Wal> {
+        let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
         #[cfg(test)]
         durability_probe::note_create(path);
-        let records = match &cipher {
+        let (records, log_id) = match &cipher {
             Some(c) => match read_optional(path)? {
-                Some(b) => c.open_records(&id, &b).len() as u64,
-                None => 0,
+                Some(b) if !b.is_empty() => {
+                    let log = c.open_log(&ids, &b);
+                    (log.records.len() as u64, log.log_id)
+                }
+                // A fresh log: its header first, under the current scheme.
+                _ => match c.log_header(&ids)? {
+                    Some((h, log_id)) => {
+                        file.write_all(&h)?;
+                        (0, Some(log_id))
+                    }
+                    None => (0, None),
+                },
             },
-            None => 0,
+            None => (0, None),
         };
         let group = Arc::new(LogSync::new(path, file.try_clone()?, file.metadata()?.len()));
-        Ok(Wal { file, path: path.to_path_buf(), group, cipher, id, records })
+        Ok(Wal { file, path: path.to_path_buf(), group, cipher, ids, log_id, records })
+    }
+
+    /// The ordinal the next record is sealed with: the records so far, and
+    /// the header before them when the log has one.
+    fn next_index(&self) -> u64 {
+        self.records + self.log_id.is_some() as u64
+    }
+
+    /// Start the file afresh: a header under the current scheme, unless
+    /// writes are pinned, and a new id for the log.
+    fn begin(&mut self) -> Result<()> {
+        self.records = 0;
+        self.log_id = None;
+        if let Some(c) = &self.cipher {
+            if let Some((h, log_id)) = c.log_header(&self.ids)? {
+                self.file.write_all(&h)?;
+                self.log_id = Some(log_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the log at `path` is whole: a log under the current scheme
+    /// that an archive wrote ends with a trailer that says so, and one cut
+    /// at a record boundary has lost it; a log under the legacy scheme
+    /// cannot say. What a restore asks of each archived log it fetched.
+    pub(crate) fn complete(path: &Path, cipher: &crate::cipher::Shared, ids: &crate::cipher::Ids) -> Result<bool> {
+        let Some(c) = cipher else { return Ok(true) };
+        let Some(b) = read_optional(path)? else { return Ok(true) };
+        let log = c.open_log(ids, &b);
+        Ok(log.log_id.is_none() || log.complete)
+    }
+
+    /// The bytes of the log as an archive keeps them: the file as it is,
+    /// and under the current scheme a trailer after its records that says
+    /// the copy is whole, so a copy cut at a record boundary is refused
+    /// rather than replayed short.
+    pub(crate) fn archived_bytes(path: &Path, cipher: &crate::cipher::Shared, ids: &crate::cipher::Ids) -> Result<Vec<u8>> {
+        let mut b = read_optional(path)?.unwrap_or_default();
+        if let Some(c) = cipher {
+            let log = c.open_log(ids, &b);
+            if let Some(log_id) = &log.log_id {
+                b.truncate(log.opened);
+                if !log.complete {
+                    let index = 1 + log.records.len() as u64;
+                    b.extend_from_slice(&c.seal_record(ids, Some(log_id), index, &[], true)?);
+                }
+            }
+        }
+        Ok(b)
     }
 
     /// The sync a writer that appended just now settles outside the lock:
@@ -1680,7 +1745,7 @@ impl Wal {
         put_u32(&mut out, crc32(&body));
         out.extend_from_slice(&body);
         if let Some(c) = &self.cipher {
-            out = c.seal_record(&self.id, self.records, &out)?;
+            out = c.seal_record(&self.ids, self.log_id.as_ref(), self.next_index(), &out, false)?;
             self.records += 1;
         }
         // Under the group's lock, so a sync that failed -- and cut the log
@@ -1734,7 +1799,7 @@ impl Wal {
     pub(crate) fn replay(
         path: &Path,
         cipher: &crate::cipher::Shared,
-        id: &str,
+        ids: &crate::cipher::Ids,
     ) -> Result<Vec<WalRecord>> {
         let Some(b) = read_optional(path)? else { return Ok(Vec::new()) };
         // Under a cipher the log is frames, each holding one record as the
@@ -1742,7 +1807,7 @@ impl Wal {
         // applies unchanged; a torn or foreign frame ends the replay where
         // a bad CRC would have.
         let b: Vec<u8> = match cipher {
-            Some(c) => c.open_records(id, &b).concat(),
+            Some(c) => c.open_log(ids, &b).records.concat(),
             None => b,
         };
         let mut out = Vec::new();
@@ -1806,7 +1871,7 @@ impl Wal {
         fs::rename(&self.path, &rotated)?;
         sync_dir_of(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
-        self.records = 0;
+        self.begin()?;
         self.group.replace(self.file.try_clone()?);
         Ok(rotated)
     }
@@ -1817,7 +1882,7 @@ impl Wal {
         // `self.file` closes the first at the second assignment.
         self.file = truncate_file(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
-        self.records = 0;
+        self.begin()?;
         // The records it held are in segments a published manifest names,
         // which is the only way a caller may get here, so every writer still
         // waiting on them is durable.
@@ -1895,7 +1960,7 @@ pub struct SealTicket {
     archive: Option<Arc<crate::backup::LogArchive>>,
     index: usize,
     cipher: crate::cipher::Shared,
-    log_id: String,
+    log_ids: crate::cipher::Ids,
     timeline: u64,
     fork: Option<(u64, Timestamp)>,
 }
@@ -2074,7 +2139,7 @@ impl Shard {
     /// backup and a move carry for the files they make rather than copy.
     pub(crate) fn seal_content(&self, name: &str, plain: &[u8]) -> Result<Vec<u8>> {
         match &self.opts.cipher {
-            Some(c) => c.seal_file(&self.file_id(name), plain),
+            Some(c) => c.seal_file(&self.file_ids(name), plain),
             None => Ok(plain.to_vec()),
         }
     }
@@ -2202,7 +2267,7 @@ impl Shard {
         self.wal = Some(Wal::open(
             &dir.join("wal.log"),
             self.opts.cipher.clone(),
-            self.file_id("wal.log"),
+            self.file_ids("wal.log"),
         )?);
         // Every one of those creations is a new entry in `dir`, and a directory
         // entry is dirty metadata like any other. The WAL's own fdatasync
@@ -3074,7 +3139,7 @@ impl Shard {
             self.wal_seq,
             &dir.join("wal.log"),
             &self.opts.cipher,
-            &self.file_id("wal.log"),
+            &self.file_ids("wal.log"),
         )
     }
 
@@ -3173,7 +3238,7 @@ impl Shard {
             archive: self.opts.log_archive.clone(),
             index: self.index,
             cipher: self.opts.cipher.clone(),
-            log_id: self.file_id("wal.log"),
+            log_ids: self.file_ids("wal.log"),
             timeline: self.timeline,
             fork: self.fork,
         });
@@ -3207,7 +3272,7 @@ impl Shard {
                 None => t.timeline,
             };
             for p in &t.wals {
-                a.put_log(&t.coll.name, t.index, tl, rotated_seq(p)?, p, &t.cipher, &t.log_id)?;
+                a.put_log(&t.coll.name, t.index, tl, rotated_seq(p)?, p, &t.cipher, &t.log_ids)?;
             }
         }
         let mut segments = Vec::new();
@@ -3544,7 +3609,7 @@ impl Shard {
                     rotated_seq(p)?,
                     p,
                     &self.opts.cipher,
-                    &self.file_id("wal.log"),
+                    &self.file_ids("wal.log"),
                 )?;
             }
             if let Some(dir) = &self.dir {
@@ -3557,7 +3622,7 @@ impl Shard {
                     seq,
                     &live,
                     &self.opts.cipher,
-                    &self.file_id("wal.log"),
+                    &self.file_ids("wal.log"),
                 )?
                 .is_some()
                 {
@@ -3606,7 +3671,7 @@ impl Shard {
         Some(SegmentDisk {
             dir: dir.join("segments"),
             cipher: self.opts.cipher.clone(),
-            prefix: self.file_id(""),
+            prefix: self.file_ids(""),
         })
     }
 
@@ -3747,7 +3812,7 @@ impl Shard {
             }
             let written = publish_content(
                 &self.opts.cipher,
-                &self.file_id(&format!("{:016x}.dlog", h.id())),
+                &self.file_ids(&format!("{:016x}.dlog", h.id())),
                 &p,
                 &d,
             )?;
@@ -3791,7 +3856,7 @@ impl Shard {
         {
             return Ok(());
         }
-        let written = write_content(&self.opts.cipher, &self.file_id("MANIFEST"), &p, &body)?;
+        let written = write_content(&self.opts.cipher, &self.file_ids("MANIFEST"), &p, &body)?;
         // Only after the rename is durable: a failed write must leave the next
         // call willing to try again.
         *self.published_manifest.write().unwrap() = Some(written);
@@ -3852,7 +3917,7 @@ impl Shard {
         // cannot be read: that opened a shard with zero segments over a
         // directory full of them, and the next flush published the empty set.
         if let Some(b) =
-            read_content(&s.opts.cipher, &s.file_id("MANIFEST"), &dir.join("MANIFEST"))?
+            read_content(&s.opts.cipher, &s.file_ids("MANIFEST"), &dir.join("MANIFEST"))?
         {
             if b.len() < 4 {
                 return Err(Error::Storage("manifest: truncated".into()));
@@ -3905,7 +3970,7 @@ impl Shard {
                 let dpath = dir.join("deletes").join(format!("{:016x}.dlog", meta.id));
                 let dl = match read_content(
                     &s.opts.cipher,
-                    &s.file_id(&format!("{:016x}.dlog", meta.id)),
+                    &s.file_ids(&format!("{:016x}.dlog", meta.id)),
                     &dpath,
                 )? {
                     Some(d) => DeleteLog::decode(&d).map_err(|e| match e {
@@ -3971,9 +4036,9 @@ impl Shard {
         }
         let mut records = Vec::new();
         for p in &rotated {
-            records.extend(Wal::replay(p, &s.opts.cipher, &s.file_id("wal.log"))?);
+            records.extend(Wal::replay(p, &s.opts.cipher, &s.file_ids("wal.log"))?);
         }
-        records.extend(Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_id("wal.log"))?);
+        records.extend(Wal::replay(&dir.join("wal.log"), &s.opts.cipher, &s.file_ids("wal.log"))?);
         let before = records.len();
         if let Some(f) = floor {
             // A restore's base holds everything up to the floor: a record
@@ -4510,22 +4575,24 @@ pub(crate) fn collect_from_handles(
 }
 
 impl Shard {
-    /// The identity a file of this shard is encrypted under: the shard's
-    /// directory name and the file's, so a segment keeps its key whether it
-    /// sits in `segments/`, `archive/` or the store, and a file cannot
-    /// stand in for another.
-    pub(crate) fn file_id(&self, name: &str) -> String {
+    /// The identities a file of this shard is encrypted under: the
+    /// collection, the shard's directory name and the file's (since
+    /// 0.84.0), and the shard's directory name and the file's alone (as
+    /// written before), so a segment keeps its key whether it sits in
+    /// `segments/`, `archive/` or the store, and a file cannot stand in for
+    /// another -- not another collection's of the same shard index either.
+    pub(crate) fn file_ids(&self, name: &str) -> crate::cipher::Ids {
         let shard = self
             .dir
             .as_ref()
             .and_then(|d| d.file_name())
             .and_then(|f| f.to_str())
             .unwrap_or("shard");
-        format!("{shard}/{name}")
+        crate::cipher::Ids::new(format!("{}/{shard}/{name}", self.coll.name), format!("{shard}/{name}"))
     }
 
-    fn segment_file_id(&self, id: u64) -> String {
-        self.file_id(&format!("{id:016x}.seg"))
+    fn segment_file_ids(&self, id: u64) -> crate::cipher::Ids {
+        self.file_ids(&format!("{id:016x}.seg"))
     }
 
     /// `src`, framed under the shard's cipher when it has one.
@@ -4534,7 +4601,7 @@ impl Shard {
             Some(c) => SegmentSource::Encrypted {
                 inner: Box::new(src),
                 cipher: c.clone(),
-                id: self.segment_file_id(id),
+                ids: self.segment_file_ids(id),
             },
             None => src,
         }
@@ -4840,7 +4907,7 @@ mod tests {
         let mutant = dir.join("mutant.log");
         crate::fuzz::sweep(32, &[sample], 3000, |b| {
             fs::write(&mutant, b).unwrap();
-            let _ = Wal::replay(&mutant, &None, "t/wal.log");
+            let _ = Wal::replay(&mutant, &None, &"t/wal.log".into());
         });
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6630,7 +6697,7 @@ mod tests {
             p.log.lock().ship.is_empty(),
             "the cut record is still queued to ship, should the log ever sync again"
         );
-        assert_eq!(Wal::replay(&log, &None, "t/wal.log").unwrap().len(), 4, "the cut");
+        assert_eq!(Wal::replay(&log, &None, &"t/wal.log".into()).unwrap().len(), 4, "the cut");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6797,7 +6864,7 @@ mod tests {
         // the wild: the log is cut back to where the statement found it, so
         // only the first insert's record is there.
         assert_eq!(
-            Wal::replay(&log, &None, "t/wal.log").unwrap().len(),
+            Wal::replay(&log, &None, &"t/wal.log".into()).unwrap().len(),
             1,
             "the first insert only: the records of the two rejected writes were taken back off \
              the log"
@@ -6939,7 +7006,7 @@ mod tests {
             "the log was emptied for a manifest that was never published: {ev:?}"
         );
         assert_eq!(
-            Wal::replay(&dir.join("wal.log"), &None, "t/wal.log").unwrap().len(),
+            Wal::replay(&dir.join("wal.log"), &None, &"t/wal.log".into()).unwrap().len(),
             40,
             "the only surviving copy of the sealed documents was thrown away"
         );
@@ -7166,7 +7233,7 @@ mod tests {
         }
         let good = fs::read(&log).unwrap();
         // The control: all three records are there and all three replay.
-        let replayed = Wal::replay(&log, &None, "t/wal.log").unwrap();
+        let replayed = Wal::replay(&log, &None, &"t/wal.log".into()).unwrap();
         assert_eq!(replayed.len(), 3);
         assert_eq!(replayed[0].key, format!("t1{KEY_SEP}d0001"));
 
@@ -7179,7 +7246,7 @@ mod tests {
         assert_eq!(torn.len(), good.len(), "the damage is one flipped bit, not a truncation");
         fs::write(&log, &torn).unwrap();
 
-        let replayed = Wal::replay(&log, &None, "t/wal.log").unwrap();
+        let replayed = Wal::replay(&log, &None, &"t/wal.log".into()).unwrap();
         assert_eq!(
             replayed.len(),
             1,

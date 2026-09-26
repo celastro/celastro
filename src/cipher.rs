@@ -6,9 +6,13 @@
 //! the master key (ChaCha20-Poly1305, the key file's own identity as the
 //! AAD). The master key comes from the environment and is never written;
 //! the data key never leaves memory. A file is encrypted under a *file
-//! key* derived from the data key and the file's identity (its path
-//! relative to the collection, or its bare name at the root), so two files
-//! never share a key and a file cannot be moved to stand in for another.
+//! key* derived from the data key and the file's identity (its
+//! collection, shard directory and name, or its bare name at the root;
+//! before 0.84.0 the shard directory and name alone, which is still read),
+//! so two files never share a key and a file cannot be moved to stand in
+//! for another -- see [`Ids`] for the two identities, and a frame's
+//! associated data (`Frame`, private) for what else the current scheme
+//! binds: the last frame of a file, and a log's own id in each record.
 //!
 //! **Frames.** A file is a sequence of frames of at most [`CHUNK`] bytes
 //! of plaintext: `nonce[12] | ciphertext | tag[16]`, the frame's index in
@@ -48,6 +52,82 @@ const FRAME: usize = framed(CHUNK);
 pub struct Cipher {
     data_key: [u8; 32],
     previous: Vec<[u8; 32]>,
+    /// Write under the identities and the framing 0.83.0 and earlier read
+    /// (`CELASTRO_SEAL_IDENTITY=1`): what keeps a rollback possible through
+    /// the first days on a release that raised them. Read is always both.
+    legacy_writes: bool,
+}
+
+/// A file's identity under the cipher: `current` as written since 0.84.0
+/// -- the collection, the shard's directory and the file, so a file of one
+/// collection cannot stand in for the same-index shard's of another -- and
+/// `legacy`, the shard's directory and the file alone, as 0.83.0 and
+/// earlier wrote. A reader tries the current first, then the legacy; a
+/// writer uses the current unless the seal identity is pinned. A root file
+/// (`CATALOG`) has one name for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ids {
+    pub current: String,
+    pub legacy: String,
+}
+
+impl Ids {
+    pub fn new(current: impl Into<String>, legacy: impl Into<String>) -> Ids {
+        Ids { current: current.into(), legacy: legacy.into() }
+    }
+
+    /// One name under both schemes: a root file's.
+    pub fn same(name: &str) -> Ids {
+        Ids { current: name.to_string(), legacy: name.to_string() }
+    }
+
+    /// The identities an archived object of `coll` at `id` has:
+    /// `<coll>/<id>` now, `<id>` before.
+    pub fn of(coll: &str, id: &str) -> Ids {
+        Ids { current: format!("{coll}/{id}"), legacy: id.to_string() }
+    }
+
+    /// `name` appended to both: a prefix made into a file's.
+    pub fn join(&self, name: &str) -> Ids {
+        Ids { current: format!("{}{name}", self.current), legacy: format!("{}{name}", self.legacy) }
+    }
+}
+
+impl From<&str> for Ids {
+    fn from(name: &str) -> Ids {
+        Ids::same(name)
+    }
+}
+
+/// How a frame's associated data is laid out, which goes with which
+/// identity it names: the current scheme carries a flags byte after the
+/// index (bit 0: the last frame of a file, so a file cut at a frame
+/// boundary does not open shorter) and, in a log, the log's own sixteen
+/// bytes (so a record of one log does not open in another of the same
+/// shard: a rotation's, a timeline's, an archived copy's). The legacy
+/// scheme is the identity and the index alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Current,
+    Legacy,
+}
+
+/// The first record of a log written under the current scheme: this magic
+/// and the log's own sixteen random bytes, which every record after it
+/// carries in its associated data.
+pub const LOG_MAGIC: &[u8; 4] = b"CWL1";
+const LOG_ID: usize = 16;
+
+/// A log as [`Cipher::open_log`] read it: its records in order, the log's
+/// own id when it was written under the current scheme, whether its
+/// closing trailer was seen (an archived copy carries one; a live log
+/// never does), and how many bytes of the file opened.
+#[derive(Debug, Default)]
+pub struct Log {
+    pub records: Vec<Vec<u8>>,
+    pub log_id: Option<[u8; LOG_ID]>,
+    pub complete: bool,
+    pub opened: usize,
 }
 
 impl std::fmt::Debug for Cipher {
@@ -61,18 +141,62 @@ impl std::fmt::Debug for Cipher {
 /// the current key first and the ring of previous ones after it.
 const KEY_MAGIC: &[u8; 5] = b"CELK1";
 const KEY_MAGIC_RING: &[u8; 5] = b"CELK2";
+/// The ring from 0.84.0: each entry's associated data carries its index and
+/// the ring's count, so an entry cannot be moved to the current slot or a
+/// retired key spliced back by someone who can write `KEY` and has an old
+/// copy. `CELK2` rings are read as they are; a ring is written as `CELK3`
+/// unless the seal identity is pinned.
+const KEY_MAGIC_RING_V3: &[u8; 5] = b"CELK3";
 const KEY_AAD: &[u8] = b"celastro data key v1";
+
+/// The associated data of ring entry `index` of `count`, in a `CELK3` ring.
+fn ring_aad(index: usize, count: usize) -> Vec<u8> {
+    let mut a = KEY_AAD.to_vec();
+    a.extend_from_slice(b" ring ");
+    a.push(index as u8);
+    a.push(count as u8);
+    a
+}
+
+fn unwrap_ring_entry(
+    key_file: &[u8],
+    master: &[u8; 32],
+    index: usize,
+    count: usize,
+) -> Result<[u8; 32]> {
+    let at = 6 + index * WRAPPED;
+    let mut nonce = [0u8; NONCE];
+    nonce.copy_from_slice(&key_file[at..at + NONCE]);
+    let mut data = key_file[at + NONCE..at + NONCE + 32].to_vec();
+    let mut tag = [0u8; TAG];
+    tag.copy_from_slice(&key_file[at + NONCE + 32..at + WRAPPED]);
+    if !open(master, &nonce, &ring_aad(index, count), &mut data, &tag) {
+        return Err(Error::Storage(
+            "the master key does not open this database's KEY ring, or an entry of it was moved \
+             or replaced"
+                .into(),
+        ));
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&data);
+    wipe(&mut data);
+    Ok(k)
+}
 const WRAPPED: usize = NONCE + 32 + TAG;
 
 impl Cipher {
     /// A fresh data key, from the kernel's randomness.
     pub fn generate() -> Result<Cipher> {
-        Ok(Cipher { data_key: crate::crypto::random::array32()?, previous: Vec::new() })
+        Ok(Cipher {
+            data_key: crate::crypto::random::array32()?,
+            previous: Vec::new(),
+            legacy_writes: legacy_writes_pinned(),
+        })
     }
 
     /// A cipher over `data_key` with `previous` behind it (tests).
     pub fn with_previous(data_key: [u8; 32], previous: Vec<[u8; 32]>) -> Cipher {
-        Cipher { data_key, previous }
+        Cipher { data_key, previous, legacy_writes: legacy_writes_pinned() }
     }
 
     /// How many previous data keys this cipher still opens files under.
@@ -94,7 +218,7 @@ impl Cipher {
     /// accident is a second copy of a key -- so this is the one way to make
     /// another, and it says in its name what it is for.
     pub fn without_previous(&self) -> Cipher {
-        Cipher { data_key: self.data_key, previous: Vec::new() }
+        Cipher { data_key: self.data_key, previous: Vec::new(), legacy_writes: self.legacy_writes }
     }
 
     /// Forget the previous keys: `key retire`, once nothing is under them.
@@ -109,12 +233,12 @@ impl Cipher {
     /// key in the form every release reads, the ring in the form from
     /// 0.66.0 when there is one.
     pub fn wrap(&self, master: &[u8; 32]) -> Result<Vec<u8>> {
-        let wrap_one = |k: &[u8; 32], out: &mut Vec<u8>| -> Result<()> {
+        let wrap_one = |k: &[u8; 32], aad: &[u8], out: &mut Vec<u8>| -> Result<()> {
             let nonce_bytes = crate::crypto::random::bytes(NONCE)?;
             let mut nonce = [0u8; NONCE];
             nonce.copy_from_slice(&nonce_bytes);
             let mut data = k.to_vec();
-            let tag = seal(master, &nonce, KEY_AAD, &mut data);
+            let tag = seal(master, &nonce, aad, &mut data);
             out.extend_from_slice(&nonce);
             out.extend_from_slice(&data);
             out.extend_from_slice(&tag);
@@ -123,14 +247,24 @@ impl Cipher {
         let mut out = Vec::with_capacity(6 + WRAPPED * (1 + self.previous.len()));
         if self.previous.is_empty() {
             out.extend_from_slice(KEY_MAGIC);
-            wrap_one(&self.data_key, &mut out)?;
+            wrap_one(&self.data_key, KEY_AAD, &mut out)?;
             return Ok(out);
         }
-        out.extend_from_slice(KEY_MAGIC_RING);
-        out.push((1 + self.previous.len()) as u8);
-        wrap_one(&self.data_key, &mut out)?;
-        for k in &self.previous {
-            wrap_one(k, &mut out)?;
+        let count = 1 + self.previous.len();
+        if self.legacy_writes {
+            out.extend_from_slice(KEY_MAGIC_RING);
+            out.push(count as u8);
+            wrap_one(&self.data_key, KEY_AAD, &mut out)?;
+            for k in &self.previous {
+                wrap_one(k, KEY_AAD, &mut out)?;
+            }
+            return Ok(out);
+        }
+        out.extend_from_slice(KEY_MAGIC_RING_V3);
+        out.push(count as u8);
+        wrap_one(&self.data_key, &ring_aad(0, count), &mut out)?;
+        for (i, k) in self.previous.iter().enumerate() {
+            wrap_one(k, &ring_aad(i + 1, count), &mut out)?;
         }
         Ok(out)
     }
@@ -158,7 +292,11 @@ impl Cipher {
             Ok(k)
         };
         if key_file.len() == 5 + WRAPPED && &key_file[..5] == KEY_MAGIC {
-            return Ok(Cipher { data_key: unwrap_one(5)?, previous: Vec::new() });
+            return Ok(Cipher {
+                data_key: unwrap_one(5)?,
+                previous: Vec::new(),
+                legacy_writes: legacy_writes_pinned(),
+            });
         }
         if key_file.len() >= 6 && &key_file[..5] == KEY_MAGIC_RING {
             let n = key_file[5] as usize;
@@ -170,9 +308,44 @@ impl Cipher {
             for i in 1..n {
                 previous.push(unwrap_one(6 + i * WRAPPED)?);
             }
-            return Ok(Cipher { data_key, previous });
+            return Ok(Cipher { data_key, previous, legacy_writes: legacy_writes_pinned() });
+        }
+        if key_file.len() >= 6 && &key_file[..5] == KEY_MAGIC_RING_V3 {
+            let n = key_file[5] as usize;
+            if n == 0 || key_file.len() != 6 + n * WRAPPED {
+                return Err(Error::Storage("KEY is not a wrapped data key ring".into()));
+            }
+            let data_key = unwrap_ring_entry(key_file, master, 0, n)?;
+            let mut previous = Vec::with_capacity(n - 1);
+            for i in 1..n {
+                previous.push(unwrap_ring_entry(key_file, master, i, n)?);
+            }
+            return Ok(Cipher { data_key, previous, legacy_writes: legacy_writes_pinned() });
         }
         Err(Error::Storage("KEY is not a wrapped data key".into()))
+    }
+
+    /// Write under the identities and framing 0.83.0 reads, or not.
+    pub fn set_legacy_writes(&mut self, on: bool) {
+        self.legacy_writes = on;
+    }
+
+    pub fn writes_legacy(&self) -> bool {
+        self.legacy_writes
+    }
+
+    /// The identity and scheme a write goes under.
+    fn write_as<'a>(&self, ids: &'a Ids) -> (&'a str, Scheme) {
+        if self.legacy_writes {
+            (&ids.legacy, Scheme::Legacy)
+        } else {
+            (&ids.current, Scheme::Current)
+        }
+    }
+
+    /// The identity and scheme a read tries, in order.
+    fn read_as(ids: &Ids) -> [(&str, Scheme); 2] {
+        [(&ids.current, Scheme::Current), (&ids.legacy, Scheme::Legacy)]
     }
 
     /// The key of one file, from its identity, under the current data key.
@@ -196,56 +369,67 @@ impl Cipher {
         v
     }
 
-    /// The whole of `plain` as frames.
-    pub fn seal_file(&self, id: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    /// The whole of `plain` as frames, under the identity a write goes
+    /// under; under the current scheme the last frame says it is the last.
+    pub fn seal_file(&self, ids: &Ids, plain: &[u8]) -> Result<Vec<u8>> {
+        let (id, scheme) = self.write_as(ids);
         let key = self.file_key(id);
         let frames = plain.len().div_ceil(CHUNK).max(1);
         let mut out = Vec::with_capacity(frames * NONCE + plain.len() + frames * TAG);
         if plain.is_empty() {
             // An empty file is one empty frame, so it still authenticates.
-            self.push_frame(&key, id, 0, &[], &mut out)?;
+            self.push_frame(
+                &key,
+                Frame { id, scheme, index: 0, last: true, log_id: None },
+                &[],
+                &mut out,
+            )?;
             return Ok(out);
         }
         for (index, c) in plain.chunks(CHUNK).enumerate() {
-            self.push_frame(&key, id, index as u64, c, &mut out)?;
+            let f =
+                Frame { id, scheme, index: index as u64, last: index + 1 == frames, log_id: None };
+            self.push_frame(&key, f, c, &mut out)?;
         }
         Ok(out)
     }
 
-    fn push_frame(
-        &self,
-        key: &[u8; 32],
-        id: &str,
-        index: u64,
-        c: &[u8],
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
+    fn push_frame(&self, key: &[u8; 32], f: Frame<'_>, c: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let nonce_bytes = crate::crypto::random::bytes(NONCE)?;
         let mut nonce = [0u8; NONCE];
         nonce.copy_from_slice(&nonce_bytes);
         let mut data = c.to_vec();
-        let tag = seal(key, &nonce, &aad(id, index), &mut data);
+        let tag = seal(key, &nonce, &f.aad(), &mut data);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&data);
         out.extend_from_slice(&tag);
         Ok(())
     }
 
-    /// The whole of a framed file: under the current key, or under a
-    /// previous one the ring keeps.
-    pub fn open_file(&self, id: &str, framed_bytes: &[u8]) -> Result<Vec<u8>> {
-        let keys = self.file_keys(id);
+    /// The whole of a framed file: under the current identity or the
+    /// legacy one, under the current key or a previous one the ring keeps.
+    /// A file under the current scheme whose last frame does not say it is
+    /// the last is cut, and refused.
+    pub fn open_file(&self, ids: &Ids, framed_bytes: &[u8]) -> Result<Vec<u8>> {
         let mut last = None;
-        for key in &keys {
-            match self.open_file_under(key, id, framed_bytes) {
-                Ok(p) => return Ok(p),
-                Err(e) => last = Some(e),
+        for (id, scheme) in Self::read_as(ids) {
+            for key in &self.file_keys(id) {
+                match self.open_file_under(key, id, scheme, framed_bytes) {
+                    Ok(p) => return Ok(p),
+                    Err(e) => last = Some(e),
+                }
             }
         }
         Err(last.expect("at least one key"))
     }
 
-    fn open_file_under(&self, key: &[u8; 32], id: &str, framed_bytes: &[u8]) -> Result<Vec<u8>> {
+    fn open_file_under(
+        &self,
+        key: &[u8; 32],
+        id: &str,
+        scheme: Scheme,
+        framed_bytes: &[u8],
+    ) -> Result<Vec<u8>> {
         let key = *key;
         let mut out = Vec::with_capacity(framed_bytes.len());
         let mut index = 0u64;
@@ -256,7 +440,8 @@ impl Cipher {
                 return Err(Error::Storage(format!("{id}: an encrypted frame is torn")));
             }
             let (frame, after) = rest.split_at(take);
-            out.extend_from_slice(&self.open_frame(&key, id, index, frame)?);
+            let f = Frame { id, scheme, index, last: after.is_empty(), log_id: None };
+            out.extend_from_slice(&self.open_frame(&key, f, frame)?);
             rest = after;
             index += 1;
             if rest.is_empty() {
@@ -266,15 +451,16 @@ impl Cipher {
         Ok(out)
     }
 
-    fn open_frame(&self, key: &[u8; 32], id: &str, index: u64, frame: &[u8]) -> Result<Vec<u8>> {
+    fn open_frame(&self, key: &[u8; 32], f: Frame<'_>, frame: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0u8; NONCE];
         nonce.copy_from_slice(&frame[..NONCE]);
         let mut data = frame[NONCE..frame.len() - TAG].to_vec();
         let mut tag = [0u8; TAG];
         tag.copy_from_slice(&frame[frame.len() - TAG..]);
-        if !open(key, &nonce, &aad(id, index), &mut data, &tag) {
+        if !open(key, &nonce, &f.aad(), &mut data, &tag) {
             return Err(Error::Storage(format!(
-                "{id}: frame {index} does not authenticate; the file is damaged or under another key"
+                "{}: frame {} does not authenticate; the file is damaged, cut, or under another key",
+                f.id, f.index
             )));
         }
         Ok(data)
@@ -299,28 +485,34 @@ impl Cipher {
     /// range cut out. What a segment's ranged reads become.
     pub fn read_range(
         &self,
-        id: &str,
+        ids: &Ids,
         read: &dyn Fn(u64, u64) -> Result<Vec<u8>>,
+        framed_len: u64,
         off: u64,
         len: u64,
     ) -> Result<Vec<u8>> {
-        // Under the current key, then under each the ring keeps.
-        let keys = self.file_keys(id);
+        // Under either identity, under the current key then each the ring
+        // keeps: a wrong guess costs one frame's failed authentication.
         let mut last = None;
-        for key in &keys {
-            match self.read_range_under(key, id, read, off, len) {
-                Ok(p) => return Ok(p),
-                Err(e) => last = Some(e),
+        for (id, scheme) in Self::read_as(ids) {
+            for key in &self.file_keys(id) {
+                match self.read_range_under(key, id, scheme, read, framed_len, off, len) {
+                    Ok(p) => return Ok(p),
+                    Err(e) => last = Some(e),
+                }
             }
         }
         Err(last.expect("at least one key"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_range_under(
         &self,
         key: &[u8; 32],
         id: &str,
+        scheme: Scheme,
         read: &dyn Fn(u64, u64) -> Result<Vec<u8>>,
+        framed_len: u64,
         off: u64,
         len: u64,
     ) -> Result<Vec<u8>> {
@@ -331,10 +523,12 @@ impl Cipher {
         let first = off / CHUNK as u64;
         let last = (off + len - 1) / CHUNK as u64;
         let framed_off = first * FRAME as u64;
-        let framed_len = (last - first + 1) * FRAME as u64;
+        let framed_span = (last - first + 1) * FRAME as u64;
+        // The file's last frame, which under the current scheme says so.
+        let final_index = framed_len.saturating_sub(1) / FRAME as u64;
         // The last frame of the file may be short; ask for what covers the
         // range and let the reader cut at the file's end.
-        let bytes = read(framed_off, framed_len)?;
+        let bytes = read(framed_off, framed_span)?;
         let mut plain = Vec::with_capacity(bytes.len());
         let mut rest = bytes.as_slice();
         let mut index = first;
@@ -344,7 +538,8 @@ impl Cipher {
                 return Err(Error::Storage(format!("{id}: an encrypted frame is torn")));
             }
             let (frame, after) = rest.split_at(take);
-            plain.extend_from_slice(&self.open_frame(&key, id, index, frame)?);
+            let f = Frame { id, scheme, index, last: index == final_index, log_id: None };
+            plain.extend_from_slice(&self.open_frame(&key, f, frame)?);
             rest = after;
             index += 1;
         }
@@ -369,36 +564,137 @@ impl Cipher {
 }
 
 impl Cipher {
+    /// The first record of a fresh log under the current scheme: the
+    /// magic and the log's own id, sealed as record 0. `None` when writes
+    /// are pinned to the legacy scheme, whose logs have no header. What
+    /// `Wal::open`, `rotate` and `truncate` write before any record.
+    pub fn log_header(&self, ids: &Ids) -> Result<Option<(Vec<u8>, [u8; LOG_ID])>> {
+        if self.legacy_writes {
+            return Ok(None);
+        }
+        let mut log_id = [0u8; LOG_ID];
+        log_id.copy_from_slice(&crate::crypto::random::bytes(LOG_ID)?);
+        let mut plain = LOG_MAGIC.to_vec();
+        plain.extend_from_slice(&log_id);
+        let key = self.file_key(&ids.current);
+        let mut frame = Vec::with_capacity(4 + framed(plain.len()));
+        frame.extend_from_slice(&(framed(plain.len()) as u32).to_le_bytes());
+        let f = Frame {
+            id: &ids.current,
+            scheme: Scheme::Current,
+            index: 0,
+            last: false,
+            log_id: None,
+        };
+        self.push_frame(&key, f, &plain, &mut frame)?;
+        Ok(Some((frame, log_id)))
+    }
+
     /// One record of an append-only log as a length-prefixed frame:
     /// `u32 len | nonce | ciphertext | tag`, `index` the record's ordinal in
-    /// the log's AAD. What the WAL appends.
-    pub fn seal_record(&self, id: &str, index: u64, plain: &[u8]) -> Result<Vec<u8>> {
+    /// the log (the header is 0 in a log that has one) in the AAD, with the
+    /// log's id under the current scheme. `last` marks the trailer an
+    /// archived copy ends with: an empty record that says the copy is whole.
+    pub fn seal_record(
+        &self,
+        ids: &Ids,
+        log_id: Option<&[u8; LOG_ID]>,
+        index: u64,
+        plain: &[u8],
+        last: bool,
+    ) -> Result<Vec<u8>> {
+        let (id, scheme) = match log_id {
+            Some(_) => (ids.current.as_str(), Scheme::Current),
+            None => (ids.legacy.as_str(), Scheme::Legacy),
+        };
         let key = self.file_key(id);
         let mut frame = Vec::with_capacity(4 + framed(plain.len()));
         frame.extend_from_slice(&(framed(plain.len()) as u32).to_le_bytes());
-        self.push_frame(&key, id, index, plain, &mut frame)?;
+        self.push_frame(&key, Frame { id, scheme, index, last, log_id }, plain, &mut frame)?;
         Ok(frame)
     }
 
     /// The records of a log of length-prefixed frames, in order, stopping
     /// at the first frame that is torn or does not authenticate -- the
-    /// rule a WAL's CRC applies to a torn tail.
-    pub fn open_records(&self, id: &str, log: &[u8]) -> Vec<Vec<u8>> {
-        // The key the first record opens under decides the log's: a log is
-        // under one key, the current or one the ring keeps.
-        let keys = self.file_keys(id);
-        for key in &keys {
-            let out = self.open_records_under(key, id, log);
-            if !out.is_empty() || log.len() < 4 {
+    /// rule a WAL's CRC applies to a torn tail. A log whose first record is
+    /// a header is read under the current scheme with the id it carries,
+    /// and ends at its trailer if it has one; any other log is read under
+    /// the legacy scheme. Which key of the ring seals it is decided from
+    /// the first record.
+    pub fn open_log(&self, ids: &Ids, log: &[u8]) -> Log {
+        if log.len() < 4 {
+            return Log::default();
+        }
+        // The current scheme: a header first.
+        for key in &self.file_keys(&ids.current) {
+            if let Some(out) = self.open_log_current(key, &ids.current, log) {
                 return out;
             }
         }
-        Vec::new()
+        for key in &self.file_keys(&ids.legacy) {
+            let out = self.open_log_legacy(key, &ids.legacy, log);
+            if !out.records.is_empty() {
+                return out;
+            }
+        }
+        Log::default()
     }
 
-    fn open_records_under(&self, key: &[u8; 32], id: &str, log: &[u8]) -> Vec<Vec<u8>> {
+    fn open_log_current(&self, key: &[u8; 32], id: &str, log: &[u8]) -> Option<Log> {
         let key = *key;
-        let mut out = Vec::new();
+        let len = u32::from_le_bytes([log[0], log[1], log[2], log[3]]) as usize;
+        let head = log.get(4..4 + len)?;
+        if len < NONCE + TAG {
+            return None;
+        }
+        let f = Frame { id, scheme: Scheme::Current, index: 0, last: false, log_id: None };
+        let plain = self.open_frame(&key, f, head).ok()?;
+        if plain.len() != LOG_MAGIC.len() + LOG_ID || &plain[..4] != LOG_MAGIC {
+            return None;
+        }
+        let mut log_id = [0u8; LOG_ID];
+        log_id.copy_from_slice(&plain[4..]);
+        let mut out =
+            Log { records: Vec::new(), log_id: Some(log_id), complete: false, opened: 4 + len };
+        let mut i = 4 + len;
+        let mut index = 1u64;
+        while i + 4 <= log.len() {
+            let len = u32::from_le_bytes([log[i], log[i + 1], log[i + 2], log[i + 3]]) as usize;
+            let Some(frame) = log.get(i + 4..i + 4 + len) else { break };
+            if len < NONCE + TAG {
+                break;
+            }
+            let record =
+                Frame { id, scheme: Scheme::Current, index, last: false, log_id: Some(&log_id) };
+            match self.open_frame(&key, record, frame) {
+                Ok(p) => out.records.push(p),
+                Err(_) => {
+                    // The trailer: an empty record that says it is the last.
+                    let trailer = Frame {
+                        id,
+                        scheme: Scheme::Current,
+                        index,
+                        last: true,
+                        log_id: Some(&log_id),
+                    };
+                    if self.open_frame(&key, trailer, frame).map(|p| p.is_empty()).unwrap_or(false)
+                    {
+                        out.complete = true;
+                        out.opened = i + 4 + len;
+                    }
+                    break;
+                }
+            }
+            i += 4 + len;
+            index += 1;
+            out.opened = i;
+        }
+        Some(out)
+    }
+
+    fn open_log_legacy(&self, key: &[u8; 32], id: &str, log: &[u8]) -> Log {
+        let key = *key;
+        let mut out = Log::default();
         let mut i = 0usize;
         let mut index = 0u64;
         while i + 4 <= log.len() {
@@ -407,22 +703,57 @@ impl Cipher {
             if len < NONCE + TAG {
                 break;
             }
-            match self.open_frame(&key, id, index, frame) {
-                Ok(p) => out.push(p),
+            let f = Frame { id, scheme: Scheme::Legacy, index, last: false, log_id: None };
+            match self.open_frame(&key, f, frame) {
+                Ok(p) => out.records.push(p),
                 Err(_) => break,
             }
             i += 4 + len;
             index += 1;
+            out.opened = i;
         }
         out
     }
 }
 
-fn aad(id: &str, index: u64) -> Vec<u8> {
-    let mut a = Vec::with_capacity(id.len() + 8);
-    a.extend_from_slice(id.as_bytes());
-    a.extend_from_slice(&index.to_be_bytes());
-    a
+/// One frame's place: what its associated data names.
+#[derive(Clone, Copy)]
+struct Frame<'a> {
+    id: &'a str,
+    scheme: Scheme,
+    index: u64,
+    /// The last frame of a file, or a log's trailer.
+    last: bool,
+    /// A log's own id, in every record after its header.
+    log_id: Option<&'a [u8; LOG_ID]>,
+}
+
+impl Frame<'_> {
+    fn aad(&self) -> Vec<u8> {
+        let mut a = Vec::with_capacity(self.id.len() + 8 + 1 + LOG_ID);
+        a.extend_from_slice(self.id.as_bytes());
+        a.extend_from_slice(&self.index.to_be_bytes());
+        if self.scheme == Scheme::Current {
+            a.push(self.last as u8);
+            if let Some(l) = self.log_id {
+                a.extend_from_slice(l);
+            }
+        }
+        a
+    }
+}
+
+/// Whether writes are pinned to the identities and framing 0.83.0 reads:
+/// `CELASTRO_SEAL_IDENTITY=1`, read once by the binary at start. Every
+/// cipher made afterwards writes that way; reads are always both.
+static LEGACY_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pin_legacy_writes(on: bool) {
+    LEGACY_PIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn legacy_writes_pinned() -> bool {
+    LEGACY_PIN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A shared cipher, or none: what every writer and reader of the database's
@@ -625,46 +956,224 @@ mod tests {
     }
 
     /// Files of every size around the frame boundary round-trip whole and
-    /// by range; the identity and the frame index are bound.
+    /// by range; the identity and the frame index are bound, under both
+    /// schemes.
     #[test]
     fn files_round_trip_whole_and_by_range_and_frames_cannot_move() {
-        let c = Cipher { data_key: [7; 32], previous: Vec::new() };
-        for n in [0usize, 1, 100, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + 17, 3 * CHUNK] {
-            let plain: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
-            let framed = c.seal_file("shard-0000/segments/1.seg", &plain).unwrap();
-            assert_eq!(Cipher::plain_len(framed.len() as u64).unwrap(), n as u64, "n={n}");
-            assert_eq!(c.open_file("shard-0000/segments/1.seg", &framed).unwrap(), plain, "n={n}");
-            let read = |off: u64, len: u64| -> Result<Vec<u8>> {
-                let end = (off + len).min(framed.len() as u64) as usize;
-                Ok(framed[off as usize..end].to_vec())
-            };
-            for (off, len) in
-                [(0u64, 1u64), (0, n as u64), (n as u64 / 2, n as u64 / 3), (CHUNK as u64 - 5, 10)]
-            {
-                if off + len > n as u64 {
-                    continue;
+        for legacy in [false, true] {
+            let c = Cipher { data_key: [7; 32], previous: Vec::new(), legacy_writes: legacy };
+            let one = Ids::new("docs/shard-0000/segments/1.seg", "shard-0000/segments/1.seg");
+            let two = Ids::new("docs/shard-0000/segments/2.seg", "shard-0000/segments/2.seg");
+            for n in [0usize, 1, 100, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + 17, 3 * CHUNK] {
+                let plain: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+                let framed = c.seal_file(&one, &plain).unwrap();
+                assert_eq!(Cipher::plain_len(framed.len() as u64).unwrap(), n as u64, "n={n}");
+                assert_eq!(c.open_file(&one, &framed).unwrap(), plain, "n={n} legacy={legacy}");
+                let read = |off: u64, len: u64| -> Result<Vec<u8>> {
+                    let end = (off + len).min(framed.len() as u64) as usize;
+                    Ok(framed[off as usize..end].to_vec())
+                };
+                for (off, len) in [
+                    (0u64, 1u64),
+                    (0, n as u64),
+                    (n as u64 / 2, n as u64 / 3),
+                    (CHUNK as u64 - 5, 10),
+                ] {
+                    if off + len > n as u64 {
+                        continue;
+                    }
+                    let got = c.read_range(&one, &read, framed.len() as u64, off, len).unwrap();
+                    assert_eq!(
+                        got,
+                        &plain[off as usize..(off + len) as usize],
+                        "n={n} off={off} len={len} legacy={legacy}"
+                    );
                 }
-                let got = c.read_range("shard-0000/segments/1.seg", &read, off, len).unwrap();
-                assert_eq!(
-                    got,
-                    &plain[off as usize..(off + len) as usize],
-                    "n={n} off={off} len={len}"
-                );
+                if n > 0 {
+                    assert!(c.open_file(&two, &framed).is_err(), "another file's identity");
+                }
             }
-            if n > 0 {
-                assert!(
-                    c.open_file("shard-0000/segments/2.seg", &framed).is_err(),
-                    "another file's identity"
-                );
-            }
+            // Two frames swapped do not authenticate.
+            let plain = vec![1u8; 2 * CHUNK];
+            let f = Ids::same("f");
+            let framed = c.seal_file(&f, &plain).unwrap();
+            let mut swapped = Vec::new();
+            swapped.extend_from_slice(&framed[FRAME..]);
+            swapped.extend_from_slice(&framed[..FRAME]);
+            assert!(c.open_file(&f, &swapped).is_err());
         }
-        // Two frames swapped do not authenticate.
-        let plain = vec![1u8; 2 * CHUNK];
-        let framed = c.seal_file("f", &plain).unwrap();
-        let mut swapped = Vec::new();
-        swapped.extend_from_slice(&framed[FRAME..]);
-        swapped.extend_from_slice(&framed[..FRAME]);
-        assert!(c.open_file("f", &swapped).is_err());
+    }
+
+    /// The identity carries the collection now: a segment of one
+    /// collection does not open as the same-index shard's of another, and
+    /// a file cut at a whole-frame boundary does not open shorter -- both
+    /// of which a file under the legacy scheme allowed, and a legacy file
+    /// still does, since the legacy scheme is read as it was written.
+    #[test]
+    fn a_file_cannot_stand_in_for_another_collections_nor_open_shorter() {
+        let c = Cipher { data_key: [3; 32], previous: Vec::new(), legacy_writes: false };
+        let a = Ids::new("a/shard-0000/0000000000000001.seg", "shard-0000/0000000000000001.seg");
+        let b = Ids::new("b/shard-0000/0000000000000001.seg", "shard-0000/0000000000000001.seg");
+        let plain = vec![9u8; 2 * CHUNK + 5];
+        let sealed = c.seal_file(&a, &plain).unwrap();
+        assert_eq!(c.open_file(&a, &sealed).unwrap(), plain);
+        assert!(c.open_file(&b, &sealed).is_err(), "collection b must not open a's file");
+        // Cut at the first frame boundary: the frame that is now last does
+        // not say it is.
+        assert!(c.open_file(&a, &sealed[..FRAME]).is_err(), "a cut file must not open shorter");
+        assert!(c.open_file(&a, &sealed[..2 * FRAME]).is_err());
+        let read = |off: u64, len: u64| -> Result<Vec<u8>> {
+            let end = (off + len).min(FRAME as u64) as usize;
+            Ok(sealed[off as usize..end].to_vec())
+        };
+        assert!(
+            c.read_range(&a, &read, FRAME as u64, 0, 10).is_err(),
+            "a ranged read of the cut file's last frame must refuse it"
+        );
+        // Under the legacy scheme the same file did open for b and cut.
+        let legacy = Cipher { data_key: [3; 32], previous: Vec::new(), legacy_writes: true };
+        let old = legacy.seal_file(&a, &plain).unwrap();
+        assert_eq!(c.open_file(&a, &old).unwrap(), plain, "the legacy file is read as written");
+        assert_eq!(c.open_file(&b, &old).unwrap(), plain, "which is the flaw the scheme closes");
+        assert_eq!(c.open_file(&a, &old[..FRAME]).unwrap().len(), CHUNK);
+    }
+
+    /// A log under the current scheme carries its own id in every record:
+    /// a record of one log does not open in another log of the same shard
+    /// (a rotation's, a timeline's, an archived copy's), and the trailer an
+    /// archive adds is what says a copy is whole. A legacy log has neither,
+    /// and reads as it was written.
+    #[test]
+    fn a_log_record_does_not_open_in_another_log_and_a_copy_says_it_is_whole() {
+        let c = Cipher { data_key: [5; 32], previous: Vec::new(), legacy_writes: false };
+        let ids = Ids::new("docs/shard-0000/wal.log", "shard-0000/wal.log");
+        let make = |records: &[&[u8]], trailer: bool| -> Vec<u8> {
+            let (header, log_id) = c.log_header(&ids).unwrap().unwrap();
+            let mut out = header;
+            for (i, r) in records.iter().enumerate() {
+                out.extend_from_slice(
+                    &c.seal_record(&ids, Some(&log_id), 1 + i as u64, r, false).unwrap(),
+                );
+            }
+            if trailer {
+                let index = 1 + records.len() as u64;
+                out.extend_from_slice(
+                    &c.seal_record(&ids, Some(&log_id), index, &[], true).unwrap(),
+                );
+            }
+            out
+        };
+        let one = make(&[b"r0", b"r1", b"r2"], false);
+        let two = make(&[b"s0", b"s1", b"s2"], false);
+        let opened = c.open_log(&ids, &one);
+        assert_eq!(opened.records, vec![b"r0".to_vec(), b"r1".to_vec(), b"r2".to_vec()]);
+        assert!(opened.log_id.is_some() && !opened.complete && opened.opened == one.len());
+        // Record 1 of `two` in place of record 1 of `one`: the replay ends
+        // before it, as a torn tail would.
+        let rec = |log: &[u8], n: usize| -> (usize, usize) {
+            let mut i = 0;
+            for _ in 0..n {
+                let len = u32::from_le_bytes([log[i], log[i + 1], log[i + 2], log[i + 3]]) as usize;
+                i += 4 + len;
+            }
+            let len = u32::from_le_bytes([log[i], log[i + 1], log[i + 2], log[i + 3]]) as usize;
+            (i, i + 4 + len)
+        };
+        let (a0, a1) = rec(&one, 2);
+        let (b0, b1) = rec(&two, 2);
+        let mut mixed = one[..a0].to_vec();
+        mixed.extend_from_slice(&two[b0..b1]);
+        mixed.extend_from_slice(&one[a1..]);
+        let m = c.open_log(&ids, &mixed);
+        assert_eq!(m.records, vec![b"r0".to_vec()], "the foreign record ends the replay");
+        assert!(m.opened < mixed.len());
+        // The trailer: whole with it, cut without it -- and a cut at the
+        // record before the trailer is not whole either.
+        let whole = make(&[b"r0", b"r1"], true);
+        let w = c.open_log(&ids, &whole);
+        assert!(w.complete && w.records.len() == 2 && w.opened == whole.len());
+        let (t0, _) = rec(&whole, 3);
+        let cut = c.open_log(&ids, &whole[..t0]);
+        assert!(!cut.complete && cut.records.len() == 2);
+        // A legacy log: no header, records from index 0, never complete
+        // -- and its records read as written.
+        let legacy = Cipher { data_key: [5; 32], previous: Vec::new(), legacy_writes: true };
+        assert!(legacy.log_header(&ids).unwrap().is_none());
+        let old = [
+            legacy.seal_record(&ids, None, 0, b"r0", false).unwrap(),
+            legacy.seal_record(&ids, None, 1, b"r1", false).unwrap(),
+        ]
+        .concat();
+        let o = c.open_log(&ids, &old);
+        assert_eq!(o.records, vec![b"r0".to_vec(), b"r1".to_vec()]);
+        assert!(o.log_id.is_none() && !o.complete && o.opened == old.len());
+    }
+
+    /// The check walk opens what is sealed and passes over what is written
+    /// in the clear beside it: `ARCHIVED`, a shard's next log number, was
+    /// taken for a frame and reported torn on every shard with an archive.
+    #[test]
+    fn the_check_walk_passes_over_the_files_a_shard_writes_in_the_clear() {
+        let c = Cipher { data_key: [8; 32], previous: Vec::new(), legacy_writes: false };
+        let dir = std::env::temp_dir().join(format!("celastro-check-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("collections/docs/shard-0000");
+        std::fs::create_dir_all(shard.join("segments")).unwrap();
+        let ids = Ids::new("docs/shard-0000/MANIFEST", "shard-0000/MANIFEST");
+        std::fs::write(shard.join("MANIFEST"), c.seal_file(&ids, b"a manifest").unwrap()).unwrap();
+        std::fs::write(shard.join("ARCHIVED"), b"1 7").unwrap();
+        std::fs::write(shard.join("CONFIRMED"), b"12").unwrap();
+        std::fs::write(dir.join("LOCK"), b"pid").unwrap();
+        let w = check_dir(&dir, &c).unwrap();
+        assert!(w.failures.is_empty(), "{:?}", w.failures);
+        assert_eq!(w.files, 1, "the manifest, and nothing in the clear counted as sealed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ring's entries carry their index and the ring's count: an entry
+    /// moved to the current slot, or a retired key spliced back, does not
+    /// unwrap; a `CELK2` ring from before is read as it was written.
+    #[test]
+    fn a_ring_entry_cannot_be_moved_or_spliced_back() {
+        let master = [4u8; 32];
+        let a = Cipher::generate().unwrap();
+        let b = Cipher::generate().unwrap();
+        let mut ring = Cipher::generate().unwrap();
+        ring.keep_previous(&a);
+        ring.previous.push(b.data_key);
+        let wrapped = ring.wrap(&master).unwrap();
+        assert_eq!(&wrapped[..5], b"CELK3");
+        assert_eq!(Cipher::unwrap(&wrapped, &master).unwrap().previous_keys(), 2);
+        // Entry 1 moved to slot 0.
+        let mut moved = wrapped.clone();
+        let (e0, e1) = (6..6 + WRAPPED, 6 + WRAPPED..6 + 2 * WRAPPED);
+        let first = moved[e0.clone()].to_vec();
+        let second = moved[e1.clone()].to_vec();
+        moved[e0.clone()].copy_from_slice(&second);
+        moved[e1.clone()].copy_from_slice(&first);
+        assert!(Cipher::unwrap(&moved, &master).is_err(), "a moved entry must not unwrap");
+        // The ring cut to two entries: the count in the AAD disagrees.
+        let mut cut = wrapped[..6 + 2 * WRAPPED].to_vec();
+        cut[5] = 2;
+        assert!(Cipher::unwrap(&cut, &master).is_err(), "a shortened ring must not unwrap");
+        // A retired key spliced back: the old three-entry ring, from a copy.
+        let mut retired = Cipher::unwrap(&wrapped, &master).unwrap();
+        retired.retire_previous();
+        let plain = retired.wrap(&master).unwrap();
+        assert_eq!(&plain[..5], b"CELK1");
+        assert_eq!(Cipher::unwrap(&plain, &master).unwrap().previous_keys(), 0);
+        // (The splice is the old file put back whole, which is the copy the
+        // adversary has; what the AAD stops is composing a ring from parts.)
+        let mut spliced = plain.clone();
+        spliced.extend_from_slice(&wrapped[6 + WRAPPED..]);
+        assert!(Cipher::unwrap(&spliced, &master).is_err());
+        // The legacy ring is read as written.
+        let mut legacy = Cipher::generate().unwrap();
+        legacy.keep_previous(&a);
+        legacy.set_legacy_writes(true);
+        let old = legacy.wrap(&master).unwrap();
+        assert_eq!(&old[..5], b"CELK2");
+        assert_eq!(Cipher::unwrap(&old, &master).unwrap().previous_keys(), 1);
     }
 }
 
@@ -691,7 +1200,11 @@ pub struct Walked {
 /// data key: the lock, the wrapped key itself (and the one a rotation is
 /// moving to), and the marks written as plain text.
 fn is_plain_file(name: &str) -> bool {
-    matches!(name, "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED")
+    // `ARCHIVED` (the next log number and the timeline, 0.81.0) is written
+    // in the clear like the rest of these, and a walk that took it for a
+    // frame called every shard with an archive damaged (found by H6's
+    // migration drill).
+    matches!(name, "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED" | "ARCHIVED")
 }
 
 /// A shard's log: a frame per record, the record's ordinal in the AAD.
@@ -700,19 +1213,21 @@ fn is_log(name: &str) -> bool {
 }
 
 /// Every framed file under `dir`, in the order the walk finds them:
-/// `f(path, id, is_log)`. The identity is what the shard gives a file --
-/// the shard directory's name and the file's own, whichever of
-/// `segments/`, `archive/` or `deletes/` holds it -- and a root file's is
-/// its name. A move in flight (an `incoming/` directory) is refused: its
-/// files are the source's until the move ends.
+/// `f(path, ids, is_log)`. The identities are what the shard gives a file
+/// -- the collection, the shard directory's name and the file's own,
+/// whichever of `segments/`, `archive/` or `deletes/` holds it, and the
+/// legacy pair without the collection -- and a root file's is its name. A
+/// move in flight (an `incoming/` directory) is refused: its files are the
+/// source's until the move ends.
 fn walk_framed(
     dir: &std::path::Path,
-    f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+    f: &mut dyn FnMut(&std::path::Path, &Ids, bool) -> Result<()>,
 ) -> Result<()> {
     fn shard_dir(
         dir: &std::path::Path,
+        coll: &str,
         shard: &str,
-        f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+        f: &mut dyn FnMut(&std::path::Path, &Ids, bool) -> Result<()>,
     ) -> Result<()> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
         entries.sort_by_key(|e| e.file_name());
@@ -725,16 +1240,18 @@ fn walk_framed(
                         dir.display()
                     )));
                 }
-                shard_dir(&entry.path(), shard, f)?;
+                shard_dir(&entry.path(), coll, shard, f)?;
             } else if !is_plain_file(&name) {
-                f(&entry.path(), &format!("{shard}/{name}"), is_log(&name))?;
+                let ids = Ids::new(format!("{coll}/{shard}/{name}"), format!("{shard}/{name}"));
+                f(&entry.path(), &ids, is_log(&name))?;
             }
         }
         Ok(())
     }
     fn shards_in(
         dir: &std::path::Path,
-        f: &mut dyn FnMut(&std::path::Path, &str, bool) -> Result<()>,
+        coll: &str,
+        f: &mut dyn FnMut(&std::path::Path, &Ids, bool) -> Result<()>,
     ) -> Result<()> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
         entries.sort_by_key(|e| e.file_name());
@@ -744,9 +1261,9 @@ fn walk_framed(
                 continue;
             }
             if name.starts_with("shard-") {
-                shard_dir(&entry.path(), &name, f)?;
+                shard_dir(&entry.path(), coll, &name, f)?;
             } else if name == "followed" {
-                shards_in(&entry.path(), f)?;
+                shards_in(&entry.path(), coll, f)?;
             } else if name == "incoming" {
                 return Err(Error::Storage(format!(
                     "{}: a move is in flight (incoming/); finish or abort it first",
@@ -767,12 +1284,13 @@ fn walk_framed(
                 colls.sort_by_key(|e| e.file_name());
                 for c in colls {
                     if c.file_type()?.is_dir() {
-                        shards_in(&c.path(), f)?;
+                        let coll = c.file_name().to_string_lossy().to_string();
+                        shards_in(&c.path(), &coll, f)?;
                     }
                 }
             }
         } else if !is_plain_file(&name) {
-            f(&entry.path(), &name, is_log(&name))?;
+            f(&entry.path(), &Ids::same(&name), is_log(&name))?;
         }
     }
     Ok(())
@@ -784,22 +1302,21 @@ fn walk_framed(
 /// run reports every damaged file.
 pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
     let mut w = Walked::default();
-    walk_framed(dir, &mut |path, id, log| {
+    walk_framed(dir, &mut |path, ids, log| {
         let bytes = std::fs::read(path)?;
         if log {
-            let records = cipher.open_records(id, &bytes);
-            let opened: usize = records.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
-            if opened < bytes.len() {
+            let opened = cipher.open_log(ids, &bytes);
+            if opened.opened < bytes.len() {
                 w.failures.push(format!(
                     "{}: {} record(s) open, then the log does not (torn or under another key)",
                     path.display(),
-                    records.len()
+                    opened.records.len()
                 ));
             }
-            w.records += records.len();
+            w.records += opened.records.len();
             w.files += 1;
         } else {
-            match cipher.open_file(id, &bytes) {
+            match cipher.open_file(ids, &bytes) {
                 Ok(_) => w.files += 1,
                 Err(e) => w.failures.push(format!("{}: {e}", path.display())),
             }
@@ -816,20 +1333,18 @@ pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
 /// touched. The plain files stay as they are.
 pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<Walked> {
     let mut w = Walked::default();
-    walk_framed(dir, &mut |path, id, log| {
+    walk_framed(dir, &mut |path, ids, log| {
         let bytes = std::fs::read(path)?;
         if log {
             if bytes.is_empty() {
                 return Ok(());
             }
-            let records = from.open_records(id, &bytes);
-            let opened: usize = records.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
-            if records.is_empty() || opened < bytes.len() {
+            let opened = from.open_log(ids, &bytes);
+            if opened.records.is_empty() || opened.opened < bytes.len() {
                 // Under the new key already, or damaged: told apart by
                 // opening under the new one.
-                let under_new = to.open_records(id, &bytes);
-                let opened_new: usize = under_new.iter().map(|r| r.len() + 4 + NONCE + TAG).sum();
-                if opened_new == bytes.len() {
+                let under_new = to.open_log(ids, &bytes);
+                if under_new.opened == bytes.len() && !under_new.records.is_empty() {
                     w.already += 1;
                     return Ok(());
                 }
@@ -837,21 +1352,40 @@ pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<W
                     "{}: {} record(s) open under the current key, then the log does not; \
                      nothing was changed",
                     path.display(),
-                    records.len()
+                    opened.records.len()
                 )));
             }
+            // Written afresh under the new key, as a log of the scheme the
+            // new cipher writes: its own header, its records, and the
+            // trailer again if it had one.
             let mut out = Vec::with_capacity(bytes.len());
-            for (i, r) in records.iter().enumerate() {
-                out.extend_from_slice(&to.seal_record(id, i as u64, r)?);
+            let header = to.log_header(ids)?;
+            let log_id = header.as_ref().map(|(_, l)| *l);
+            if let Some((h, _)) = &header {
+                out.extend_from_slice(h);
+            }
+            let base = log_id.is_some() as u64;
+            for (i, r) in opened.records.iter().enumerate() {
+                out.extend_from_slice(&to.seal_record(
+                    ids,
+                    log_id.as_ref(),
+                    base + i as u64,
+                    r,
+                    false,
+                )?);
+            }
+            if opened.complete && log_id.is_some() {
+                let index = base + opened.records.len() as u64;
+                out.extend_from_slice(&to.seal_record(ids, log_id.as_ref(), index, &[], true)?);
             }
             crate::shard::atomic_write(path, &out)?;
-            w.records += records.len();
+            w.records += opened.records.len();
             w.files += 1;
         } else {
-            let plain = match from.open_file(id, &bytes) {
+            let plain = match from.open_file(ids, &bytes) {
                 Ok(p) => p,
                 Err(e) => {
-                    if to.open_file(id, &bytes).is_ok() {
+                    if to.open_file(ids, &bytes).is_ok() {
                         w.already += 1;
                         return Ok(());
                     }
@@ -861,7 +1395,7 @@ pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<W
                     )));
                 }
             };
-            crate::shard::atomic_write(path, &to.seal_file(id, &plain)?)?;
+            crate::shard::atomic_write(path, &to.seal_file(ids, &plain)?)?;
             w.files += 1;
         }
         Ok(())
@@ -900,8 +1434,8 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
     // walk does not reach, so the old key stays behind the new one in a
     // ring and those objects open as before, until `key retire`.
     if let Some(bytes) = crate::shard::read_optional(&dir.join("CATALOG"))? {
-        let plain =
-            old.open_file("CATALOG", &bytes).or_else(|_| new.open_file("CATALOG", &bytes))?;
+        let root = Ids::same("CATALOG");
+        let plain = old.open_file(&root, &bytes).or_else(|_| new.open_file(&root, &bytes))?;
         let catalog = crate::catalog::Catalog::decode(&plain)?;
         let archived = catalog
             .collections
@@ -930,12 +1464,13 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
 pub const HEAD_BYTES: usize = FRAME;
 
 /// What an archived object's key says about it: the collection it belongs
-/// to, the shard, and the identity it was sealed under.
+/// to, the shard, and the identities it was sealed under.
 ///
 /// The object key is `<prefix><collection>/<shard>/<id>.seg` and the seal
-/// identity is `<shard>/<id>.seg` (`Shard::file_id`), so one is read off
-/// the other and neither has to be guessed from a manifest.
-pub fn archived_seal_id(object_key: &str) -> Option<(String, String, String)> {
+/// identity is `<collection>/<shard>/<id>.seg` (`Shard::file_ids`), or
+/// `<shard>/<id>.seg` before 0.84.0, so both are read off the key and
+/// neither has to be guessed from a manifest.
+pub fn archived_seal_id(object_key: &str) -> Option<(String, String, Ids)> {
     let mut parts = object_key.rsplitn(3, '/');
     let file = parts.next()?.to_string();
     let shard = parts.next()?.to_string();
@@ -943,29 +1478,39 @@ pub fn archived_seal_id(object_key: &str) -> Option<(String, String, String)> {
     if !file.ends_with(".seg") {
         return None;
     }
-    Some((coll, shard.clone(), format!("{shard}/{file}")))
+    let ids = Ids::new(format!("{coll}/{shard}/{file}"), format!("{shard}/{file}"));
+    Some((coll, shard, ids))
 }
 
 impl Cipher {
-    /// Which key of the ring opens `id`'s first frame: `Some(0)` for the
-    /// current key, `Some(n)` for the nth previous one, `None` for a frame
-    /// no key in the ring opens.
+    /// Which key of the ring opens the file's first frame, and under which
+    /// identity: `Some((0, _))` for the current key, `Some((n, _))` for the
+    /// nth previous one, `None` for a frame no key in the ring opens under
+    /// either identity.
     ///
     /// `head` is the first [`HEAD_BYTES`] of the file, or the whole of it
     /// when it is shorter -- a frame authenticates on its own, so nothing
-    /// more needs fetching to answer this.
-    pub fn opening_key(&self, id: &str, head: &[u8]) -> Option<usize> {
-        let keys = self.file_keys(id);
-        for (n, key) in keys.iter().enumerate() {
-            if self.open_file_under(key, id, head).is_ok() {
-                return Some(n);
+    /// more needs fetching to answer this. A one-frame file's frame is its
+    /// last, which the current scheme's associated data says.
+    pub fn opening_key(&self, ids: &Ids, head: &[u8], whole: bool) -> Option<(usize, bool)> {
+        for (id, scheme) in Self::read_as(ids) {
+            let keys = self.file_keys(id);
+            for (n, key) in keys.iter().enumerate() {
+                if head.len() < NONCE + TAG {
+                    return None;
+                }
+                let f = Frame { id, scheme, index: 0, last: whole, log_id: None };
+                if self.open_frame(key, f, &head[..head.len().min(FRAME)]).is_ok() {
+                    return Some((n, scheme == Scheme::Current));
+                }
             }
         }
         None
     }
 
-    /// `framed` opened under whichever key of the ring seals it and sealed
-    /// again under the current one, a frame at a time into `out`.
+    /// `framed` opened under whichever key and identity of the ring seals
+    /// it and sealed again under the current key, a frame at a time into
+    /// `out`, under the identity a write goes under.
     ///
     /// Frames are independent -- a nonce, the ciphertext and a tag, with
     /// the file's identity and the frame's index as associated data -- so
@@ -977,30 +1522,46 @@ impl Cipher {
     ///
     /// Which key opens it is decided from the first frame, so the object is
     /// not decrypted once per candidate key to find out.
-    pub fn reseal_into(&self, id: &str, sealed: &[u8], out: &mut dyn std::io::Write) -> Result<()> {
+    pub fn reseal_into(
+        &self,
+        ids: &Ids,
+        sealed: &[u8],
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
         let head = &sealed[..sealed.len().min(HEAD_BYTES)];
-        let Some(which) = self.opening_key(id, head) else {
+        let Some((which, current)) = self.opening_key(ids, head, sealed.len() <= FRAME) else {
             return Err(Error::Storage(format!(
-                "{id}: no data key this KEY holds opens it; it is damaged, or was sealed under a \
-                 key that has been retired"
+                "{}: no data key this KEY holds opens it; it is damaged, or was sealed under a \
+                 key that has been retired",
+                ids.current
             )));
         };
-        let keys = self.file_keys(id);
+        let (from_id, from_scheme) = if current {
+            (ids.current.as_str(), Scheme::Current)
+        } else {
+            (ids.legacy.as_str(), Scheme::Legacy)
+        };
+        let keys = self.file_keys(from_id);
         let from = &keys[which];
-        let to = self.file_key(id);
+        let (to_id, to_scheme) = self.write_as(ids);
+        let to = self.file_key(to_id);
         let (mut index, mut rest) = (0u64, sealed);
         loop {
             let take = rest.len().min(FRAME);
             if take < NONCE + TAG {
-                return Err(Error::Storage(format!("{id}: an encrypted frame is torn")));
+                return Err(Error::Storage(format!("{}: an encrypted frame is torn", ids.current)));
             }
             let (frame, after) = rest.split_at(take);
-            let mut plain = self.open_frame(from, id, index, frame)?;
+            let last = after.is_empty();
+            let f = Frame { id: from_id, scheme: from_scheme, index, last, log_id: None };
+            let mut plain = self.open_frame(from, f, frame)?;
             let mut one = Vec::with_capacity(framed(plain.len()));
-            self.push_frame(&to, id, index, &plain, &mut one)?;
+            let g = Frame { id: to_id, scheme: to_scheme, index, last, log_id: None };
+            self.push_frame(&to, g, &plain, &mut one)?;
             wipe(&mut plain);
-            out.write_all(&one)
-                .map_err(|e| Error::Storage(format!("{id}: writing a re-sealed frame: {e}")))?;
+            out.write_all(&one).map_err(|e| {
+                Error::Storage(format!("{}: writing a re-sealed frame: {e}", ids.current))
+            })?;
             rest = after;
             index += 1;
             if rest.is_empty() {
@@ -1011,15 +1572,13 @@ impl Cipher {
 
     /// [`Cipher::reseal_into`] into a buffer, for a caller that wants the
     /// bytes rather than a writer.
-    pub fn reseal_file(&self, id: &str, framed: &[u8]) -> Result<Vec<u8>> {
+    pub fn reseal_file(&self, ids: &Ids, framed: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(framed.len());
-        self.reseal_into(id, framed, &mut out)?;
+        self.reseal_into(ids, framed, &mut out)?;
         Ok(out)
     }
 }
 
-/// What a walk of the archived tier found: the objects still sealed under a
-/// previous data key, by collection.
 #[derive(Debug, Default)]
 pub struct ArchiveWalk {
     pub objects: usize,
@@ -1069,16 +1628,17 @@ pub fn walk_archive(
     let mut w = ArchiveWalk::default();
     for name in colls {
         for key in store.list(&format!("{prefix}{name}/"))? {
-            let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
+            let Some((coll, _shard, ids)) = archived_seal_id(&key) else { continue };
             if &coll != name {
                 continue;
             }
             // One request per object: whether it is there and what its
-            // first frame says are the same question.
+            // first frame says are the same question. A head shorter than
+            // a frame is the whole object, and its frame the last.
             let Some(head) = store.head(&key, HEAD_BYTES as u64)? else { continue };
             w.objects += 1;
-            match cipher.opening_key(&id, &head) {
-                Some(0) => {}
+            match cipher.opening_key(&ids, &head, head.len() < HEAD_BYTES) {
+                Some((0, true)) => {}
                 Some(_) => {
                     w.under_previous += 1;
                     w.collections.insert(coll);
@@ -1118,19 +1678,22 @@ pub fn reseal_archive(
     let out = (|| -> Result<usize> {
         for name in colls {
             for key in store.list(&format!("{prefix}{name}/"))? {
-                let Some((coll, _shard, id)) = archived_seal_id(&key) else { continue };
+                let Some((coll, _shard, ids)) = archived_seal_id(&key) else { continue };
                 if &coll != name {
                     continue;
                 }
                 let Some(head) = store.head(&key, HEAD_BYTES as u64)? else { continue };
-                match cipher.opening_key(&id, &head) {
-                    Some(0) | None => continue,
+                // Under the current key and identity already, or under no
+                // key at all: left alone. Under a previous key, or under
+                // the legacy identity: sealed again.
+                match cipher.opening_key(&ids, &head, head.len() < HEAD_BYTES) {
+                    Some((0, true)) | None => continue,
                     Some(_) => {}
                 }
                 let sealed = store.get(&key)?;
                 let mut f = std::fs::File::create(&tmp)
                     .map_err(|e| Error::Storage(format!("{}: {e}", tmp.display())))?;
-                cipher.reseal_into(&id, &sealed, &mut f)?;
+                cipher.reseal_into(&ids, &sealed, &mut f)?;
                 drop(sealed);
                 use std::io::Write;
                 f.flush().map_err(|e| Error::Storage(format!("{}: {e}", tmp.display())))?;
@@ -1172,40 +1735,45 @@ mod ring_tests {
     fn a_previous_key_in_the_ring_opens_what_was_sealed_under_it() {
         let master = [9u8; 32];
         let old = Cipher::generate().unwrap();
-        let sealed = old.seal_file("shard-0000/a.seg", b"rows").unwrap();
+        let seg = Ids::new("docs/shard-0000/a.seg", "shard-0000/a.seg");
+        let wal = Ids::new("docs/shard-0000/wal.log", "shard-0000/wal.log");
+        let sealed = old.seal_file(&seg, b"rows").unwrap();
+        let (header, log_id) = old.log_header(&wal).unwrap().unwrap();
         let log = [
-            old.seal_record("shard-0000/wal.log", 0, b"r0").unwrap(),
-            old.seal_record("shard-0000/wal.log", 1, b"r1").unwrap(),
+            header,
+            old.seal_record(&wal, Some(&log_id), 1, b"r0", false).unwrap(),
+            old.seal_record(&wal, Some(&log_id), 2, b"r1", false).unwrap(),
         ]
         .concat();
         let mut new = Cipher::generate().unwrap();
-        assert!(new.open_file("shard-0000/a.seg", &sealed).is_err());
+        assert!(new.open_file(&seg, &sealed).is_err());
         new.keep_previous(&old);
         assert_eq!(new.previous_keys(), 1);
-        assert_eq!(new.open_file("shard-0000/a.seg", &sealed).unwrap(), b"rows");
-        assert_eq!(new.open_records("shard-0000/wal.log", &log).len(), 2);
+        assert_eq!(new.open_file(&seg, &sealed).unwrap(), b"rows");
+        assert_eq!(new.open_log(&wal, &log).records.len(), 2);
         let range = new
             .read_range(
-                "shard-0000/a.seg",
+                &seg,
                 &|off, len| {
                     Ok(sealed[off as usize..(off + len).min(sealed.len() as u64) as usize].to_vec())
                 },
+                sealed.len() as u64,
                 1,
                 2,
             )
             .unwrap();
         assert_eq!(range, b"ow");
         let wrapped = new.wrap(&master).unwrap();
-        assert_eq!(&wrapped[..5], b"CELK2");
+        assert_eq!(&wrapped[..5], b"CELK3");
         let back = Cipher::unwrap(&wrapped, &master).unwrap();
         assert_eq!(back.previous_keys(), 1);
-        assert_eq!(back.open_file("shard-0000/a.seg", &sealed).unwrap(), b"rows");
+        assert_eq!(back.open_file(&seg, &sealed).unwrap(), b"rows");
         let plain = old.wrap(&master).unwrap();
         assert_eq!(&plain[..5], b"CELK1");
         assert_eq!(Cipher::unwrap(&plain, &master).unwrap().previous_keys(), 0);
         let mut retired = back;
         retired.retire_previous();
-        assert!(retired.open_file("shard-0000/a.seg", &sealed).is_err());
+        assert!(retired.open_file(&seg, &sealed).is_err());
         assert_eq!(&retired.wrap(&master).unwrap()[..5], b"CELK1");
     }
 }
@@ -1335,8 +1903,8 @@ pub(crate) mod core_dump {
         };
         // The same derivation as the real path, used and dropped.
         {
-            let c = Cipher { data_key, previous: Vec::new() };
-            let _ = c.seal_file("shard-0000/a.seg", b"a segment's bytes");
+            let c = Cipher { data_key, previous: Vec::new(), legacy_writes: false };
+            let _ = c.seal_file(&Ids::same("shard-0000/a.seg"), b"a segment's bytes");
         }
         let n = occurrences(&masked);
         eprintln!("file key: {n} copy(ies) left in memory");
@@ -1439,14 +2007,19 @@ mod archive_ring_tests {
     /// manifest to know what a segment was sealed as.
     #[test]
     fn an_object_key_names_the_collection_and_the_seal_identity() {
-        let (coll, shard, id) =
+        let (coll, shard, ids) =
             archived_seal_id("docs/shard-0000/0000000000000007.seg").expect("a segment key");
         assert_eq!((coll.as_str(), shard.as_str()), ("docs", "shard-0000"));
-        assert_eq!(id, "shard-0000/0000000000000007.seg");
+        assert_eq!(ids.current, "docs/shard-0000/0000000000000007.seg");
+        assert_eq!(ids.legacy, "shard-0000/0000000000000007.seg");
         // A prefix in front of it changes only the collection's position.
-        let (coll, _, id) =
+        let (coll, _, ids) =
             archived_seal_id("celastro/archive/docs/shard-0002/0000000000000001.seg").unwrap();
-        assert_eq!((coll.as_str(), id.as_str()), ("docs", "shard-0002/0000000000000001.seg"));
+        assert_eq!(
+            (coll.as_str(), ids.legacy.as_str()),
+            ("docs", "shard-0002/0000000000000001.seg")
+        );
+        assert_eq!(ids.current, "docs/shard-0002/0000000000000001.seg");
         // Anything that is not a segment is not one.
         assert!(archived_seal_id("docs/shard-0000/MANIFEST").is_none());
         assert!(archived_seal_id("lonely.seg").is_none());
@@ -1467,11 +2040,26 @@ mod archive_ring_tests {
         // from the ranged read the walk does.
         let plain = vec![7u8; CHUNK * 3 + 11];
         let stale_id = "shard-0000/0000000000000001.seg";
-        store.put(&format!("docs/{stale_id}"), &old.seal_file(stale_id, &plain).unwrap()).unwrap();
+        store
+            .put(
+                &format!("docs/{stale_id}"),
+                &old.seal_file(&Ids::of("docs", stale_id), &plain).unwrap(),
+            )
+            .unwrap();
         let fresh_id = "shard-0001/0000000000000002.seg";
-        store.put(&format!("docs/{fresh_id}"), &new.seal_file(fresh_id, &plain).unwrap()).unwrap();
+        store
+            .put(
+                &format!("docs/{fresh_id}"),
+                &new.seal_file(&Ids::of("docs", fresh_id), &plain).unwrap(),
+            )
+            .unwrap();
         let other_id = "shard-0000/0000000000000003.seg";
-        store.put(&format!("logs/{other_id}"), &old.seal_file(other_id, &plain).unwrap()).unwrap();
+        store
+            .put(
+                &format!("logs/{other_id}"),
+                &old.seal_file(&Ids::of("logs", other_id), &plain).unwrap(),
+            )
+            .unwrap();
 
         let w = walk_archive(&new, &store, "", &colls(&["docs", "logs"])).unwrap();
         assert_eq!(w.objects, 3);
@@ -1493,7 +2081,12 @@ mod archive_ring_tests {
         let stranger = Cipher::generate().unwrap();
         let mine = Cipher::generate().unwrap();
         let id = "shard-0000/0000000000000001.seg";
-        store.put(&format!("docs/{id}"), &stranger.seal_file(id, b"not mine").unwrap()).unwrap();
+        store
+            .put(
+                &format!("docs/{id}"),
+                &stranger.seal_file(&Ids::of("docs", id), b"not mine").unwrap(),
+            )
+            .unwrap();
         let w = walk_archive(&mine, &store, "", &colls(&["docs"])).unwrap();
         assert_eq!(w.under_previous, 0);
         assert_eq!(w.unopenable, vec!["docs/shard-0000/0000000000000001.seg".to_string()]);
@@ -1511,9 +2104,14 @@ mod archive_ring_tests {
 
         let plain = vec![3u8; CHUNK + 5];
         let stale_id = "shard-0000/0000000000000001.seg";
-        store.put(&format!("docs/{stale_id}"), &old.seal_file(stale_id, &plain).unwrap()).unwrap();
+        store
+            .put(
+                &format!("docs/{stale_id}"),
+                &old.seal_file(&Ids::of("docs", stale_id), &plain).unwrap(),
+            )
+            .unwrap();
         let fresh_id = "shard-0000/0000000000000002.seg";
-        let fresh_bytes = new.seal_file(fresh_id, &plain).unwrap();
+        let fresh_bytes = new.seal_file(&Ids::of("docs", fresh_id), &plain).unwrap();
         store.put(&format!("docs/{fresh_id}"), &fresh_bytes).unwrap();
 
         let tmp = temp("reseal-tmp");
@@ -1534,7 +2132,12 @@ mod archive_ring_tests {
         let mut retired = new.without_previous();
         retired.retire_previous();
         assert_eq!(
-            retired.open_file(stale_id, &store.get(&format!("docs/{stale_id}")).unwrap()).unwrap(),
+            retired
+                .open_file(
+                    &Ids::of("docs", stale_id),
+                    &store.get(&format!("docs/{stale_id}")).unwrap()
+                )
+                .unwrap(),
             plain
         );
         // Not merely emptied: the scratch directory is taken away, so a run
@@ -1564,12 +2167,17 @@ mod archive_ring_tests {
         // old key, and the LATEST that says a backup was written here.
         let pooled = "shard-0000/0000000000000001.seg";
         let pool_key = format!("pool/docs/{pooled}");
-        let pool_bytes = old.seal_file(pooled, b"a backup's segment").unwrap();
+        let pool_bytes = old.seal_file(&Ids::of("docs", pooled), b"a backup's segment").unwrap();
         store.put(&pool_key, &pool_bytes).unwrap();
         store.put("nodes/local/LATEST", b"123\n").unwrap();
         // And one real archived object of the tier, also under the old key.
         let mine = "shard-0000/0000000000000002.seg";
-        store.put(&format!("docs/{mine}"), &old.seal_file(mine, b"the tier's").unwrap()).unwrap();
+        store
+            .put(
+                &format!("docs/{mine}"),
+                &old.seal_file(&Ids::of("docs", mine), b"the tier's").unwrap(),
+            )
+            .unwrap();
 
         // The overlap is detectable, and the commands refuse on it.
         assert!(backups_share_this_prefix(&store, "").unwrap());
@@ -1600,7 +2208,9 @@ mod archive_ring_tests {
         let mut new = Cipher::generate().unwrap();
         new.keep_previous(&old);
         let id = "shard-0000/0000000000000001.seg";
-        store.put(&format!("docs/{id}"), &old.seal_file(id, b"rows").unwrap()).unwrap();
+        store
+            .put(&format!("docs/{id}"), &old.seal_file(&Ids::of("docs", id), b"rows").unwrap())
+            .unwrap();
         let tmp = temp("again-tmp");
         assert_eq!(reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(), 1);
         assert_eq!(

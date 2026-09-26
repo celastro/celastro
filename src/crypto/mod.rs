@@ -192,7 +192,7 @@ mod timing {
         // decrypts only after the tag verifies -- and that difference is
         // the outcome the peer sees anyway, not a secret.)
         let tkey = [6u8; 32];
-        let ticket = super::tls13::seal_ticket(&tkey, &[8u8; 32], 1_700_000_000, 5).unwrap();
+        let ticket = super::tls13::seal_ticket(&tkey, &[8u8; 32], 1_700_000_000, 5, None).unwrap();
         let last = ticket.len() - 1;
         let mut wrong_first = ticket.clone();
         wrong_first[last - 15] ^= 1;

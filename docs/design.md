@@ -1958,7 +1958,11 @@ ClientHello included; a ticket that does not open is a full handshake, a
 binder that does not verify is a refusal; the server never accepts a PSK
 without a key share); no 0-RTT, and early data a client sends anyway is
 skipped; client certificates when the wire requires them (0.67.0,
-`CELASTRO_TLS_CLIENT_AUTH=required`); KeyUpdate both ways; HelloRetryRequest
+`CELASTRO_TLS_CLIENT_AUTH=required`, and since 0.84.0 the address a caller
+names itself by in a frame has to be among the certificate's names, DNS
+or IP, so the fence against an older process at an address cannot be
+pointed at a node by a token holder with a certificate of its own -- H5's
+F10); KeyUpdate both ways; HelloRetryRequest
 from 0.66.0, for a client whose first share is of another group. A
 handshake that failed leaves the stream dead, every later read or write of
 it an error (0.83.0): before that a failure left the stream without keys
@@ -2024,16 +2028,35 @@ cluster's pods are given one (`CELASTRO_KEY_FILE`, `key init`) and a
 backup and an export carry `KEY`. The one path that crosses regimes is
 `import_collection`: it opens each file under the export's key and seals
 it under the database's, which is how a plain database takes a key and
-how one changes keys. A file's identity is its shard directory's name and
-its own (`shard-0003/00000000000000a1.seg`), the same in `segments/`,
-`archive/` and the store, so a file cannot stand in for another and a
-tier move needs no rewrite; root files are their bare names. The WAL is
+how one changes keys. A file's identity is its collection, its shard
+directory's name and its own (`docs/shard-0003/00000000000000a1.seg`,
+since 0.84.0; before it the shard and the file alone, and a file is read
+under both, the current first), the same in `segments/`, `archive/` and
+the store, so a file cannot stand in for another -- not for the
+same-index shard's of another collection either -- and a tier move needs
+no rewrite; root files are their bare names. Under the current identity
+the last frame's AAD says it is the last, so a file cut at a whole-frame
+boundary does not open shorter (H5's F7); a ranged read knows the file's
+length and asks the same of the frame it reaches last. The WAL is
 length-prefixed frames, one per record, the record's ordinal in the AAD,
-so a torn tail ends the replay where the CRC would have and a frame
-cannot be replayed from another log. The data key is per database, drawn
-at the first open of an empty directory and kept in `KEY` wrapped under
-the master (`CELK1 | nonce | ciphertext | tag`); per-file keys are HKDF
-of it and the identity; the master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes
+so a torn tail ends the replay where the CRC would have; and since
+0.84.0 a log begins with a header record naming an id of its own, sixteen
+random bytes that every record after it carries in its AAD, so a record
+of one log cannot be replayed from another log of the shard -- a
+rotation's, a timeline's, an archived copy's, which all sealed as
+`wal.log` with ordinals from nought before (H5's F3). An archived copy
+of a log ends with a trailer, an empty record whose AAD says it is the
+last, and a restore refuses a copy without one: a copy cut at a record
+boundary was a rollback nothing detected. A log written before has no
+header and is read as it was written; a live one is continued as it was
+until it is rotated or truncated, when the fresh file gets a header. The
+data key is per database, drawn at the first open of an empty directory
+and kept in `KEY` wrapped under the master (`CELK1 | nonce | ciphertext
+| tag` for one key; a ring of several as `CELK3 | count | entries`, each
+entry's AAD carrying its index and the count, so an entry cannot be
+moved to the current slot or a retired key spliced back from an old copy
+of the file (H5's F4); a `CELK2` ring from before reads as it was
+written); per-file keys are HKDF of it and the identity; the master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes
 or 64 hex digits, or `CELASTRO_MASTER_KEY`) is never written, and `key
 rekey` rewraps `KEY` under a new one without touching a data file. A
 directory with `KEY` and no master is refused, and so is a plain
@@ -2050,6 +2073,16 @@ reopen twice as long at a quarter of a second, and the reads -- point
 lookups, BM25, vector, hybrid, the walk -- within noise: a segment's
 components are opened once into the residency cache, and the frames are
 opened on the way in.
+
+**The identity's rollback window.** The files 0.84.0 writes do not open
+under 0.83.0 -- another identity, a header in each log, a `CELK3` ring
+-- so a node rolled back after its first write refuses its directory,
+as it does across a raised catalog format. `CELASTRO_SEAL_IDENTITY=1`
+pins the writes to what 0.83.0 reads (reads are always both), for the
+first days on the release; lifted, new files go under the current
+identity and a `celastro key rotate` re-seals the old ones. What the pin
+costs is the three substitutions the identity closes, for as long as it
+is set.
 
 **`serve` is a well-behaved PID 1, by an in-tree `signal(2)` binding.** The
 kernel does not deliver a default-disposition signal to PID 1, so a container
@@ -2658,6 +2691,8 @@ guarantee:
 | a failed TLS handshake leaves the stream dead, and the wire runs it before its first read | `crypto::tls13::tests::a_handshake_that_failed_leaves_the_stream_dead` (a silent peer past the read timeout, then a plaintext record: no read answers it, no write goes out, the peer sees an alert and nothing else), `tls::a_peer_silent_past_the_idle_poll_is_not_served_in_the_clear` (the same through the wire's serve loop, with a real frame carrying the token), `wire::tests::a_peer_whose_hello_comes_after_the_idle_poll_is_still_served` (the other half: a ClientHello later than the poll is served, under the handshake's own timeout) |
 | a hostile certificate is refused before it is verified | `crypto::x509::tests::a_wide_exponent_and_a_long_chain_are_refused_before_they_are_verified` (33 bits refused, 32 admitted, an exponent as wide as the modulus refused; eight certificates read, nine refused unread) |
 | a token guess of another length never compares equal | `wire::tests` (the length difference folded to a boolean: a guess 256 and 512 bytes longer than the token, padded with NULs) |
+| a file is sealed under its collection, a log under an id of its own, an archived copy says it is whole, the ring binds its entries, and everything written before is read as written | `cipher::tests::a_file_cannot_stand_in_for_another_collections_nor_open_shorter`, `cipher::tests::a_log_record_does_not_open_in_another_log_and_a_copy_says_it_is_whole`, `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back`, `cipher::tests::files_round_trip_whole_and_by_range_and_frames_cannot_move` (both schemes), the encryption, backup and PITR suites unchanged over the new identity, and `do/h6/migrate.sh` (a volume written by 0.83.0 opened, written, reopened and checked by the new binary; the pin keeping one 0.83.0 still opens; a rotation re-sealing it) |
+| a caller's claimed address is its certificate's to claim, and the wire's request handler never panics on a damaged frame | `tls::a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_has`, `wire::tests::fuzz_wire_requests_never_panic_the_handler` (every request a node sends, damaged, cut, stretched, with a length aimed past the end, with and without certificate names) |
 | WAND ≡ brute force | `text::scorer::tests::wand_agrees_with_brute_force` |
 | fusing early is wrong | `plan::fusion::tests::fusing_early_gives_a_different_and_wrong_answer` |
 | filtered-search strategy selection prices the traversal that would run, and a visit budget binds knowingly | `vector::tests::{few_survivors_pick_brute_force_and_are_exact, high_selectivity_picks_post_filter, a_ten_percent_filter_on_a_small_segment_is_scanned_not_traversed, filter_aware_is_chosen_by_its_visits_and_a_budget_bounds_them}` (the last asserts the visit count against the model's bound, and that a budget of 64 stops the walk at 64 and says so) |

@@ -113,19 +113,19 @@ pub enum SegmentSource {
     /// A source whose bytes are the frames of `crate::cipher`: every read is
     /// a ranged read of the frames covering it, opened under the file's
     /// key. Wraps a file, an archived file or an object alike.
-    Encrypted { inner: Box<SegmentSource>, cipher: Arc<crate::cipher::Cipher>, id: String },
+    Encrypted { inner: Box<SegmentSource>, cipher: Arc<crate::cipher::Cipher>, ids: crate::cipher::Ids },
 }
 
 impl SegmentSource {
     fn read(&self, off: u64, len: u64) -> Result<Vec<u8>> {
         match self {
-            SegmentSource::Encrypted { inner, cipher, id } => {
+            SegmentSource::Encrypted { inner, cipher, ids } => {
                 let size = inner.len()?;
                 let read = |o: u64, l: u64| -> Result<Vec<u8>> {
                     let l = l.min(size.saturating_sub(o));
                     inner.read(o, l)
                 };
-                cipher.read_range(id, &read, off, len)
+                cipher.read_range(ids, &read, size, off, len)
             }
             SegmentSource::Bytes(b) => off
                 .checked_add(len)

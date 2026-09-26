@@ -183,6 +183,52 @@ fn an_encrypted_database_holds_no_plaintext_and_opens_under_its_master_only() {
     }
 }
 
+/// A segment is sealed under its collection: moved to the same-index
+/// shard of another collection it does not open, and the directory does
+/// not open with it there. Before 0.84.0 the identity was the shard and
+/// the file alone, and the moved segment opened as the other's.
+#[test]
+fn a_segment_moved_to_another_collections_shard_is_refused() {
+    let _turn = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let d = dir("swap");
+    let mut db = Db::open(&d, opts(Some(master(1)))).unwrap();
+    setup(&mut db, 30);
+    ack(&mut db, "CREATE COLLECTION other (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT)");
+    for i in 0..30 {
+        db.insert("other", doc(i)).unwrap();
+    }
+    ack(&mut db, "FLUSH other");
+    drop(db);
+    let seg_of = |coll: &str| -> PathBuf {
+        let segs = d.join("collections").join(coll).join("shard-0000").join("segments");
+        let mut names: Vec<PathBuf> = std::fs::read_dir(&segs)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+            .collect();
+        names.sort();
+        names.remove(0)
+    };
+    let (a, b) = (seg_of("items"), seg_of("other"));
+    // The same segment number on both sides, so the swap is a swap of
+    // identity alone; if the numbers differ, `other`'s file is put
+    // under `items`'s first name and vice versa.
+    let (ab, bb) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    std::fs::write(&a, &bb).unwrap();
+    std::fs::write(&b, &ab).unwrap();
+    let e = match Db::open(&d, opts(Some(master(1)))) {
+        Ok(mut db) => {
+            // Opened lazily: the first read of the moved segment refuses it.
+            let r = db.query("SELECT id FROM items LIMIT 100");
+            let r2 = db.query("SELECT id FROM other LIMIT 100");
+            format!("{:?} {:?}", r.err(), r2.err())
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("does not authenticate"), "a moved segment must be refused: {e}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_plain_database_with_data_is_not_encrypted_in_place() {
     let d = dir("inplace");

@@ -243,6 +243,7 @@ pub(super) fn seal_ticket(
     psk: &[u8; 32],
     issued_at: u64,
     age_add: u32,
+    names: Option<&[String]>,
 ) -> io::Result<Vec<u8>> {
     let nonce: [u8; 12] =
         random::bytes(12).map_err(|e| err(e.to_string()))?.try_into().expect("twelve bytes");
@@ -250,9 +251,20 @@ pub(super) fn seal_ticket(
     plain.extend_from_slice(psk);
     plain.extend_from_slice(&issued_at.to_be_bytes());
     plain.extend_from_slice(&age_add.to_be_bytes());
+    // Version 2: the names of the client's certificate, so a resumed
+    // connection -- which presents no certificate -- still knows whose
+    // it is. Each name at most 255 bytes, at most 255 of them.
+    if let Some(names) = names {
+        plain.push(names.len().min(255) as u8);
+        for n in names.iter().take(255) {
+            let b = n.as_bytes();
+            plain.push(b.len().min(255) as u8);
+            plain.extend_from_slice(&b[..b.len().min(255)]);
+        }
+    }
     let tag = aead::seal(tkey, &nonce, TICKET_AAD, &mut plain);
     let mut out = Vec::with_capacity(1 + 12 + plain.len() + 16);
-    out.push(1);
+    out.push(if names.is_some() { 2 } else { 1 });
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&plain);
     out.extend_from_slice(&tag);
@@ -260,16 +272,21 @@ pub(super) fn seal_ticket(
 }
 
 /// The PSK a ticket stands for, if this server sealed it and it is not
-/// older than the lifetime. `None` for anything else -- another node's
-/// key, a tampered byte, an old ticket -- and the handshake goes on in
-/// full, which is what the protocol says happens.
-pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
-    if ticket.len() != 1 + 12 + 44 + 16 || ticket[0] != 1 {
+/// older than the lifetime, and the names of the client's certificate
+/// when the ticket carries them. `None` for anything else -- another
+/// node's key, a tampered byte, an old ticket -- and the handshake goes
+/// on in full, which is what the protocol says happens.
+pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<([u8; 32], Option<Vec<String>>)> {
+    let version = *ticket.first()?;
+    if ticket.len() < 1 + 12 + 44 + 16 || !(version == 1 || version == 2) {
+        return None;
+    }
+    if version == 1 && ticket.len() != 1 + 12 + 44 + 16 {
         return None;
     }
     let nonce: [u8; 12] = ticket[1..13].try_into().ok()?;
-    let mut data = ticket[13..13 + 44].to_vec();
-    let tag: [u8; 16] = ticket[13 + 44..].try_into().ok()?;
+    let mut data = ticket[13..ticket.len() - 16].to_vec();
+    let tag: [u8; 16] = ticket[ticket.len() - 16..].try_into().ok()?;
     if !aead::open(tkey, &nonce, TICKET_AAD, &mut data, &tag) {
         return None;
     }
@@ -279,7 +296,24 @@ pub(super) fn open_ticket(tkey: &[u8; 32], ticket: &[u8]) -> Option<[u8; 32]> {
     if now < issued_at.saturating_sub(60) || now > issued_at + TICKET_LIFETIME_SECS {
         return None;
     }
-    Some(psk)
+    if version == 1 {
+        return Some((psk, None));
+    }
+    let mut names = Vec::new();
+    let mut i = 44usize;
+    let count = *data.get(i)? as usize;
+    i += 1;
+    for _ in 0..count {
+        let len = *data.get(i)? as usize;
+        i += 1;
+        let b = data.get(i..i + len)?;
+        names.push(String::from_utf8_lossy(b).to_string());
+        i += len;
+    }
+    if i != data.len() {
+        return None;
+    }
+    Some((psk, Some(names)))
 }
 
 /// The PSK a resumption master secret and a ticket nonce make.
@@ -374,6 +408,10 @@ pub struct TlsStream {
     /// Bytes of the socket read ahead of a record boundary.
     inbuf: Vec<u8>,
     closed: bool,
+    /// The names of the peer's certificate, when this side asked for one
+    /// and verified it: its DNS names lowercased and its IP addresses as
+    /// text. What the wire holds a caller's claimed address against.
+    peer_names: Option<Vec<String>>,
     /// The handshake failed, and the stream is dead for good: without keys
     /// a read would hand up a record in the clear and a write would send
     /// one, and a listener that treats a timeout as idle would come back
@@ -437,6 +475,7 @@ impl TlsStream {
             pending_at: 0,
             inbuf: Vec::new(),
             closed: false,
+            peer_names: None,
             failed: false,
             resumed: false,
             retried: false,
@@ -448,6 +487,13 @@ impl TlsStream {
             res_master: None,
             store_key: None,
         }
+    }
+
+    /// The names of the peer's verified certificate, when this side asked
+    /// for one: DNS names lowercased, IP addresses as text. `None` on a
+    /// stream that asked for no certificate, or before the handshake.
+    pub fn peer_names(&self) -> Option<&[String]> {
+        self.peer_names.as_deref()
     }
 
     /// Whether the handshake resumed from a ticket rather than running in
@@ -772,11 +818,17 @@ impl TlsStream {
                         ticket_key(key, client_anchors.is_some(), ticket_day().saturating_sub(1));
                     open_ticket(&yesterday, &offer.identity)
                 }) {
-                    Some(psk) => {
+                    // A ticket this side sealed while asking for a client
+                    // certificate carries that certificate's names; one
+                    // without them does not resume here, whatever the key
+                    // said, since a resumed connection shows no certificate.
+                    Some((_, None)) if client_anchors.is_some() => None,
+                    Some((psk, names)) => {
                         let truncated = sha256(&transcript[..ch_start + 4 + offer.binders_at]);
                         if !super::ct_eq(&psk_binder(&psk, &truncated), &offer.binder) {
                             return Err(err("the PSK binder does not verify"));
                         }
+                        self.peer_names = names;
                         Some(psk)
                     }
                     None => None,
@@ -925,6 +977,20 @@ impl TlsStream {
             let now = crate::time::now_micros() / 1_000_000;
             x509::chain_reaches_anchor(&chain, anchors, now)
                 .map_err(|e| err(format!("the peer's certificate: {e}")))?;
+            let mut names: Vec<String> = chain[0].dns_names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            for ip in &chain[0].ip_addresses {
+                let text = match ip.len() {
+                    4 => std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
+                    16 => {
+                        let mut o = [0u8; 16];
+                        o.copy_from_slice(ip);
+                        std::net::Ipv6Addr::from(o).to_string()
+                    }
+                    _ => continue,
+                };
+                names.push(text);
+            }
+            self.peer_names = Some(names);
             let th_before_cv = sha256(&transcript);
             (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
             if ty != HS_CERTIFICATE_VERIFY {
@@ -958,7 +1024,10 @@ impl TlsStream {
         let age_add = u32::from_be_bytes(
             random::bytes(4).map_err(|e| err(e.to_string()))?.try_into().expect("four bytes"),
         );
-        let ticket = seal_ticket(&tkey, &psk_next, now_secs(), age_add)?;
+        // The names of the client's certificate ride in the ticket when
+        // this side asked for one, so a resumed connection keeps them.
+        let names = if client_anchors.is_some() { self.peer_names.as_deref() } else { None };
+        let ticket = seal_ticket(&tkey, &psk_next, now_secs(), age_add, names)?;
         let mut nst = Vec::with_capacity(ticket.len() + 16);
         nst.extend_from_slice(&(TICKET_LIFETIME_SECS as u32).to_be_bytes());
         nst.extend_from_slice(&age_add.to_be_bytes());
@@ -1781,7 +1850,7 @@ mod tests {
         let key =
             KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
         let tkey = ticket_key(&key, false, ticket_day());
-        let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7).unwrap();
+        let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7, None).unwrap();
         let mut nst = Vec::new();
         nst.extend_from_slice(&86_400u32.to_be_bytes());
         nst.extend_from_slice(&7u32.to_be_bytes());

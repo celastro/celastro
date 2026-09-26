@@ -290,16 +290,31 @@ impl LogArchive {
         seq: u64,
         path: &Path,
         cipher: &crate::cipher::Shared,
-        id: &str,
+        ids: &crate::cipher::Ids,
     ) -> Result<Option<(Timestamp, Timestamp)>> {
-        let records = crate::shard::Wal::replay(path, cipher, id)?;
+        let records = crate::shard::Wal::replay(path, cipher, ids)?;
         let (Some(first), Some(last)) =
             (records.iter().map(|r| r.ts).min(), records.iter().map(|r| r.ts).max())
         else {
             return Ok(None);
         };
         let key = self.key(collection, shard, timeline, seq, first, last);
-        self.target.store.put_file(&self.target.key(&key), path)?;
+        // The bytes as they lie, and under the cipher's current scheme a
+        // trailer that says the copy is whole: put from a file beside the
+        // log, since a store takes a path.
+        match cipher {
+            Some(_) => {
+                let bytes = crate::shard::Wal::archived_bytes(path, cipher, ids)?;
+                let tmp = path.with_extension("archive.part");
+                std::fs::write(&tmp, &bytes)?;
+                let put = self.target.store.put_file(&self.target.key(&key), &tmp);
+                let _ = std::fs::remove_file(&tmp);
+                put?;
+            }
+            None => {
+                self.target.store.put_file(&self.target.key(&key), path)?;
+            }
+        }
         Ok(Some((first, last)))
     }
 

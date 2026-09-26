@@ -1966,6 +1966,9 @@ fn serve_connection(
         return;
     }
     let _ = s.set_read_timeout(Some(IDLE_POLL));
+    // What the peer's certificate names, when the wire required one: a
+    // caller's claimed address has to be among them.
+    let peer_names = s.peer_names();
     let mut last_frame = Instant::now();
     loop {
         // Checked per frame, not only when a read times out: a connection
@@ -1992,7 +1995,7 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, followed, held, lease, identity, &frame) {
+        match handle(db, moves, followed, held, lease, identity, peer_names.as_deref(), &frame) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -2012,6 +2015,24 @@ fn serve_connection(
             return;
         }
     }
+}
+
+/// Whether a certificate's names cover the host of `url` (`tcp://host:port`):
+/// its DNS names by exact match, case aside, or its addresses by value.
+fn certificate_names(names: &[String], url: &str) -> bool {
+    let rest = url.strip_prefix("tcp://").unwrap_or(url);
+    let host = match rest.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => rest,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    names.iter().any(|n| {
+        n.eq_ignore_ascii_case(&host)
+            || matches!(
+                (n.parse::<std::net::IpAddr>(), host.parse::<std::net::IpAddr>()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    })
 }
 
 /// Compare without leaking where the first difference is.
@@ -2071,6 +2092,7 @@ impl Held<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     db: &RwLock<Db>,
     moves: &Moves,
@@ -2078,6 +2100,7 @@ fn handle(
     held: &crate::engine::HeldTerms,
     lease: &crate::engine::Lease,
     identity: &Identity,
+    peer_names: Option<&[String]>,
     frame: &[u8],
 ) -> Result<Vec<u8>> {
     SERVING.with(|s| s.set(true));
@@ -2104,6 +2127,19 @@ fn handle(
         None
     };
     if let Some((node, epoch)) = &caller {
+        // Under client certificates the claimed address is the
+        // certificate's to claim: a token holder could otherwise name
+        // another node's address with a large epoch and have that node
+        // fenced as an older process.
+        if let Some(names) = peer_names {
+            if !certificate_names(names, node) {
+                return Err(Error::Plan(format!(
+                    "the caller claims to be {node} and its certificate names {}; a node's \
+                     certificate must name the address it calls itself by",
+                    if names.is_empty() { "nothing".to_string() } else { names.join(", ") }
+                )));
+            }
+        }
         if let Ok(g) = db.try_read() {
             g.observe_caller(node, *epoch)?;
         }
@@ -2764,6 +2800,134 @@ mod tests {
         assert_eq!(resp.first(), Some(&0), "the hello was answered: {resp:?}");
         assert!(String::from_utf8_lossy(&resp).contains("localhost"), "{resp:?}");
         stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The server's half of the wire under fuzz: every request frame a
+    /// node sends, damaged a byte at a time, cut short, stretched, or with
+    /// a length field aimed past the end, is refused or answered and never
+    /// a panic. The client's decoders have been fuzzed since 0.29.0; the
+    /// handler that a peer without the token reaches with the head of a
+    /// frame, and one with the token reaches with the rest, had not.
+    #[test]
+    fn fuzz_wire_requests_never_panic_the_handler() {
+        let db = Arc::new(RwLock::new(crate::engine::Db::in_memory()));
+        {
+            let mut g = db.write().unwrap();
+            g.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (splits = ['m'])")
+                .unwrap();
+            g.execute("CREATE INDEX items_body ON items USING fulltext (body) WITH (analyzer = 'english')")
+                .unwrap();
+            g.execute(
+                "CREATE INDEX items_emb ON items USING vector (embedding) WITH (dims = 2, metric = 'cosine')",
+            )
+            .unwrap();
+            for i in 0..20 {
+                let d = crate::json::parse(&format!(
+                    r#"{{"id":"{}{i:02}","n":{i},"body":"item {i}","embedding":[{},1.0]}}"#,
+                    if i % 2 == 0 { "a" } else { "z" },
+                    i as f32 / 20.0
+                ))
+                .unwrap();
+                g.insert("items", d).unwrap();
+            }
+        }
+        let (moves, followed, held, lease) = {
+            let g = db.read().unwrap();
+            (g.moves(), g.followed(), g.held_terms(), g.lease())
+        };
+        let identity = Identity {
+            node: Some("tcp://127.0.0.1:1".into()),
+            role: crate::engine::Role::Data,
+            epoch: 5,
+            region: None,
+            token: "fuzz-token".into(),
+            also: None,
+        };
+        // Real frames, as a node builds them, for the calls a statement
+        // and a cluster make.
+        let node = Node::new("tcp://127.0.0.1:1", Some("fuzz-token"), None)
+            .unwrap()
+            .with_identity("tcp://127.0.0.1:2", Arc::new(std::sync::atomic::AtomicU64::new(9)));
+        node.peer_wire.store(WIRE_VERSION_MAX, Ordering::Relaxed);
+        let mut body = Vec::new();
+        put_str(&mut body, "SELECT id FROM items WHERE n > 3 LIMIT 5");
+        put_values(&mut body, &[]);
+        let mut hello = node.request(Call::Hello, "", 0, &[]);
+        let mut frames = vec![
+            node.request(Call::Count, "items", 0, &[]),
+            node.request(Call::Statement, "", 0, &body),
+            node.request(Call::TermStats, "items", 1, &{
+                let mut b = Vec::new();
+                put_str(&mut b, "body");
+                put_strs(&mut b, &["item".to_string()]);
+                put_ts(&mut b, 1 << 40);
+                b
+            }),
+            node.request(Call::Candidates, "items", 0, &{
+                let mut b = Vec::new();
+                put_str(&mut b, "SELECT id FROM items ORDER BY hybrid(text_match(body, 'item'), embedding <=> [0.5, 1.0]) LIMIT 5");
+                put_values(&mut b, &[]);
+                put_ts(&mut b, 1 << 40);
+                put_opt_str(&mut b, None);
+                put_uvarint(&mut b, 10);
+                put_stats(&mut b, &BTreeMap::new());
+                put_bool(&mut b, false);
+                put_frontiers(&mut b, &[]);
+                b
+            }),
+            node.request(Call::Get, "items", 1, &{
+                let mut b = Vec::new();
+                put_str(&mut b, "z01");
+                put_ts(&mut b, 1 << 40);
+                b
+            }),
+        ];
+        frames.append(&mut vec![hello.clone()]);
+        // Every one of them whole first: answered, or refused for a reason
+        // the codec names -- never a panic.
+        for f in &frames {
+            let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, f);
+        }
+        let mut rng = Rng::new(0x5eed_f00d);
+        let mut runs = 0usize;
+        for f in &frames {
+            for _ in 0..300 {
+                let mut m = f.clone();
+                match rng.next_u64() % 5 {
+                    0 => {
+                        let i = (rng.next_u64() as usize) % m.len();
+                        m[i] ^= 1 << (rng.next_u64() % 8);
+                    }
+                    1 => {
+                        let i = (rng.next_u64() as usize) % m.len();
+                        m[i] = rng.next_u64() as u8;
+                    }
+                    2 => {
+                        let cut = (rng.next_u64() as usize) % m.len();
+                        m.truncate(cut);
+                    }
+                    3 => {
+                        let extra = (rng.next_u64() as usize) % 64;
+                        m.extend((0..extra).map(|_| rng.next_u64() as u8));
+                    }
+                    _ => {
+                        // A length field aimed past the end: the byte at
+                        // a random place set high, twice over.
+                        for _ in 0..2 {
+                            let i = (rng.next_u64() as usize) % m.len();
+                            m[i] = 0xff;
+                        }
+                    }
+                }
+                let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, &m);
+                let _ = handle(&db, &moves, &followed, &held, &lease, &identity, Some(&["127.0.0.1".to_string()]), &m);
+                runs += 1;
+            }
+        }
+        // And the head-only frame a refused peer leaves the handler with.
+        hello.truncate(hello.len().min(FRAME_HEAD));
+        let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, &hello);
+        assert!(runs >= 1500);
     }
 
     /// A request frame is read only as far as its token has to be seen:

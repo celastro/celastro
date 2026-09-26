@@ -6,6 +6,50 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Every encrypted file is sealed under the collection it belongs to,
+every log under an id of its own, and a file that was cut says so.**
+The identity a file was sealed under was its shard's directory and its
+name, and every write-ahead log of a shard -- the live one, each
+rotation, each timeline, each archived copy -- was sealed as `wal.log`
+with its records numbered from nought; so, with write access to the
+volume or to the archive bucket and no key at all, an authenticated
+frame of one log stood in for the same frame of another log of the
+shard, a segment or manifest of collection A for the same-index shard's
+of collection B, and a file cut at a whole-frame boundary opened
+shorter. A file is sealed under `<collection>/<shard>/<name>` now, its
+last frame marked as the last; a log begins with a header naming an id
+of its own that every record after it carries, and an archived copy
+ends with a trailer that says the copy is whole; the data-key ring in
+`KEY` binds each entry to its place and the ring's size, so a retired
+key cannot be spliced back nor an entry moved to the current slot.
+Everything written before is read as it was written, and a restore
+refuses an archived log whose trailer is missing.
+
+**Upgrading from 0.83.0 with encryption at rest:** the files this
+release writes do not open under 0.83.0, so a rollback after the first
+write is refused by the older binary. Through the first days on this
+release, start it with `CELASTRO_SEAL_IDENTITY=1`, which keeps writing
+what 0.83.0 reads (the older identity, logs without a header, a `CELK2`
+ring), and lift the pin once the release is trusted; `celastro key
+rotate` re-seals every file under the current identity, pin or none.
+A database in the clear is unaffected.
+
+**`celastro check` no longer calls a shard with an archive damaged.** The
+`ARCHIVED` file a shard keeps beside its log since 0.81.0 (the next log
+number and the timeline) is written in the clear, and the check walk
+took it for an encrypted frame and reported it torn on every shard that
+had archived a log. Found by the migration drill.
+
+**A caller's address is its certificate's to claim.** On a wire that
+requires client certificates, the address a caller names itself by has
+to be among the names of the certificate it presented; a token holder
+with a certificate of its own could otherwise claim another node's
+address with a large epoch and have that node refused as an older
+process. The wire's request handler is under fuzz now as the client's
+decoders have been.
+
 ## 0.83.0 — 2026-09-26
 
 **A failed TLS handshake leaves the connection dead.** A stream whose

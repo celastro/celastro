@@ -157,6 +157,55 @@ fn the_wire_serves_tls_and_a_node_without_the_ca_cannot_attach() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Under client certificates a caller's claimed address is the
+/// certificate's to claim: a node whose certificate names `localhost` and
+/// `127.0.0.1` is served when it calls itself either, and refused naming
+/// its certificate when it claims another host -- the fence against an
+/// older process at an address cannot be pointed at a node by a token
+/// holder with a certificate of its own.
+#[test]
+fn a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_has() {
+    let _turn = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::tls::CLIENT_AUTH_ENV, "required");
+    let tls = material();
+    std::env::remove_var(celastro::tls::CLIENT_AUTH_ENV);
+    assert!(tls.client_auth());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("tcp://localhost:{port}");
+    let mut opts = DbOpts::default();
+    opts.node = Some(url.clone());
+    opts.tls = Some(tls.clone());
+    let db = Arc::new(RwLock::new(Db::with_opts(opts)));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (d, s, t) = (db.clone(), stop.clone(), tls.clone());
+        std::thread::spawn(move || {
+            celastro::wire::serve(listener, d, "wire-tls-token".to_string(), s, Some(t)).unwrap()
+        });
+    }
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
+    for me in ["tcp://localhost:7876", "tcp://127.0.0.1:7876", "tcp://LOCALHOST:1"] {
+        let peer = celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(tls.clone()))
+            .unwrap()
+            .with_identity(me, epoch.clone());
+        // The first hello learns the peer's wire version; the second carries
+        // the identity.
+        peer.hello().unwrap();
+        peer.hello().unwrap_or_else(|e| panic!("{me}: {e}"));
+    }
+    for me in ["tcp://other.example:7876", "tcp://10.0.0.9:7876"] {
+        let peer = celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(tls.clone()))
+            .unwrap()
+            .with_identity(me, epoch.clone());
+        let _ = peer.hello();
+        let e = peer.hello().unwrap_err().to_string();
+        assert!(e.contains("its certificate names"), "{me}: {e}");
+        assert!(e.contains("localhost"), "{me}: {e}");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A peer that connects to a TLS wire and says nothing for longer than the
 /// serve loop's idle poll, then sends a plain frame carrying the token, is
 /// not answered: the handshake runs first under its own timeout and a

@@ -1683,7 +1683,7 @@ fn archived_collections(
         // No catalog is a database with no collections, so no tier.
         Err(_) => return Ok(Vec::new()),
     };
-    let plain = match cipher.open_file("CATALOG", &bytes) {
+    let plain = match cipher.open_file(&celastro::cipher::Ids::same("CATALOG"), &bytes) {
         Ok(p) => p,
         Err(e) => return Err(fail(json, &format!("{}/CATALOG: {e}", dir.display()))),
     };
@@ -2786,6 +2786,13 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         eprintln!(
             "celastro: DRILL: the clock is offset by {off} us; not for a database anyone relies on"
         );
+    }
+    if let Some(v) = var("CELASTRO_SEAL_IDENTITY") {
+        match v.trim() {
+            "1" | "legacy" => celastro::cipher::pin_legacy_writes(true),
+            "2" | "current" | "" => {}
+            other => return Err(format!("CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy) or 2 (current)")),
+        }
     }
     if let Some(v) = var("CELASTRO_CATALOG_FORMAT") {
         let f: u8 =
