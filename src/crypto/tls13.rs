@@ -30,7 +30,9 @@ const SUITE_CHACHA: u16 = 0x1303;
 const GROUP_X25519: u16 = 0x001d;
 const SIG_ED25519: u16 = 0x0807;
 const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
 const VERSION_13: u16 = 0x0304;
 const LEGACY_VERSION: u16 = 0x0303;
 const MAX_PLAINTEXT: usize = 1 << 14;
@@ -1080,7 +1082,13 @@ impl TlsStream {
                 // its own.
                 let mut req = vec![0u8];
                 let mut list = Vec::new();
-                for s in [SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256, SIG_ECDSA_SECP256R1_SHA256] {
+                for s in [
+                    SIG_ED25519,
+                    SIG_RSA_PSS_RSAE_SHA256,
+                    SIG_RSA_PSS_RSAE_SHA384,
+                    SIG_ECDSA_SECP256R1_SHA256,
+                    SIG_ECDSA_SECP384R1_SHA384,
+                ] {
                     list.extend_from_slice(&s.to_be_bytes());
                 }
                 let mut sa = Vec::with_capacity(2 + list.len());
@@ -1291,13 +1299,20 @@ impl TlsStream {
             groups.extend_from_slice(&2u16.to_be_bytes());
             groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
             extension(&mut exts, EXT_SUPPORTED_GROUPS, &groups);
-            // Ed25519 for our own peers; RSA-PSS and ECDSA P-256 for a server
-            // whose certificate another issuer signed, such as a cluster's API.
+            // Ed25519 for our own peers; RSA-PSS and ECDSA on P-256 or P-384
+            // for a server whose certificate another issuer signed, such as
+            // a cluster's API or an object store behind a public CA.
             let mut sigs = Vec::new();
-            sigs.extend_from_slice(&6u16.to_be_bytes());
-            sigs.extend_from_slice(&SIG_ED25519.to_be_bytes());
-            sigs.extend_from_slice(&SIG_ECDSA_SECP256R1_SHA256.to_be_bytes());
-            sigs.extend_from_slice(&SIG_RSA_PSS_RSAE_SHA256.to_be_bytes());
+            sigs.extend_from_slice(&10u16.to_be_bytes());
+            for s in [
+                SIG_ED25519,
+                SIG_ECDSA_SECP256R1_SHA256,
+                SIG_ECDSA_SECP384R1_SHA384,
+                SIG_RSA_PSS_RSAE_SHA256,
+                SIG_RSA_PSS_RSAE_SHA384,
+            ] {
+                sigs.extend_from_slice(&s.to_be_bytes());
+            }
             extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sigs);
             if let Some(share) = share {
                 let mut ks = Vec::new();
@@ -1648,8 +1663,12 @@ fn verify_signature(body: &[u8], key: &x509::PublicKey, content: &[u8]) -> io::R
             ed25519::verify(pk, content, &s)
         }
         (SIG_RSA_PSS_RSAE_SHA256, x509::PublicKey::Rsa(pk)) => pk.verify_pss_sha256(content, sig),
+        (SIG_RSA_PSS_RSAE_SHA384, x509::PublicKey::Rsa(pk)) => pk.verify_pss_sha384(content, sig),
         (SIG_ECDSA_SECP256R1_SHA256, x509::PublicKey::P256(pk)) => {
             pk.verify_sha256_der(content, sig)
+        }
+        (SIG_ECDSA_SECP384R1_SHA384, x509::PublicKey::P384(pk)) => {
+            pk.verify_sha384_der(content, sig)
         }
         _ => {
             return Err(err("the peer signed with a scheme this build does not verify for its key"))
@@ -2460,6 +2479,48 @@ mod tests {
         let mut relabelled = bare.clone();
         relabelled[0] = 2;
         assert!(open_ticket(&plain, &relabelled).is_none(), "the format byte is under the seal");
+    }
+
+    /// A CertificateVerify under `ecdsa_secp384r1_sha384` with a P-384 key
+    /// and under `rsa_pss_rsae_sha384` with an RSA key verifies, with the
+    /// openssl-made signatures over a known message; the other scheme for
+    /// the same key is refused as not this build's for that key, and a
+    /// signature over another message fails.
+    #[test]
+    fn a_certificate_verify_under_the_sha384_schemes_verifies() {
+        let pki = |f: &str| {
+            std::fs::read_to_string(format!("{}/tests/pki/{f}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap()
+        };
+        let msg = std::fs::read(format!("{}/tests/pki/msg", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let body = |scheme: u16, sig: &[u8]| -> Vec<u8> {
+            let mut b = scheme.to_be_bytes().to_vec();
+            b.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+            b.extend_from_slice(sig);
+            b
+        };
+        let ec =
+            x509::parse(&pem::decode_all(&pki("ec384-ca.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
+        let ecdsa = pem::base64_decode(pki("ecdsa384.sig.b64").trim()).unwrap();
+        assert!(verify_signature(&body(SIG_ECDSA_SECP384R1_SHA384, &ecdsa), &ec.public_key, &msg)
+            .unwrap());
+        assert!(!verify_signature(
+            &body(SIG_ECDSA_SECP384R1_SHA384, &ecdsa),
+            &ec.public_key,
+            b"no"
+        )
+        .unwrap());
+        assert!(verify_signature(&body(SIG_ECDSA_SECP256R1_SHA256, &ecdsa), &ec.public_key, &msg)
+            .is_err());
+        let rsa = x509::parse(&pem::decode_all(&pki("rsa384-ca.crt"), "CERTIFICATE").unwrap()[0])
+            .unwrap();
+        let pss = pem::base64_decode(pki("pss384.sig.b64").trim()).unwrap();
+        assert!(
+            verify_signature(&body(SIG_RSA_PSS_RSAE_SHA384, &pss), &rsa.public_key, &msg).unwrap()
+        );
+        assert!(
+            !verify_signature(&body(SIG_RSA_PSS_RSAE_SHA256, &pss), &rsa.public_key, &msg).unwrap()
+        );
     }
 
     /// The four tightenings of 0.85.0, each a refusal where the transcript

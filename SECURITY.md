@@ -198,8 +198,8 @@ carries no dependency, and **nobody outside it has reviewed it**. What it
 is: TLS 1.3 only; one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`; X25519
 key exchange; the node's own certificate is Ed25519 (material from
 cert-manager needs `privateKey.algorithm: Ed25519`); the CA above it and
-any intermediate may be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256) or
-ECDSA P-256, and as a client the node accepts servers signing with those
+any intermediate may be Ed25519, RSA (PKCS#1 v1.5 or PSS with SHA-256 or
+SHA-384) or ECDSA on P-256 or P-384, and as a client the node accepts servers signing with those
 too, which is how it reaches a Kubernetes API and answers its
 `CertificateRequest` with an empty certificate. Session resumption by
 ticket (0.40.0): after every handshake the server sends a

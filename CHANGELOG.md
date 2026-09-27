@@ -6,6 +6,30 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**P-384 and SHA-384 in the chain verifier.** The in-tree X.509 verified
+Ed25519, RSA with SHA-256 and P-256 with SHA-256, so a chain with a P-384
+key or a SHA-384 signature below the root -- a Let's Encrypt ECDSA chain
+under ISRG Root X2, Google Trust Services R4, DigiCert's G3 ECC roots --
+failed closed, and the archive's `https://` endpoint behind one could not
+be reached without a private CA. `ecdsa-with-SHA384`,
+`sha384WithRSAEncryption` and P-384 keys are read now, either digest on
+either curve, with RSA-PSS SHA-384 and the TLS schemes
+`ecdsa_secp384r1_sha384` and `rsa_pss_rsae_sha384` in CertificateVerify;
+P-384 against every Wycheproof vector, and openssl-made chains in the
+tests. Verification is over public data, so no constant-time claim is
+made for it.
+
+**Compatibility, stated and checked.** The README says what a release
+promises: what release N wrote opens under N+1 and later; a release that
+raised an on-disk form has a pin for a rollback window; from 1.0.0 the
+forms are frozen and a change is a major version. And every tag now runs
+a cross-version drill before it is cut: the previous published image
+writes a volume, a backup and an archived log the release build opens,
+checks, restores and rotates, and the release build pinned writes what
+the previous image opens, reads and restores.
+
 ## 0.88.0 — 2026-09-26
 
 **The backup record sealed, and the archived log's place in its

@@ -28,12 +28,14 @@ pub mod ed25519;
 pub mod fe25519;
 pub mod hkdf;
 pub mod p256;
+pub mod p384;
 pub mod pem;
 pub mod random;
 pub mod rsa;
 pub mod sc25519;
 pub mod sha2;
 pub mod tls13;
+mod weierstrass;
 #[cfg(test)]
 mod wycheproof;
 pub mod x25519;

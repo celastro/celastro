@@ -450,6 +450,28 @@ guarantee to the test that pins it, is in [docs/design.md](docs/design.md);
 [docs/architecture.md](docs/architecture.md) draws one node and one
 cluster, every box naming the module behind it.
 
+## Compatibility
+
+What a release promises about what the one before it wrote, and what
+the one after will read:
+
+- **Forward.** A data directory, a backup and an archived log written by
+  release N open under N+1, and under every later release: what the
+  previous release wrote is read as it was written, and a `celastro key
+  rotate` re-seals it under the current form when you want that.
+- **Back.** A release that raised an on-disk form has a pin that keeps
+  N+1 writing what N opens (`CELASTRO_CATALOG_FORMAT=<previous>` for the
+  catalog, `CELASTRO_SEAL_IDENTITY=1` or `2` for encrypted files; the
+  changelog says when a form moved), for the first days on the release,
+  so a rollback can still open the directory. Lift the pin once the
+  release is trusted.
+- **Checked.** Every tag runs a cross-version drill before it is cut: the
+  previous published image writes a volume, a backup and an archived log
+  the release build opens, checks, restores and rotates, and the release
+  build pinned writes what the previous image opens, reads and restores.
+- **From 1.0.0** the on-disk forms are frozen: a change to any of them
+  is a major version, with a migration, not a pin.
+
 ## Tuning
 
 Every performance knob is an environment variable read at start —

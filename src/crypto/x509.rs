@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 
 use super::bignum::Big;
 use super::der::{self, BIT_STRING, BOOLEAN, INTEGER, OCTET_STRING, OID, SEQUENCE, SET};
-use super::{ed25519, p256, pem, random, rsa};
+use super::{ed25519, p256, p384, pem, random, rsa};
 
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 const OID_SAN: &[u8] = &[0x55, 0x1d, 0x11];
@@ -36,11 +36,15 @@ const OID_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02]
 /// 1.2.840.113549.1.1.1, rsaEncryption; 1.2.840.113549.1.1.11, sha256WithRSAEncryption.
 const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_RSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 /// 1.2.840.10045.2.1, id-ecPublicKey; 1.2.840.10045.3.1.7, prime256v1;
 /// 1.2.840.10045.4.3.2, ecdsa-with-SHA256.
 const OID_EC: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+/// secp384r1, 1.3.132.0.34.
+const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 
 /// A subject's public key, by algorithm.
 #[derive(Debug, Clone)]
@@ -48,6 +52,7 @@ pub enum PublicKey {
     Ed25519([u8; 32]),
     Rsa(rsa::PublicKey),
     P256(p256::PublicKey),
+    P384(p384::PublicKey),
 }
 
 /// How a certificate is signed.
@@ -55,7 +60,9 @@ pub enum PublicKey {
 pub enum SigAlg {
     Ed25519,
     RsaSha256,
+    RsaSha384,
     EcdsaSha256,
+    EcdsaSha384,
     /// A trust anchor's, when it is not one of the three: never verified,
     /// so never matched by `signed_by`.
     Unverified,
@@ -297,9 +304,12 @@ fn signature_algorithm(alg: &[u8]) -> Result<SigAlg> {
     match oid {
         o if o == der::ED25519_OID => Ok(SigAlg::Ed25519),
         o if o == OID_RSA_SHA256 => Ok(SigAlg::RsaSha256),
+        o if o == OID_RSA_SHA384 => Ok(SigAlg::RsaSha384),
         o if o == OID_ECDSA_SHA256 => Ok(SigAlg::EcdsaSha256),
+        o if o == OID_ECDSA_SHA384 => Ok(SigAlg::EcdsaSha384),
         _ => Err(bad("the signature algorithm is not one this build verifies (Ed25519, \
-             sha256WithRSAEncryption, ecdsa-with-SHA256)")),
+             sha256WithRSAEncryption, sha384WithRSAEncryption, ecdsa-with-SHA256, \
+             ecdsa-with-SHA384)")),
     }
 }
 
@@ -351,14 +361,21 @@ fn public_key(spki: &[u8]) -> Result<PublicKey> {
         }
         o if o == OID_EC => {
             let (curve, _) = der::expect(alg_rest, OID)?;
-            if curve != OID_P256 {
-                return Err(bad("an EC key on a curve other than P-256"));
+            if curve == OID_P256 {
+                let pk = p256::PublicKey::from_uncompressed(key).ok_or_else(|| {
+                    bad("a P-256 key that is not an uncompressed point on the curve")
+                })?;
+                Ok(PublicKey::P256(pk))
+            } else if curve == OID_P384 {
+                let pk = p384::PublicKey::from_uncompressed(key).ok_or_else(|| {
+                    bad("a P-384 key that is not an uncompressed point on the curve")
+                })?;
+                Ok(PublicKey::P384(pk))
+            } else {
+                Err(bad("an EC key on a curve other than P-256 or P-384"))
             }
-            let pk = p256::PublicKey::from_uncompressed(key)
-                .ok_or_else(|| bad("a P-256 key that is not an uncompressed point on the curve"))?;
-            Ok(PublicKey::P256(pk))
         }
-        _ => Err(bad("the public key is not one this build reads (Ed25519, RSA, P-256)")),
+        _ => Err(bad("the public key is not one this build reads (Ed25519, RSA, P-256, P-384)")),
     }
 }
 
@@ -427,8 +444,22 @@ impl Certificate {
             (SigAlg::RsaSha256, PublicKey::Rsa(pk)) => {
                 pk.verify_pkcs1_sha256(&self.tbs, &self.signature)
             }
+            (SigAlg::RsaSha384, PublicKey::Rsa(pk)) => {
+                pk.verify_pkcs1_sha384(&self.tbs, &self.signature)
+            }
+            // Either digest on either curve: the digest's leftmost bits(n)
+            // bits are what ECDSA signs (SEC 1 §4.1.4).
             (SigAlg::EcdsaSha256, PublicKey::P256(pk)) => {
                 pk.verify_sha256_der(&self.tbs, &self.signature)
+            }
+            (SigAlg::EcdsaSha384, PublicKey::P256(pk)) => {
+                pk.verify_sha384_der(&self.tbs, &self.signature)
+            }
+            (SigAlg::EcdsaSha256, PublicKey::P384(pk)) => {
+                pk.verify_sha256_der(&self.tbs, &self.signature)
+            }
+            (SigAlg::EcdsaSha384, PublicKey::P384(pk)) => {
+                pk.verify_sha384_der(&self.tbs, &self.signature)
             }
             _ => false,
         }
@@ -967,14 +998,19 @@ mod tests {
     }
 
     /// Chains another issuer signed: an RSA-2048 CA and a P-256 CA, made by
-    /// openssl, each signing an Ed25519 leaf; and the two signature schemes
-    /// TLS 1.3 asks of such servers, over a known message.
+    /// openssl, each signing an Ed25519 leaf; the same with SHA-384 -- a
+    /// P-384 CA, a P-256 CA signing with SHA-384, an RSA CA with SHA-384
+    /// (what the public issuers' ECDSA chains use); and the signature
+    /// schemes TLS 1.3 asks of such servers, over a known message.
     #[test]
     fn rsa_and_p256_chains_and_signatures_from_openssl_verify() {
         let now = crate::time::now_micros() / 1_000_000;
         for (ca_file, leaf_file, alg) in [
             ("rsa-ca.crt", "leaf-by-rsa.crt", SigAlg::RsaSha256),
             ("ec-ca.crt", "leaf-by-ec.crt", SigAlg::EcdsaSha256),
+            ("ec384-ca.crt", "leaf-by-ec384.crt", SigAlg::EcdsaSha384),
+            ("ec-sha384-ca.crt", "leaf-by-ec-sha384.crt", SigAlg::EcdsaSha384),
+            ("rsa384-ca.crt", "leaf-by-rsa384.crt", SigAlg::RsaSha384),
         ] {
             let ca = parse(&pem::decode_all(&pki(ca_file), "CERTIFICATE").unwrap()[0]).unwrap();
             let leaf = parse(&pem::decode_all(&pki(leaf_file), "CERTIFICATE").unwrap()[0]).unwrap();
@@ -1010,6 +1046,28 @@ mod tests {
         let ecdsa = pem::base64_decode(pki("ecdsa.sig.b64").trim()).unwrap();
         assert!(ec_pub.verify_sha256_der(&msg, &ecdsa));
         assert!(!ec_pub.verify_sha256_der(b"another message", &ecdsa));
+        // The SHA-384 schemes: `ecdsa_secp384r1_sha384` with the P-384 CA's
+        // key, `rsa_pss_rsae_sha384` with the SHA-384 RSA CA's.
+        let ec384_ca =
+            parse(&pem::decode_all(&pki("ec384-ca.crt"), "CERTIFICATE").unwrap()[0]).unwrap();
+        let ec384_pub = match &ec384_ca.public_key {
+            PublicKey::P384(k) => k.clone(),
+            other => panic!("{other:?}"),
+        };
+        let ecdsa384 = pem::base64_decode(pki("ecdsa384.sig.b64").trim()).unwrap();
+        assert!(ec384_pub.verify_sha384_der(&msg, &ecdsa384));
+        assert!(!ec384_pub.verify_sha384_der(b"another message", &ecdsa384));
+        assert!(!ec384_pub.verify_sha256_der(&msg, &ecdsa384), "the digest is part of it");
+        let spki_der = pem::decode_all(&pki("rsa384-pub.pem"), "PUBLIC KEY").unwrap().remove(0);
+        let (spki, _) = der::expect(&spki_der, SEQUENCE).unwrap();
+        let rsa384_pub = match public_key(spki).unwrap() {
+            PublicKey::Rsa(k) => k,
+            other => panic!("{other:?}"),
+        };
+        let pss384 = pem::base64_decode(pki("pss384.sig.b64").trim()).unwrap();
+        assert!(rsa384_pub.verify_pss_sha384(&msg, &pss384));
+        assert!(!rsa384_pub.verify_pss_sha384(b"another message", &pss384));
+        assert!(!rsa384_pub.verify_pss_sha256(&msg, &pss384), "the digest is part of it");
     }
 
     /// One DER element: a tag, a length in the short or the long form, a

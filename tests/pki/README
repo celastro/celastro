@@ -10,3 +10,12 @@ a self-signed CA with a critical name constraint (the parser refuses it);
 usage is clientAuth alone; and `root2.crt` -> `inter-nosign.crt` (a CA whose
 key usage is digitalSignature only) -> `leaf-by-inter.crt` (serverAuth,
 `localhost`), a chain that must not link through the intermediate.
+
+Added for P-384 and SHA-384 (0.89.0), made with openssl: `ec384-ca.crt`, a
+P-384 CA self-signed with SHA-384, and `leaf-by-ec384.crt`, an Ed25519 leaf
+for `localhost` it signed with ecdsa-with-SHA384; `ec-sha384-ca.crt` and
+`leaf-by-ec-sha384.crt`, the same with a P-256 CA signing with SHA-384;
+`rsa384-ca.crt` and `leaf-by-rsa384.crt`, an RSA-2048 CA and its leaf with
+sha384WithRSAEncryption, and `rsa384-pub.pem`, its public key; over `msg`,
+`ecdsa384.sig.b64` (the P-384 key, SHA-384, DER) and `pss384.sig.b64` (the
+RSA key, PSS with SHA-384 and a 48-byte salt). The keys are not here.

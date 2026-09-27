@@ -4,7 +4,7 @@
 //! non-canonical points, a signature bent every way, non-minimal DER, a
 //! tag a byte short, a length at every boundary. Every file runs whole.
 
-use super::{chacha20poly1305 as aead, ed25519, hkdf, p256, rsa, x25519};
+use super::{chacha20poly1305 as aead, ed25519, hkdf, p256, p384, rsa, x25519};
 use crate::{json, Value};
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -146,6 +146,48 @@ fn ecdsa_p256_agrees_with_wycheproof_on_every_vector() {
         checked += 1;
     }
     assert!(checked >= 450, "{checked} vectors");
+}
+
+#[test]
+fn ecdsa_p384_agrees_with_wycheproof_on_every_vector() {
+    let mut checked = 0;
+    for (g, t) in tests(include_str!("../../tests/wycheproof/ecdsa_secp384r1_sha384_test.json")) {
+        let point = unhex(text(g.get("publicKey").unwrap(), "uncompressed"));
+        let pk = p384::PublicKey::from_uncompressed(&point).expect("a P-384 point");
+        let msg = unhex(text(&t, "msg"));
+        let sig = unhex(text(&t, "sig"));
+        let valid = text(&t, "result") == "valid";
+        assert_eq!(pk.verify_sha384_der(&msg, &sig), valid, "{}", name(&t));
+        checked += 1;
+    }
+    assert!(checked >= 350, "{checked} vectors");
+}
+
+/// PKCS#1 v1.5 over SHA-384, `sha384WithRSAEncryption`, on every vector.
+#[test]
+fn rsa_pkcs1_sha384_agrees_with_wycheproof_on_every_vector() {
+    use super::bignum::Big;
+    let (mut checked, mut skipped) = (0, 0);
+    for (g, t) in tests(include_str!("../../tests/wycheproof/rsa_signature_2048_sha384_test.json"))
+    {
+        let key = g.get("publicKey").unwrap();
+        let pk = rsa::PublicKey {
+            n: Big::from_be_bytes(&unhex(text(key, "modulus"))),
+            e: Big::from_be_bytes(&unhex(text(key, "publicExponent"))),
+        };
+        let msg = unhex(text(&t, "msg"));
+        let sig = unhex(text(&t, "sig"));
+        match text(&t, "result") {
+            "valid" => assert!(pk.verify_pkcs1_sha384(&msg, &sig), "{}", name(&t)),
+            "invalid" => assert!(!pk.verify_pkcs1_sha384(&msg, &sig), "{}", name(&t)),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 200 && skipped <= 2, "{checked} vectors, {skipped} skipped");
 }
 
 /// PKCS#1 v1.5 over SHA-256 is what an X.509 chain another issuer signed

@@ -974,8 +974,9 @@ did not reach. The
 `archived` tier is an S3-compatible object store when one is configured, a
 directory on any mount when one is named (`CELASTRO_ARCHIVE_DIR`; the same
 trait, so NFS is the cluster's business), and the shard-local directory
-otherwise; the client is in-tree, plain HTTP or, since 0.42.0, HTTPS over the in-tree TLS (`CELASTRO_ARCHIVE_CA`, or the system bundle): the TLS (0.28.0) encrypts
-the wire and the console, not the archive client, yet. Backups (0.30.0)
+otherwise; the client is in-tree, plain HTTP or, since 0.42.0, HTTPS over
+the in-tree TLS (`CELASTRO_ARCHIVE_CA`, or the system bundle), the same
+TLS (0.28.0) that encrypts the wire and the console. Backups (0.30.0)
 go through the same trait: `BACKUP TO` and `RESTORE FROM` in `backup.rs`.
 
 The *boundaries* those attach to are real, and that is the point of having built
@@ -1930,8 +1931,9 @@ it is free again.
 **The `archived` tier is an object store, reached the way the design budgets
 for.** One S3-compatible surface: a bucket, a key that reads like the path it
 stands in for, `PUT`, ranged `GET`, `HEAD` and `DELETE`, path-style and signed
-with Signature Version 4, over plain HTTP or the in-tree TLS (0.42.0; verified against `CELASTRO_ARCHIVE_CA` or the system bundle, wildcard names allowed in the leftmost label, every resolved address tried in turn): the TLS covers the wire and the
-console, not this client, yet.
+with Signature Version 4, over plain HTTP or the in-tree TLS (0.42.0;
+verified against `CELASTRO_ARCHIVE_CA` or the system bundle, wildcard names
+allowed in the leftmost label, every resolved address tried in turn).
 SHA-256, HMAC, the signer and a small HTTP/1.1 client are in-tree and pinned
 against the published vectors, AWS's own worked example included. A remote
 segment is opened by reading its footer with two ranged reads and each
@@ -2009,8 +2011,10 @@ verification costs a multiplication per exponent bit and a chain a
 verification per link, both the peer's to choose, and neither is seen
 before the token is. A stock client speaks that subset; an Ed25519 leaf is the one thing it asks of an issuer. Verifying
 is wider than signing: chains and CertificateVerify from RSA (PKCS#1 v1.5
-and PSS, SHA-256) and ECDSA P-256 are accepted (0.29.0; `bignum`, `rsa`,
-`p256`, public-key operations only, so no timing concern), which is what
+and PSS, SHA-256 or SHA-384) and ECDSA on P-256 or P-384 with either digest
+are accepted (0.29.0, the 384s in 0.89.0 for the public issuers' ECDSA
+chains; `bignum`, `rsa`, `weierstrass` under `p256` and `p384`, public-key
+operations only, so no timing concern), which is what
 lets `celastro tls secret` reach a cluster's API, whose certificate
 no cluster issues as Ed25519 and which asks for a client certificate (the
 client answers with an empty one, as the RFC has it). Every primitive
@@ -2131,6 +2135,18 @@ reopen twice as long at a quarter of a second, and the reads -- point
 lookups, BM25, vector, hybrid, the walk -- within noise: a segment's
 components are opened once into the residency cache, and the frames are
 opened on the way in.
+
+**Compatibility, stated once.** Forward: what release N wrote -- a data
+directory, a backup, an archived log -- opens under N+1 and every later
+release, as written. Back: a release that raised an on-disk form carries
+a pin for a rollback window (`CELASTRO_CATALOG_FORMAT`,
+`CELASTRO_SEAL_IDENTITY`), lifted once the release is trusted. Checked:
+the release procedure runs a cross-version drill before every tag -- the
+previous published image and the release build read, check, restore and
+rotate each other's volumes, pinned and not -- since 0.89.0, after the
+at-rest form moved three times in four releases and a log with a header
+and no record broke `key rotate` for two of them unseen. From 1.0.0 the
+forms are frozen and a change is a major version.
 
 **The identity's rollback window.** The files 0.84.1 writes do not open
 under 0.83.0 -- another identity, a header in each log, a `CELK3` ring
@@ -2819,6 +2835,9 @@ guarantee:
 | one key wraps as a `CELK3` ring of one; `CELK1`/`CELK2` still read and are marked for rewriting | `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back` |
 | an encrypted backup's record is sealed; a byte changed refuses the restore; a record in the clear still restores | `encryption::a_backup_record_is_sealed_and_a_changed_one_is_refused` |
 | an archived log copied to another number is refused by name; put back, the restore is whole | `pitr::a_restore_refuses_an_archived_log_moved_to_another_slot` |
+| P-384 ECDSA against every Wycheproof vector; PKCS#1 v1.5 with SHA-384 likewise | `wycheproof::ecdsa_p384_agrees_with_wycheproof_on_every_vector`, `wycheproof::rsa_pkcs1_sha384_agrees_with_wycheproof_on_every_vector` |
+| a P-384 chain, a P-256 chain signed with SHA-384 and a SHA-384 RSA chain from openssl verify, with the two SHA-384 TLS schemes | `x509::tests::rsa_and_p256_chains_and_signatures_from_openssl_verify` |
+| a CertificateVerify under `ecdsa_secp384r1_sha384` and `rsa_pss_rsae_sha384` verifies; the other scheme for the key is refused | `tls13::tests::a_certificate_verify_under_the_sha384_schemes_verifies` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
@@ -2902,5 +2921,5 @@ tests/
   tls.rs                         the console and the wire over TLS
   encryption.rs                  no plaintext at rest; refusals; backup, import and move under a key
   aggregates.rs                  count, sum, min, max, avg and GROUP BY over segments and a memtable
-  pki/                           RSA and P-256 chains and signatures from openssl
+  pki/                           RSA, P-256 and P-384 chains and signatures from openssl
 ```

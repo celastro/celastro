@@ -271,16 +271,46 @@ const K512: [u64; 80] = [
 /// wiped before this returns, since the seed and the nonce prefix of an
 /// Ed25519 key come through here.
 pub fn sha512(msg: &[u8]) -> [u8; 64] {
-    let mut h: [u64; 8] = [
-        0x6a09e667f3bcc908,
-        0xbb67ae8584caa73b,
-        0x3c6ef372fe94f82b,
-        0xa54ff53a5f1d36f1,
-        0x510e527fade682d1,
-        0x9b05688c2b3e6c1f,
-        0x1f83d9abfb41bd6b,
-        0x5be0cd19137e2179,
-    ];
+    sha2_64(
+        msg,
+        [
+            0x6a09e667f3bcc908,
+            0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b,
+            0xa54ff53a5f1d36f1,
+            0x510e527fade682d1,
+            0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b,
+            0x5be0cd19137e2179,
+        ],
+    )
+}
+
+/// SHA-384: the SHA-512 core from its own initial values, the first 48
+/// bytes of the state (FIPS 180-4 §5.3.4, §6.5). What an ECDSA P-384
+/// signature and a `sha384WithRSAEncryption` chain are hashed with.
+pub fn sha384(msg: &[u8]) -> [u8; 48] {
+    let full = sha2_64(
+        msg,
+        [
+            0xcbbb9d5dc1059ed8,
+            0x629a292a367cd507,
+            0x9159015a3070dd17,
+            0x152fecd8f70e5939,
+            0x67332667ffc00b31,
+            0x8eb44a8768581511,
+            0xdb0c2e0d64f98fa7,
+            0x47b5481dbefa4fa4,
+        ],
+    );
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&full[..48]);
+    out
+}
+
+/// The 64-bit SHA-2 core from `iv`, as `sha512` documents it.
+fn sha2_64(msg: &[u8], iv: [u64; 8]) -> [u8; 64] {
+    let mut h: [u64; 8] = iv;
     let mut chunks = msg.chunks_exact(128);
     for block in &mut chunks {
         compress512(&mut h, block);
@@ -349,6 +379,19 @@ mod tests {
     use crate::crypto::hex;
     /// FIPS 180-4's two vectors and the empty message, whose digest is also
     /// the `x-amz-content-sha256` of every bodiless request.
+    /// FIPS 180-4's vectors for SHA-384: the empty message and "abc".
+    #[test]
+    fn sha384_matches_the_published_vectors() {
+        assert_eq!(
+            hex(&sha384(b"")),
+            "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        );
+        assert_eq!(
+            hex(&sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+        );
+    }
+
     #[test]
     fn sha256_matches_the_published_vectors() {
         assert_eq!(
