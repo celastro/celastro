@@ -23,7 +23,7 @@ pub struct PublicKey(Affine);
 
 impl PublicKey {
     pub fn from_uncompressed(bytes: &[u8]) -> Option<PublicKey> {
-        curve().from_uncompressed(bytes).map(PublicKey)
+        curve().decode_uncompressed(bytes).map(PublicKey)
     }
 
     /// ECDSA over SHA-256 with the signature as the DER `SEQUENCE { r, s }`.

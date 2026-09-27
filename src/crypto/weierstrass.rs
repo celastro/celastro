@@ -152,7 +152,7 @@ pub(super) struct Affine {
 
 impl Curve {
     /// A point from its uncompressed encoding `04 || x || y`, on the curve.
-    pub fn from_uncompressed(&self, bytes: &[u8]) -> Option<Affine> {
+    pub fn decode_uncompressed(&self, bytes: &[u8]) -> Option<Affine> {
         if bytes.len() != 1 + 2 * self.bytes || bytes[0] != 4 {
             return None;
         }
