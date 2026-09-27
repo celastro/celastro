@@ -2378,8 +2378,27 @@ impl Db {
                     left / 86_400
                 )
             };
+            let crl = match tls.crl_status() {
+                None => String::new(),
+                Some((n, next)) => format!(
+                    "; CRL revokes {n} certificate(s){}",
+                    match next {
+                        Some(at) if at < now => format!(
+                            ", next update was due {} PAST DUE",
+                            crate::time::format_micros(at * 1_000_000)
+                        ),
+                        Some(at) => {
+                            format!(
+                                ", next update due {}",
+                                crate::time::format_micros(at * 1_000_000)
+                            )
+                        }
+                        None => String::new(),
+                    }
+                ),
+            };
             out.push_str(&format!(
-                "tls: {}; {}{}\n",
+                "tls: {}; {}{}{crl}\n",
                 describe("certificate", tls.expires_at()),
                 describe("CA", tls.anchors_expire_at()),
                 if tls.client_auth() { "; the wire requires a peer's certificate" } else { "" }

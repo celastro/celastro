@@ -831,7 +831,13 @@ fn connect(endpoint: &str, tls: Option<&ArchiveTls>) -> Result<Box<dyn crate::tl
             use crate::crypto::tls13::{ClientSide, TlsStream};
             Ok(Box::new(TlsStream::client(
                 s,
-                ClientSide { anchors: &t.anchors, host: &t.host, chain_der: None, key: None },
+                ClientSide {
+                    anchors: &t.anchors,
+                    host: &t.host,
+                    chain_der: None,
+                    key: None,
+                    revoked: &[],
+                },
             )))
         }
     }

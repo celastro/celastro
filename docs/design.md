@@ -1985,7 +1985,12 @@ extensions is refused, a NewSessionTicket sent to a server and a
 KeyUpdate of more than its byte are refused, and a ticket (format 3,
 its format byte under its seal) carries the client certificate's
 expiry and is keyed by the anchors as well as the day, so it resumes
-past neither the certificate nor a change of CA; HelloRetryRequest
+past neither the certificate nor a change of CA; since 0.91.0 a CA's
+`pathLenConstraint` bounds the intermediates below it, on anchors and
+links alike, and a revocation list the CA signed (`CELASTRO_TLS_CRL`,
+re-read when it changes) refuses the certificates it names wherever they
+stand in a chain -- the two things H5 recorded as not implemented
+(0.91.0); HelloRetryRequest
 from 0.66.0, for a client whose first share is of another group. A
 handshake that failed leaves the stream dead, every later read or write of
 it an error (0.83.0): before that a failure left the stream without keys
@@ -2842,6 +2847,9 @@ guarantee:
 | the page carries its token in a meta tag, escaped, and links its assets bare | `serve::tests::the_page_carries_its_token_in_a_meta_tag_and_its_assets_as_plain_paths` |
 | a host may call itself by thirty-two addresses and no more; another host's first is not counted against it | `engine::tests::a_host_may_call_itself_by_so_many_addresses_and_no_more`, `tls::a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_has` |
 | an archive response past the bounds is refused, not held | `objstore::tests::a_response_past_the_bounds_is_refused_not_held` |
+| a CA's pathLenConstraint bounds the intermediates below it, on anchors and links | `x509::tests::a_path_length_constraint_bounds_the_intermediates_below_a_ca` |
+| a revoked certificate is refused; a list another CA signed revokes nothing; openssl's list parses | `x509::tests::a_revoked_certificate_is_refused_and_an_unvouched_list_revokes_nothing` |
+| a revoked client certificate is refused at the handshake, naming the revocation | `tls13::tests::a_revoked_client_certificate_is_refused_at_the_handshake` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

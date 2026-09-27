@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -25,6 +25,11 @@ pub const KEY_ENV: &str = "CELASTRO_TLS_KEY";
 /// The CA every node's certificate chains to, PEM; what a peer is verified
 /// against.
 pub const CA_ENV: &str = "CELASTRO_TLS_CA";
+/// A certificate revocation list, PEM (`X509 CRL` blocks), signed by a CA
+/// in `CELASTRO_TLS_CA`: the certificates it names are refused, as a
+/// peer's on the wire or a server's on a dial. Optional; re-read when the
+/// file changes, checked at most once a minute.
+pub const CRL_ENV: &str = "CELASTRO_TLS_CRL";
 /// `required` makes the wire ask every peer for a certificate the CA
 /// signed and refuse one without; unset or `off` asks for none.
 pub const CLIENT_AUTH_ENV: &str = "CELASTRO_TLS_CLIENT_AUTH";
@@ -106,6 +111,22 @@ fn names_from_env() -> Result<Option<(String, String, String)>> {
     }
 }
 
+/// The revocation list as last read: where from, when, and what it says.
+struct Revocations {
+    path: String,
+    mtime: Option<std::time::SystemTime>,
+    checked: Instant,
+    revoked: Vec<crate::crypto::x509::Revoked>,
+    next_update: Option<i64>,
+}
+
+/// How often the revocation list's file is looked at for a change.
+const CRL_RECHECK: Duration = Duration::from_secs(60);
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// What a node holds: its certificate chain and key to serve with, and the
 /// CA every peer is verified against.
 pub struct Tls {
@@ -123,6 +144,8 @@ pub struct Tls {
     /// and refuses one without: `CELASTRO_TLS_CLIENT_AUTH=required`. The
     /// console never asks; browsers and tools speak to it with the token.
     client_auth: bool,
+    /// The revocation list `CELASTRO_TLS_CRL` names, when it does.
+    revocations: Option<std::sync::Mutex<Revocations>>,
     /// Whether this node's own certificate can be presented as a client
     /// certificate: its extended key usage names client authentication,
     /// or names nothing. A set made by `tls init` before 0.67.0 names
@@ -184,8 +207,22 @@ impl Tls {
                 }
             },
         };
-        let tls =
-            Tls::from_texts((&cert, &cert_text), (&key, &key_text), (&ca, &ca_text), client_auth);
+        let crl_path = std::env::var(CRL_ENV).ok().filter(|v| !v.is_empty());
+        let crl_text = match &crl_path {
+            Some(p) => Some(read("CRL", p)?),
+            None => None,
+        };
+        let crl = match (&crl_path, &crl_text) {
+            (Some(p), Some(t)) => Some((p.as_str(), t.as_str())),
+            _ => None,
+        };
+        let tls = Tls::from_texts_with_crl(
+            (&cert, &cert_text),
+            (&key, &key_text),
+            (&ca, &ca_text),
+            crl,
+            client_auth,
+        );
         // The key file's text is a copy of the seed too.
         crate::cipher::wipe_string(&mut key_text);
         tls.map(Some)
@@ -195,10 +232,29 @@ impl Tls {
     /// path, or whatever the caller has): what `from_env` does once the
     /// files are read, for a caller that has the PEMs in hand and no
     /// environment to speak of.
+    #[cfg(test)]
     pub(crate) fn from_texts(
         (cert, cert_text): (&str, &str),
         (key, key_text): (&str, &str),
         (ca, ca_text): (&str, &str),
+        client_auth: bool,
+    ) -> Result<Tls> {
+        Tls::from_texts_with_crl(
+            (cert, cert_text),
+            (key, key_text),
+            (ca, ca_text),
+            None,
+            client_auth,
+        )
+    }
+
+    /// [`from_texts`](Self::from_texts) with a revocation list: its path
+    /// (re-read from there when it changes) and its text as first read.
+    pub(crate) fn from_texts_with_crl(
+        (cert, cert_text): (&str, &str),
+        (key, key_text): (&str, &str),
+        (ca, ca_text): (&str, &str),
+        crl: Option<(&str, &str)>,
         client_auth: bool,
     ) -> Result<Tls> {
         use crate::crypto::{pem, x509};
@@ -245,15 +301,72 @@ impl Tls {
         let anchors_not_after = anchors.iter().map(|a| a.not_after).min().unwrap_or(0);
         check_client_purpose(&leaf, cert, client_auth)?;
         let serves_as_client = leaf.fit_for(crate::crypto::x509::Purpose::ClientAuth).is_ok();
+        let revocations = match crl {
+            Some((path, text)) => {
+                let (revoked, next_update) = x509::revocations_from_pem(text, &anchors)
+                    .map_err(|e| read_err("CRL", path, e))?;
+                Some(std::sync::Mutex::new(Revocations {
+                    path: path.to_string(),
+                    mtime: file_mtime(path),
+                    checked: Instant::now(),
+                    revoked,
+                    next_update,
+                }))
+            }
+            None => None,
+        };
         Ok(Tls {
             chain_der,
             key: pair,
             anchors,
             not_after: leaf.not_after,
             anchors_not_after,
+            revocations,
             client_auth,
             serves_as_client,
         })
+    }
+
+    /// The revoked certificates as of now: the list re-read when its file
+    /// has changed, looked at most once a minute. A file that stopped
+    /// reading keeps the last list that did, and says so once in the log.
+    pub fn revoked(&self) -> Vec<crate::crypto::x509::Revoked> {
+        let Some(m) = &self.revocations else { return Vec::new() };
+        let mut r = m.lock().unwrap_or_else(|p| p.into_inner());
+        if r.checked.elapsed() >= CRL_RECHECK {
+            r.checked = Instant::now();
+            let mtime = file_mtime(&r.path);
+            if mtime != r.mtime {
+                r.mtime = mtime;
+                match std::fs::read_to_string(&r.path)
+                    .map_err(Error::Io)
+                    .and_then(|t| crate::crypto::x509::revocations_from_pem(&t, &self.anchors))
+                {
+                    Ok((revoked, next_update)) => {
+                        crate::log::info(
+                            "crl_reloaded",
+                            &[("path", r.path.clone()), ("revoked", revoked.len().to_string())],
+                        );
+                        r.revoked = revoked;
+                        r.next_update = next_update;
+                    }
+                    Err(e) => crate::log::warn(
+                        "crl_not_reloaded",
+                        &[("path", r.path.clone()), ("error", e.to_string())],
+                    ),
+                }
+            }
+        }
+        r.revoked.clone()
+    }
+
+    /// What the revocation list says of itself, for `SHOW HEALTH`: how
+    /// many serials it revokes and when its next update is due, or `None`
+    /// when no list is configured.
+    pub fn crl_status(&self) -> Option<(usize, Option<i64>)> {
+        let m = self.revocations.as_ref()?;
+        let r = m.lock().unwrap_or_else(|p| p.into_inner());
+        Some((r.revoked.len(), r.next_update))
     }
 
     /// Whether the wire requires a peer's certificate.
@@ -283,7 +396,12 @@ impl Tls {
         use crate::crypto::tls13::{ServerSide, TlsStream};
         Ok(Box::new(TlsStream::server(
             sock,
-            ServerSide { chain_der: &self.chain_der, key: &self.key, client_anchors: None },
+            ServerSide {
+                chain_der: &self.chain_der,
+                key: &self.key,
+                client_anchors: None,
+                revoked: &[],
+            },
         )))
     }
 
@@ -298,6 +416,7 @@ impl Tls {
                 chain_der: &self.chain_der,
                 key: &self.key,
                 client_anchors: self.client_auth.then_some(self.anchors.as_slice()),
+                revoked: &self.revoked(),
             },
         )))
     }
@@ -314,6 +433,7 @@ impl Tls {
                 host,
                 chain_der: Some(&self.chain_der),
                 key: Some(&self.key),
+                revoked: &self.revoked(),
             },
         )))
     }
@@ -375,7 +495,13 @@ pub fn https_request(
     let sock = dial(addr, timeout)?;
     let mut s = TlsStream::client(
         sock,
-        ClientSide { anchors: &anchors, host: server_name, chain_der: None, key: None },
+        ClientSide {
+            anchors: &anchors,
+            host: server_name,
+            chain_der: None,
+            key: None,
+            revoked: &[],
+        },
     );
     let request = http_text(server_name, req);
     s.write_all(request.as_bytes()).map_err(Error::Io)?;

@@ -19,3 +19,8 @@ for `localhost` it signed with ecdsa-with-SHA384; `ec-sha384-ca.crt` and
 sha384WithRSAEncryption, and `rsa384-pub.pem`, its public key; over `msg`,
 `ecdsa384.sig.b64` (the P-384 key, SHA-384, DER) and `pss384.sig.b64` (the
 RSA key, PSS with SHA-384 and a 48-byte salt). The keys are not here.
+
+Added for revocation (0.91.0), made with `openssl ca`: `crl-ca.crt`, an
+Ed25519 CA; `crl-ok.crt` (serial 0x1000) and `crl-revoked.crt` (serial
+0x1001), leaves for `localhost` it signed; and `revoked.crl`, the CA's
+revocation list naming the second. The keys are not here.

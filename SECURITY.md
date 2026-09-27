@@ -46,6 +46,12 @@ same-origin check;
 with `--bind` it answers the operator's token from `CELASTRO_TOKEN` and the
 `Host` allow-list gives way to the token, a browser's `Origin` having to be
 the `Host` it named; with certificates it serves TLS 1.3 and verifies peers.
+A certificate the CA has revoked is refused when `CELASTRO_TLS_CRL` names a
+revocation list the CA signed (PEM, `X509 CRL` blocks; re-read when the
+file changes, looked at once a minute; `SHOW HEALTH` says how many it
+revokes and when its next update is due), and a CA's `pathLenConstraint`
+bounds the intermediates below it (0.91.0). Revocation is the operator's
+list, not a fetch: the node reaches no distribution point.
 Everything behind the token is a SQL prompt, so anything that reaches the
 executor without it is a serious finding:
 

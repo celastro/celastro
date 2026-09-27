@@ -2813,7 +2813,13 @@ mod tests {
         std::thread::sleep(IDLE_POLL + Duration::from_millis(300));
         let mut s = TlsStream::client(
             sock,
-            ClientSide { anchors: &anchors, host: "localhost", chain_der: None, key: None },
+            ClientSide {
+                anchors: &anchors,
+                host: "localhost",
+                chain_der: None,
+                key: None,
+                revoked: &[],
+            },
         );
         s.handshake().expect("a peer slower than the idle poll completes its handshake");
         let node = Node::new(&url, Some("slow-hello-token"), None).unwrap();

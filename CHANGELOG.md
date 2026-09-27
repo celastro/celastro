@@ -6,6 +6,21 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**Revocation, and path length constraints.** `CELASTRO_TLS_CRL` names a
+certificate revocation list -- PEM, `X509 CRL` blocks, each signed by a CA
+in `CELASTRO_TLS_CA`, or the file is refused at start -- and the
+certificates it names are refused wherever they stand in a chain: a peer's
+on the wire under client certificates, a server's on a dial. The file is
+re-read when it changes (looked at once a minute); one that stops reading
+keeps the last list that did and says so in the log; `SHOW HEALTH` reports
+how many certificates it revokes and when its next update is due, and says
+so when that is past. A CA's `pathLenConstraint` is honoured on anchors and
+intermediates alike: a chain with more intermediates below a CA than it
+allows is refused, naming the count. These were the two things the
+cryptography reviews recorded as not implemented.
+
 ## 0.90.0 — 2026-09-27
 
 **The console's token leaves the URL.** The URL `serve` prints still

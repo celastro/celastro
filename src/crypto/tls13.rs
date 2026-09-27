@@ -433,6 +433,8 @@ pub struct ServerSide<'a> {
     /// for one -- the wire under `CELASTRO_TLS_CLIENT_AUTH=required`;
     /// `None` asks for nothing, as the console never does.
     pub client_anchors: Option<&'a [Certificate]>,
+    /// The certificates a revocation list the anchors signed names.
+    pub revoked: &'a [x509::Revoked],
 }
 
 pub struct ClientSide<'a> {
@@ -443,6 +445,8 @@ pub struct ClientSide<'a> {
     /// empty Certificate, which a server that requires one refuses.
     pub chain_der: Option<&'a [Vec<u8>]>,
     pub key: Option<&'a KeyPair>,
+    /// The certificates a revocation list the anchors signed names.
+    pub revoked: &'a [x509::Revoked],
 }
 
 enum Role {
@@ -450,12 +454,14 @@ enum Role {
         chain_der: Vec<Vec<u8>>,
         key: KeyPair,
         client_anchors: Option<Vec<Certificate>>,
+        revoked: Vec<x509::Revoked>,
     },
     Client {
         anchors: Vec<Certificate>,
         host: String,
         chain_der: Option<Vec<Vec<u8>>>,
         key: Option<KeyPair>,
+        revoked: Vec<x509::Revoked>,
     },
 }
 
@@ -543,6 +549,7 @@ impl TlsStream {
                 chain_der: side.chain_der.to_vec(),
                 key: side.key.clone(),
                 client_anchors: side.client_anchors.map(<[Certificate]>::to_vec),
+                revoked: side.revoked.to_vec(),
             },
         )
     }
@@ -555,6 +562,7 @@ impl TlsStream {
                 host: side.host.to_string(),
                 chain_der: side.chain_der.map(<[Vec<u8>]>::to_vec),
                 key: side.key.cloned(),
+                revoked: side.revoked.to_vec(),
             },
         )
     }
@@ -654,11 +662,11 @@ impl TlsStream {
         let Some(role) = self.role.take() else { return Ok(()) };
         self.hs_started = Some(std::time::Instant::now());
         let r = match role {
-            Role::Server { chain_der, key, client_anchors } => {
-                self.server_handshake(&chain_der, &key, client_anchors.as_deref())
+            Role::Server { chain_der, key, client_anchors, revoked } => {
+                self.server_handshake(&chain_der, &key, client_anchors.as_deref(), &revoked)
             }
-            Role::Client { anchors, host, chain_der, key } => {
-                self.client_handshake(&anchors, &host, chain_der.as_deref(), key.as_ref())
+            Role::Client { anchors, host, chain_der, key, revoked } => {
+                self.client_handshake(&anchors, &host, chain_der.as_deref(), key.as_ref(), &revoked)
             }
         };
         self.hs_started = None;
@@ -894,6 +902,7 @@ impl TlsStream {
         chain_der: &[Vec<u8>],
         key: &KeyPair,
         client_anchors: Option<&[Certificate]>,
+        revoked: &[x509::Revoked],
     ) -> io::Result<()> {
         let mut transcript = Vec::new();
         let mut hs_buf = Vec::new();
@@ -1159,8 +1168,14 @@ impl TlsStream {
                 ));
             }
             let now = crate::time::now_micros() / 1_000_000;
-            x509::chain_reaches_anchor(&chain, anchors, now)
-                .map_err(|e| err(format!("the peer's certificate: {e}")))?;
+            x509::chain_reaches_anchor_with(
+                &chain,
+                anchors,
+                revoked,
+                now,
+                x509::Purpose::ClientAuth,
+            )
+            .map_err(|e| err(format!("the peer's certificate: {e}")))?;
             let mut names: Vec<String> =
                 chain[0].dns_names.iter().map(|n| n.to_ascii_lowercase()).collect();
             for ip in &chain[0].ip_addresses {
@@ -1242,6 +1257,7 @@ impl TlsStream {
         host: &str,
         chain_der: Option<&[Vec<u8>]>,
         key: Option<&KeyPair>,
+        revoked: &[x509::Revoked],
     ) -> io::Result<()> {
         let mut transcript = Vec::new();
         let mut hs_buf = Vec::new();
@@ -1521,7 +1537,8 @@ impl TlsStream {
         }
         let chain = parse_certificate_message(&body)?;
         let now = crate::time::now_micros() / 1_000_000;
-        x509::verify_chain(&chain, anchors, host, now).map_err(|e| err(e.to_string()))?;
+        x509::verify_chain_with(&chain, anchors, revoked, host, now)
+            .map_err(|e| err(e.to_string()))?;
         let th_before_cv = sha256(&transcript);
         let (ty, body) = self.read_handshake(&mut hs_buf, &mut transcript)?;
         if ty != HS_CERTIFICATE_VERIFY {
@@ -2314,7 +2331,7 @@ mod tests {
             sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
             let mut s = TlsStream::server(
                 sock,
-                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None, revoked: &[] },
             );
             server_hooks(&mut s);
             let r = s.handshake();
@@ -2335,6 +2352,7 @@ mod tests {
                 host: "127.0.0.1",
                 chain_der: None,
                 key: None,
+                revoked: &[],
             },
         );
         client_hooks(&mut c);
@@ -2413,7 +2431,12 @@ mod tests {
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
                 let mut s = TlsStream::server(
                     sock,
-                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                    ServerSide {
+                        chain_der: &chain_der,
+                        key: &key,
+                        client_anchors: None,
+                        revoked: &[],
+                    },
                 );
                 s.write_all(b"the whole answer").unwrap();
                 if notify {
@@ -2430,6 +2453,7 @@ mod tests {
                     host: "127.0.0.1",
                     chain_der: None,
                     key: None,
+                    revoked: &[],
                 },
             );
             let mut got = Vec::new();
@@ -2521,6 +2545,80 @@ mod tests {
         assert!(
             !verify_signature(&body(SIG_RSA_PSS_RSAE_SHA256, &pss), &rsa.public_key, &msg).unwrap()
         );
+    }
+
+    /// Under client certificates a certificate the CA has revoked is refused
+    /// at the handshake, naming the revocation; the same certificate with
+    /// no list, or with a list naming another serial, is served. The list
+    /// is the CA's own, signed with its key, as `CELASTRO_TLS_CRL` gives it.
+    #[test]
+    fn a_revoked_client_certificate_is_refused_at_the_handshake() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let ca_key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.ca_key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let leaf = x509::parse(&chain_der[0]).unwrap();
+        let now = now_secs() as i64;
+        let revoking = pem::encode(
+            "X509 CRL",
+            &x509::issue_crl(&anchor, &ca_key, &[&leaf.serial], now - 60, now + 86_400),
+        );
+        let (revoked, _) =
+            x509::revocations_from_pem(&revoking, std::slice::from_ref(&anchor)).unwrap();
+        let other = pem::encode(
+            "X509 CRL",
+            &x509::issue_crl(&anchor, &ca_key, &[&[0x77]], now - 60, now + 86_400),
+        );
+        let (other_revoked, _) =
+            x509::revocations_from_pem(&other, std::slice::from_ref(&anchor)).unwrap();
+        for (list, want) in [(Vec::new(), true), (other_revoked, true), (revoked, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (cd, k, a) = (chain_der.clone(), key.clone(), anchor.clone());
+            let server = std::thread::spawn(move || {
+                let (sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide {
+                        chain_der: &cd,
+                        key: &k,
+                        client_anchors: Some(std::slice::from_ref(&a)),
+                        revoked: &list,
+                    },
+                );
+                s.handshake().map_err(|e| e.to_string())
+            });
+            let sock = TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: Some(&chain_der),
+                    key: Some(&key),
+                    revoked: &[],
+                },
+            );
+            // The client's handshake is done on its side once its Finished
+            // is out; the server's refusal is what its next read hears.
+            let heard = c.handshake().map_err(|e| e.to_string()).and_then(|()| {
+                let mut b = [0u8; 1];
+                c.read(&mut b).map(|_| ()).map_err(|e| e.to_string())
+            });
+            let _ = c.close_notify();
+            let served = server.join().unwrap();
+            assert_eq!(served.is_ok(), want, "{served:?}");
+            if !want {
+                assert!(served.unwrap_err().contains("is revoked"));
+                assert!(heard.is_err(), "the client hears the refusal on its next read");
+            }
+        }
     }
 
     /// The four tightenings of 0.85.0, each a refusal where the transcript
@@ -2643,7 +2741,7 @@ mod tests {
         sock.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
         let mut s = TlsStream::server(
             sock,
-            ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+            ServerSide { chain_der: &chain_der, key: &key, client_anchors: None, revoked: &[] },
         );
         let first = s.handshake();
         assert!(first.is_err(), "the handshake must time out on a silent peer");
@@ -2688,7 +2786,12 @@ mod tests {
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut s = TlsStream::server(
                     sock,
-                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                    ServerSide {
+                        chain_der: &chain_der,
+                        key: &key,
+                        client_anchors: None,
+                        revoked: &[],
+                    },
                 );
                 let mut buf = Vec::new();
                 let r = s.read_to_end(&mut buf).and_then(|_| s.write_all(&buf));
@@ -2751,6 +2854,7 @@ mod tests {
                     host: "127.0.0.1",
                     chain_der: None,
                     key: None,
+                    revoked: &[],
                 },
             );
             let payload = vec![0x61u8; 700];
@@ -2789,7 +2893,7 @@ mod tests {
             let (sock, _) = listener.accept().unwrap();
             let mut s = TlsStream::server(
                 sock,
-                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None, revoked: &[] },
             );
             let mut buf = Vec::new();
             s.read_to_end(&mut buf).unwrap();
@@ -2805,6 +2909,7 @@ mod tests {
                 host: "127.0.0.1",
                 chain_der: None,
                 key: None,
+                revoked: &[],
             },
         );
         c.send_junk_early_data = true;
@@ -2838,7 +2943,7 @@ mod tests {
             let (sock, _) = listener.accept().unwrap();
             let mut s = TlsStream::server(
                 sock,
-                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None, revoked: &[] },
             );
             let mut buf = Vec::new();
             s.read_to_end(&mut buf).unwrap();
@@ -2854,6 +2959,7 @@ mod tests {
                     host: "127.0.0.1",
                     chain_der: None,
                     key: None,
+                    revoked: &[],
                 },
             );
             c.write_all(b"a handshake").unwrap();
@@ -2897,7 +3003,7 @@ mod tests {
             let (sock, _) = listener.accept().unwrap();
             let mut s = TlsStream::server(
                 sock,
-                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                ServerSide { chain_der: &chain_der, key: &key, client_anchors: None, revoked: &[] },
             );
             let mut buf = [0u8; 3];
             s.read_exact(&mut buf).unwrap();
@@ -2923,6 +3029,7 @@ mod tests {
                 host: "127.0.0.1",
                 chain_der: None,
                 key: None,
+                revoked: &[],
             },
         );
         c.write_all(b"one").unwrap();
@@ -2957,7 +3064,12 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let mut s = TlsStream::server(
                     sock,
-                    ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                    ServerSide {
+                        chain_der: &chain_der,
+                        key: &key,
+                        client_anchors: None,
+                        revoked: &[],
+                    },
                 );
                 let mut buf = Vec::new();
                 s.read_to_end(&mut buf).unwrap();
@@ -2976,6 +3088,7 @@ mod tests {
                     host: "127.0.0.1",
                     chain_der: None,
                     key: None,
+                    revoked: &[],
                 },
             );
             c.omit_first_share = omit;
@@ -3031,6 +3144,7 @@ mod tests {
                                 chain_der: &chain_der,
                                 key: &key,
                                 client_anchors: anchors.as_deref(),
+                                revoked: &[],
                             },
                         );
                         let mut buf = Vec::new();
@@ -3058,7 +3172,13 @@ mod tests {
             let sock = TcpStream::connect(addr).unwrap();
             let mut c = TlsStream::client(
                 sock,
-                ClientSide { anchors: std::slice::from_ref(&anchor), host, chain_der: chain, key },
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host,
+                    chain_der: chain,
+                    key,
+                    revoked: &[],
+                },
             );
             c.write_all(b"hello").map_err(|e| e.to_string())?;
             c.close_notify().map_err(|e| e.to_string())?;
@@ -3112,7 +3232,12 @@ mod tests {
                     let (sock, _) = listener.accept().unwrap();
                     let mut s = TlsStream::server(
                         sock,
-                        ServerSide { chain_der: &chain_der, key: &key, client_anchors: None },
+                        ServerSide {
+                            chain_der: &chain_der,
+                            key: &key,
+                            client_anchors: None,
+                            revoked: &[],
+                        },
                     );
                     let mut buf = Vec::new();
                     s.read_to_end(&mut buf).unwrap();
@@ -3133,6 +3258,7 @@ mod tests {
                     host,
                     chain_der: None,
                     key: None,
+                    revoked: &[],
                 },
             );
             c.write_all(b"hello").unwrap();
@@ -3216,7 +3342,12 @@ mod tests {
                 let (sock, _) = listener.accept().unwrap();
                 let mut s = TlsStream::server(
                     sock,
-                    ServerSide { chain_der: &chain_s, key: &key_s, client_anchors: None },
+                    ServerSide {
+                        chain_der: &chain_s,
+                        key: &key_s,
+                        client_anchors: None,
+                        revoked: &[],
+                    },
                 );
                 let mut buf = Vec::new();
                 match s.read_to_end(&mut buf) {
@@ -3239,6 +3370,7 @@ mod tests {
                 host: "localhost",
                 chain_der: None,
                 key: None,
+                revoked: &[],
             },
         );
         let payload = vec![7u8; 40_000];
@@ -3260,6 +3392,7 @@ mod tests {
                 host: "localhost",
                 chain_der: None,
                 key: None,
+                revoked: &[],
             },
         );
         let e = c.write_all(b"x").unwrap_err();
