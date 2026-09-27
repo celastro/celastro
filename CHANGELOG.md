@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.91.0 — 2026-09-27
 
 **Revocation, and path length constraints.** `CELASTRO_TLS_CRL` names a
 certificate revocation list -- PEM, `X509 CRL` blocks, each signed by a CA
