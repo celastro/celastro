@@ -210,7 +210,7 @@ Only the URL is on stdout; the banner is stderr. Ctrl-C ends the server
 saved, exit 0, and so does a `POST` from a second terminal:
 
 ```
-$ curl -s -X POST 'http://127.0.0.1:8787/api/shutdown?t=fdd2b8856f798668b6f29478e4f1fd5b'
+$ curl -s -X POST -H 'X-Celastro-Token: fdd2b8856f798668b6f29478e4f1fd5b' http://127.0.0.1:8787/api/shutdown
 {"ok":true,"kind":"ack","message":"shutting down"}
 ```
 

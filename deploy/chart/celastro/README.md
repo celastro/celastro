@@ -253,7 +253,7 @@ a restart read the log again.
 
 With `console.expose=true` the token is the one in the `Secret`, read with
 `kubectl get secret celastro-console -o jsonpath='{.data.CELASTRO_TOKEN}' |
-base64 -d`, sent as `X-Celastro-Token` (or `?t=`) with every request to
+base64 -d`, sent as `X-Celastro-Token` with every request to
 `http://celastro-console:8787` from inside the cluster; the notes `helm`
 prints say the same with the release's names filled in.
 

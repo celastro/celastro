@@ -17,7 +17,7 @@ the Secret {{ include "celastro.consoleSecretName" . }}:
 
   kubectl -n {{ .Release.Namespace }} get secret {{ include "celastro.consoleSecretName" . }} -o jsonpath='{.data.CELASTRO_TOKEN}' | base64 -d
 
-Send it as the X-Celastro-Token header (or ?t=) with every request, for
+Send it as the X-Celastro-Token header with every request, for
 example from a pod in the cluster:
 
   {{ if .Values.tls.enabled }}https{{ else }}http{{ end }}://{{ include "celastro.fullname" . }}-console:{{ .Values.port }}/api/health

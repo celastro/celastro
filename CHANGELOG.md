@@ -6,6 +6,25 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The console's token leaves the URL.** The URL `serve` prints still
+carries the per-run token, but the browser presents it once: `GET /?t=`
+opens a session -- a random id in an `HttpOnly`, `SameSite=Strict` cookie,
+`Secure` under TLS, idle for twelve hours at most -- and is redirected to
+`/` without it; the page carries the token in its own source for the
+script's headers, and its assets are plain paths the cookie rides with. A
+browser with neither a session nor a header gets a sign-in page, whose
+token goes to `POST /api/session` in a header. The API never takes a
+token from a URL now, on loopback either (`curl ... '/api/x?t=...'` is
+`-H 'X-Celastro-Token: ...'`); `celastro --url 'http://.../?t=...'` is
+unchanged, the tool having always sent the header. **Two bounds.** Under
+client certificates a host may call itself by at most thirty-two
+addresses (a certificate names no ports, and each claimed address was a
+record without limit); and the archive client refuses a response longer
+than any object, or one without a length past 256 MiB, rather than
+holding it.
+
 ## 0.89.0 — 2026-09-27
 
 **P-384 and SHA-384 in the chain verifier.** The in-tree X.509 verified

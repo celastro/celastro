@@ -9,6 +9,9 @@
      The empty-data icon keeps the browser from requesting a favicon we do not
      serve; it is a URL the browser resolves internally, not a network fetch. -->
 <link rel="icon" href="data:,">
+<!-- Filled by the server for the session this page was served to: the token
+     the page's script sends in a header with every request. -->
+<meta name="celastro-token" content="">
 <link rel="stylesheet" href="/style.css">
 <script src="/app.js" defer></script>
 </head>
@@ -35,10 +38,11 @@
     <p class="muted foot">History is kept in this tab only, never on disk &mdash;
       statements can contain keys, tenant ids and other literals worth not
       leaving behind.</p>
-    <p class="muted foot">The access token is taken out of the address bar as
-      soon as this page loads and kept in memory, so it is not on screen or in
-      browser history &mdash; and a reload needs the link the CLI printed
-      again.</p>
+    <p class="muted foot">The access token never sits in the address bar: the
+      link the CLI printed was exchanged for a session on the first request and
+      redirected away, and the token rides in a header from this page's own
+      source. A reload keeps the session; a new browser needs the link, or the
+      token typed into the sign-in page.</p>
     <!-- AGPL §13: a user interacting with this program over a network is
          offered its source. The placeholders are filled by the server with
          the repository the crate declares, at the tag of the running
@@ -51,9 +55,9 @@
   </nav>
 
   <main>
-    <!-- Deliberately not a form element: a stray submit would navigate, and
-         the token is held only in memory once app.js has stripped it from the
-         URL, so a reload without it leaves the console unable to talk back. -->
+    <!-- Deliberately not a form element: a stray submit would navigate and
+         lose the editor's state; the token itself is in the page's source and
+         a reload under the session brings it back. -->
     <div class="editor">
       <label for="sql">SQL</label>
       <textarea id="sql" rows="6" spellcheck="false" autocapitalize="off"

@@ -41,7 +41,8 @@ given.
 ### The console (`celastro serve`)
 
 On loopback the console is guarded by a per-run token from `/dev/urandom`
-(`?t=` or `X-Celastro-Token`), a `Host` allow-list and a same-origin check;
+(`X-Celastro-Token`, or a session it opened), a `Host` allow-list and a
+same-origin check;
 with `--bind` it answers the operator's token from `CELASTRO_TOKEN` and the
 `Host` allow-list gives way to the token, a browser's `Origin` having to be
 the `Host` it named; with certificates it serves TLS 1.3 and verifies peers.
@@ -74,11 +75,19 @@ executor without it is a serious finding:
 
 ### The token, on a network
 
-With `--bind` off loopback the API (`/api/*`) takes the token in the
-`X-Celastro-Token` header only: a `?t=` in a URL is written into every
-proxy's and balancer's access log and into a browser's history. The page
-and its two assets still take `?t=`, since a `<link>` and a `<script>`
-can carry nothing else. Tokens compare in constant time, and a source
+The API (`/api/*`) takes the token in the `X-Celastro-Token` header (or
+`Authorization: Bearer`) or from a session the console opened, never from
+a URL: a `?t=` in a URL is written into every proxy's and balancer's
+access log and into a browser's history. The one request a `?t=` is taken
+on is `GET /` -- the URL `serve` printed -- where it opens a session (a
+random id in an `HttpOnly`, `SameSite=Strict` cookie, `Secure` under TLS,
+idle for twelve hours at most, at most 256 of them) and the browser is
+redirected to `/` without it; the page then carries the token in its own
+source for the script's headers, and its assets are plain paths the
+cookie rides with (0.90.0; until then the page and its assets took `?t=`
+and, on loopback, so did the API). A browser with neither gets a sign-in
+page whose token goes to `/api/session` in a header. Tokens compare in
+constant time, and a source
 address that was refused waits a hundred milliseconds more per refusal in
 the last minute, two seconds at most, before it is answered again.
 

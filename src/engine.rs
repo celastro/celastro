@@ -174,6 +174,19 @@ const BACKUP_POLL_DEADLINE_MS: u64 = 8_000;
 const BACKUP_SILENT_POLLS: u32 = 6;
 const BACKUP_LEGACY_MS: u64 = 600_000;
 
+/// Addresses one host may call itself by, as `observe_caller` records them.
+const MAX_ADDRESSES_PER_HOST: usize = 32;
+
+/// The host of `tcp://host:port`, lowercased, brackets off.
+fn host_of(url: &str) -> String {
+    let rest = url.strip_prefix("tcp://").unwrap_or(url);
+    let host = match rest.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => rest,
+    };
+    host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()
+}
+
 /// What `SHOW HEALTH` and the sweep have seen of a peer's hello.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerSeen {
@@ -3126,6 +3139,20 @@ impl Db {
             return Ok(());
         }
         let mut seen = guard(&self.peers_seen);
+        // A caller may name itself by any port on a host its certificate
+        // names (a certificate names no ports), and each name is a record
+        // here: bounded per host, so a token holder with a certificate
+        // cannot grow this table without limit, one address a call.
+        if !seen.contains_key(node) {
+            let host = host_of(node);
+            let on_host = seen.keys().filter(|k| host_of(k) == host).count();
+            if on_host >= MAX_ADDRESSES_PER_HOST {
+                return Err(Error::Plan(format!(
+                    "a call from {node}: {on_host} addresses on {host} have called already, the \
+                     most a host is allowed; a node names itself by one address"
+                )));
+            }
+        }
         let entry = seen.entry(node.to_string()).or_default();
         if entry.epoch > 0 && epoch < entry.epoch {
             return Err(Error::Plan(format!(
@@ -10399,6 +10426,27 @@ mod tests {
                 "shard {i}: {regs:?}"
             );
         }
+    }
+
+    /// A caller's claimed addresses are recorded per address, and a host
+    /// may claim so many of them: the thirty-third address on one host is
+    /// refused, naming the count, while another host's first is not, and
+    /// an address already seen is never counted again.
+    #[test]
+    fn a_host_may_call_itself_by_so_many_addresses_and_no_more() {
+        let dir = std::env::temp_dir().join(format!("celastro-callers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir, DbOpts::default()).unwrap();
+        for port in 0..MAX_ADDRESSES_PER_HOST {
+            db.observe_caller(&format!("tcp://h.example:{}", 7000 + port), 5).unwrap();
+        }
+        let e = db.observe_caller("tcp://H.EXAMPLE:9999", 5).unwrap_err().to_string();
+        assert!(e.contains("32 addresses on h.example"), "{e}");
+        db.observe_caller("tcp://h.example:7000", 6).unwrap();
+        db.observe_caller("tcp://other.example:1", 5).unwrap();
+        assert_eq!(host_of("tcp://[::1]:7876"), "::1");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A collection made through the library is named by the statement's

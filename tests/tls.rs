@@ -203,6 +203,24 @@ fn a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_h
         assert!(e.contains("its certificate names"), "{me}: {e}");
         assert!(e.contains("localhost"), "{me}: {e}");
     }
+    // A certificate names no ports, so any port on its host is its to
+    // claim -- up to a bound per host, past which the next new address is
+    // refused naming the count (the table a claim grows is bounded).
+    let mut refused = None;
+    for port in 20_000..20_040u16 {
+        let me = format!("tcp://localhost:{port}");
+        let peer = celastro::wire::Node::new(&url, Some("wire-tls-token"), Some(tls.clone()))
+            .unwrap()
+            .with_identity(&me, epoch.clone());
+        let _ = peer.hello();
+        if let Err(e) = peer.hello() {
+            refused = Some((port, e.to_string()));
+            break;
+        }
+    }
+    let (port, e) = refused.expect("a host's claims are bounded");
+    assert!(e.contains("addresses on localhost"), "{port}: {e}");
+    assert!(port < 20_034, "refused only at the {port}th port of the host");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 

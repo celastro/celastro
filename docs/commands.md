@@ -383,8 +383,9 @@ podman quadlet.
 Every request but `/api/health` carries the token in the
 `X-Celastro-Token` header, or in `Authorization: Bearer <token>`, which
 is the same secret by the name scrapers and API clients already speak
-(on loopback, `?t=` in the URL is accepted too; on a network bind the
-API takes a header only, because a URL is what proxies log). `POST
+(never from the URL: a `?t=` is taken on `GET /` alone, where it opens a
+browser session and is redirected away, because a URL is what proxies log
+and browsers keep). `POST
 /api/query` takes `{"sql": "..."}` and answers the same JSON `send`
 prints; an error is `{"ok":false,"error":"..."}` with status 200, so a
 client reads `ok`.

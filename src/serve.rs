@@ -128,6 +128,8 @@ pub struct Server {
     /// Tokens that open one collection, or every collection, for reading
     /// or for reading and writing, and nothing else (`CELASTRO_SCOPED_TOKENS`).
     scoped: Vec<(String, Scope)>,
+    /// The browsers' sessions, each standing for one of the tokens above.
+    sessions: Sessions,
 }
 
 /// What a scoped token may do: one collection or every one, read-only or
@@ -215,12 +217,101 @@ fn select_edges(sel: &sql::Select) -> Vec<&str> {
 pub(crate) struct Tokens<'a> {
     operator: &'a str,
     scoped: &'a [(String, Scope)],
+    /// The sessions browsers hold, each standing for one of the tokens.
+    sessions: &'a Sessions,
+    /// Whether a session cookie is marked `Secure`: the console is on TLS.
+    secure: bool,
+}
+
+/// The sessions the console opened for browsers: a random id in a cookie,
+/// standing for the token that opened it, so the token is presented once
+/// -- in the URL `serve` printed, exchanged on the first request and
+/// redirected away, or typed into the login page and sent in a header --
+/// and never sits in an address bar, a history or a proxy's log. Held in
+/// memory, gone with the process; idle ones expire, and the table is
+/// bounded (the oldest goes) so a browser cannot grow it without end.
+#[derive(Default)]
+pub(crate) struct Sessions(Mutex<std::collections::HashMap<String, Session>>);
+
+struct Session {
+    token: String,
+    last: Instant,
+}
+
+/// How long a session lives unused, and how many the console keeps.
+const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
+const MAX_SESSIONS: usize = 256;
+const SESSION_COOKIE: &str = "celastro_session";
+
+impl Sessions {
+    /// A new session for `token`: its id, thirty-two hex digits from the
+    /// kernel's randomness.
+    fn open(&self, token: &str) -> std::io::Result<String> {
+        let id = crate::crypto::hex(&urandom_bytes()?);
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        m.retain(|_, s| now.duration_since(s.last) < SESSION_IDLE);
+        while m.len() >= MAX_SESSIONS {
+            let oldest = m.iter().min_by_key(|(_, s)| s.last).map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => m.remove(&k),
+                None => break,
+            };
+        }
+        m.insert(id.clone(), Session { token: token.to_string(), last: now });
+        Ok(id)
+    }
+
+    /// The token a session id stands for, if the session is live; the
+    /// session is touched. Compared in constant time, like a token.
+    fn token_for(&self, id: &str) -> Option<String> {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let key = m.keys().find(|k| token_matches(k, id)).cloned()?;
+        let s = m.get_mut(&key)?;
+        if now.duration_since(s.last) >= SESSION_IDLE {
+            m.remove(&key);
+            return None;
+        }
+        s.last = now;
+        Some(s.token.clone())
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+/// The `Set-Cookie` value for a session: the id, the whole site, never
+/// readable by script, never sent cross-site, and only over TLS when the
+/// console is.
+fn session_cookie(id: &str, secure: bool) -> String {
+    format!(
+        "{SESSION_COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// The session id a request's `Cookie` header carries, if any.
+fn session_id(head: &Head) -> Option<&str> {
+    let cookies = head.header("cookie")?;
+    cookies
+        .split(';')
+        .map(str::trim)
+        .find_map(|c| c.strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+}
+
+#[cfg(test)]
+fn test_sessions() -> &'static Sessions {
+    static S: std::sync::OnceLock<Sessions> = std::sync::OnceLock::new();
+    S.get_or_init(Sessions::default)
 }
 
 impl<'a> Tokens<'a> {
     #[cfg(test)]
     fn operator(token: &'a str) -> Tokens<'a> {
-        Tokens { operator: token, scoped: &[] }
+        Tokens { operator: token, scoped: &[], sessions: test_sessions(), secure: false }
     }
 
     /// What `given` opens, if it is a token at all. Every candidate is
@@ -795,6 +886,7 @@ impl Server {
             group_commit: true,
             operator_token: false,
             scoped: Vec::new(),
+            sessions: Sessions::default(),
         })
     }
 
@@ -839,6 +931,7 @@ impl Server {
             // is the whole reason it exists.
             operator_token: true,
             scoped: Vec::new(),
+            sessions: Sessions::default(),
         })
     }
 
@@ -1090,7 +1183,12 @@ impl Server {
         let mut io = BufReader::new(stream);
         // The lock is taken inside `answer`, around the statement and nothing
         // else; the socket is never read or written under it.
-        let tokens = Tokens { operator: &self.token, scoped: &self.scoped };
+        let tokens = Tokens {
+            operator: &self.token,
+            scoped: &self.scoped,
+            sessions: &self.sessions,
+            secure: self.tls.is_some(),
+        };
         let served = answer(&mut io, &tokens, self.addr.port(), self.reach, db, deadlines);
         if served.response.status == 401 || served.response.status == 403 {
             COUNTERS.refused.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1769,15 +1867,6 @@ fn header_token(head: &Head) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
 }
 
-/// The token the request presented, if it presented one.
-///
-/// No percent-decoding: the token alphabet is `[0-9a-f]`, so a real token never
-/// needs escaping, and a decoder here would only add ways for two different
-/// strings to compare equal.
-fn presented_token(head: &Head) -> Option<&str> {
-    header_token(head).or_else(|| query_param(&head.query, "t"))
-}
-
 /// What to do with a request, once everything decidable without the database
 /// has been decided.
 enum Action {
@@ -1810,26 +1899,62 @@ fn page(token: &str) -> Action {
         200,
         "OK",
         CT_HTML,
-        with_tokenised_assets(&with_source_offer(INDEX_HTML), token),
+        with_token_meta(&with_source_offer(INDEX_HTML), token),
     ))
 }
 
-/// Stitch the token into the page's own asset URLs.
+/// Stitch the token into the page, in a `<meta>` the script reads.
 ///
-/// `index.html` links `/style.css` and `/app.js` as plain paths, and a `<link>`
-/// or a `<script>` is an ordinary browser request: it carries no
-/// `X-Celastro-Token` header, and no JavaScript can add one to it because the
-/// script is the thing being fetched. Without this, the page the browser has
-/// just loaded is answered 401 twice and renders unstyled and dead.
-///
-/// The alternative — exempting "just the static files" from the token — is a
-/// hole: it would let any page on the machine confirm this console is running
-/// and read its source. Rewriting the two URLs keeps the rule that every single
-/// request carries a token. If the markup ever stops matching, the replacement
-/// simply does not fire, and the test below is what notices.
-fn with_tokenised_assets(html: &str, token: &str) -> String {
-    let styled = html.replace("\"/style.css\"", &format!("\"/style.css?t={token}\""));
-    styled.replace("\"/app.js\"", &format!("\"/app.js?t={token}\""))
+/// The page is served to a browser holding a session (or a header), and its
+/// script needs the token the session stands for to send in the header of
+/// every API call. Until 0.90.0 the token rode in the page's own asset URLs
+/// (`/app.js?t=`) and in the address bar; now it is in the page's source,
+/// which only the session's holder is served, and nowhere a log or a
+/// history keeps. The `<link>` and `<script>` are plain paths: the browser
+/// sends the session cookie with them. If the markup ever stops matching,
+/// the replacement does not fire, and the test below is what notices.
+fn with_token_meta(html: &str, token: &str) -> String {
+    let escaped = token
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    html.replace(
+        "<meta name=\"celastro-token\" content=\"\">",
+        &format!("<meta name=\"celastro-token\" content=\"{escaped}\">"),
+    )
+}
+
+/// The page a browser gets with neither a session nor a token: a field for
+/// the token, which goes to `/api/session` in a header -- never in a URL --
+/// and a reload into the console under the session it opened. Inline and
+/// asset-free, so it hands out nothing of the console's own surface.
+const LOGIN_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>celastro console</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:28em;margin:4em auto;padding:0 1em;color:#222}
+label{display:block;margin-bottom:.5em}input{width:100%;box-sizing:border-box;font:inherit;padding:.4em}
+button{margin-top:.8em;font:inherit;padding:.4em 1em}p.err{color:#a00}</style></head>
+<body><h1>celastro</h1>
+<label for="t">Access token</label>
+<input id="t" type="password" autocomplete="off" autofocus>
+<button id="go" type="button">Open the console</button>
+<p id="m" class="err" role="status"></p>
+<p>The token is sent in a header and exchanged for a session cookie; it does not go into the address bar.</p>
+<script>
+'use strict';
+var t=document.getElementById('t'),m=document.getElementById('m');
+function go(){var v=t.value.trim();if(!v){m.textContent='A token is needed.';return;}
+fetch('/api/session',{method:'POST',headers:{'X-Celastro-Token':v}}).then(function(r){
+if(r.status===204){location.replace('/');}else{m.textContent='Refused: that is not a token this console answers.';}
+}).catch(function(){m.textContent='The console did not answer.';});}
+document.getElementById('go').addEventListener('click',go);
+t.addEventListener('keydown',function(e){if(e.key==='Enter'){go();}});
+</script></body></html>
+"#;
+
+fn login_page() -> Action {
+    Action::Reply(Response::new(200, "OK", CT_HTML, LOGIN_HTML.to_string()))
 }
 
 /// The methods a known path answers, in `Allow` order, or `None` if the path is
@@ -1839,7 +1964,7 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
         "/" | "/app.js" | "/style.css" | "/api/health" | "/api/catalog" | "/api/metrics" => {
             Some("GET")
         }
-        "/api/query" | "/api/shutdown" => Some("POST"),
+        "/api/query" | "/api/shutdown" | "/api/session" => Some("POST"),
         p if p.starts_with("/api/ingest/") => Some("POST"),
         p if p.starts_with("/api/changes/") => Some("GET"),
         _ => None,
@@ -1951,22 +2076,39 @@ fn dispatch_for(
     if head.method == "GET" && head.path == "/api/health" {
         return Ok(Action::Health);
     }
-    let given = match presented_token(head) {
-        Some(t) => t,
-        None => return Err(Reject::Unauthorized),
+    // The credential: a token in a header, or a session a browser holds.
+    // A `?t=` in the URL is taken on one request only -- `GET /`, the URL
+    // `serve` printed -- and exchanged there for a session, the browser
+    // sent on to `/` without it: a URL is what proxies and balancers log
+    // and browsers keep, so the token is in none of them past that one
+    // request, and the API never takes one from a URL at all (until
+    // 0.90.0 it did on loopback). With neither, `GET /` is the login page,
+    // which sends the token typed into it in a header.
+    let given: String = if let Some(t) = header_token(head) {
+        t.to_string()
+    } else if let Some(t) = session_id(head).and_then(|id| tokens.sessions.token_for(id)) {
+        t
+    } else if head.method == "GET" && head.path == "/" {
+        match query_param(&head.query, "t") {
+            Some(t) => {
+                if tokens.grant(t).is_none() {
+                    return Err(Reject::Unauthorized);
+                }
+                let id = tokens.sessions.open(t).map_err(|_| Reject::BadRequest)?;
+                return Ok(Action::Reply(Response::redirect_with_session(
+                    "/",
+                    session_cookie(&id, tokens.secure),
+                )));
+            }
+            None => return Ok(login_page()),
+        }
+    } else {
+        return Err(Reject::Unauthorized);
     };
+    let given = given.as_str();
     let Some(grant) = tokens.grant(given) else {
         return Err(Reject::Unauthorized);
     };
-    // On a network the API takes the token in the header only: a `?t=` in
-    // the URL is written into every proxy's and balancer's access log on
-    // the way, and into a browser's history. The page and its two assets
-    // still take it, because a `<link>` and a `<script>` can carry nothing
-    // else; on loopback nothing is logged between the browser and the
-    // console, and the URL `serve` prints stays the way in.
-    if reach == Reach::Network && header_token(head).is_none() && head.path.starts_with("/api/") {
-        return Err(Reject::Unauthorized);
-    }
     // A body over the statement's bound is refused before a byte of it is
     // read, on every route but the ingest, which reads its body a line at
     // a time and may be any length.
@@ -1979,6 +2121,18 @@ fn dispatch_for(
         ("GET", "/") => Ok(page(given)),
         ("GET", "/app.js") => Ok(asset(CT_JS, APP_JS)),
         ("GET", "/style.css") => Ok(asset(CT_CSS, STYLE_CSS)),
+        // The login page's exchange: a token in a header becomes a session.
+        ("POST", "/api/session") => {
+            same_site_post(head, port, reach)?;
+            if header_token(head).is_none() {
+                return Err(Reject::Unauthorized);
+            }
+            let id = tokens.sessions.open(given).map_err(|_| Reject::BadRequest)?;
+            Ok(Action::Reply(
+                Response::new(204, "No Content", CT_JSON, String::new())
+                    .with_header("Set-Cookie", session_cookie(&id, tokens.secure)),
+            ))
+        }
         ("GET", "/api/catalog") if grant.sees_all() => Ok(Action::Catalog),
         ("GET", "/api/metrics") if grant.sees_all() => Ok(Action::Metrics),
         ("GET", "/api/catalog") | ("GET", "/api/metrics") => Err(Reject::Forbidden),
@@ -2908,11 +3062,34 @@ struct Response {
     body: String,
     /// False for a `HEAD`: the head is written, the body is not.
     send_body: bool,
+    /// Headers a few answers carry beyond the ones every answer does: a
+    /// redirect's `Location`, a session's `Set-Cookie`.
+    extra: Vec<(&'static str, String)>,
 }
 
 impl Response {
     fn new(status: u16, reason: &'static str, content_type: &'static str, body: String) -> Self {
-        Response { status, reason, content_type, allow: None, body, send_body: true }
+        Response {
+            status,
+            reason,
+            content_type,
+            allow: None,
+            body,
+            send_body: true,
+            extra: Vec::new(),
+        }
+    }
+
+    fn with_header(mut self, name: &'static str, value: String) -> Self {
+        self.extra.push((name, value));
+        self
+    }
+
+    /// A `303 See Other` to `location`, with a session cookie set.
+    fn redirect_with_session(location: &str, cookie: String) -> Self {
+        Response::new(303, "See Other", CT_HTML, String::new())
+            .with_header("Location", location.to_string())
+            .with_header("Set-Cookie", cookie)
     }
 
     fn json(body: String) -> Response {
@@ -2938,6 +3115,9 @@ impl Response {
         head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
         if let Some(allow) = self.allow {
             head.push_str(&format!("Allow: {allow}\r\n"));
+        }
+        for (name, value) in &self.extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
         }
         // The console serves JavaScript from the same origin as whatever a
         // query returns; content sniffing is how that becomes an execution of
@@ -3784,19 +3964,24 @@ mod tests {
         assert!(APP_JS.contains("http://www.w3.org/2000/svg"), "and that one is the namespace");
     }
 
-    /// On a network bind the API takes the token in the header only, while
-    /// the page and its assets still take `?t=`; on loopback both work
-    /// everywhere, as they always have.
+    /// The API takes the token in a header, or a session; never from a
+    /// URL, on a network or on loopback. `GET /?t=` -- the URL `serve`
+    /// printed -- is the one request a query-string token is taken on: it
+    /// opens a session and redirects to `/` without it. The session's
+    /// cookie then opens the page, its assets and the API; `POST
+    /// /api/session` opens one from a header, for the login page; and a
+    /// browser with neither gets the login page, which names no API.
     #[test]
-    fn on_a_network_the_api_takes_the_token_in_the_header_only() {
+    fn the_token_rides_in_a_header_or_a_session_and_in_a_url_only_once() {
         let token = "0123456789abcdef0123456789abcdef";
+        let sessions = Sessions::default();
+        let tokens = Tokens { operator: token, scoped: &[], sessions: &sessions, secure: false };
         let head = |line: &str, extra: &str| {
             parse_head(&format!("{line} HTTP/1.1\r\nHost: h:8787\r\n{extra}\r\n")).unwrap()
         };
         let by_query = |path: &str| head(&format!("GET {path}?t={token}"), "");
         let by_header =
             |path: &str| head(&format!("GET {path}"), &format!("X-Celastro-Token: {token}\r\n"));
-        // What a Prometheus scrape sends, and what it must not get away with.
         let by_bearer = |path: &str| {
             head(&format!("GET {path}"), &format!("Authorization: Bearer {token}\r\n"))
         };
@@ -3804,30 +3989,126 @@ mod tests {
             |path: &str| head(&format!("GET {path}"), &format!("Authorization: Basic {token}\r\n"));
         let wrong_bearer =
             |path: &str| head(&format!("GET {path}"), "Authorization: Bearer 0123456789abcdef\r\n");
-        for (h, want_ok) in [
-            (by_query("/api/catalog"), false),
-            (by_header("/api/catalog"), true),
-            (by_bearer("/api/metrics"), true),
-            (by_bearer("/api/catalog"), true),
-            (wrong_scheme("/api/metrics"), false),
-            (wrong_bearer("/api/metrics"), false),
-            (by_query("/"), true),
-            (by_query("/app.js"), true),
-            (by_query("/style.css"), true),
-        ] {
-            let got = dispatch_for(&h, &Tokens::operator(token), 8787, Reach::Network);
-            assert_eq!(got.is_ok(), want_ok, "{} {}", h.method, h.path);
-            if !want_ok {
-                assert!(matches!(got, Err(Reject::Unauthorized)));
+        for reach in [Reach::Network, Reach::Loopback] {
+            let host = if reach == Reach::Network { "h:8787" } else { "localhost:8787" };
+            let at = |h: Head| -> Head {
+                let mut h = h;
+                for (k, v) in h.headers.iter_mut() {
+                    if k == "host" {
+                        *v = host.to_string();
+                    }
+                }
+                h
+            };
+            for (h, want_ok) in [
+                (by_query("/api/catalog"), false),
+                (by_query("/app.js"), false),
+                (by_query("/style.css"), false),
+                (by_header("/api/catalog"), true),
+                (by_header("/app.js"), true),
+                (by_bearer("/api/metrics"), true),
+                (wrong_scheme("/api/metrics"), false),
+                (wrong_bearer("/api/metrics"), false),
+            ] {
+                let h = at(h);
+                let got = dispatch_for(&h, &tokens, 8787, reach);
+                assert_eq!(got.is_ok(), want_ok, "{reach:?} {} {}?{}", h.method, h.path, h.query);
+                if !want_ok {
+                    assert!(matches!(got, Err(Reject::Unauthorized)));
+                }
             }
+            // The exchange: the printed URL opens a session and redirects.
+            let h = at(by_query("/"));
+            let cookie = match dispatch_for(&h, &tokens, 8787, reach) {
+                Ok(Action::Reply(r)) => {
+                    assert_eq!(r.status, 303, "{reach:?}");
+                    assert!(r.extra.iter().any(|(k, v)| *k == "Location" && v == "/"));
+                    let (_, c) =
+                        r.extra.iter().find(|(k, _)| *k == "Set-Cookie").expect("a cookie");
+                    assert!(c.starts_with("celastro_session=") && c.contains("HttpOnly"), "{c}");
+                    assert!(c.contains("SameSite=Strict") && !c.contains("Secure"), "{c}");
+                    c.split(';').next().unwrap().to_string()
+                }
+                _ => panic!("{reach:?}: not a reply"),
+            };
+            // A wrong token in the URL opens nothing.
+            let h = at(head("GET /?t=0123456789abcdef", ""));
+            assert!(matches!(dispatch_for(&h, &tokens, 8787, reach), Err(Reject::Unauthorized)));
+            // The session opens the page (with the token in its meta tag,
+            // not its URLs), the assets and the API.
+            let with_cookie =
+                |line: &str| at(head(line, &format!("Cookie: other=1; {cookie}\r\n")));
+            match dispatch_for(&with_cookie("GET /"), &tokens, 8787, reach) {
+                Ok(Action::Reply(r)) => {
+                    assert_eq!(r.status, 200);
+                    assert!(r.body.contains(&format!("content=\"{token}\"")), "the meta token");
+                    assert!(
+                        r.body.contains("href=\"/style.css\"")
+                            && r.body.contains("src=\"/app.js\"")
+                    );
+                    assert!(!r.body.contains("?t="), "no token in the page's URLs");
+                }
+                _ => panic!("not the reply expected"),
+            }
+            assert!(dispatch_for(&with_cookie("GET /app.js"), &tokens, 8787, reach).is_ok());
+            assert!(dispatch_for(&with_cookie("GET /style.css"), &tokens, 8787, reach).is_ok());
+            assert!(matches!(
+                dispatch_for(&with_cookie("GET /api/catalog"), &tokens, 8787, reach),
+                Ok(Action::Catalog)
+            ));
+            // A session nobody opened opens nothing.
+            let h = at(head(
+                "GET /api/catalog",
+                "Cookie: celastro_session=00ff00ff00ff00ff00ff00ff00ff00ff\r\n",
+            ));
+            assert!(matches!(dispatch_for(&h, &tokens, 8787, reach), Err(Reject::Unauthorized)));
+            // Neither: the login page, which names no API and links no asset.
+            match dispatch_for(&at(head("GET /", "")), &tokens, 8787, reach) {
+                Ok(Action::Reply(r)) => {
+                    assert_eq!(r.status, 200);
+                    assert!(r.body.contains("Access token") && r.body.contains("/api/session"));
+                    assert!(
+                        !r.body.contains("/api/query") && !r.body.contains("/app.js"),
+                        "{}",
+                        r.body
+                    );
+                }
+                _ => panic!("not the reply expected"),
+            }
+            // The login page's exchange: a header opens a session.
+            let post = at(parse_head(&format!(
+                "POST /api/session HTTP/1.1\r\nHost: {host}\r\nX-Celastro-Token: {token}\r\nOrigin: http://{host}\r\n\r\n"
+            ))
+            .unwrap());
+            match dispatch_for(&post, &tokens, 8787, reach) {
+                Ok(Action::Reply(r)) => {
+                    assert_eq!(r.status, 204);
+                    assert!(r
+                        .extra
+                        .iter()
+                        .any(|(k, v)| *k == "Set-Cookie" && v.contains("celastro_session=")));
+                }
+                _ => panic!("not the reply expected"),
+            }
+            let bad = at(parse_head(&format!(
+                "POST /api/session HTTP/1.1\r\nHost: {host}\r\nX-Celastro-Token: nope\r\n\r\n"
+            ))
+            .unwrap());
+            assert!(matches!(dispatch_for(&bad, &tokens, 8787, reach), Err(Reject::Unauthorized)));
         }
-        // Loopback keeps the URL as the way in, for the line `serve` prints
-        // (its Host check wants a local name, which is a different guard).
-        let local = parse_head(&format!(
-            "GET /api/catalog?t={token} HTTP/1.1\r\nHost: localhost:8787\r\n\r\n"
-        ))
-        .unwrap();
-        assert!(dispatch_for(&local, &Tokens::operator(token), 8787, Reach::Loopback).is_ok());
+        // The table is bounded: past the cap the oldest session goes.
+        for _ in 0..(MAX_SESSIONS + 5) {
+            sessions.open(token).unwrap();
+        }
+        assert_eq!(sessions.count(), MAX_SESSIONS);
+        // Under TLS the cookie is Secure.
+        let secure = Tokens { operator: token, scoped: &[], sessions: &sessions, secure: true };
+        match dispatch_for(&by_query("/"), &secure, 8787, Reach::Network) {
+            Ok(Action::Reply(r)) => {
+                assert!(r.extra.iter().any(|(k, v)| *k == "Set-Cookie" && v.contains("; Secure")));
+            }
+            _ => panic!("not the reply expected"),
+        }
     }
 
     /// Refusals earn a wait that grows a step per refusal, caps at two
@@ -3972,7 +4253,7 @@ mod tests {
     fn serve_scoped(db: &mut Db, scoped: &[(String, Scope)], request: &str) -> (String, Next) {
         let mut io = Cursor::new(request.as_bytes());
         let shared = RwLock::new(std::mem::take(db));
-        let tokens = Tokens { operator: "tok", scoped };
+        let tokens = Tokens { operator: "tok", scoped, sessions: test_sessions(), secure: false };
         let served = answer(&mut io, &tokens, PORT, Reach::Loopback, &shared, wide());
         *db = shared.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::new();
@@ -4040,9 +4321,9 @@ mod tests {
 
     #[test]
     fn a_rebound_host_is_refused_even_when_the_token_is_correct() {
-        let h = get("/api/catalog?t=tok", "console.evil.example", None);
+        let h = get("/api/catalog", "console.evil.example", Some("tok"));
         assert_eq!(dispatch(&h, "tok", PORT).err(), Some(Reject::Forbidden));
-        let h = get("/api/catalog?t=tok", "localhost", None);
+        let h = get("/api/catalog", "localhost", Some("tok"));
         assert!(dispatch(&h, "tok", PORT).is_ok());
     }
 
@@ -4163,16 +4444,19 @@ mod tests {
         let expected = "0123456789abcdef";
         let wrong = ["", "x", "0123456789abcde", "0123456789abcdef0", "0123456789abcdee"];
         for guess in wrong {
-            let h = get(&format!("/api/catalog?t={guess}"), "localhost", None);
+            let h = get("/api/catalog", "localhost", Some(guess));
             let refused = dispatch(&h, expected, PORT).err();
             assert_eq!(refused, Some(Reject::Unauthorized), "`{guess}` must not be accepted");
+            // In the printed URL's place too: a wrong token opens no session.
+            let h = get(&format!("/?t={guess}"), "localhost", None);
+            assert_eq!(dispatch(&h, expected, PORT).err(), Some(Reject::Unauthorized), "`{guess}`");
         }
-        let h = get(&format!("/api/catalog?t={expected}"), "localhost", None);
-        assert!(dispatch(&h, expected, PORT).is_ok());
-        // The header form is the same credential through another door.
         let h = get("/api/catalog", "localhost", Some(expected));
         assert!(dispatch(&h, expected, PORT).is_ok());
         let h = get("/api/catalog", "localhost", Some("nope"));
+        assert_eq!(dispatch(&h, expected, PORT).err(), Some(Reject::Unauthorized));
+        // The URL form is taken on `GET /` alone, and only to open a session.
+        let h = get(&format!("/api/catalog?t={expected}"), "localhost", None);
         assert_eq!(dispatch(&h, expected, PORT).err(), Some(Reject::Unauthorized));
     }
 
@@ -4180,10 +4464,18 @@ mod tests {
     fn the_html_console_itself_is_not_served_without_the_token() {
         // The page is not public just because it is only a page: serving it
         // hands out the API surface and invites the browser to go and use it.
-        for path in ["/", "/app.js", "/style.css", "/api/catalog"] {
+        // Without a credential `/` is the login page -- a token field and
+        // nothing of the console's own -- and everything else is refused.
+        for path in ["/app.js", "/style.css", "/api/catalog"] {
             let h = get(path, "localhost", None);
             let refused = dispatch(&h, "tok", PORT).err();
             assert_eq!(refused, Some(Reject::Unauthorized), "{path} must require the token");
+        }
+        match dispatch(&get("/", "localhost", None), "tok", PORT) {
+            Ok(Action::Reply(r)) => {
+                assert!(r.body.contains("Access token") && !r.body.contains("/app.js"))
+            }
+            _ => panic!("not the reply expected"),
         }
         // The one path served without it, by decision: a supervisor's probe
         // cannot know the token, and health executes nothing. Still behind
@@ -4195,28 +4487,21 @@ mod tests {
     }
 
     #[test]
-    fn the_pages_own_stylesheet_and_script_arrive_with_a_token_of_their_own() {
-        // A `<link>` and a `<script>` cannot send the header, so a bare path in
-        // the markup means the browser fetches those two anonymously and this
-        // server refuses them: a console that renders unstyled and does nothing.
-        let markup = "<link rel=\"stylesheet\" href=\"/style.css\">\n<script src=\"/app.js\">";
-        let rewritten = with_tokenised_assets(markup, "abc");
-        assert!(rewritten.contains("\"/style.css?t=abc\""), "{rewritten}");
-        assert!(rewritten.contains("\"/app.js?t=abc\""), "{rewritten}");
-        // Whatever the markup says, the page as served must not link an asset
-        // path that carries no token.
-        let served = with_tokenised_assets(INDEX_HTML, "tok");
-        for asset in ["/style.css", "/app.js"] {
-            for (at, _) in served.match_indices(asset) {
-                let rest = &served[at + asset.len()..];
-                assert!(rest.starts_with("?t="), "{asset} is linked without a token");
-            }
-        }
-        // And the tokenised URLs are ones the router accepts.
-        let h = get("/style.css?t=tok", "localhost", None);
-        assert!(dispatch(&h, "tok", PORT).is_ok());
-        let h = get("/app.js?t=tok", "localhost", None);
-        assert!(dispatch(&h, "tok", PORT).is_ok());
+    fn the_page_carries_its_token_in_a_meta_tag_and_its_assets_as_plain_paths() {
+        // The script reads the token from the page rather than the address
+        // bar, so the page as served must carry it -- escaped, since a scoped
+        // token is any printable ASCII -- and must link its assets bare, for
+        // the session cookie to ride with them.
+        let served = with_token_meta(INDEX_HTML, "tok\"<&>");
+        assert!(
+            served.contains("<meta name=\"celastro-token\" content=\"tok&quot;&lt;&amp;&gt;\">"),
+            "{served}"
+        );
+        assert!(served.contains("href=\"/style.css\"") && served.contains("src=\"/app.js\""));
+        assert!(!served.contains("?t="), "no token in a URL of the page");
+        // If the markup ever loses the tag, the page carries no token and the
+        // script would say so: this is what notices.
+        assert!(INDEX_HTML.contains("<meta name=\"celastro-token\" content=\"\">"));
     }
 
     #[test]
@@ -4308,8 +4593,10 @@ mod tests {
     fn a_huge_declared_body_is_answered_413_without_reading_a_byte_of_it() {
         // The request promises two mebibytes and sends none of them. Reading
         // before checking would block here until the read timeout.
-        let mut request = String::from("POST /api/query?t=tok HTTP/1.1\r\n");
-        request.push_str("Host: localhost\r\nContent-Length: 2097152\r\n\r\n");
+        let mut request = String::from("POST /api/query HTTP/1.1\r\n");
+        request.push_str(
+            "Host: localhost\r\nX-Celastro-Token: tok\r\nContent-Length: 2097152\r\n\r\n",
+        );
         let response = answer_to(&request);
         assert_eq!(status_line(&response), "HTTP/1.1 413 Payload Too Large");
     }
@@ -4420,10 +4707,18 @@ mod tests {
     #[test]
     fn every_protocol_failure_keeps_its_own_status_code_end_to_end() {
         let cases = [
-            ("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 401 Unauthorized"),
+            // Without a credential `/` is the sign-in page; everything else
+            // is refused, and the printed URL's token is exchanged for a
+            // session with a redirect.
+            ("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 200 OK"),
+            ("GET /app.js HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 401 Unauthorized"),
+            ("GET /?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 303 See Other"),
             ("GET /?t=nope HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 401 Unauthorized"),
             ("GET /?t=tok HTTP/1.1\r\nHost: evil.example\r\n\r\n", "HTTP/1.1 403 Forbidden"),
-            ("GET /nope?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 404 Not Found"),
+            (
+                "GET /nope HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\r\n",
+                "HTTP/1.1 404 Not Found",
+            ),
             ("nonsense\r\n\r\n", "HTTP/1.1 400 Bad Request"),
         ];
         for (request, expected) in cases {
@@ -4597,7 +4892,8 @@ mod tests {
         let expected =
             format!("{}/tree/v{}", env!("CARGO_PKG_REPOSITORY"), env!("CARGO_PKG_VERSION"));
         assert!(expected.starts_with("https://"), "{expected}");
-        let page = answer_to("GET /?t=tok HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
+        let page =
+            answer_to("GET / HTTP/1.1\r\nHost: 127.0.0.1:9\r\nX-Celastro-Token: tok\r\n\r\n");
         assert_eq!(status_line(&page), "HTTP/1.1 200 OK");
         let body = body_of(&page);
         assert!(body.contains(&format!("href=\"{expected}\"")), "no source link on the page");
@@ -4624,7 +4920,9 @@ mod tests {
     #[test]
     fn a_statement_arriving_over_http_is_run_and_its_answer_is_shaped_by_kind() {
         let sql = r#"{"sql":"CREATE COLLECTION items (id TEXT PRIMARY KEY, kind TEXT)"}"#;
-        let mut request = String::from("POST /api/query?t=tok HTTP/1.1\r\nHost: localhost\r\n");
+        let mut request = String::from(
+            "POST /api/query HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n",
+        );
         request.push_str("Content-Type: application/json\r\n");
         request.push_str(&format!("Content-Length: {}\r\n\r\n{sql}", sql.len()));
         let response = answer_to(&request);
@@ -4637,7 +4935,7 @@ mod tests {
 
     #[test]
     fn a_body_shorter_than_its_declared_length_is_a_bad_request_not_a_hang() {
-        let mut request = String::from("POST /api/query?t=tok HTTP/1.1\r\n");
+        let mut request = String::from("POST /api/query HTTP/1.1\r\nX-Celastro-Token: tok\r\n");
         request.push_str("Host: localhost\r\nContent-Type: application/json\r\n");
         request.push_str("Content-Length: 400\r\n\r\n{\"sql\":\"SELECT 1\"}");
         assert_eq!(status_line(&answer_to(&request)), "HTTP/1.1 400 Bad Request");
@@ -5248,7 +5546,9 @@ mod tests {
         // is why pasting a large statement into the console reported "network
         // error" rather than the 413 this server actually sent.
         let sql = r#"{"sql":"SELECT 1"}"#;
-        let mut request = String::from("POST /api/query?t=nope HTTP/1.1\r\nHost: localhost\r\n");
+        let mut request = String::from(
+            "POST /api/query HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: nope\r\n",
+        );
         request.push_str("Content-Type: application/json\r\n");
         request.push_str(&format!("Content-Length: {}\r\n\r\n{sql}", sql.len()));
         let db = Db::in_memory();
@@ -5369,7 +5669,9 @@ mod tests {
         // `run` looping forever is what made the console lose writes: nothing
         // after it could run, so nothing could close the database.
         let mut db = Db::in_memory();
-        let mut request = String::from("POST /api/shutdown?t=tok HTTP/1.1\r\nHost: localhost\r\n");
+        let mut request = String::from(
+            "POST /api/shutdown HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n",
+        );
         request.push_str(&format!("Origin: http://127.0.0.1:{}\r\n", PORT));
         request.push_str("Sec-Fetch-Site: same-origin\r\nContent-Length: 0\r\n\r\n");
         let (response, next) = serve_request(&mut db, &request);
@@ -5382,7 +5684,7 @@ mod tests {
         // Every other request leaves the console serving.
         let health = "GET /api/health?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n";
         assert_eq!(serve_request(&mut db, health).1, Next::Serve);
-        let page = "GET /?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let page = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\r\n";
         assert_eq!(serve_request(&mut db, page).1, Next::Serve);
         // And it is a route like any other: no token, no shutdown.
         let mut anonymous = String::from("POST /api/shutdown HTTP/1.1\r\nHost: localhost\r\n");
@@ -5816,7 +6118,8 @@ mod tests {
         // A 405 with a body desynchronises a client that is counting bytes off
         // the connection, and a 405 that will not say what it allows makes the
         // client guess. `allowed_methods` knows, so it costs nothing to say.
-        let response = answer_to("HEAD /?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let response =
+            answer_to("HEAD / HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\r\n");
         assert_eq!(status_line(&response), "HTTP/1.1 405 Method Not Allowed");
         assert!(response.contains("Allow: GET\r\n"), "{response}");
         assert_eq!(body_of(&response), "", "a HEAD response carries no body");
@@ -5826,7 +6129,9 @@ mod tests {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .expect("a HEAD response still announces the length a GET would send");
         assert!(declared > 0, "{response}");
-        let response = answer_to("HEAD /api/query?t=tok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let response = answer_to(
+            "HEAD /api/query HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n\r\n",
+        );
         assert!(response.contains("Allow: POST\r\n"), "{response}");
         assert_eq!(body_of(&response), "");
         // A GET is unaffected: it still gets the body it asked for.
@@ -5912,7 +6217,9 @@ mod tests {
     /// One statement, posted the way the console posts it.
     fn post(sql: &str) -> String {
         let body = format!(r#"{{"sql":{}}}"#, jstr(sql));
-        let mut request = String::from("POST /api/query?t=tok HTTP/1.1\r\nHost: localhost\r\n");
+        let mut request = String::from(
+            "POST /api/query HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: tok\r\n",
+        );
         request.push_str("Content-Type: application/json\r\n");
         request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         request

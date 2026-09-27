@@ -778,6 +778,7 @@ impl ObjectStore for DirStore {
 
 // ------------------------------------------------------------------ HTTP
 
+#[derive(Debug)]
 struct Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -839,19 +840,52 @@ fn connect(endpoint: &str, tls: Option<&ArchiveTls>) -> Result<Box<dyn crate::tl
 /// Read one HTTP/1.1 response in full: a status line, headers to the blank
 /// line, then a body sized by `content-length`, by chunked framing, or by the
 /// close of the connection (which the request asked for).
-fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Response> {
+/// The most a response may carry: a body the headers frame (a
+/// content-length), and one they do not (chunked, or framed by the end of
+/// the stream). An object is at most a segment, and a segment is bounded
+/// by the compaction that made it; a response past these is not the
+/// store's answer, and is refused before it fills the node's memory.
+const MAX_FRAMED_RESPONSE: u64 = 4 << 30;
+const MAX_UNFRAMED_RESPONSE: u64 = 256 << 20;
+/// The most a response's header block may be.
+const MAX_RESPONSE_HEAD: usize = 64 << 10;
+
+/// `stream` read to its end or to `cap + 1` bytes, whichever first:
+/// the bytes, whether the stream ended properly (`cut` when it did not),
+/// and whether the cap was passed.
+fn read_up_to<R: Read + ?Sized>(stream: &mut R, cap: u64) -> Result<(Vec<u8>, bool, bool)> {
     let mut raw = Vec::new();
-    // Over TLS a stream that ends without a close_notify is an error
-    // (0.87.0), with what came before it in `raw`: a body the headers
-    // frame -- a content-length met, a chunked body's last chunk -- is
-    // whole whatever ended the stream; one framed by the end alone is
-    // taken only from a stream that ended properly.
-    let cut = match stream.read_to_end(&mut raw) {
-        Ok(_) => false,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => true,
-        Err(e) => return Err(e.into()),
-    };
-    let head_end = find(&raw, b"\r\n\r\n")
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        if raw.len() as u64 > cap {
+            return Ok((raw, false, true));
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok((raw, false, false)),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // Over TLS a stream that ends without a close_notify is an
+            // error (0.87.0), with what came before it kept: a body the
+            // headers frame is whole whatever ended the stream; one framed
+            // by the end alone is taken only from a stream that ended
+            // properly.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok((raw, true, false))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Response> {
+    let (raw, cut, over) = read_up_to(stream, MAX_FRAMED_RESPONSE)?;
+    if over {
+        return Err(Error::Storage(format!(
+            "archive: the response is longer than {MAX_FRAMED_RESPONSE} bytes, more than any \
+             object; refused rather than held"
+        )));
+    }
+    let head_end = find(&raw[..raw.len().min(MAX_RESPONSE_HEAD)], b"\r\n\r\n")
         .ok_or_else(|| Error::Storage("archive: response without a header block".into()))?;
     let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
     let mut lines = head.split("\r\n");
@@ -872,14 +906,29 @@ fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Re
         .iter()
         .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
     // A HEAD carries the object's content-length and no body.
+    let unframed = |rest: &[u8]| -> Result<()> {
+        if rest.len() as u64 > MAX_UNFRAMED_RESPONSE {
+            return Err(Error::Storage(format!(
+                "archive: a response without a content-length is longer than \
+                 {MAX_UNFRAMED_RESPONSE} bytes; refused rather than held"
+            )));
+        }
+        Ok(())
+    };
     let body = if head_only {
         Vec::new()
     } else if chunked {
+        unframed(rest)?;
         dechunk(rest)?
     } else if let Some(n) = headers.iter().find(|(k, _)| k == "content-length") {
-        let n: usize =
+        let n: u64 =
             n.1.parse().map_err(|_| Error::Storage("archive: bad content-length".into()))?;
-        rest.get(..n)
+        if n > MAX_FRAMED_RESPONSE {
+            return Err(Error::Storage(format!(
+                "archive: the response declares {n} bytes, more than any object; refused"
+            )));
+        }
+        rest.get(..n as usize)
             .ok_or_else(|| Error::Storage("archive: the response body was cut short".into()))?
             .to_vec()
     } else if cut {
@@ -887,6 +936,7 @@ fn read_response<R: Read + ?Sized>(stream: &mut R, head_only: bool) -> Result<Re
             "archive: the response had no length and the connection was cut before it ended".into(),
         ));
     } else {
+        unframed(rest)?;
         rest.to_vec()
     };
     Ok(Response { status, headers, body })
@@ -1016,6 +1066,42 @@ pub(crate) fn amz_date(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A response is held within bounds: one that declares more than any
+    /// object is refused on its header; one with no length is refused past
+    /// its own, smaller bound; a reader that never ends stops at the cap
+    /// rather than growing without limit.
+    #[test]
+    fn a_response_past_the_bounds_is_refused_not_held() {
+        let declared =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nx", MAX_FRAMED_RESPONSE + 1);
+        let e = read_response(&mut declared.as_bytes(), false).unwrap_err().to_string();
+        assert!(e.contains("more than any object"), "{e}");
+        struct Endless(u64);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Ok(0);
+                }
+                let n = (buf.len() as u64).min(self.0) as usize;
+                buf[..n].fill(b'z');
+                self.0 -= n as u64;
+                Ok(n)
+            }
+        }
+        let head = b"HTTP/1.1 200 OK\r\n\r\n";
+        // No length: bounded by the smaller cap, on what arrived.
+        let mut r = std::io::Cursor::new(head.to_vec()).chain(Endless(MAX_UNFRAMED_RESPONSE + 1));
+        let e = read_response(&mut r, false).unwrap_err().to_string();
+        assert!(e.contains("without a content-length is longer"), "{e}");
+        // Within the bound, the same shape is a body.
+        let mut r = std::io::Cursor::new(head.to_vec()).chain(Endless(1000));
+        assert_eq!(read_response(&mut r, false).unwrap().body.len(), 1000);
+        // A reader that would never end is stopped at the framed cap.
+        let mut r = std::io::Cursor::new(head.to_vec()).chain(Endless(MAX_FRAMED_RESPONSE + 2));
+        let e = read_response(&mut r, false).unwrap_err().to_string();
+        assert!(e.contains("longer than"), "{e}");
+    }
 
     #[test]
     fn fuzz_store_responses_never_panic() {

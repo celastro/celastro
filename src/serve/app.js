@@ -11,14 +11,16 @@
 // template string: please don't.
 'use strict';
 
-// The token arrives once, in the URL the CLI printed. We read it into this
-// variable and then rewrite the address bar without it, so it is not sitting on
-// screen during a screenshare and not written into the browser's history
-// database (which some browsers sync between devices). Every later request
-// sends it as a header instead, so it also stays out of access logs and
-// Referer. From here on the token exists only in memory: navigating away loses
-// it, which is why nothing on this page is a link or a form submit.
-var TOKEN = new URLSearchParams(location.search).get('t') || '';
+// The token arrives in this page's own source, in a <meta> the server fills
+// for the session that opened the page: the URL the CLI printed was exchanged
+// for that session on the first request and redirected away, so the token
+// was never on screen during a screenshare, never in the browser's history
+// database (which some browsers sync between devices) and never in a log
+// between the browser and the console. Every request sends it as a header.
+// A `?t=` still in the URL -- a browser that did not follow the redirect --
+// is read as a fallback and stripped from the address bar.
+var meta = document.querySelector('meta[name="celastro-token"]');
+var TOKEN = (meta && meta.getAttribute('content')) || new URLSearchParams(location.search).get('t') || '';
 if (location.search) {
   // A console that failed to boot over a cosmetic URL rewrite would be a bad
   // trade, so a refusal here is survivable: the token is already captured.
@@ -540,7 +542,7 @@ editor.addEventListener('keydown', function (e) {
 });
 
 if (!TOKEN) {
-  setStatus('No access token in this URL. Open the link the CLI printed.', 'error');
+  setStatus('No access token: open the link the CLI printed, or sign in at /.', 'error');
 }
 api('/api/health').then(function (res) {
   if (res && res.version) document.getElementById('version').textContent = 'v' + res.version;
