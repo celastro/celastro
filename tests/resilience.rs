@@ -287,7 +287,7 @@ fn a_node_killed_outright_keeps_every_row_it_acknowledged() {
         let mut s = std::net::TcpStream::connect(addr)?;
         write!(
             s,
-            "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: \
+            "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: \
              application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )?;
@@ -509,7 +509,7 @@ fn a_point_lookup_answers_while_a_large_vector_seal_builds() {
         let mut s = std::net::TcpStream::connect(&addr).unwrap();
         write!(
             s,
-            "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+            "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\n\r\n{body}",
             body.len()
         )

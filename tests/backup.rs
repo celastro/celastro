@@ -321,7 +321,7 @@ fn the_console_runs_a_backup_without_holding_its_lock_and_send_carries_the_state
         let mut s = TcpStream::connect(&addr).unwrap();
         write!(
             s,
-            "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+            "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )

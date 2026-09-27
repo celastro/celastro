@@ -43,7 +43,7 @@ fn sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives() {
     let mut s = TcpStream::connect(&addr).unwrap();
     write!(
         s,
-        "POST /api/query?t={token} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+        "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
@@ -100,7 +100,7 @@ fn a_connection_is_accepted_when_it_arrives_and_not_when_a_clock_says() {
         let mut s = TcpStream::connect(&addr).unwrap();
         write!(
             s,
-            "GET /api/health?t={token} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            "GET /api/health HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nConnection: close\r\n\r\n"
         )
         .unwrap();
         let mut reply = String::new();
