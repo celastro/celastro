@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.90.0 — 2026-09-27
 
 **The console's token leaves the URL.** The URL `serve` prints still
 carries the per-run token, but the browser presents it once: `GET /?t=`
