@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.89.0 — 2026-09-27
 
 **P-384 and SHA-384 in the chain verifier.** The in-tree X.509 verified
 Ed25519, RSA with SHA-256 and P-256 with SHA-256, so a chain with a P-384
