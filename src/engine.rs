@@ -2639,6 +2639,13 @@ impl Db {
         (syncs, settled, failed)
     }
 
+    /// The wire token this node presents and expects, read from
+    /// `CELASTRO_WIRE_TOKEN` when the database opened: what a dial made
+    /// after the environment was scrubbed of it takes.
+    pub fn wire_token(&self) -> Option<String> {
+        self.wire_token.clone()
+    }
+
     pub fn seal_failures(&self) -> (u64, Option<String>) {
         let mut n = 0;
         let mut last = None;

@@ -1157,11 +1157,14 @@ const ATTACH_ENV: &str = "CELASTRO_ATTACH";
 /// peer that is this node's own address is skipped, so the same list can be
 /// handed to every member of a cluster.
 fn attach_peers(db: &RwLock<Db>, stop: &AtomicBool, peers: &[String]) {
-    let (me, tls) = {
+    // The token from the database, which read it at open: `serve` has
+    // scrubbed it from the environment by now (0.87.0), and reading the
+    // environment here found nothing, so no peer named in CELASTRO_ATTACH
+    // was ever attached (0.87.0 through 0.91.0).
+    let (me, tls, token) = {
         let g = db.read().unwrap_or_else(|p| p.into_inner());
-        (g.node().map(str::to_string), g.tls())
+        (g.node().map(str::to_string), g.tls(), g.wire_token())
     };
-    let token = celastro::wire::token_from_env();
     let mut pending: Vec<&String> = peers.iter().filter(|p| me.as_ref() != Some(*p)).collect();
     let mut attempt = 0u32;
     while !pending.is_empty() && !stop.load(Ordering::Relaxed) {

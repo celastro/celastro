@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A peer named in `CELASTRO_ATTACH` is attached again.** From 0.87.0 the
+binary scrubs its secrets from the environment once read, and the thread
+that attaches the peers read the wire token from the environment after
+that, found nothing, and retried forever: a cluster deployed by the chart,
+the Ansible role or cloud-init on 0.87.0 through 0.91.0 never formed, each
+node logging "CELASTRO_WIRE_TOKEN is not set" for every peer. The dial now
+takes the token the database read at open. Found by a drill on the chart;
+a test now starts two processes and waits for the second to attach.
+
 ## 0.91.0 — 2026-09-27
 
 **Revocation, and path length constraints.** `CELASTRO_TLS_CRL` names a
