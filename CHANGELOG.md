@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.91.1 — 2026-09-28
 
 **A peer named in `CELASTRO_ATTACH` is attached again.** From 0.87.0 the
 binary scrubs its secrets from the environment once read, and the thread
