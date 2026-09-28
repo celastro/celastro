@@ -2005,6 +2005,9 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
 /// `check <DIR>`: every frame of every file under DIR opened under its data
 /// key, and every file that does not open named.
 fn check_dir(dir: &Path, json: bool) -> i32 {
+    if !dir.join("KEY").exists() {
+        return check_plain_dir(dir, json);
+    }
     let master = match master_or_fail(json, "check") {
         Ok(m) => m,
         Err(code) => return code,
@@ -2039,6 +2042,37 @@ fn check_dir(dir: &Path, json: bool) -> i32 {
             json,
             &format!(
                 "{}: {} file(s) open, {} do(es) not:\n  {}",
+                dir.display(),
+                w.files,
+                w.failures.len(),
+                w.failures.join("\n  ")
+            ),
+        ),
+        Err(e) => fail(json, &format!("could not check {}: {e}", dir.display())),
+    }
+}
+
+/// `check` on a directory with no `KEY`: every segment's regions, every
+/// manifest, delete log and catalog against their checksums, every log
+/// record against its CRC, a torn tail named.
+fn check_plain_dir(dir: &Path, json: bool) -> i32 {
+    match celastro::shard::check_plain_dir(dir) {
+        Ok(w) if w.failures.is_empty() => {
+            ack(
+                json,
+                &format!(
+                    "{}: {} file(s) and {} log record(s) in the clear check; nothing is damaged",
+                    dir.display(),
+                    w.files,
+                    w.records
+                ),
+            );
+            EXIT_OK
+        }
+        Ok(w) => fail(
+            json,
+            &format!(
+                "{}: {} file(s) check, {} do(es) not:\n  {}",
                 dir.display(),
                 w.files,
                 w.failures.len(),

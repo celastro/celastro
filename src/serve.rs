@@ -538,6 +538,31 @@ fn metrics_text(db: &Db) -> String {
         "",
         c.statements_failed.load(Relaxed).to_string(),
     );
+    // The recovery point, as `SHOW HEALTH` reports it: absent until this
+    // process has made a backup, or shipped a log to an archive.
+    let (backup, reach, _) = db.recovery_point();
+    let now = crate::time::now_micros();
+    let age = |ts: u64| ((now - crate::time::physical_micros(ts)).max(0) / 1_000_000).to_string();
+    if let Some(ts) = backup {
+        line(
+            "celastro_backup_age_seconds",
+            "gauge",
+            "Seconds since the last backup this process completed. Alert on it growing past \
+             the backup cadence.",
+            "",
+            age(ts),
+        );
+    }
+    if let Some(ts) = reach {
+        line(
+            "celastro_archive_lag_seconds",
+            "gauge",
+            "Seconds between now and the instant the archived logs of every shard held here \
+             reach: what a restore to the archive would lose if this node were lost now.",
+            "",
+            age(ts),
+        );
+    }
     // The latency histogram. It goes through `line` like everything else,
     // with the suffix in the label slot, so the family gets ONE HELP and
     // TYPE line and the series come out `celastro_statement_seconds_bucket

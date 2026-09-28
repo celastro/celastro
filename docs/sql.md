@@ -510,7 +510,13 @@ clock against this one, whether an older process still answers at its
 address, every shard with whether its holder does, the steward, every
 follower of a shard held here with its state (`live`, `catching up`,
 `asking` -- and `DEGRADED` when a follower away leaves a write on this
-disk alone), and every copy this node follows.
+disk alone), and every copy this node follows. Its `recovery:` line is
+what a restore could reach if this node were lost now: the last backup
+this process completed and how far the archived logs of the shards held
+here reach (the least over them, as this process shipped them -- a seal's
+rotated logs, `BACKUP LOG TO`), each with its age; `STALE` when that
+stands further back than `CELASTRO_RECOVERY_WARN` seconds (an hour by
+default), or when nothing has been shipped since the process started.
 
 `PROMOTE SHARD i OF c ON 'follower'` makes a follower the holder at the
 next term -- what to run when a holder is lost, from any node; the

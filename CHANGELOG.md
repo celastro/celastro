@@ -6,6 +6,29 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A write the disk refuses names the log.** A log append that fails --
+no space left, a volume gone -- is refused with the log's path before the
+system's error, so the client's error says which shard's volume it was;
+the statement is cut back off the log as before, and a reopen replays only
+what was acknowledged.
+
+**`celastro check` on a database in the clear.** A directory with no `KEY`
+used to be refused ("an encrypted database has one"); now every segment's
+regions, the manifests, the delete logs and the catalog are read against
+their checksums and every log record against its CRC, a log that ends
+mid-record is named as torn with where, and one run names every damaged
+file. Under a key the check is what it was: every frame opened.
+
+**`SHOW HEALTH` says how far back a restore reaches.** A `recovery:` line
+carries the last backup this process completed and the instant the
+archived logs of the shards held here reach (the least over them, as this
+process shipped them), each with its age, and `STALE` when that stands
+further back than `CELASTRO_RECOVERY_WARN` seconds -- an hour by default
+-- or when nothing has been shipped since the start. The metrics gain
+`celastro_backup_age_seconds` and `celastro_archive_lag_seconds`.
+
 ## 0.91.1 — 2026-09-28
 
 **A peer named in `CELASTRO_ATTACH` is attached again.** From 0.87.0 the

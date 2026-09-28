@@ -186,8 +186,13 @@ destination want different prefixes, or different buckets. A ring
 that nothing can need -- no index is at the archived tier at all -- is
 dropped by the next open without being asked, and logged.
 
-**`check <DIR>`** opens every frame of every file and names what does
-not open, with nothing written: what to run on a volume you doubt.
+**`check <DIR>`** reads every file and names what does not check, with
+nothing written: what to run on a volume you doubt. Under a key (a `KEY`
+in the directory) it opens every frame; in the clear it reads every
+segment's regions, the manifests, the delete logs and the catalog against
+their checksums and every log record against its CRC, and names a log
+that ends mid-record as torn, with where. One run reports every damaged
+file; the exit status is the verdict.
 
 ```sh
 CELASTRO_MASTER_KEY_FILE=./master.key celastro key rotate ./data
@@ -459,6 +464,8 @@ celastro_statements_total 5
 celastro_statement_seconds_count{kind="insert"} 2
 celastro_statement_seconds_max 0.000318
 celastro_data_key_ring_size 0
+celastro_backup_age_seconds 41
+celastro_archive_lag_seconds 12
 celastro_compactions_total 1
 celastro_attached_nodes 0
 celastro_shards{collection="notes"} 1

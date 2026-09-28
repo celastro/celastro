@@ -140,6 +140,18 @@ pub enum Role {
     Coordinator,
 }
 
+/// How far back the recovery point may stand before `SHOW HEALTH` marks
+/// it `STALE`: `CELASTRO_RECOVERY_WARN` seconds, an hour by default.
+pub fn recovery_warn_secs() -> u64 {
+    std::env::var("CELASTRO_RECOVERY_WARN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(RECOVERY_WARN_SECS)
+}
+
+/// The default of `CELASTRO_RECOVERY_WARN`.
+pub const RECOVERY_WARN_SECS: u64 = 3_600;
+
 /// How often the console's sweep pulls every peer's catalog and
 /// reconciles it with this node's, seconds; `CELASTRO_RECONCILE_SECS`
 /// changes it, `0` turns the sweep off. `ATTACH NODE` reconciles at once.
@@ -1124,6 +1136,9 @@ pub struct Db {
     archive: Option<crate::objstore::ArchiveHandle>,
     /// The log archive every shard held here writes to, when set.
     log_archive: Option<Arc<crate::backup::LogArchive>>,
+    /// The instant of the last backup this process completed, zero for
+    /// none: set by the job when its record is written, wherever it ran.
+    last_backup: Arc<std::sync::atomic::AtomicU64>,
     /// Writes per collection, for the statistics cache: its refresh gate and
     /// its anchor compare against the collection whose statistics they guard,
     /// so traffic on an unrelated collection neither ages an entry nor
@@ -1238,6 +1253,7 @@ impl Db {
             writes: 0,
             archive: None,
             log_archive: None,
+            last_backup: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             collection_writes: BTreeMap::new(),
             lifecycle_checked_at_writes: 0,
             activity_persisted_micros: 0,
@@ -1595,6 +1611,7 @@ impl Db {
             colls,
             keep,
             self.cipher.clone(),
+            self.last_backup.clone(),
         )))
     }
 
@@ -2353,6 +2370,7 @@ impl Db {
                  are held at the instant before it -- restart the node to replay the log\n"
             ));
         }
+        out.push_str(&self.recovery_line());
         let lead = self.hlc_lead_micros();
         if lead > 1_000_000 {
             out.push_str(&format!(
@@ -2644,6 +2662,69 @@ impl Db {
     /// after the environment was scrubbed of it takes.
     pub fn wire_token(&self) -> Option<String> {
         self.wire_token.clone()
+    }
+
+    /// The recovery point: the last backup this process completed and how
+    /// far the archived logs of the shards held here reach, as this
+    /// process shipped them -- the least reach over the shards, since a
+    /// restore `AS OF` an instant needs every shard's log to it. `None`
+    /// for a backup means none since the start; for the reach, no log
+    /// archive set or nothing shipped yet; the flag says whether one is
+    /// set.
+    pub fn recovery_point(&self) -> (Option<Timestamp>, Option<Timestamp>, bool) {
+        let backup = match self.last_backup.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ts => Some(ts),
+        };
+        let reach = if self.log_archive.is_some() {
+            self.shards.values().flatten().map(|s| s.archived_reach).min().flatten()
+        } else {
+            None
+        };
+        (backup, reach, self.log_archive.is_some())
+    }
+
+    /// `SHOW HEALTH`'s recovery line: what a restore could reach if this
+    /// node were lost now, and `STALE` when that is further back than
+    /// `CELASTRO_RECOVERY_WARN` seconds (an hour by default) -- the
+    /// archived logs' reach when a log archive is set, the last backup's
+    /// age otherwise.
+    fn recovery_line(&self) -> String {
+        let (backup, reach, archive) = self.recovery_point();
+        let now = crate::time::now_micros();
+        let warn = recovery_warn_secs() as i64 * 1_000_000;
+        let ago = |at: i64| -> String {
+            let s = (now - at).max(0) / 1_000_000;
+            if s < 120 {
+                format!("{s} s ago")
+            } else if s < 7_200 {
+                format!("{} min ago", s / 60)
+            } else {
+                format!("{:.1} h ago", s as f64 / 3_600.0)
+            }
+        };
+        let backup_text = match backup {
+            Some(ts) => {
+                let at = crate::time::physical_micros(ts);
+                format!("last backup {} ({})", ago(at), crate::time::format_micros(at))
+            }
+            None => "no backup since this process started".to_string(),
+        };
+        let (reach_text, stale) = match (archive, reach) {
+            (false, _) => (
+                "no log archive set".to_string(),
+                backup.is_some_and(|ts| now - crate::time::physical_micros(ts) > warn),
+            ),
+            (true, None) => ("no archived log since this process started".to_string(), true),
+            (true, Some(ts)) => {
+                let at = crate::time::physical_micros(ts);
+                (
+                    format!("archived logs reach {} ({})", crate::time::format_micros(at), ago(at)),
+                    now - at > warn,
+                )
+            }
+        };
+        format!("recovery: {backup_text}; {reach_text}{}\n", if stale { " STALE" } else { "" })
     }
 
     pub fn seal_failures(&self) -> (u64, Option<String>) {
@@ -10473,6 +10554,51 @@ mod tests {
         assert_eq!(host_of("tcp://[::1]:7876"), "::1");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SHOW HEALTH`'s recovery line says what a restore could reach: no
+    /// backup and no archived log since the start at first (`STALE`, since
+    /// nothing is recoverable), the archived logs' reach once a log is
+    /// shipped, the last backup once one is made -- and `STALE` when the
+    /// reach is older than `CELASTRO_RECOVERY_WARN` seconds. The metrics
+    /// carry the same two ages.
+    #[test]
+    fn the_health_report_says_how_far_back_a_restore_reaches() {
+        let root = std::env::temp_dir().join(format!("celastro-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, archive, backups) = (root.join("data"), root.join("archive"), root.join("b"));
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&backups).unwrap();
+        let opts = DbOpts { log_archive: Some(archive.display().to_string()), ..DbOpts::default() };
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for i in 0..5 {
+            db.insert("notes", Value::obj(vec![("id".into(), Value::Str(format!("n{i}")))]))
+                .unwrap();
+        }
+        let h = db.show_health();
+        assert!(
+            h.contains("recovery: no backup since this process started; no archived log since this process started STALE"),
+            "{h}"
+        );
+        let (backup, reach, archive_set) = db.recovery_point();
+        assert!(backup.is_none() && reach.is_none() && archive_set);
+        db.execute(&format!("BACKUP LOG TO '{}'", archive.display())).unwrap();
+        let h = db.show_health();
+        assert!(h.contains("archived logs reach ") && h.contains(" s ago)"), "{h}");
+        assert!(!h.contains("STALE"), "{h}");
+        let (_, reach, _) = db.recovery_point();
+        assert!(reach.is_some());
+        db.execute(&format!("BACKUP TO '{}'", backups.display())).unwrap().finished().unwrap();
+        let h = db.show_health();
+        assert!(h.contains("recovery: last backup ") && h.contains(" s ago ("), "{h}");
+        // Past the threshold: the reach stands where it was, and now says so.
+        std::env::set_var("CELASTRO_RECOVERY_WARN", "0");
+        let h = db.show_health();
+        std::env::remove_var("CELASTRO_RECOVERY_WARN");
+        assert!(h.contains("STALE"), "{h}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A collection made through the library is named by the statement's

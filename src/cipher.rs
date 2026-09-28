@@ -1498,7 +1498,7 @@ fn is_log(name: &str) -> bool {
 /// legacy pair without the collection -- and a root file's is its name. A
 /// move in flight (an `incoming/` directory) is refused: its files are the
 /// source's until the move ends.
-fn walk_framed(
+pub(crate) fn walk_framed(
     dir: &std::path::Path,
     f: &mut dyn FnMut(&std::path::Path, &Ids, bool) -> Result<()>,
 ) -> Result<()> {

@@ -151,8 +151,15 @@ pub(crate) fn job(
     colls: Exported,
     keep: Option<usize>,
     cipher: crate::cipher::Shared,
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Deferred {
-    Deferred::new(move || run(target, ts, node, catalog, key, colls, keep, cipher))
+    // `done` takes the backup's instant once the record is written: what
+    // `SHOW HEALTH` reports as the last backup, from wherever the job ran.
+    Deferred::new(move || {
+        let out = run(target, ts, node, catalog, key, colls, keep, cipher)?;
+        done.store(ts, std::sync::atomic::Ordering::Relaxed);
+        Ok(out)
+    })
 }
 
 /// Whether record bytes are a record in the clear: what every backup

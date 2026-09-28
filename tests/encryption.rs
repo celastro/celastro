@@ -247,6 +247,48 @@ fn a_plain_database_with_data_is_not_encrypted_in_place() {
     let _ = std::fs::remove_dir_all(&empty);
 }
 
+/// `celastro check` on a directory in the clear: every segment's regions,
+/// the manifests and the catalog against their checksums, every log
+/// record against its CRC -- and a byte flipped in a segment, a manifest
+/// with a byte changed and a log cut mid-record are each named, in one
+/// run, with the rest still counted.
+#[test]
+fn a_plain_directory_is_checked_and_every_damaged_file_is_named() {
+    let d = dir("plain-check");
+    let mut db = Db::open(&d, opts(None)).unwrap();
+    setup(&mut db, 10);
+    drop(db);
+    let w = celastro::shard::check_plain_dir(&d).unwrap();
+    assert!(w.failures.is_empty(), "{:?}", w.failures);
+    assert!(w.files >= 4 && w.records >= 5, "{} file(s), {} record(s)", w.files, w.records);
+    let shard = d.join("collections/items/shard-0000");
+    let seg = std::fs::read_dir(shard.join("segments"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "seg"))
+        .expect("the flush wrote a segment");
+    let mut bytes = std::fs::read(&seg).unwrap();
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0x55;
+    std::fs::write(&seg, &bytes).unwrap();
+    let manifest = shard.join("MANIFEST");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes[2] ^= 0x01;
+    std::fs::write(&manifest, &bytes).unwrap();
+    let wal = shard.join("wal.log");
+    let bytes = std::fs::read(&wal).unwrap();
+    std::fs::write(&wal, &bytes[..bytes.len() - 7]).unwrap();
+    let w = celastro::shard::check_plain_dir(&d).unwrap();
+    let named =
+        |what: &str, why: &str| w.failures.iter().any(|f| f.contains(what) && f.contains(why));
+    assert!(named(&seg.display().to_string(), "checksum"), "{:?}", w.failures);
+    assert!(named("MANIFEST", "checksum mismatch"), "{:?}", w.failures);
+    assert!(named("wal.log", "torn at byte"), "{:?}", w.failures);
+    assert_eq!(w.failures.len(), 3, "{:?}", w.failures);
+    assert!(w.files >= 2, "the files that check are still counted");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended() {
     let d = dir("torn");

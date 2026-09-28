@@ -679,6 +679,73 @@ pub(crate) fn publish_content(
     Ok(bytes)
 }
 
+/// A manifest's bytes checked against the checksum they end in, and
+/// decoded.
+pub(crate) fn manifest_checked(b: &[u8]) -> Result<Manifest> {
+    if b.len() < 4 {
+        return Err(Error::Storage("manifest: truncated".into()));
+    }
+    let (body, tail) = b.split_at(b.len() - 4);
+    if crc32(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
+        return Err(Error::Storage("manifest: checksum mismatch".into()));
+    }
+    Manifest::decode(body)
+}
+
+/// Every file of a database in the clear under `dir` read and checked,
+/// nothing written: what `celastro check` prints for a directory with no
+/// `KEY`. A segment is opened and every region read against its
+/// checksum; a manifest and a delete log against theirs and decoded; the
+/// catalog decoded; a log parsed record by record against each record's
+/// CRC, and one that does not parse to its end named as torn, with where.
+/// A file that does not check is a failure named with its reason, not an
+/// error, so one run reports every damaged file. The encrypted
+/// counterpart is [`crate::cipher::check_dir`], which opens every frame
+/// instead: under a key every file is a frame, and a frame that opens is
+/// whole.
+pub fn check_plain_dir(dir: &Path) -> Result<crate::cipher::Walked> {
+    let mut w = crate::cipher::Walked::default();
+    crate::cipher::walk_framed(dir, &mut |path, _ids, log| {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let bytes = fs::read(path)?;
+        let checked: Result<usize> = if log {
+            let (records, used) = Wal::parse_plain(&bytes);
+            if used < bytes.len() {
+                Err(Error::Storage(format!(
+                    "{} record(s) parse, then the log does not: torn at byte {used} of {}",
+                    records.len(),
+                    bytes.len()
+                )))
+            } else {
+                Ok(records.len())
+            }
+        } else if name.ends_with(".seg") {
+            crate::segment::Segment::open(crate::segment::SegmentSource::File(path.to_path_buf()))
+                .and_then(|s| s.verify())
+                .map(|_| 0)
+        } else if name.ends_with(".dlog") {
+            crate::mvcc::DeleteLog::decode(&bytes).map(|_| 0)
+        } else if name == "MANIFEST" {
+            manifest_checked(&bytes).map(|_| 0)
+        } else if name == "CATALOG" {
+            crate::catalog::Catalog::decode(&bytes).map(|_| 0)
+        } else {
+            // RANGE and the rest carry no checksum: present is what is
+            // checked.
+            Ok(0)
+        };
+        match checked {
+            Ok(records) => {
+                w.files += 1;
+                w.records += records;
+            }
+            Err(e) => w.failures.push(format!("{}: {e}", path.display())),
+        }
+        Ok(())
+    })?;
+    Ok(w)
+}
+
 /// The content of `path`, opened under the cipher when there is one;
 /// `None` when the file is absent.
 pub(crate) fn read_content(
@@ -1792,7 +1859,8 @@ impl Wal {
 
     pub(crate) fn append(&mut self, r: &WalRecord) -> Result<()> {
         #[cfg(test)]
-        durability_probe::check(durability_probe::Op::WalAppend, &self.path)?;
+        durability_probe::check(durability_probe::Op::WalAppend, &self.path)
+            .map_err(|e| e.prefixed(&format!("{}: ", self.path.display())))?;
         let mut body = Vec::new();
         body.push(r.kind);
         put_str(&mut body, &r.key);
@@ -1821,7 +1889,11 @@ impl Wal {
         if let Some(e) = &st.failed {
             return Err(LogSync::refused(&self.path, e));
         }
-        self.file.write_all(&out)?;
+        // Named: a disk with no space left says so through the client's
+        // error, and the log's path is which shard's volume it is.
+        self.file
+            .write_all(&out)
+            .map_err(|e| Error::Io(e).prefixed(&format!("{}: ", self.path.display())))?;
         st.appended += 1;
         drop(st);
         // Recorded so that a test can assert the sync below happens AFTER this.
@@ -1876,12 +1948,22 @@ impl Wal {
             Some(c) => c.open_log(ids, &b).records.concat(),
             None => b,
         };
+        Ok(Wal::parse_plain(&b).0)
+    }
+
+    /// The records of a log's bytes in the clear, and how many of the
+    /// bytes they took: a torn tail -- a record whose length or checksum
+    /// does not check out, or the zeros a crash extends a file with --
+    /// ends the parse rather than failing it, and a count short of the
+    /// length is where the tear is. `replay` takes the records; `check`
+    /// takes the count too.
+    pub(crate) fn parse_plain(b: &[u8]) -> (Vec<WalRecord>, usize) {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + 8 <= b.len() {
             let mut j = i;
-            let len = get_u32(&b, &mut j).unwrap() as usize;
-            let crc = get_u32(&b, &mut j).unwrap();
+            let len = get_u32(b, &mut j).unwrap() as usize;
+            let crc = get_u32(b, &mut j).unwrap();
             // A crash leaves a zero-extended tail, and `crc32(&[]) == 0`, so
             // eight zero bytes look exactly like a valid empty record. A real
             // record is never empty.
@@ -1913,7 +1995,7 @@ impl Wal {
             let segment_id = get_u64(body, &mut k).unwrap_or(0);
             out.push(WalRecord { kind, key, ts, doc, supersedes, segment_id });
         }
-        Ok(out)
+        (out, i)
     }
 
     /// Forget every record in the log.
@@ -2045,6 +2127,9 @@ pub struct SealBuilt {
     segments: Vec<Segment>,
     /// The segments already on the disk, by id: the build wrote them.
     written: BTreeMap<u64, PathBuf>,
+    /// The last instant the rotated logs the build archived reach, for
+    /// the install to record on the shard.
+    archived_reach: Option<Timestamp>,
 }
 
 impl Sealed {
@@ -2147,6 +2232,11 @@ pub struct Shard {
     /// the last one's reason: a disk that is full or gone, seen here first.
     pub(crate) seal_failures: u64,
     pub(crate) last_seal_error: Option<String>,
+    /// The last instant an archived log of this shard reaches, as this
+    /// process shipped them (a seal's rotated logs, `BACKUP LOG`): the
+    /// recovery point `SHOW HEALTH` reports. Nothing since the start until
+    /// the first ship.
+    pub(crate) archived_reach: Option<Timestamp>,
     /// Group commit: a write appends and applies, and leaves its log's sync
     /// in `pending` for the caller to settle with the database's lock let go
     /// ([`LogSync`]). Off, the write syncs before it returns, as the embedded
@@ -2238,6 +2328,7 @@ impl Shard {
             wal: None,
             flushes: 0,
             seal_failures: 0,
+            archived_reach: None,
             last_seal_error: None,
             defer_sync: false,
             pending: Vec::new(),
@@ -3198,7 +3289,7 @@ impl Shard {
         }
         self.resolve_fork(a)?;
         let Some(dir) = &self.dir else { return Ok(None) };
-        a.put_log(
+        let put = a.put_log(
             &self.coll.name,
             self.index,
             self.timeline,
@@ -3206,7 +3297,11 @@ impl Shard {
             &dir.join("wal.log"),
             &self.opts.cipher,
             &self.file_ids("wal.log"),
-        )
+        )?;
+        if let Some((_, last)) = put {
+            self.archived_reach = self.archived_reach.max(Some(last));
+        }
+        Ok(put)
     }
 
     /// A fork a restore recorded, made a timeline of the archive's: the
@@ -3327,6 +3422,7 @@ impl Shard {
         // takes: an archive that is down fails the seal here, and the seal
         // is tried again with the logs still on the disk.
         let mut timeline = None;
+        let mut archived_reach = None;
         if let Some(a) = &t.archive {
             let tl = match t.fork {
                 Some((parent, at)) => {
@@ -3338,7 +3434,18 @@ impl Shard {
                 None => t.timeline,
             };
             for p in &t.wals {
-                a.put_log(&t.coll.name, t.index, tl, rotated_seq(p)?, p, &t.cipher, &t.log_ids)?;
+                let put = a.put_log(
+                    &t.coll.name,
+                    t.index,
+                    tl,
+                    rotated_seq(p)?,
+                    p,
+                    &t.cipher,
+                    &t.log_ids,
+                )?;
+                if let Some((_, last)) = put {
+                    archived_reach = archived_reach.max(Some(last));
+                }
             }
         }
         let mut segments = Vec::new();
@@ -3370,7 +3477,7 @@ impl Shard {
                 }
             }
         }
-        Ok(SealBuilt { timeline, segments, written })
+        Ok(SealBuilt { timeline, segments, written, archived_reach })
     }
 
     /// Commit a build: the manifest naming the segments the build wrote, the deletes
@@ -3386,6 +3493,9 @@ impl Shard {
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
         if let Some(tl) = built.timeline {
             self.took_timeline(tl)?;
+        }
+        if let Some(reach) = built.archived_reach {
+            self.archived_reach = self.archived_reach.max(Some(reach));
         }
         let deletes = Shard::deletes_of(&t.frozen);
         let committed = self
@@ -3985,14 +4095,7 @@ impl Shard {
         if let Some(b) =
             read_content(&s.opts.cipher, &s.file_ids("MANIFEST"), &dir.join("MANIFEST"))?
         {
-            if b.len() < 4 {
-                return Err(Error::Storage("manifest: truncated".into()));
-            }
-            let (body, tail) = b.split_at(b.len() - 4);
-            if crc32(body) != u32::from_le_bytes(tail.try_into().unwrap()) {
-                return Err(Error::Storage("manifest: checksum mismatch".into()));
-            }
-            let m = Manifest::decode(body)?;
+            let m = manifest_checked(&b)?;
             s.manifest_version = m.version;
             // Never below what `attach_dir` read off the disk: the manifest's
             // counter is the lowest id it would be safe to resume at if the
@@ -4978,6 +5081,44 @@ mod tests {
             fs::write(&mutant, b).unwrap();
             let _ = Wal::replay(&mutant, &None, &"t/wal.log".into());
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A write the disk refuses is refused naming the log it could not
+    /// take -- which shard's volume -- and the statement's rollback to
+    /// its mark leaves nothing of it: the next reopen replays what was
+    /// acknowledged and no more.
+    #[test]
+    fn an_append_the_disk_refuses_names_the_log_and_leaves_nothing_of_the_record() {
+        let dir = std::env::temp_dir().join(format!("celastro-full-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let ids: crate::cipher::Ids = "t/wal.log".into();
+        let rec = |i: u64| WalRecord {
+            kind: 0,
+            key: format!("k{i}"),
+            ts: 100 + i,
+            doc: None,
+            supersedes: false,
+            segment_id: 0,
+        };
+        let mut w = Wal::open(&log, None, ids.clone()).unwrap();
+        w.append(&rec(0)).unwrap();
+        w.sync().unwrap();
+        let mark = w.mark().unwrap();
+        durability_probe::fail_next(durability_probe::Op::WalAppend, &log);
+        let e = w.append(&rec(1)).unwrap_err().to_string();
+        assert!(e.starts_with(&format!("io error: {}: ", log.display())), "{e}");
+        w.rollback(mark).unwrap();
+        // The next record lands, and a reopen replays the two that were
+        // acknowledged.
+        w.append(&rec(2)).unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let keys: Vec<String> =
+            Wal::replay(&log, &None, &ids).unwrap().into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, vec!["k0".to_string(), "k2".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 

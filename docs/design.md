@@ -658,6 +658,13 @@ pod deleted under a write load (`loss`): 2,443 writes acknowledged, two
 refused, none lost, the far shard named by `partial_results` meanwhile.
 Every pod killed at once, no grace, under load (`powerloss`): 1,749
 acknowledged, 145 refused, none lost after every node replayed its log. A
+node's volume filled under load (`diskfull`, 0.92.0, a 48 MiB tmpfs and a
+balloon file): 1,438 acknowledged on the other nodes' shards, 430 refused
+on the full node's naming its log, none lost, a `FLUSH` refused naming
+the space, the pod never restarted; 824 acknowledged and none refused
+once the space came back, and none lost after a restart with no grace --
+the refused statements' cut-back left no torn record for the replay to
+stop at. A
 link cut five seconds and healed five, three times, under load (`flap`):
 6,833 acknowledged, none refused, none lost -- a five-second cut sits
 inside the dial retry and the deadline. A move during a split
@@ -2374,7 +2381,12 @@ counted and left -- and `open_key` refuses a directory with a
 rotation; so does an index at the archived tier, whose objects are in a
 store the walk does not reach (the choice was that, or a key ring the
 frames cannot name a key into). `celastro check <DIR>` is the same walk
-opening everything and writing nothing.
+opening everything and writing nothing -- and on a directory in the clear
+(no `KEY`; 0.92.0) the same walk reading every segment's regions, the
+manifests, the delete logs and the catalog against their checksums and
+every log record against its CRC, a log that ends mid-record named as
+torn with where; under a key every file is a frame and a frame that opens
+is whole, which is why the two checks differ in what they read.
 
 **Measured, not proven: the constant-time claim and the build.** The
 crate's timing test (`crypto::timing`, ignored, run by hand in release)
@@ -2850,6 +2862,9 @@ guarantee:
 | a CA's pathLenConstraint bounds the intermediates below it, on anchors and links | `x509::tests::a_path_length_constraint_bounds_the_intermediates_below_a_ca` |
 | a revoked certificate is refused; a list another CA signed revokes nothing; openssl's list parses | `x509::tests::a_revoked_certificate_is_refused_and_an_unvouched_list_revokes_nothing` |
 | a revoked client certificate is refused at the handshake, naming the revocation | `tls13::tests::a_revoked_client_certificate_is_refused_at_the_handshake` |
+| a write the disk refuses names the log; the statement's cut leaves nothing of it | `shard::tests::an_append_the_disk_refuses_names_the_log_and_leaves_nothing_of_the_record` |
+| a directory in the clear is checked; a damaged segment, manifest and torn log are each named | `tests/encryption.rs::a_plain_directory_is_checked_and_every_damaged_file_is_named` |
+| the health report's recovery line: nothing shipped, a reach, a backup, STALE past the threshold | `engine::tests::the_health_report_says_how_far_back_a_restore_reaches` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
