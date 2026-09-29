@@ -403,7 +403,13 @@ NNNN/<rotation>-<first instant>-<last instant>.log`; an inline seal
 (`FLUSH`) archives the live log under the number its rotation would have
 taken and keeps that number consumed across restarts (`ARCHIVED` in the
 shard's directory), and `BACKUP LOG TO` copies the live logs under their
-next numbers, the rotation later replacing the copy with the whole. A
+next numbers, the rotation later replacing the copy with the whole (and
+since 0.93.0 removing it: a name carries the instants, so the whole is a
+new object, and the older copies of a number go once it is there); with
+`CELASTRO_LOG_SHIP_EVERY` set, `serve` does that on a cadence (0.93.0):
+the synced prefix of each live log copied beside it under the lock and
+put with the lock let go, so a store's seconds hold no statement up, a
+failed tick tried again at the next. A
 restore `AS OF t` takes the newest backup at or before `t`, lists the
 shard's archived logs, claims them in sequence from the one that
 straddles the backup's instant (or the first, or the one after a log the
@@ -664,7 +670,13 @@ on the full node's naming its log, none lost, a `FLUSH` refused naming
 the space, the pod never restarted; 824 acknowledged and none refused
 once the space came back, and none lost after a restart with no grace --
 the refused statements' cut-back left no torn record for the replay to
-stop at. A
+stop at. The live log shipped every five seconds, then every pod lost
+with no grace and its volume with it (`logship`, 0.93.0): 3,383
+acknowledged under the load, six ticks with something to ship and none
+failed, one archived log per node on the claim (each tick's copy
+replacing the last), and after the loss each pod restored its backup and
+that one log -- none of the 3,383 missing, the count the seed and the
+load. A
 link cut five seconds and healed five, three times, under load (`flap`):
 6,833 acknowledged, none refused, none lost -- a five-second cut sits
 inside the dial retry and the deadline. A move during a split

@@ -1108,6 +1108,12 @@ impl Server {
                 let (stop, grants) = (&stop, &grants);
                 scope.spawn(move || reconciler(db, stop, every, grants));
             }
+            if let (Some(every), Some(a)) =
+                (crate::engine::log_ship_interval(), read(db).log_archive())
+            {
+                let stop = &stop;
+                scope.spawn(move || log_shipper(db, stop, every, &a));
+            }
             if read(db).auto_failover() {
                 let (stop, grants) = (&stop, &grants);
                 scope.spawn(move || lease_renewer(db, stop, grants));
@@ -2338,6 +2344,64 @@ impl Grants {
             None
         } else {
             Some(left)
+        }
+    }
+}
+
+/// The log cadence (`CELASTRO_LOG_SHIP_EVERY`): every `every`, the live
+/// log of every shard held here to the archive, so a restore `AS OF`
+/// reaches within a tick of any acknowledged write without waiting for a
+/// seal or a `BACKUP LOG`. The synced prefix is copied under the lock --
+/// a memtable's worth at most, a local copy -- and put with the lock let
+/// go; a put that fails is logged and the next tick tries again, the
+/// copy replaced whole each time under the number the rotation will
+/// take. `SHOW HEALTH`'s recovery line moves with it.
+fn log_shipper(db: &RwLock<Db>, stop: &AtomicBool, every: Duration, a: &crate::backup::LogArchive) {
+    let mut last = Instant::now();
+    loop {
+        if crate::signal::shutdown_requested() || stop.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        if last.elapsed() < every {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        last = Instant::now();
+        let ships = match write(db).live_log_snapshots() {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log::warn("log_ship_failed", &[("error", e.to_string())]);
+                continue;
+            }
+        };
+        let (mut shipped, mut reach) = (0usize, 0u64);
+        let mut landed = Vec::new();
+        for ship in ships {
+            let (coll, index) = (ship.coll.clone(), ship.index);
+            match ship.put(a) {
+                Ok(Some((_, last))) => {
+                    shipped += 1;
+                    reach = reach.max(last);
+                    landed.push((coll, index, last));
+                }
+                Ok(None) => {}
+                Err(e) => crate::log::warn(
+                    "log_ship_failed",
+                    &[("collection", coll), ("shard", index.to_string()), ("error", e.to_string())],
+                ),
+            }
+        }
+        if !landed.is_empty() {
+            let mut g = write(db);
+            for (coll, index, last) in landed {
+                g.note_archived(&coll, index, last);
+            }
+        }
+        if shipped > 0 {
+            crate::log::info(
+                "logs_shipped",
+                &[("shards", shipped.to_string()), ("reaching", reach.to_string())],
+            );
         }
     }
 }

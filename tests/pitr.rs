@@ -6,7 +6,11 @@
 use celastro::engine::{Db, DbOpts, Outcome};
 use celastro::memtable::FlushThresholds;
 use celastro::value::Value;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("celastro-pitr-{tag}-{}", std::process::id()));
@@ -462,4 +466,88 @@ fn a_restore_forks_a_timeline_and_a_later_restore_follows_it() {
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&fresh);
     let _ = std::fs::remove_dir_all(&fresh2);
+}
+
+/// A statement to a served node over its console, and the reply's body.
+fn post(addr: &str, token: &str, sql: &str) -> String {
+    let body = celastro::json::to_string(&Value::obj(vec![("sql".into(), Value::Str(sql.into()))]));
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).unwrap();
+    reply
+}
+
+/// The cadence under `serve`: `CELASTRO_LOG_SHIP_EVERY=1` ships the live
+/// log every second, the process is lost with no grace, its volume with
+/// it, and a restore `AS OF` an instant after the last acknowledged write
+/// holds every row -- none of them sealed, none of them copied by hand.
+/// The point of L4: a power loss between two seals costs a tick, not the
+/// live log.
+#[test]
+fn a_served_node_ships_its_live_log_on_a_cadence_and_a_restore_holds_every_row_after_a_power_loss()
+{
+    let dest = dir("cadence-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let data = dir("cadence-data");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
+        .args(["--json", "--dir", data.to_str().unwrap(), "serve", "--port", "0"])
+        .env("CELASTRO_LOG_ARCHIVE", dest.to_str().unwrap())
+        .env("CELASTRO_LOG_SHIP_EVERY", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn celastro");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
+    let addr = hello.get("addr").and_then(|v| v.as_str()).unwrap().to_string();
+    let token = hello.get("token").and_then(|v| v.as_str()).unwrap().to_string();
+    let r = post(&addr, &token, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    assert!(r.contains("\"ok\":true"), "{r}");
+    let r = post(&addr, &token, &format!("BACKUP TO '{}'", dest.display()));
+    assert!(r.contains("\"ok\":true"), "{r}");
+    for i in 0..20 {
+        let r = post(
+            &addr,
+            &token,
+            &format!("INSERT INTO items VALUES ('{{\"id\":\"k{i:03}\",\"n\":{i}}}')"),
+        );
+        assert!(r.contains("\"ok\":true"), "{r}");
+    }
+    // Until the cadence has shipped every row: the health line's reach
+    // is an instant, and a restore to now holds twenty rows.
+    let t0 = Instant::now();
+    let fresh = dir("cadence-fresh");
+    let mut held = Vec::new();
+    while t0.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(500));
+        let h = post(&addr, &token, "SHOW HEALTH");
+        if !h.contains("archived logs reach ") {
+            continue;
+        }
+        let now = celastro::time::from_micros(celastro::time::now_micros());
+        let (_, rows) = restore_at(&fresh, &dest, now);
+        held = rows;
+        if held.len() == 20 {
+            break;
+        }
+    }
+    assert_eq!(held, expected(0..20), "the cadence never shipped every row");
+    // The power loss: no grace, and the volume gone with it.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&data);
+    let now = celastro::time::from_micros(celastro::time::now_micros());
+    let (m, held) = restore_at(&fresh, &dest, now);
+    assert_eq!(held, expected(0..20), "{m}");
+    assert!(m.contains("replayed"), "{m}");
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&fresh);
 }

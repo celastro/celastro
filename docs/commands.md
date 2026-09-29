@@ -553,6 +553,7 @@ Exit 0 is success, 1 a runtime or SQL error, 2 a usage error. Every
 above, the keys and certificates, `CELASTRO_ARCHIVE_*` and
 `CELASTRO_BACKUP_DIR` for the archived tier and the backups,
 `CELASTRO_LOG_ARCHIVE` for the write-ahead logs a restore to any instant
-replays, and the
+replays (`CELASTRO_LOG_SHIP_EVERY` ships the live ones on a cadence), and
+the
 tunables in [docs/tuning.md](tuning.md). A value that does not parse
 stops the start naming the variable.

@@ -6,6 +6,22 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The live log shipped on a cadence.** `CELASTRO_LOG_SHIP_EVERY=<seconds>`
+has `serve` copy every held shard's live log to `CELASTRO_LOG_ARCHIVE` on
+that cadence -- the synced part of the log, copied under the lock (a
+memtable's worth at most) and put with the lock let go, under the number
+its rotation will take, so each tick replaces the last copy -- and a
+restore `AS OF` then reaches within a tick of any acknowledged write
+without a seal or a `BACKUP LOG` in between. A tick that fails is logged
+and tried again at the next; `SHOW HEALTH`'s `recovery:` line moves with
+each. Off unless set. A copy of a log's number now removes the older
+copies of that number once it is there -- a name carries the instants a
+log spans, so a longer copy was a new object beside the shorter one, and
+a cadence would have left one behind per tick; a restore took the longest
+of a number already and still does.
+
 ## 0.92.0 — 2026-09-28
 
 **A write the disk refuses names the log.** A log append that fails --

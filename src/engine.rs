@@ -152,6 +152,18 @@ pub fn recovery_warn_secs() -> u64 {
 /// The default of `CELASTRO_RECOVERY_WARN`.
 pub const RECOVERY_WARN_SECS: u64 = 3_600;
 
+/// How often `serve` ships every held shard's live log to the log
+/// archive: `CELASTRO_LOG_SHIP_EVERY` seconds, `None` when unset or `0`
+/// (the default: the live log reaches the archive on `BACKUP LOG` and at
+/// its rotation only).
+pub fn log_ship_interval() -> Option<std::time::Duration> {
+    let secs = std::env::var("CELASTRO_LOG_SHIP_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 /// How often the console's sweep pulls every peer's catalog and
 /// reconciles it with this node's, seconds; `CELASTRO_RECONCILE_SECS`
 /// changes it, `0` turns the sweep off. `ATTACH NODE` reconciles at once.
@@ -2662,6 +2674,36 @@ impl Db {
     /// after the environment was scrubbed of it takes.
     pub fn wire_token(&self) -> Option<String> {
         self.wire_token.clone()
+    }
+
+    /// The log archive this node ships to, when `CELASTRO_LOG_ARCHIVE` set
+    /// one.
+    pub fn log_archive(&self) -> Option<Arc<crate::backup::LogArchive>> {
+        self.log_archive.clone()
+    }
+
+    /// A tick of the log cadence, under the lock: every held shard's live
+    /// log, its synced prefix copied beside it, for the caller to put to
+    /// the archive with the lock let go and then `note_archived`. Nothing
+    /// without a log archive.
+    pub fn live_log_snapshots(&mut self) -> Result<Vec<crate::shard::LiveLogShip>> {
+        let Some(a) = self.log_archive.clone() else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
+            if let Some(ship) = s.live_log_snapshot(&a)? {
+                out.push(ship);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A ship landed for a shard held here: its reach, for `SHOW HEALTH`.
+    pub fn note_archived(&mut self, coll: &str, index: usize, reach: Timestamp) {
+        if let Some(s) =
+            self.shards.get_mut(coll).and_then(|v| v.iter_mut().find(|s| s.index == index))
+        {
+            s.note_archived_reach(reach);
+        }
     }
 
     /// The recovery point: the last backup this process completed and how
@@ -10599,6 +10641,84 @@ mod tests {
         assert!(h.contains("STALE"), "{h}");
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tick of the log cadence: the synced live log copied under the
+    /// lock and put without it, the reach recorded; a second tick with
+    /// nothing new puts the same copy again under the same number; more
+    /// writes move the reach; and a restore `AS OF` the reach holds every
+    /// row the tick covered.
+    #[test]
+    fn a_tick_of_the_log_cadence_ships_the_synced_live_log_and_moves_the_reach() {
+        let root = std::env::temp_dir().join(format!("celastro-logship-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, archive) = (root.join("data"), root.join("archive"));
+        std::fs::create_dir_all(&archive).unwrap();
+        let opts = DbOpts { log_archive: Some(archive.display().to_string()), ..DbOpts::default() };
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(&format!("BACKUP TO '{}'", archive.display())).unwrap().finished().unwrap();
+        let row = |i: u32| Value::obj(vec![("id".into(), Value::Str(format!("n{i:03}")))]);
+        for i in 0..5 {
+            db.insert("notes", row(i)).unwrap();
+        }
+        let a = db.log_archive().unwrap();
+        let ships = db.live_log_snapshots().unwrap();
+        assert_eq!(ships.len(), 1);
+        let (coll, index) = (ships[0].coll.clone(), ships[0].index);
+        let (first, last) = ships.into_iter().next().unwrap().put(&a).unwrap().expect("records");
+        assert!(first <= last);
+        db.note_archived(&coll, index, last);
+        assert_eq!(db.recovery_point().1, Some(last));
+        let t5 = last;
+        // Nothing new: the same copy, the same number, the reach where it was.
+        let again = db.live_log_snapshots().unwrap().into_iter().next().unwrap().put(&a).unwrap();
+        assert_eq!(again, Some((first, last)));
+        for i in 5..8 {
+            db.insert("notes", row(i)).unwrap();
+        }
+        let (_, later) =
+            db.live_log_snapshots().unwrap().into_iter().next().unwrap().put(&a).unwrap().unwrap();
+        assert!(later > last);
+        db.note_archived(&coll, index, later);
+        assert_eq!(db.recovery_point().1, Some(later));
+        let logs: Vec<_> = walk(&archive).into_iter().filter(|p| p.ends_with(".log")).collect();
+        assert_eq!(logs.len(), 1, "one copy, replaced: {logs:?}");
+        drop(db);
+        // A restore to the first tick's reach holds the five rows it covered.
+        let fresh = root.join("fresh");
+        let mut r = Db::open(&fresh, DbOpts::default()).unwrap();
+        let m = match r
+            .execute(&format!("RESTORE FROM '{}' AS OF {t5}", archive.display()))
+            .unwrap()
+            .finished()
+            .unwrap()
+        {
+            Outcome::Ack(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(m.contains("replayed"), "{m}");
+        let n = r.query("SELECT id FROM notes LIMIT 100").unwrap().rows.len();
+        assert_eq!(n, 5, "{m}");
+        drop(r);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `dir`, as paths relative to it.
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p.strip_prefix(dir).unwrap().display().to_string());
+                }
+            }
+        }
+        out
     }
 
     /// A collection made through the library is named by the statement's

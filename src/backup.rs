@@ -200,6 +200,24 @@ pub struct LogArchive {
     pub(crate) slug: String,
 }
 
+/// An archived log's name read: `<seq>-<first>-<last>.log` (timeline 0,
+/// as before 0.81.0) or `<timeline>-<seq>-<first>-<last>.log`.
+fn parse_log_name(name: &str) -> Option<(u64, u64, Timestamp, Timestamp)> {
+    let stem = name.strip_suffix(".log")?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    let (timeline, rest) = match parts.len() {
+        3 => (0u64, &parts[..]),
+        4 => (parts[0].parse::<u64>().ok()?, &parts[1..]),
+        _ => return None,
+    };
+    Some((
+        timeline,
+        rest[0].parse::<u64>().ok()?,
+        rest[1].parse::<Timestamp>().ok()?,
+        rest[2].parse::<Timestamp>().ok()?,
+    ))
+}
+
 /// One archived log, by name.
 pub(crate) struct ArchivedLog {
     pub key: String,
@@ -350,6 +368,28 @@ impl LogArchive {
                 self.target.store.put_file(&self.target.key(&key), path)?;
             }
         }
+        // The copy replaces the last: the name carries the instants, so a
+        // longer copy of the same number -- a live log shipped a tick
+        // later, or the rotation's whole -- is a new object, and the
+        // shorter one is removed once the new one is there. A restore
+        // takes the longest copy of a number anyway; this keeps a cadence
+        // from leaving one object per tick behind. Best effort: a copy
+        // left behind is harmless, the ship landed.
+        let keep = self.target.key(&key);
+        let prefix = self.target.key(&self.prefix(collection, shard));
+        if let Ok(keys) = self.target.store.list(&prefix) {
+            for k in keys {
+                if k == keep {
+                    continue;
+                }
+                let name = k.rsplit('/').next().unwrap_or("");
+                if let Some((tl, s, _, _)) = parse_log_name(name) {
+                    if tl == timeline && s == seq {
+                        let _ = self.target.store.delete(&k);
+                    }
+                }
+            }
+        }
         Ok(Some((first, last)))
     }
 
@@ -379,19 +419,7 @@ impl LogArchive {
         let mut logs: Vec<ArchivedLog> = Vec::new();
         for key in self.target.store.list(&prefix)? {
             let name = key.rsplit('/').next().unwrap_or("");
-            let Some(stem) = name.strip_suffix(".log") else { continue };
-            let parts: Vec<&str> = stem.split('-').collect();
-            let (timeline, rest) = match parts.len() {
-                3 => (Some(0u64), &parts[..]),
-                4 => (parts[0].parse::<u64>().ok(), &parts[1..]),
-                _ => continue,
-            };
-            let seq = rest[0].parse::<u64>().ok();
-            let first = rest[1].parse::<Timestamp>().ok();
-            let last = rest[2].parse::<Timestamp>().ok();
-            if let (Some(timeline), Some(seq), Some(first), Some(last)) =
-                (timeline, seq, first, last)
-            {
+            if let Some((timeline, seq, first, last)) = parse_log_name(name) {
                 logs.push(ArchivedLog { key: key.clone(), timeline, seq, first, last, cut: false });
             }
         }

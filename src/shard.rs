@@ -679,6 +679,38 @@ pub(crate) fn publish_content(
     Ok(bytes)
 }
 
+/// A live log's synced prefix, copied beside the log under the lock and
+/// put to the archive without it: what the cadence ships. The copy is
+/// removed by `put`, taken or not.
+pub struct LiveLogShip {
+    pub coll: String,
+    pub index: usize,
+    timeline: u64,
+    seq: u64,
+    tmp: PathBuf,
+    cipher: crate::cipher::Shared,
+    ids: crate::cipher::Ids,
+}
+
+impl LiveLogShip {
+    /// The copy to the archive under the number the log's rotation will
+    /// take -- the same number again replaces the last copy -- and the
+    /// instants it spans, or none for a copy with no record.
+    pub fn put(self, a: &crate::backup::LogArchive) -> Result<Option<(Timestamp, Timestamp)>> {
+        let put = a.put_log(
+            &self.coll,
+            self.index,
+            self.timeline,
+            self.seq,
+            &self.tmp,
+            &self.cipher,
+            &self.ids,
+        );
+        let _ = fs::remove_file(&self.tmp);
+        put
+    }
+}
+
 /// A manifest's bytes checked against the checksum they end in, and
 /// decoded.
 pub(crate) fn manifest_checked(b: &[u8]) -> Result<Manifest> {
@@ -1841,6 +1873,14 @@ impl Wal {
     /// The log's length on disk.
     pub(crate) fn len(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    /// The log's length at its last good sync: what is on the disk for
+    /// sure, and so what a copy of the live log may carry -- a record
+    /// past it is acknowledged to nobody yet, and a sync that fails cuts
+    /// it off.
+    pub(crate) fn synced_len(&self) -> u64 {
+        self.group.lock().synced_len
     }
 
     /// Cut the log back to `mark`: the records a refused statement wrote
@@ -3275,6 +3315,46 @@ impl Shard {
         } else {
             now
         }
+    }
+
+    /// The live log's synced prefix copied beside it, for a ship off the
+    /// lock (`CELASTRO_LOG_SHIP_EVERY`): what `archive_live_log` does under
+    /// the lock, split so the put -- seconds to a store over the network
+    /// -- holds no statement up. The fork is resolved here, as there.
+    /// `None` for a shard in memory or a log with nothing synced.
+    pub(crate) fn live_log_snapshot(
+        &mut self,
+        a: &crate::backup::LogArchive,
+    ) -> Result<Option<LiveLogShip>> {
+        if self.dir.is_none() {
+            return Ok(None);
+        }
+        self.resolve_fork(a)?;
+        let Some(dir) = &self.dir else { return Ok(None) };
+        let Some(w) = &self.wal else { return Ok(None) };
+        let len = w.synced_len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let live = dir.join("wal.log");
+        let tmp = dir.join("wal.ship.part");
+        let bytes = fs::read(&live)?;
+        let take = (len as usize).min(bytes.len());
+        fs::write(&tmp, &bytes[..take])?;
+        Ok(Some(LiveLogShip {
+            coll: self.coll.name.clone(),
+            index: self.index,
+            timeline: self.timeline,
+            seq: self.wal_seq,
+            tmp,
+            cipher: self.opts.cipher.clone(),
+            ids: self.file_ids("wal.log"),
+        }))
+    }
+
+    /// A ship off the lock landed: the reach it moved to, never back.
+    pub(crate) fn note_archived_reach(&mut self, reach: Timestamp) {
+        self.archived_reach = self.archived_reach.max(Some(reach));
     }
 
     /// `BACKUP LOG`: the live log to the archive `a`, under the number its

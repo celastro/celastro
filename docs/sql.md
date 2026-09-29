@@ -447,7 +447,10 @@ path that leaves it.
 write-ahead log is copied there as a seal rotates it -- before the seal
 removes it, and a seal the archive refuses is tried again with the log
 still on the disk -- and `BACKUP LOG TO '<the same>'` copies the live
-logs now (a job every minute is a one-minute point). `RESTORE FROM '<the
+logs now, and `CELASTRO_LOG_SHIP_EVERY=<seconds>` has `serve` do that on
+a cadence -- the synced part of each live log, replaced each tick, so a
+restore reaches within a tick of any acknowledged write (0.93.0).
+`RESTORE FROM '<the
 same>' AS OF <any instant>` then takes the newest backup at or before it,
 replays the archived logs up to it, and says how far it reached: the
 instant asked, or where the archive ends, or a gap where a log was never
