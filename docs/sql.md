@@ -446,6 +446,16 @@ backup 7331102771519565824 to /mnt/backups: 1 collection(s), 1 shard(s), ...; at
 `CELASTRO_BACKUP_DIR` makes a bare name resolve under it and refuses a
 path that leaves it.
 
+**How many rows.** A select with no `LIMIT` answers ten. A `GROUP BY`
+with no `LIMIT` answers `CELASTRO_MAX_ROWS` groups (10,000 by default),
+and any `LIMIT` is taken as at most `CELASTRO_MAX_ROWS_HARD` (1,000,000):
+a statement cannot ask a node to hold every row of a collection in one
+answer. When a bound the statement did not set cut the rows and the cut
+left rows behind, the reply says so -- `"more": true` on the console's
+API, `more` in the library's result -- and the console prints it above
+the table; a `LIMIT` the statement set is the statement's own, and the
+reply does not second-guess it. (0.96.0)
+
 **Any instant.** A backup is exact at its instant. With
 `CELASTRO_LOG_ARCHIVE=<dir or s3://bucket/prefix>` every held shard's
 write-ahead log is copied there as a seal rotates it -- before the seal

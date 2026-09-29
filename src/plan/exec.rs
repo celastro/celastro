@@ -183,6 +183,11 @@ pub type Facets = Vec<(String, Vec<(Value, u64)>)>;
 #[non_exhaustive]
 pub struct QueryResult {
     pub rows: Vec<Row>,
+    /// The rows were cut by a bound the statement did not set -- the ten a
+    /// select with no `LIMIT` answers, `CELASTRO_MAX_ROWS` for a `GROUP BY`
+    /// with none, `CELASTRO_MAX_ROWS_HARD` for a `LIMIT` past it -- and the
+    /// cut left rows behind, as far as this node can tell.
+    pub more: bool,
     /// `FACET`: per path, its top values by count over the rows the
     /// predicate admits, the most first.
     pub facets: Facets,
@@ -220,6 +225,7 @@ impl QueryResult {
     /// filling in what the answer carried.
     pub fn of_rows(rows: Vec<Row>) -> QueryResult {
         QueryResult {
+            more: false,
             rows,
             facets: Vec::new(),
             explain: None,
@@ -371,6 +377,9 @@ pub struct ExecInput<'a> {
     /// order; `select` already has them bound as `IN` lists, and these are
     /// for the shards on other nodes that re-parse the statement.
     pub frontiers: &'a [Vec<String>],
+    /// The limit is the node's bound, not the statement's (`Db::bound_select`):
+    /// the answer says `more` when the cut left rows behind.
+    pub capped: bool,
     /// One candidate list per `hops(...)` source of the ORDER BY, in order,
     /// each key scored by the hop it was first reached at.
     pub hop_sources: Vec<Vec<Candidate>>,
@@ -681,7 +690,12 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
 
     // --- Non-ranked queries: no candidate generation, just a filtered scan.
     if sources.is_empty() {
-        let out = scan(&input, &prefix, k, &mut ex)?;
+        // One row past the cut when the cut is the node's, so the answer
+        // can say `more`: the scan holds `offset + k + 1` at most.
+        let ask = if input.capped { k.saturating_add(1) } else { k };
+        let mut out = scan(&input, &prefix, ask, &mut ex)?;
+        let more = input.capped && out.0.len() > k;
+        out.0.truncate(k);
         ex.total_micros = t0.elapsed().as_micros();
         let cut = truncated_prefixes(input.stats);
         ex.notes.extend(cut.iter().cloned());
@@ -696,6 +710,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         missing.extend(out.1);
         ex.missing = missing.clone();
         return Ok(QueryResult {
+            more,
             rows,
             facets,
             explain: if input.analyze { Some(ex) } else { None },
@@ -916,6 +931,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     }
 
     // COLLAPSE BY: keep the best-scoring child per parent (§5.4).
+    let more = input.capped && ranked.len() > want;
     let mut fetch_t = Instant::now();
     let mut rows: Vec<Row> = Vec::new();
     if let Some(parent_path) = &sel.collapse {
@@ -1001,6 +1017,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     }
     let facets = facets_for(&input, &prefix, t0)?;
     Ok(QueryResult {
+        more,
         rows,
         facets,
         explain: if input.analyze { Some(ex) } else { None },
@@ -1037,6 +1054,7 @@ fn facets_for(input: &ExecInput<'_>, prefix: &Option<String>, t0: Instant) -> Re
             cut_walks: Vec::new(),
             walk_missing: Vec::new(),
             facet: Some(path.clone()),
+            capped: false,
         };
         let r = aggregate_select(&finput, prefix, t0, Explain::default())?;
         let values = r
@@ -1456,8 +1474,9 @@ fn aggregate_select(
         });
     }
     let total = rows.len();
-    let rows: Vec<Row> =
-        rows.into_iter().skip(sel.offset).take(sel.limit.unwrap_or(usize::MAX)).collect();
+    let taking = sel.limit.unwrap_or(usize::MAX);
+    let more = input.capped && total > sel.offset.saturating_add(taking);
+    let rows: Vec<Row> = rows.into_iter().skip(sel.offset).take(taking).collect();
     ex.limit = sel.limit.unwrap_or(total);
     ex.notes.push(format!("aggregate: {total} group(s) merged from the shards' partials"));
     ex.total_micros = t0.elapsed().as_micros();
@@ -1470,6 +1489,7 @@ fn aggregate_select(
     all_missing.extend(missing);
     ex.missing = all_missing.clone();
     Ok(QueryResult {
+        more,
         rows,
         explain: if input.analyze { Some(ex) } else { None },
         missing: all_missing,

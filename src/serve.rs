@@ -3451,7 +3451,7 @@ fn catalog_json(db: &Db) -> String {
 
 pub(crate) fn rows_json(r: &QueryResult, elapsed_ms: u128) -> String {
     let count = r.rows.len();
-    let mut out = format!(r#"{{"ok":true,"kind":"rows","count":{count},"#);
+    let mut out = format!(r#"{{"ok":true,"kind":"rows","count":{count},"more":{},"#, r.more);
     out.push_str(&format!(r#""elapsed_ms":{elapsed_ms},"missing":["#));
     for (i, m) in r.missing.iter().enumerate() {
         if i > 0 {
@@ -5036,6 +5036,18 @@ mod tests {
         request.push_str("Host: localhost\r\nContent-Type: application/json\r\n");
         request.push_str("Content-Length: 400\r\n\r\n{\"sql\":\"SELECT 1\"}");
         assert_eq!(status_line(&answer_to(&request)), "HTTP/1.1 400 Bad Request");
+    }
+
+    /// The rows reply carries `more`: true when the cut left rows behind,
+    /// false otherwise, beside the count.
+    #[test]
+    fn a_rows_reply_says_more_when_the_cut_left_rows_behind() {
+        let cut = QueryResult { more: true, ..Default::default() };
+        let whole = QueryResult::default();
+        let j = rows_json(&cut, 1);
+        assert!(j.contains(r#""count":0,"more":true,"#), "{j}");
+        let j = rows_json(&whole, 1);
+        assert!(j.contains(r#""count":0,"more":false,"#), "{j}");
     }
 
     #[test]

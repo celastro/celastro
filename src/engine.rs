@@ -152,6 +152,23 @@ pub fn recovery_warn_secs() -> u64 {
 /// The default of `CELASTRO_RECOVERY_WARN`.
 pub const RECOVERY_WARN_SECS: u64 = 3_600;
 
+/// The defaults of `CELASTRO_MAX_ROWS` and `CELASTRO_MAX_ROWS_HARD`: the
+/// rows a `GROUP BY` with no `LIMIT` answers, and the most any `LIMIT` is
+/// taken as.
+pub const MAX_ROWS: usize = 10_000;
+pub const MAX_ROWS_HARD: usize = 1_000_000;
+
+/// `(CELASTRO_MAX_ROWS, CELASTRO_MAX_ROWS_HARD)`, or the defaults; the hard
+/// one is never below the other, and neither is zero.
+pub fn row_caps_from_env() -> (usize, usize) {
+    let read = |name: &str, or: usize| {
+        std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(or).max(1)
+    };
+    let max = read("CELASTRO_MAX_ROWS", MAX_ROWS);
+    let hard = read("CELASTRO_MAX_ROWS_HARD", MAX_ROWS_HARD).max(max);
+    (max, hard)
+}
+
 /// How often `serve` ships every held shard's live log to the log
 /// archive: `CELASTRO_LOG_SHIP_EVERY` seconds, `None` when unset or `0`
 /// (the default: the live log reaches the archive on `BACKUP LOG` and at
@@ -1178,6 +1195,11 @@ pub struct Db {
     /// (`CELASTRO_MIN_HOLDERS`, read at open): what every shard's options
     /// carry.
     min_holders: usize,
+    /// The row caps (`CELASTRO_MAX_ROWS`, `CELASTRO_MAX_ROWS_HARD`, read at
+    /// open): what a `GROUP BY` with no `LIMIT` gets, and the most any
+    /// `LIMIT` is taken as. See [`Db::bound_select`].
+    max_rows: usize,
+    max_rows_hard: usize,
     /// One connection per other node, opened on demand. See `crate::wire`.
     nodes: Mutex<BTreeMap<String, Arc<crate::wire::Node>>>,
     /// The nodes this process has verified since it started -- an `ATTACH
@@ -1278,6 +1300,8 @@ impl Db {
             sim: None,
             wire_token: crate::wire::token_from_env(),
             min_holders: crate::replication::min_holders_from_env(),
+            max_rows: row_caps_from_env().0,
+            max_rows_hard: row_caps_from_env().1,
             nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
             not_adopted: BTreeSet::new(),
@@ -2694,6 +2718,43 @@ impl Db {
     /// after the environment was scrubbed of it takes.
     pub fn wire_token(&self) -> Option<String> {
         self.wire_token.clone()
+    }
+
+    /// The row caps in place: `(CELASTRO_MAX_ROWS, CELASTRO_MAX_ROWS_HARD)`.
+    pub fn row_caps(&self) -> (usize, usize) {
+        (self.max_rows, self.max_rows_hard)
+    }
+
+    /// The row caps changed after the open: what a test sets in place of
+    /// the environment, which is one per process.
+    pub fn set_row_caps(&mut self, max_rows: usize, hard: usize) {
+        self.max_rows = max_rows.max(1);
+        self.max_rows_hard = hard.max(self.max_rows);
+    }
+
+    /// A select bounded: a `LIMIT` past `CELASTRO_MAX_ROWS_HARD` is taken as
+    /// that, a `GROUP BY` with no `LIMIT` gets `CELASTRO_MAX_ROWS`, and a
+    /// select with no `LIMIT` keeps its ten. The flag says the bound was
+    /// the node's, not the statement's: the reply then says `more` when
+    /// the cut left rows behind, so nobody takes a bounded answer for the
+    /// whole.
+    pub fn bound_select(&self, sel: &Select) -> (Select, bool) {
+        let grouped = sel.group_by.is_some()
+            || sel.projections.iter().any(|p| matches!(p, Projection::Aggregate { .. }));
+        let mut out = sel.clone();
+        let capped = match sel.limit {
+            Some(l) if l > self.max_rows_hard => {
+                out.limit = Some(self.max_rows_hard);
+                true
+            }
+            Some(_) => false,
+            None if grouped => {
+                out.limit = Some(self.max_rows);
+                true
+            }
+            None => true,
+        };
+        (out, capped)
     }
 
     /// The store behind the `archived` tier from now on, for the shards
@@ -8946,6 +9007,10 @@ impl Db {
         partial: bool,
         mut unreachable: Vec<usize>,
     ) -> Result<QueryResult> {
+        // Bounded first, so every use of the limit below -- the candidate
+        // depth, what each shard is asked for, the cut -- sees the bound.
+        let (bounded, capped) = self.bound_select(sel);
+        let sel = &bounded;
         // Every walk first: `WITHIN k HOPS OF` is resolved to a key set here,
         // at the same pinned instant as everything after it, and bound into
         // the statement as an `IN` before the prefixes, the statistics and
@@ -9270,6 +9335,7 @@ impl Db {
             cut_walks,
             walk_missing,
             facet: None,
+            capped,
         })
     }
 
@@ -10792,6 +10858,76 @@ mod tests {
         db.set_min_holders(1);
         db.execute("DELETE FROM notes WHERE id = 'n1'").unwrap();
         assert_eq!(db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 0);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The row caps, set low on this database: a select with no `LIMIT`
+    /// answers ten and says `more`; a `GROUP BY` with none is cut at
+    /// `CELASTRO_MAX_ROWS` and says so, with a `LIMIT` it is the
+    /// statement's own; a `LIMIT` past `CELASTRO_MAX_ROWS_HARD` is taken as
+    /// the ceiling and says `more`; a `LIMIT` under it is untouched, and a
+    /// predicate that admits fewer rows than the cut says nothing.
+    #[test]
+    fn a_select_is_bounded_by_the_node_and_says_when_the_cut_left_rows_behind() {
+        let dir = std::env::temp_dir().join(format!("celastro-row-caps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.row_caps(), (MAX_ROWS, MAX_ROWS_HARD));
+        db.set_row_caps(100, 1000);
+        db.execute("CREATE COLLECTION t (id TEXT PRIMARY KEY, n INT)").unwrap();
+        db.execute("CREATE INDEX t_body ON t USING fulltext (body)").unwrap();
+        for i in 0..1200 {
+            db.insert(
+                "t",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("k{i:05}"))),
+                    ("n".into(), Value::Int(i)),
+                    ("body".into(), Value::Str(format!("row {i} of the bounded set"))),
+                ]),
+            )
+            .unwrap();
+        }
+        let q = |db: &mut Db, sql: &str| {
+            let r = db.query(sql).unwrap();
+            (r.rows.len(), r.more)
+        };
+        assert_eq!(q(&mut db, "SELECT id FROM t"), (10, true), "no LIMIT: ten, and more");
+        assert_eq!(q(&mut db, "SELECT id FROM t WHERE n < 5"), (5, false), "fewer than ten exist");
+        assert_eq!(q(&mut db, "SELECT id FROM t LIMIT 500"), (500, false), "the statement's own");
+        assert_eq!(q(&mut db, "SELECT id FROM t LIMIT 5000"), (1000, true), "past the ceiling");
+        assert_eq!(
+            q(&mut db, "SELECT id FROM t ORDER BY n LIMIT 5000"),
+            (1000, true),
+            "ordered, past the ceiling"
+        );
+        // The ranked path (which must say its LIMIT): candidates past what
+        // was fetched say more.
+        assert_eq!(
+            q(&mut db, "SELECT id FROM t ORDER BY hybrid(text_match(body, 'bounded')) LIMIT 5000"),
+            (1000, true),
+            "ranked, past the ceiling"
+        );
+        assert_eq!(
+            q(&mut db, "SELECT id FROM t ORDER BY hybrid(text_match(body, 'bounded')) LIMIT 500"),
+            (500, false),
+            "ranked, the statement's own"
+        );
+        assert_eq!(
+            q(&mut db, "SELECT n, count(*) FROM t GROUP BY n"),
+            (100, true),
+            "groups cut at the cap"
+        );
+        assert_eq!(
+            q(&mut db, "SELECT n, count(*) FROM t GROUP BY n LIMIT 200"),
+            (200, false),
+            "the statement's own"
+        );
+        assert_eq!(
+            q(&mut db, "SELECT n, count(*) FROM t WHERE n < 50 GROUP BY n"),
+            (50, false),
+            "fewer groups than the cap"
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

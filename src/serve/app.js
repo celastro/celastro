@@ -193,6 +193,13 @@ function renderRows(res) {
   // console has, so it gets its own block and goes into the live region too.
   var missing = Array.isArray(res.missing) ? res.missing : [];
   var warnings = [];
+  // `more`: the rows were cut by a bound the statement did not set (the
+  // ten a select with no LIMIT answers, the node's caps for a GROUP BY
+  // or a LIMIT past the ceiling) and the cut left rows behind.
+  if (res.more) {
+    warnings.push('MORE ROWS than these ' + rows.length + ': the reply was cut by a bound the ' +
+      'statement did not set. Add a LIMIT, or a smaller predicate, to see the rest.');
+  }
   if (missing.length) {
     warnings.push('PARTIAL RESULT: ' + missing.join(', ') +
       ' did not answer. Rows held only there are missing from this table.');

@@ -445,6 +445,11 @@ curl -s -X POST -H "$T" http://127.0.0.1:18787/api/shutdown
 {"ok":true,"kind":"ack","message":"shutting down"}
 ```
 
+A rows reply carries `more: true` when a bound the statement did not set
+-- the ten a select with no `LIMIT` answers, `CELASTRO_MAX_ROWS` for a
+`GROUP BY`, `CELASTRO_MAX_ROWS_HARD` for a `LIMIT` past it -- cut the
+rows and the cut left rows behind (0.96.0).
+
 `/api/health` needs no token: `ok:true` says the process answers,
 `attached` how many peers it has verified, and `busy:true` that the
 database lock was held when it was asked (alive, not ready). It says

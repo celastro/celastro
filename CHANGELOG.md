@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A bound on what one statement can ask a node to hold.** A `GROUP BY`
+with no `LIMIT` answers `CELASTRO_MAX_ROWS` groups (10,000 by default)
+rather than every one, and any `LIMIT` is taken as at most
+`CELASTRO_MAX_ROWS_HARD` (1,000,000). A select with no `LIMIT` answers
+ten, as it did. When a bound the statement did not set cut the rows and
+the cut left rows behind, the reply now says so: `"more": true` on the
+console's API, `more` in the library's result, and a line above the
+console's table. A `LIMIT` the statement set is its own.
+
 ## 0.95.0 — 2026-09-29
 
 **A move to the archived tier is confirmed before the local file goes.**
