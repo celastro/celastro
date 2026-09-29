@@ -6,6 +6,19 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A floor on how many nodes hold an acknowledged write.**
+`CELASTRO_MIN_HOLDERS=n` (1 by default, today's behaviour) refuses a
+write that fewer than `n` nodes would hold -- the holder and the
+followers fed live at that moment -- before it is logged, naming the
+count. Under `confirm = 'all'` a follower away or catching up holds
+nothing and the write was acknowledged on this disk alone, with
+`DEGRADED` in `SHOW HEALTH` the only sign; the floor is for the operator
+who would rather refuse than acknowledge that; a cluster just started
+refuses writes under it until its followers are fed live, a matter of
+seconds. The refusals are counted (`celastro_writes_refused_holders_total`).
+
 ## 0.93.0 — 2026-09-29
 
 **The live log shipped on a cadence.** `CELASTRO_LOG_SHIP_EVERY=<seconds>`

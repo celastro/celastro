@@ -20,7 +20,7 @@
 //! catch-up and not a node's memory.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,43 @@ pub struct Follower {
 
 /// Items a follower's backlog may hold before it is sent back to a catch-up.
 pub const BACKLOG_CAP: usize = 100_000;
+
+/// Writes the floor on holders refused (`CELASTRO_MIN_HOLDERS`, see
+/// [`holders_check`]), for the metrics.
+static HOLDER_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// `CELASTRO_MIN_HOLDERS`, or 1: the floor a database opens with.
+pub fn min_holders_from_env() -> usize {
+    std::env::var("CELASTRO_MIN_HOLDERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+pub fn holder_refusals() -> u64 {
+    HOLDER_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// The floor on how many nodes hold an acknowledged write
+/// (`CELASTRO_MIN_HOLDERS`, 1 by default), against what would hold a
+/// write to a shard: this node and `live` followers. Under `confirm =
+/// 'all'` a follower away holds nothing and the write is acknowledged on
+/// this disk alone (`SHOW HEALTH` says DEGRADED); the floor is for the
+/// operator who would rather refuse than acknowledge that. `Ok` when
+/// enough would hold it; otherwise the refusal, named and counted.
+pub fn holders_check(collection: &str, shard: usize, live: usize, min: usize) -> Result<()> {
+    let would = 1 + live;
+    if would >= min {
+        return Ok(());
+    }
+    HOLDER_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    Err(Error::Plan(format!(
+        "shard {shard} of `{collection}`: {would} node(s) would hold this write, {min} required \
+         (CELASTRO_MIN_HOLDERS); refused rather than acknowledged on too few -- a follower away or \
+         catching up holds nothing yet; see SHOW HEALTH"
+    )))
+}
 /// Items per frame.
 pub const BATCH: usize = 500;
 
@@ -319,6 +356,17 @@ impl Shipper {
 
     pub fn followers(&self) -> Vec<String> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|f| f.url.clone()).collect()
+    }
+
+    /// Followers fed from the backlog now: the ones a write reaches as it
+    /// is acknowledged, and so the ones that count towards the floor.
+    pub fn live_followers(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|f| f.state == FollowerState::Live)
+            .count()
     }
 
     pub fn stop(&self) {

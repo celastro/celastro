@@ -2107,6 +2107,9 @@ pub struct ShardOpts {
     pub residency: Option<Arc<ResidencyManager>>,
     /// Who this node is, for resolving the `minimal` tier.
     pub placement: Placement,
+    /// The floor on how many nodes hold an acknowledged write
+    /// (`CELASTRO_MIN_HOLDERS`): see [`crate::replication::holders_check`].
+    pub min_holders: usize,
     /// The object store the `archived` tier lives in, and the key prefix.
     /// `None` keeps the local `archive/` directory as the stand-in.
     pub archive: Option<crate::objstore::ArchiveHandle>,
@@ -2709,7 +2712,20 @@ impl Shard {
     /// document store with any secondary index pays anyway; in return, one
     /// delete-log entry invalidates that version across every index type at
     /// once (§4.4).
+    /// The floor on holders (`CELASTRO_MIN_HOLDERS`), before a write is
+    /// logged: this node and the followers fed live now.
+    fn holders_check(&self) -> Result<()> {
+        let live = self.shipper.as_ref().map(|s| s.live_followers()).unwrap_or(0);
+        crate::replication::holders_check(&self.coll.name, self.index, live, self.opts.min_holders)
+    }
+
+    /// The floor changed after the open (a test's): this shard's copy.
+    pub(crate) fn set_min_holders(&mut self, n: usize) {
+        self.opts.min_holders = n.max(1);
+    }
+
     pub(crate) fn insert(&mut self, mut doc: Value) -> Result<Timestamp> {
+        self.holders_check()?;
         self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         self.coll.validate(&doc)?;
         self.coll.coerce(&mut doc);
@@ -2816,6 +2832,7 @@ impl Shard {
         &mut self,
         docs: Vec<(String, Value)>,
     ) -> Result<Vec<Timestamp>> {
+        self.holders_check()?;
         self.writes.fetch_add(docs.len() as u64, AtomicOrdering::Relaxed);
         let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
             Vec::with_capacity(docs.len());
@@ -2940,6 +2957,7 @@ impl Shard {
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<Option<Timestamp>> {
+        self.holders_check()?;
         self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         let ts = self.clock.now();
         let Some(prev) = self.locate(key, MAX_TS) else { return Ok(None) };
@@ -2993,6 +3011,7 @@ impl Shard {
     /// is deleted once; a key not there is not counted. The keys that were
     /// there, with their instants.
     pub(crate) fn delete_many(&mut self, keys: &[String]) -> Result<Vec<(String, Timestamp)>> {
+        self.holders_check()?;
         self.writes.fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
         let mut seen = BTreeSet::new();
         let mut prepared: Vec<(WalRecord, Loc)> = Vec::new();

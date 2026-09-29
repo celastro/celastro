@@ -676,7 +676,15 @@ acknowledged under the load, six ticks with something to ship and none
 failed, one archived log per node on the claim (each tick's copy
 replacing the last), and after the loss each pod restored its backup and
 that one log -- none of the 3,383 missing, the count the seed and the
-load. A
+load. The failover drill under `CELASTRO_MIN_HOLDERS=2` (`holders`,
+0.94.0): a collection's followers live a second after it was made and
+1,438 acknowledged with none refused while they were; the holder cut
+off and the follower promoted 21 s later, alone, and a write to its
+shard refused naming one node and the two required rather than
+acknowledged on one disk; across the cut 1,793 acknowledged on the other
+shards and 2,923 refused, none of the acknowledged lost; the old holder
+back, demoted and caught up, a write to the shard landing again, every
+count agreeing. A
 link cut five seconds and healed five, three times, under load (`flap`):
 6,833 acknowledged, none refused, none lost -- a five-second cut sits
 inside the dial retry and the deadline. A move during a split
@@ -824,7 +832,11 @@ one, and a catch-up begins by naming where the follower stands
 (`SHIP_CATCHING_UP`), so the copy holds that position until the
 catch-up is whole and one cut short starts again from there (0.79.0;
 before it a copy already caught up moved its position with every chunk,
-and a catch-up cut short skipped the rows the chunks after it held).
+and a catch-up cut short skipped the rows the chunks after it held). Since 0.94.0 the operator can refuse instead:
+`CELASTRO_MIN_HOLDERS=n` refuses, before it is logged, a write that
+fewer than `n` nodes would hold -- the holder and the followers fed live
+at that moment -- naming the count, so nothing is acknowledged on one
+disk unless the floor says one is enough.
 
 The map entry of a shard carries a term, raised by every promotion,
 every copy replaced, and (0.80.0) every change of holder or followers
@@ -2877,6 +2889,10 @@ guarantee:
 | a write the disk refuses names the log; the statement's cut leaves nothing of it | `shard::tests::an_append_the_disk_refuses_names_the_log_and_leaves_nothing_of_the_record` |
 | a directory in the clear is checked; a damaged segment, manifest and torn log are each named | `tests/encryption.rs::a_plain_directory_is_checked_and_every_damaged_file_is_named` |
 | the health report's recovery line: nothing shipped, a reach, a backup, STALE past the threshold | `engine::tests::the_health_report_says_how_far_back_a_restore_reaches` |
+| a tick of the log cadence ships the synced live log, replaces its copy, moves the reach; a restore to the tick's reach | `engine::tests::a_tick_of_the_log_cadence_ships_the_synced_live_log_and_moves_the_reach` |
+| a served node shipping every second, lost with no grace and its volume with it, restores every row | `tests/pitr.rs::a_served_node_ships_its_live_log_on_a_cadence_and_a_restore_holds_every_row_after_a_power_loss` |
+| the floor on holders refuses an insert, a batch and a delete naming the count, counts them, logs nothing | `engine::tests::a_write_fewer_nodes_than_the_floor_would_hold_is_refused_naming_the_count` |
+| `CELASTRO_MIN_HOLDERS` is read at open; a served node under it refuses, and the metric counts it | `tests/serve_signals.rs::the_floor_on_holders_comes_from_the_environment` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

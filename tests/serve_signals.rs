@@ -81,6 +81,57 @@ fn sigterm_shuts_the_console_down_cleanly_and_the_last_write_survives() {
 /// sequential health requests over fresh connections now average well under
 /// that; the bound is loose enough for a loaded machine and tight enough
 /// that the sleep cannot pass it.
+/// `CELASTRO_MIN_HOLDERS` is read at open: a served node under a floor
+/// of two, with no follower, refuses an insert naming one node and the
+/// two required, and the metrics count it.
+#[test]
+fn the_floor_on_holders_comes_from_the_environment() {
+    let dir = std::env::temp_dir().join(format!("celastro-holders-env-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
+        .args(["--json", "--dir", dir.to_str().unwrap(), "serve", "--port", "0"])
+        .env("CELASTRO_MIN_HOLDERS", "2")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn celastro");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
+    let addr = hello.get("addr").and_then(|v| v.as_str()).unwrap().to_string();
+    let token = hello.get("token").and_then(|v| v.as_str()).unwrap().to_string();
+    let post = |sql: &str| -> String {
+        let body = celastro::json::to_string(&celastro::value::Value::obj(vec![(
+            "sql".into(),
+            celastro::value::Value::Str(sql.into()),
+        )]));
+        let mut s = TcpStream::connect(&addr).unwrap();
+        write!(
+            s,
+            "POST /api/query HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let r = post("CREATE COLLECTION notes (id TEXT PRIMARY KEY)");
+    assert!(r.contains("\"ok\":true"), "{r}");
+    let r = post("INSERT INTO notes VALUES ('{\"id\":\"n1\"}')");
+    assert!(r.contains("1 node(s) would hold this write, 2 required"), "{r}");
+    let mut s = TcpStream::connect(&addr).unwrap();
+    write!(s, "GET /api/metrics HTTP/1.1\r\nHost: {addr}\r\nX-Celastro-Token: {token}\r\n\r\n")
+        .unwrap();
+    let mut m = String::new();
+    s.read_to_string(&mut m).unwrap();
+    assert!(m.contains("celastro_writes_refused_holders_total 1"), "{m}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A peer named in `CELASTRO_ATTACH` is attached: two processes, the
 /// second told of the first, and the second's health says both answer.
 /// The dial runs after `serve` has scrubbed the secrets from the

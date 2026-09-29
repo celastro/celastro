@@ -1174,6 +1174,10 @@ pub struct Db {
     /// The token every request on the wire carries, from the environment at
     /// construction; `None` means this node can reach no other.
     wire_token: Option<String>,
+    /// The floor on how many nodes hold an acknowledged write
+    /// (`CELASTRO_MIN_HOLDERS`, read at open): what every shard's options
+    /// carry.
+    min_holders: usize,
     /// One connection per other node, opened on demand. See `crate::wire`.
     nodes: Mutex<BTreeMap<String, Arc<crate::wire::Node>>>,
     /// The nodes this process has verified since it started -- an `ATTACH
@@ -1273,6 +1277,7 @@ impl Db {
             touches: Mutex::new(Vec::new()),
             sim: None,
             wire_token: crate::wire::token_from_env(),
+            min_holders: crate::replication::min_holders_from_env(),
             nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
             not_adopted: BTreeSet::new(),
@@ -1509,10 +1514,25 @@ impl Db {
             gc_horizon: 0,
             residency: Some(self.residency.clone()),
             placement: self.opts.placement.clone(),
+            min_holders: self.min_holders,
             archive: self.archive.clone(),
             log_archive: self.log_archive.clone(),
             cipher: self.cipher.clone(),
         }
+    }
+
+    /// The floor on holders for every shard held here, and for the ones
+    /// opened from now on: what a test sets in place of the environment,
+    /// which is read once at open and is one per process.
+    pub fn set_min_holders(&mut self, n: usize) {
+        self.min_holders = n.max(1);
+        for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
+            s.set_min_holders(n);
+        }
+    }
+
+    pub fn min_holders(&self) -> usize {
+        self.min_holders
     }
 
     /// Node-level residency accounting: what is decoded, what it cost, and how
@@ -10719,6 +10739,54 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The floor on holders: at two, a shard with no follower fed live
+    /// refuses an insert, a batch and a delete before anything is logged,
+    /// naming one node and the two required, and counts each; at one --
+    /// the default -- the same writes land. Set on the database here (the
+    /// environment is one per process; `tests/serve_signals.rs` reads it
+    /// through a served one).
+    #[test]
+    fn a_write_fewer_nodes_than_the_floor_would_hold_is_refused_naming_the_count() {
+        let dir = std::env::temp_dir().join(format!("celastro-holders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.min_holders(), 1);
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.set_min_holders(2);
+        let before = crate::replication::holder_refusals();
+        let row = |i: u32| Value::obj(vec![("id".into(), Value::Str(format!("n{i}")))]);
+        let e = db.insert("notes", row(1)).unwrap_err().to_string();
+        assert!(
+            e.contains("1 node(s) would hold this write, 2 required")
+                && e.contains("CELASTRO_MIN_HOLDERS"),
+            "{e}"
+        );
+        let e = db
+            .execute("INSERT INTO notes VALUES ('{\"id\":\"n2\"}'), ('{\"id\":\"n3\"}')")
+            .expect_err("a batch is refused too")
+            .to_string();
+        assert!(e.contains("2 required"), "{e}");
+        assert_eq!(
+            db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(),
+            0,
+            "nothing was logged"
+        );
+        // A delete of a row that is there: refused too, the row still there.
+        db.set_min_holders(1);
+        db.insert("notes", row(1)).unwrap();
+        db.set_min_holders(2);
+        let e =
+            db.execute("DELETE FROM notes WHERE id = 'n1'").expect_err("a delete too").to_string();
+        assert!(e.contains("2 required"), "{e}");
+        assert_eq!(crate::replication::holder_refusals() - before, 3);
+        assert_eq!(db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 1);
+        db.set_min_holders(1);
+        db.execute("DELETE FROM notes WHERE id = 'n1'").unwrap();
+        assert_eq!(db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(), 0);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A collection made through the library is named by the statement's

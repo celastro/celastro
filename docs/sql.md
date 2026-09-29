@@ -38,7 +38,11 @@ nodes carry one (`CELASTRO_REGION`); `confirm = 'all' | 'quorum' |
 'none'` is what acknowledges a write -- every live follower, a majority
 of the copies (a follower away holds nothing, and with no majority the
 write is refused, never acknowledged on one disk), or this disk alone;
-unset is the node's `CELASTRO_REPLICATION`; `nodes_of` says an edge
+unset is the node's `CELASTRO_REPLICATION`; and `CELASTRO_MIN_HOLDERS=n`
+(1 by default) refuses a write that fewer than `n` nodes would hold --
+the holder and its live followers -- before it is logged, naming the
+count, for the operator who would rather refuse than acknowledge a write
+on one disk while a follower is away (0.94.0); `nodes_of` says an edge
 collection points into a node collection; `undirected = true` follows
 its edges both ways; `prefix_expansion` caps how many dictionary terms a
 `text_match` prefix expands to (512).

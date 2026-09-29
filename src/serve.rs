@@ -538,6 +538,14 @@ fn metrics_text(db: &Db) -> String {
         "",
         c.statements_failed.load(Relaxed).to_string(),
     );
+    line(
+        "celastro_writes_refused_holders_total",
+        "counter",
+        "Writes refused because fewer nodes than CELASTRO_MIN_HOLDERS would hold them: the \
+         holder and its live followers.",
+        "",
+        crate::replication::holder_refusals().to_string(),
+    );
     // The recovery point, as `SHOW HEALTH` reports it: absent until this
     // process has made a backup, or shipped a log to an archive.
     let (backup, reach, _) = db.recovery_point();
