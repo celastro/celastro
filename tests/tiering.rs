@@ -1676,3 +1676,102 @@ fn a_policy_built_by_hand_matches_the_one_the_parser_builds() {
     };
     assert_eq!(db.catalog.policies["p"], want);
 }
+
+/// A store behind the trait that answers every put with `Ok` and keeps
+/// nothing (`forget`), or keeps the bytes with the last one changed
+/// (`corrupt`): what a proxy that returns 200 for a body it dropped
+/// looks like, and a store that kept something else.
+#[derive(Debug)]
+struct Faithless {
+    inner: celastro::objstore::DirStore,
+    forget: bool,
+}
+
+impl celastro::objstore::ObjectStore for Faithless {
+    fn put(&self, key: &str, bytes: &[u8]) -> celastro::error::Result<()> {
+        if self.forget {
+            return Ok(());
+        }
+        let mut b = bytes.to_vec();
+        if let Some(last) = b.last_mut() {
+            *last ^= 0xff;
+        }
+        self.inner.put(key, &b)
+    }
+    fn get_range(&self, key: &str, off: u64, len: u64) -> celastro::error::Result<Vec<u8>> {
+        self.inner.get_range(key, off, len)
+    }
+    fn get(&self, key: &str) -> celastro::error::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+    fn size(&self, key: &str) -> celastro::error::Result<Option<u64>> {
+        self.inner.size(key)
+    }
+    fn delete(&self, key: &str) -> celastro::error::Result<()> {
+        self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> celastro::error::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A move to the archived tier is confirmed before the local file goes:
+/// a store that acknowledges a put and keeps nothing, and one that keeps
+/// the bytes with one changed, each fail the move naming the object, the
+/// segment file stays where it was, and the collection still answers;
+/// the honest store moves it.
+#[test]
+fn a_move_to_the_archived_tier_is_confirmed_before_the_local_file_goes() {
+    for (forget, what) in
+        [(true, "acknowledged and is not there"), (false, "read back are not what was put")]
+    {
+        let d = dir(if forget { "faithless-forget" } else { "faithless-corrupt" });
+        let store_dir = d.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let mut db = Db::open(&d, DbOpts::default()).unwrap();
+        db.set_archive(Some(celastro::objstore::ArchiveHandle {
+            store: std::sync::Arc::new(Faithless {
+                inner: celastro::objstore::DirStore::new(&store_dir).unwrap(),
+                forget,
+            }),
+            prefix: "t/".into(),
+        }));
+        setup(&mut db, 150);
+        let segs = d.join("collections/items/shard-0000/segments");
+        let before = count(&segs);
+        assert!(before > 0);
+        let mut refused = None;
+        for i in ["items_body", "items_emb", "items_kind"] {
+            if let Err(e) = db.execute(&format!("ALTER INDEX {i} ON items SET TIER 'archived'")) {
+                refused = Some(e.to_string());
+                break;
+            }
+        }
+        let e = refused.expect("the move was refused");
+        assert!(e.contains(what) && e.contains("stays local"), "{e}");
+        assert_eq!(count(&segs), before, "the local file stays");
+        let r = db.query("SELECT * FROM items WHERE text_match(body, 'postings') LIMIT 4").unwrap();
+        assert_eq!(r.rows.len(), 4, "the collection still answers from the local file");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    // The honest store: the same move lands, and the file is gone from here.
+    let d = dir("faithful");
+    let store_dir = d.join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    db.set_archive(Some(celastro::objstore::ArchiveHandle {
+        store: std::sync::Arc::new(celastro::objstore::DirStore::new(&store_dir).unwrap()),
+        prefix: "t/".into(),
+    }));
+    setup(&mut db, 150);
+    let segs = d.join("collections/items/shard-0000/segments");
+    for i in ["items_body", "items_emb", "items_kind"] {
+        db.execute(&format!("ALTER INDEX {i} ON items SET TIER 'archived'")).unwrap();
+    }
+    assert_eq!(count(&segs), 0, "the file moved to the store");
+    let r = db.query("SELECT * FROM items WHERE text_match(body, 'postings') LIMIT 4").unwrap();
+    assert_eq!(r.rows.len(), 4);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}

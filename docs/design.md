@@ -393,6 +393,15 @@ exact; an instant further ahead of its clock than `ATTACH` allows for skew
 is refused. The set restores with `RESTORE FROM ... AS OF <instant>` on
 each node.
 
+A move to the archived tier is confirmed before the local file goes
+(0.95.0): after the put, the store's size for the key and its last 64
+KiB -- the footer, its checksum and the magic -- are read back and
+compared with what was put, and a mismatch leaves the file where it is
+and fails the move naming the object. An S3 put is signed over the
+body's hash, which refuses a body that does not match; this refuses an
+acknowledgement nothing stands behind, a proxy's 200 for a body it
+dropped.
+
 A backup is exact at its instant, and since 0.78.0 an instant between
 backups is reachable too. With `CELASTRO_LOG_ARCHIVE` set, a seal's build
 copies the write-ahead log it rotated to the archive -- off the lock,
@@ -2893,6 +2902,7 @@ guarantee:
 | a served node shipping every second, lost with no grace and its volume with it, restores every row | `tests/pitr.rs::a_served_node_ships_its_live_log_on_a_cadence_and_a_restore_holds_every_row_after_a_power_loss` |
 | the floor on holders refuses an insert, a batch and a delete naming the count, counts them, logs nothing | `engine::tests::a_write_fewer_nodes_than_the_floor_would_hold_is_refused_naming_the_count` |
 | `CELASTRO_MIN_HOLDERS` is read at open; a served node under it refuses, and the metric counts it | `tests/serve_signals.rs::the_floor_on_holders_comes_from_the_environment` |
+| a move to the archived tier is refused by a store that forgets or corrupts, the file staying; the honest store moves it | `tests/tiering.rs::a_move_to_the_archived_tier_is_confirmed_before_the_local_file_goes` |
 | a move made while a node was away reaches its map when it reconnects, from the old holder's word or the new one's, and its count routes to the shard where it is | `wire::a_move_made_while_a_node_was_away_reaches_its_map_when_it_reconnects` |
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |

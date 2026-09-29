@@ -6,6 +6,17 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**A move to the archived tier is confirmed before the local file goes.**
+After the put, the store's size for the key and its last 64 KiB -- the
+segment's footer, its checksum and the magic -- are read back and
+compared with what was put; a store or a proxy that acknowledged and
+kept nothing, or kept something else, fails the move naming the object,
+and the segment file stays where it was, still answering. An S3 put is
+signed over the body's hash, which already refuses a body that does not
+match; this refuses an acknowledgement nothing stands behind.
+
 ## 0.94.0 — 2026-09-29
 
 **A floor on how many nodes hold an acknowledged write.**

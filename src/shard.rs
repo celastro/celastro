@@ -679,6 +679,44 @@ pub(crate) fn publish_content(
     Ok(bytes)
 }
 
+/// How much of an archived object's tail is read back to confirm a put:
+/// the footer, its checksum and the magic sit there, and a store that
+/// kept the bytes answers them as they were put.
+const CONFIRM_TAIL: u64 = 64 * 1024;
+
+/// The object under `key` as the store holds it now, against the `bytes`
+/// it was given: its size, and its last [`CONFIRM_TAIL`] bytes read back
+/// and compared. What the move to the archived tier asks before it
+/// removes the local file.
+fn confirm_archived(
+    store: &dyn crate::objstore::ObjectStore,
+    key: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let len = bytes.len() as u64;
+    match store.size(key)? {
+        None => {
+            return Err(Error::Storage(format!(
+                "archive: `{key}` was acknowledged and is not there"
+            )))
+        }
+        Some(s) if s != len => {
+            return Err(Error::Storage(format!(
+                "archive: `{key}` is {s} bytes there and {len} bytes here"
+            )))
+        }
+        Some(_) => {}
+    }
+    let tail = len.min(CONFIRM_TAIL);
+    let got = store.get_range(key, len - tail, tail)?;
+    if got != bytes[(len - tail) as usize..] {
+        return Err(Error::Storage(format!(
+            "archive: the last {tail} bytes of `{key}` read back are not what was put"
+        )));
+    }
+    Ok(())
+}
+
 /// A live log's synced prefix, copied beside the log under the lock and
 /// put to the archive without it: what the cadence ships. The copy is
 /// removed by `put`, taken or not.
@@ -3284,6 +3322,21 @@ impl Shard {
                 handle.segment.unload_all();
                 let bytes = fs::read(&from)?;
                 h.store.put(&key, &bytes)?;
+                // Confirmed before the local file goes: the store's size
+                // for the key and its tail read back -- the footer, its
+                // checksum and the magic -- against what was put. An S3
+                // put is signed over the body's hash, which refuses a
+                // body that does not match; this refuses an
+                // acknowledgement that nothing stands behind (a store or
+                // a proxy that answered 200 and kept nothing, or kept
+                // something else). A mismatch leaves the file where it is
+                // and fails the move naming the object.
+                confirm_archived(&*h.store, &key, &bytes).map_err(|e| {
+                    Error::Storage(format!(
+                        "segment {name} of shard {} of `{}` stays local: {e}",
+                        self.index, self.coll.name
+                    ))
+                })?;
                 let size = bytes.len() as u64;
                 handle.segment.set_source(self.wrap_source(
                     handle.id(),

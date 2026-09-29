@@ -2696,6 +2696,13 @@ impl Db {
         self.wire_token.clone()
     }
 
+    /// The store behind the `archived` tier from now on, for the shards
+    /// made after this: what a test hands a store double to. At open it
+    /// comes from the options.
+    pub fn set_archive(&mut self, archive: Option<crate::objstore::ArchiveHandle>) {
+        self.archive = archive;
+    }
+
     /// The log archive this node ships to, when `CELASTRO_LOG_ARCHIVE` set
     /// one.
     pub fn log_archive(&self) -> Option<Arc<crate::backup::LogArchive>> {
