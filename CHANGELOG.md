@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.94.0 — 2026-09-29
 
 **A floor on how many nodes hold an acknowledged write.**
 `CELASTRO_MIN_HOLDERS=n` (1 by default, today's behaviour) refuses a
