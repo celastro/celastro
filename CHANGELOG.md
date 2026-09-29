@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.93.0 — 2026-09-29
 
 **The live log shipped on a cadence.** `CELASTRO_LOG_SHIP_EVERY=<seconds>`
 has `serve` copy every held shard's live log to `CELASTRO_LOG_ARCHIVE` on
