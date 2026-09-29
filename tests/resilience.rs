@@ -49,10 +49,29 @@ impl Node {
     fn start_at(tag: &str, port: u16, reuse: Option<PathBuf>) -> Node {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let url = format!("tcp://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let reusing = reuse.is_some();
         let dir = reuse.unwrap_or_else(|| dir(tag));
         let mut opts = DbOpts::default();
         opts.node = Some(url.clone());
-        let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
+        // A restart reuses the directory of an instance being dropped on
+        // another thread, which holds the directory's lock until its wire
+        // thread has let go: waited for, bounded, rather than raced -- the
+        // race lost once in a release run on 2026-09-29.
+        let t0 = Instant::now();
+        let db = loop {
+            match Db::open(&dir, opts.clone()) {
+                Ok(db) => break db,
+                Err(e)
+                    if reusing
+                        && e.to_string().contains("is open in another process")
+                        && t0.elapsed() < Duration::from_secs(20) =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let db = Arc::new(RwLock::new(db));
         let stop = Arc::new(AtomicBool::new(false));
         let (d, s) = (db.clone(), stop.clone());
         std::thread::spawn(move || {
