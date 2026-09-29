@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.96.0 — 2026-09-29
 
 **A bound on what one statement can ask a node to hold.** A `GROUP BY`
 with no `LIMIT` answers `CELASTRO_MAX_ROWS` groups (10,000 by default)
