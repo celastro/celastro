@@ -617,10 +617,14 @@ fn run(
             for h in &ex.sealed {
                 // Under a key the pool object is named by the key's
                 // fingerprint too: the same segment under another key is
-                // another object, never trusted for its size alone.
+                // another object, never trusted for its size alone --
+                // unless the writes are pinned to what a node before
+                // 0.97.0 reads, which names an object by its id alone.
                 let key = match cipher.as_deref() {
-                    Some(c) => format!("pool/{sdir}/{:016x}.{}.seg", h.id(), c.fingerprint()),
-                    None => format!("pool/{sdir}/{:016x}.seg", h.id()),
+                    Some(c) if !crate::cipher::pool_by_id_pinned() => {
+                        format!("pool/{sdir}/{:016x}.{}.seg", h.id(), c.fingerprint())
+                    }
+                    _ => format!("pool/{sdir}/{:016x}.seg", h.id()),
                 };
                 // A segment on disk streams from its file, hashed on the
                 // way: the copy holds no segment whole, so a node's memory
@@ -984,7 +988,7 @@ pub(crate) fn fetch(
     // objects under it -- unless plain records are what this node still
     // writes, pinned (`CELASTRO_SEAL_IDENTITY`).
     if record_in_the_clear
-        && !crate::cipher::legacy_writes_pinned()
+        && !crate::cipher::plain_records_pinned()
         && target.store.size(&target.key(&format!("{own}KEY")))?.is_some()
     {
         return Err(Error::Storage(format!(

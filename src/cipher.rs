@@ -908,6 +908,31 @@ pub fn file_keyed_logs_pinned() -> bool {
     FILE_KEYED_LOGS_PIN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a backup's pool objects are pinned to their id alone, as
+/// 0.88.0 through 0.96.0 name and read them: `CELASTRO_SEAL_IDENTITY=3`.
+/// Unset, an object under a key carries the key's fingerprint in its
+/// name, so a segment resealed under another key is another object.
+static POOL_BY_ID_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pin_pool_by_id(on: bool) {
+    POOL_BY_ID_PIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the pool's objects are to be named as a node before 0.97.0
+/// reads them: pinned to that form, or to any older one.
+pub fn pool_by_id_pinned() -> bool {
+    POOL_BY_ID_PIN.load(std::sync::atomic::Ordering::Relaxed)
+        || file_keyed_logs_pinned()
+        || legacy_writes_pinned()
+}
+
+/// Whether a backup's record is to be read in the clear beside its KEY:
+/// pinned to what 0.87.0 or earlier wrote (`CELASTRO_SEAL_IDENTITY` at 2
+/// or below), the only nodes that wrote records so.
+pub fn plain_records_pinned() -> bool {
+    file_keyed_logs_pinned() || legacy_writes_pinned()
+}
+
 /// A shared cipher, or none: what every writer and reader of the database's
 /// files carries.
 pub type Shared = Option<Arc<Cipher>>;

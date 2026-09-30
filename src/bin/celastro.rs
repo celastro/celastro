@@ -2855,11 +2855,14 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
             "1" | "legacy" => celastro::cipher::pin_legacy_writes(true),
             // What 0.86.0 reads: a log's records under the file's key.
             "2" => celastro::cipher::pin_file_keyed_logs(true),
-            "3" | "current" | "" => {}
+            // What 0.88.0 through 0.96.0 read: a backup's pool objects
+            // named by their id alone.
+            "3" => celastro::cipher::pin_pool_by_id(true),
+            "4" | "current" | "" => {}
             other => {
                 return Err(format!(
-                    "CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy), 2 (what 0.86.0 reads) \
-                     or 3 (current)"
+                    "CELASTRO_SEAL_IDENTITY: `{other}` is not 1 (legacy), 2 (what 0.86.0 reads), \
+                     3 (what 0.96.0 reads) or 4 (current)"
                 ))
             }
         }

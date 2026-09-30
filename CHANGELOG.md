@@ -130,6 +130,13 @@ the command was renamed) through 0.96.0. A script, a chart or an
 entrypoint that still says `celastro-cli` must say `celastro`; the images
 and the release tarballs carry the one binary now.
 
+**Upgrading from 0.96.0: the pool's names.** An encrypted backup's pool
+object is named by its id and the data key's fingerprint now; 0.96.0
+looks for the id alone, so a node rolled back to 0.96.0 does not restore
+a backup 0.97.0 wrote unless 0.97.0 wrote it under
+`CELASTRO_SEAL_IDENTITY=3` (the pin for this release's first days, as
+`2` was for 0.87.0's). 0.97.0 restores every backup 0.96.0 wrote.
+
 ## 0.96.0 — 2026-09-29
 
 **A bound on what one statement can ask a node to hold.** A `GROUP BY`
