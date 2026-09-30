@@ -22,7 +22,7 @@ and `-arm64.tar.gz` (the binary, the licence and the notice) with a `SHA256SUMS`
 `ghcr.io/celastro/celastro:<version>` runs, taken out of it. On the host:
 
 ```sh
-v=0.96.0
+v=0.97.0
 curl -fsSL "https://github.com/celastro/celastro/releases/download/v$v/celastro-$v-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/').tar.gz" \
   | sudo tar -xzC /usr/local/bin celastro
 sudo CELASTRO_TOKEN='a-long-random-token' celastro install

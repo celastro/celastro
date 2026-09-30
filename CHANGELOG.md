@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.97.0 — 2026-09-30
 
 **The readiness assessment's first pass (R5): what it found is fixed.**
 Six read-only readers went over the cryptography, the keys and backups,
