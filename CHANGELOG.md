@@ -6,6 +6,130 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The readiness assessment's first pass (R5): what it found is fixed.**
+Six read-only readers went over the cryptography, the keys and backups,
+the acknowledgement contract, the engine and the cluster; the findings
+and every verdict are recorded with the release. Fixed here, the ones
+that lose data or lock the data out: `BACKUP ... KEEP n` on an encrypted
+database removed every pool segment of every backup at the destination
+(the sweep read the sealed records raw and found nothing named -- it
+opens them now, and a record it cannot open names everything); a backup
+after a key rotation trusted a pool object for its size, so a resealed
+segment stood in for the old-key one and no pre-rotation backup restored
+(the pool key carries the data key's fingerprint now: another key is
+another object); a segment moved to or from the archived tier kept the
+key it was sealed under, and the open dropped the ring on the catalog's
+word, so a rotation, a move back and a restart locked the moved-back
+segments out (resealed under the current key both ways; the open retires
+nothing, `key retire` does, and `key rotate` keeps the previous key until
+then); `key rotate` and `key retire` took no directory lock (they do); a
+log that opened to no frame under the directory's key -- a KEY put back
+beside newer data -- was emptied at open and counted as a whole copy by a
+restore (refused, nothing changed, and not a copy); a plain backup record
+at a destination whose backup carries a KEY (refused as a downgrade); a
+backup record naming a path a shard never writes (refused); a delayed
+live-log ship could remove the rotation's whole copy of a log (only a
+shorter copy goes now); a rollback left the synced length above the cut.
+
+**Replication: nothing dropped for a follower that is away.** An item
+pushed while a follower was away was dropped, and a catch-up cut while
+the item's write was still in flight never carried it: the follower came
+back live and "caught up" without the row, and under `quorum` its later
+instant counted the row as on a majority. The backlog is kept for every
+follower now; over its cap the oldest half goes, covered by the catch-up
+that follows. `CELASTRO_MIN_HOLDERS` makes the acknowledgement itself
+wait for the holders, not only the append; under `confirm = 'none'` a
+floor above one is refused by name. The promotion fence fires on a
+follower's answer to "where do you stand" as it does on a ship -- the
+path a failover leaves the shipper on, where the old holder went on
+acknowledging until the sweep. A shard moved onto its own follower has
+its follower on the target too: the target computes the tablet every peer
+does. The steward promotes with a lease and a quarter of hold-off, issues
+a term once (a lost answer does not make two holders at one term), and
+ranks the most recent copy above the one in its region.
+
+**Revocation reaches a resumed session.** A ticket and the client's
+ticket store are bound to the revocation list: a list that changes ends
+every ticket, so the next handshake is a full one and a revoked peer is
+refused there. Until now a peer that resumed at least daily never
+presented its certificate again.
+
+**A chain of made-up keys costs one verification.** The chain walk names
+its way to an anchor first and verifies signatures from the anchor down;
+the big-integer reduction is Barrett's and the two scalar multiplications
+of a verification share one ladder. A P-384 verification is milliseconds
+of work rather than a second, and a peer can no longer spend seconds of a
+node's CPU per unauthenticated attempt. A self-issued intermediate costs
+no depth under a pathLenConstraint.
+
+**Smaller.** A `text_match` query that nested a few hundred thousand
+deep aborted the node (bounded at 128). A vector query of another width
+than its index -- an index re-made with fewer dims over sealed segments
+-- indexed past a code's end (it matches nothing there now). An `OFFSET`
+past `CELASTRO_MAX_ROWS_HARD` is refused. `DELETE ... WHERE` is never cut
+by the row caps (0.96.0 cut it at the ceiling and acknowledged the
+statement as whole). `EXPLAIN` of anything but a `SELECT` is refused (it
+ran the statement, on this node alone). The compactor backs off a second
+after a failed build or install. A `pathLenConstraint` counts the
+intermediates below the CA, the leaf not among them. A `KeyUpdate` must
+end its record. An
+IPv6-literal peer is verified under TLS. A token may hold sixteen console
+sessions, its own oldest evicted first. The console under TLS takes its
+own page's `https` origin (it refused every POST the page made, so the
+console served nothing but its sign-in under TLS; the API with a header
+was never affected). A `DELETE ... WHERE` whose predicate walks an edge
+collection needs the token's scope on that collection, as the `SELECT`
+does. A promotion of a remote copy is issued from the steward's term
+ledger too, not from the map alone. A stale revocation list is said
+so in the log on reload. The chart's wire Secret is rendered for a
+release with coordinators, and the shared certificate names them; the
+Ansible role applies a rotated token. The streaming SHA-256 wipes its
+tail, the AEAD its key words, Ed25519 refuses a non-canonical point and
+computes its constants once.
+
+**A delete during a compaction's build is not lost at its install.** A
+compaction reads its inputs' delete logs once, at the start of a build
+that runs off the lock for as long as a merge takes; a delete or an
+update that landed on an input meanwhile went into that input's log
+alone, and the install retired the log with the input -- the row came
+back live, for good once the next seal took the rotated write-ahead
+log. The install collects the inputs' marks again, under the lock.
+
+**A log whose sync failed recovers in place once the disk answers.** A
+failed sync left its shard taking no writes and holding reads at the
+instant before, until the node restarted and replayed the log. The next
+write on the shard now probes the log with the sync that failed, and when
+that lands the shard reopens the log in place -- a fresh group over the
+file as the failure cut it, the memtable rebuilt from what the log holds,
+which is what a restart did -- and the write goes on. The rows the cut
+took were acknowledged to nobody, and the marks they placed on sealed
+versions are taken back with them, so an acknowledged row an update
+that failed would have superseded reads as it did. A read never probes
+the disk: it is held, not refused. A probe that fails is the refusal it
+was, naming both failures. Two holes the review of this change found
+are closed with it: a rollback after a failed sync could extend a fresh
+log's cut header with zeros, which the open then refused as another
+key's; and a log zero-extended by a crash is cut as a torn tail, as it
+always was, rather than refused.
+
+**The recovery point from the open on.** A node reopened reports how far
+the archive reaches for each shard it holds from its open, read from the
+archive's listing, rather than "no archived log since this process
+started" until its first ship.
+
+**A shard bounds a forwarded statement by its own caps.** A coordinator
+bounded a statement's `LIMIT` before forwarding it; the shard now applies
+`CELASTRO_MAX_ROWS` and `CELASTRO_MAX_ROWS_HARD` of its own to what it is
+asked for, so a shard trusts no statement's `LIMIT` past its ceiling.
+
+**Upgrading from 0.96.0: `celastro-cli` is gone.** The old name was kept
+as a stub that said so and ran `celastro` beside it, from 0.41.0 (when
+the command was renamed) through 0.96.0. A script, a chart or an
+entrypoint that still says `celastro-cli` must say `celastro`; the images
+and the release tarballs carry the one binary now.
+
 ## 0.96.0 — 2026-09-29
 
 **A bound on what one statement can ask a node to hold.** A `GROUP BY`

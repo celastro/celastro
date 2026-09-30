@@ -21,11 +21,11 @@ case $cmd in
     export DOCKER_BUILDKIT=1
     docker build -q --provenance=false -t "$img:$v-amd64" .
     RUSTFLAGS="-C strip=symbols -C linker=aarch64-linux-gnu-gcc" \
-      cargo build -q --release --locked --offline --target aarch64-unknown-linux-musl --bin celastro --bin celastro-cli
+      cargo build -q --release --locked --offline --target aarch64-unknown-linux-musl --bin celastro
     # A context of its own: the repository's .dockerignore is an allowlist
     # that keeps target/ out, and the prebuilt image copies from the root.
     rm -rf dist/arm64; mkdir -p dist/arm64
-    cp target/aarch64-unknown-linux-musl/release/celastro target/aarch64-unknown-linux-musl/release/celastro-cli LICENSE COPYRIGHT dist/arm64/
+    cp target/aarch64-unknown-linux-musl/release/celastro LICENSE COPYRIGHT dist/arm64/
     docker build -q --provenance=false --platform linux/arm64 -f Dockerfile.prebuilt -t "$img:$v-arm64" dist/arm64
     echo "built $img:$v-amd64 and $img:$v-arm64" ;;
   push)

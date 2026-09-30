@@ -523,6 +523,30 @@ mod tests {
         s
     }
 
+    /// A delete that lands on a compaction's input while the build runs
+    /// off the lock is carried at the install: the row stays dead. The
+    /// install applied the build's carried marks alone and retired the
+    /// input's log with the input, so the row came back live (through
+    /// 0.96.0), for good once the next seal took the rotated log.
+    #[test]
+    fn a_delete_during_the_build_is_carried_at_the_install() {
+        let mut s = shard_with(4, 25);
+        let opts = CompactionOpts::default();
+        let r = reserve(&mut s, &opts).expect("four segments merge");
+        let built = build(&r).unwrap().expect("a build");
+        let key = format!("t0{KEY_SEP}d00007");
+        assert!(s.get(&key, s.clock.peek()).unwrap().is_some());
+        s.delete(&key).unwrap();
+        assert!(s.get(&key, s.clock.peek()).unwrap().is_none());
+        assert!(install(&mut s, built).unwrap());
+        assert_eq!(s.segments.len(), 1);
+        assert!(
+            s.get(&key, s.clock.peek()).unwrap().is_none(),
+            "the delete during the build was lost at the install"
+        );
+        assert_eq!(s.num_docs(s.clock.peek()), 99);
+    }
+
     #[test]
     fn size_tiers_merge_at_the_fanout() {
         let mut s = shard_with(4, 25);

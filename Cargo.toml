@@ -42,13 +42,6 @@ path = "src/lib.rs"
 name = "celastro"
 path = "src/bin/celastro.rs"
 
-# The name the tool had until 0.40.0: a few lines that say so and exec the
-# `celastro` beside them, so a script or a chart that still says it keeps
-# working for a release or two.
-[[bin]]
-name = "celastro-cli"
-path = "src/bin/celastro-cli.rs"
-
 [profile.release]
 opt-level = 3
 debug = false

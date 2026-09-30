@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use super::bignum::Big;
+use super::bignum::{Big, Reducer};
 
 pub(super) fn hexbig(s: &str) -> Big {
     let bytes: Vec<u8> = (0..s.len())
@@ -25,6 +25,17 @@ pub(super) struct Curve {
     pub gy: Big,
     /// Bytes of a coordinate and of a scalar: 32 for P-256, 48 for P-384.
     pub bytes: usize,
+    /// Reduction modulo `p` and modulo `n`, Barrett: built once with the
+    /// curve, used for every product of a verification.
+    rp: Reducer,
+    rn: Reducer,
+}
+
+impl Curve {
+    pub fn new(p: Big, n: Big, b: Big, gx: Big, gy: Big, bytes: usize) -> Curve {
+        let (rp, rn) = (Reducer::new(&p), Reducer::new(&n));
+        Curve { p, n, b, gx, gy, bytes, rp, rn }
+    }
 }
 
 /// A point in Jacobian coordinates; `z == 0` is the point at infinity.
@@ -37,13 +48,13 @@ struct Point {
 
 impl Curve {
     fn addm(&self, a: &Big, b: &Big) -> Big {
-        a.add(b).rem(&self.p)
+        self.rp.reduce(&a.add(b))
     }
     fn subm(&self, a: &Big, b: &Big) -> Big {
-        a.add(&self.p).sub(b).rem(&self.p)
+        self.rp.reduce(&a.add(&self.p).sub(b))
     }
     fn mulm(&self, a: &Big, b: &Big) -> Big {
-        a.mulmod(b, &self.p)
+        self.rp.mulmod(a, b)
     }
 
     fn infinity() -> Point {
@@ -109,11 +120,31 @@ impl Curve {
         r
     }
 
+    /// `a * p + b * q` in one ladder (Shamir's trick): one doubling per bit
+    /// for both, and an addition of `p`, `q` or `p + q` where the bits say.
+    fn mul2(&self, a: &Big, p: &Point, b: &Big, q: &Point) -> Point {
+        let pq = self.add(p, q);
+        let ab = a.to_be_bytes(self.bytes).expect("a scalar below n");
+        let bb = b.to_be_bytes(self.bytes).expect("a scalar below n");
+        let bit = |bytes: &[u8], i: usize| (bytes[self.bytes - 1 - i / 8] >> (i % 8)) & 1 == 1;
+        let mut r = Curve::infinity();
+        for i in (0..a.bits().max(b.bits())).rev() {
+            r = self.double(&r);
+            match (bit(&ab, i), bit(&bb, i)) {
+                (true, true) => r = self.add(&r, &pq),
+                (true, false) => r = self.add(&r, p),
+                (false, true) => r = self.add(&r, q),
+                (false, false) => {}
+            }
+        }
+        r
+    }
+
     fn affine_x(&self, q: &Point) -> Option<Big> {
         if q.z.is_zero() {
             return None;
         }
-        let zi = q.z.invmod_prime(&self.p);
+        let zi = self.rp.invmod_prime(&q.z);
         Some(self.mulm(&q.x, &self.mulm(&zi, &zi)))
     }
 
@@ -185,14 +216,14 @@ impl Curve {
         debug_assert!(self.n.bits() % 8 == 0);
         let take = digest.len().min(self.n.bits() / 8);
         let e = Big::from_be_bytes(&digest[..take]);
-        let w = s.invmod_prime(&self.n);
-        let u1 = e.rem(&self.n).mulmod(&w, &self.n);
-        let u2 = r.mulmod(&w, &self.n);
+        let w = self.rn.invmod_prime(&s);
+        let u1 = self.rn.mulmod(&self.rn.reduce(&e), &w);
+        let u2 = self.rn.mulmod(&r, &w);
         let g = Point { x: self.gx.clone(), y: self.gy.clone(), z: one.clone() };
         let q = Point { x: key.x.clone(), y: key.y.clone(), z: one };
-        let x = self.add(&self.mul(&u1, &g), &self.mul(&u2, &q));
+        let x = self.mul2(&u1, &g, &u2, &q);
         match self.affine_x(&x) {
-            Some(xa) => xa.rem(&self.n) == r,
+            Some(xa) => self.rn.reduce(&xa) == r,
             None => false,
         }
     }

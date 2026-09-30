@@ -349,6 +349,10 @@ impl Tls {
                         );
                         r.revoked = revoked;
                         r.next_update = next_update;
+                        if next_update.is_some_and(|at| at < crate::time::now_micros() / 1_000_000)
+                        {
+                            crate::log::warn("crl_past_due", &[("path", r.path.clone())]);
+                        }
                     }
                     Err(e) => crate::log::warn(
                         "crl_not_reloaded",

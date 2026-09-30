@@ -28,13 +28,13 @@ case $cmd in
       # has no shell; it never runs.
       id=$(docker create --platform "linux/$arch" "$img:$v-$arch")
       stage=$(mktemp -d)
-      for f in celastro celastro-cli LICENSE COPYRIGHT; do docker cp -q "$id:/$f" "$stage/$f"; done
+      for f in celastro LICENSE COPYRIGHT; do docker cp -q "$id:/$f" "$stage/$f"; done
       docker rm "$id" >/dev/null
-      chmod 0755 "$stage/celastro" "$stage/celastro-cli"; chmod 0644 "$stage/LICENSE" "$stage/COPYRIGHT"
+      chmod 0755 "$stage/celastro"; chmod 0644 "$stage/LICENSE" "$stage/COPYRIGHT"
       # The same archive from the same files: a fixed owner, order and time,
       # so the sum does not move between two runs on one image.
       tar --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct "v$v" 2>/dev/null || date +%s)" --sort=name \
-        -czf "$out/celastro-$v-linux-$arch.tar.gz" -C "$stage" celastro celastro-cli LICENSE COPYRIGHT
+        -czf "$out/celastro-$v-linux-$arch.tar.gz" -C "$stage" celastro LICENSE COPYRIGHT
       rm -rf "$stage"
     done
     (cd "$out" && sha256sum celastro-*.tar.gz > SHA256SUMS && cat SHA256SUMS)

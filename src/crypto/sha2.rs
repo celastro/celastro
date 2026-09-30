@@ -71,7 +71,10 @@ impl Sha256 {
                 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
                 0x5be0cd19,
             ],
-            buf: Vec::with_capacity(64),
+            // Room for the tail as `finish_into` pads it: a remainder of
+            // 56..63 bytes grows past one block, and a reallocation would
+            // free the old block unwiped.
+            buf: Vec::with_capacity(128),
             len: 0,
         }
     }
@@ -380,6 +383,16 @@ mod tests {
     /// FIPS 180-4's two vectors and the empty message, whose digest is also
     /// the `x-amz-content-sha256` of every bodiless request.
     /// FIPS 180-4's vectors for SHA-384: the empty message and "abc".
+    /// FIPS 180-4's 112-byte message: the two-block path of SHA-384, which
+    /// the shorter vectors never reach.
+    #[test]
+    fn sha384_over_two_blocks_matches_fips_180_4() {
+        let msg = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        assert_eq!(msg.len(), 112);
+        let want = "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039";
+        assert_eq!(super::super::hex(&sha384(msg)), want);
+    }
+
     #[test]
     fn sha384_matches_the_published_vectors() {
         assert_eq!(

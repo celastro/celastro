@@ -41,8 +41,11 @@ write is refused, never acknowledged on one disk), or this disk alone;
 unset is the node's `CELASTRO_REPLICATION`; and `CELASTRO_MIN_HOLDERS=n`
 (1 by default) refuses a write that fewer than `n` nodes would hold --
 the holder and its live followers -- before it is logged, naming the
-count, for the operator who would rather refuse than acknowledge a write
-on one disk while a follower is away (0.94.0); `nodes_of` says an edge
+count, and since 0.97.0 makes the acknowledgement itself wait until this
+node and enough followers have it, whatever the rule (under `'none'` a
+floor above one is refused by name), for the operator who would rather
+refuse than acknowledge a write on one disk while a follower is away
+(0.94.0); `nodes_of` says an edge
 collection points into a node collection; `undirected = true` follows
 its edges both ways; `prefix_expansion` caps how many dictionary terms a
 `text_match` prefix expands to (512).
@@ -454,7 +457,11 @@ answer. When a bound the statement did not set cut the rows and the cut
 left rows behind, the reply says so -- `"more": true` on the console's
 API, `more` in the library's result -- and the console prints it above
 the table; a `LIMIT` the statement set is the statement's own, and the
-reply does not second-guess it. (0.96.0)
+reply does not second-guess it. (0.96.0) A `DELETE ... WHERE` is never
+cut: every row its predicate names goes (0.97.0). An `OFFSET` past
+`CELASTRO_MAX_ROWS_HARD` is refused -- page with `search_after`. `EXPLAIN`
+takes a `SELECT` and runs nothing else. A `text_match` query nests at
+most 128 deep.
 
 **Any instant.** A backup is exact at its instant. With
 `CELASTRO_LOG_ARCHIVE=<dir or s3://bucket/prefix>` every held shard's
@@ -531,9 +538,11 @@ disk alone), and every copy this node follows. Its `recovery:` line is
 what a restore could reach if this node were lost now: the last backup
 this process completed and how far the archived logs of the shards held
 here reach (the least over them, as this process shipped them -- a seal's
-rotated logs, `BACKUP LOG TO`), each with its age; `STALE` when that
-stands further back than `CELASTRO_RECOVERY_WARN` seconds (an hour by
-default), or when nothing has been shipped since the process started.
+rotated logs, `BACKUP LOG TO`), each with its age -- read from the
+archive's listing at the open, so a reopened node reports it from the
+start (0.97.0); `STALE` when that stands further back than
+`CELASTRO_RECOVERY_WARN` seconds (an hour by default), or when nothing is
+archived at all.
 
 `PROMOTE SHARD i OF c ON 'follower'` makes a follower the holder at the
 next term -- what to run when a holder is lost, from any node; the

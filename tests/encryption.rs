@@ -289,6 +289,109 @@ fn a_plain_directory_is_checked_and_every_damaged_file_is_named() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// `BACKUP ... KEEP 1` on an encrypted database keeps the backup it made
+/// restorable: the sweep opens the sealed records (until 0.97.0 it read
+/// them raw, found no pool key named, and removed every segment of every
+/// backup at the destination).
+#[test]
+fn a_keep_on_an_encrypted_database_leaves_its_backup_restorable() {
+    let d = dir("keep");
+    let dest = dir("keep-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut db = Db::open(&d, opts(Some(master(11)))).unwrap();
+    setup(&mut db, 40);
+    let first = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    db.insert("items", doc(100)).unwrap();
+    ack(&mut db, "FLUSH items");
+    let m = ack(&mut db, &format!("BACKUP TO '{}' KEEP 1", dest.display()));
+    assert!(m.contains("kept 1, removed 1 older backup(s)"), "{m}");
+    let ts: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let _ = first;
+    drop(db);
+    let fresh = dir("keep-fresh");
+    let mut r = Db::open(&fresh, opts(Some(master(11)))).unwrap();
+    let v = ack(&mut r, &format!("VERIFY BACKUP '{}' AS OF {ts}", dest.display()));
+    assert!(v.contains("every one as recorded"), "{v}");
+    let m = ack(&mut r, &format!("RESTORE FROM '{}' AS OF {ts}", dest.display()));
+    assert!(m.contains("restored"), "{m}");
+    assert_eq!(ids(&mut r, "SELECT id FROM items LIMIT 100").len(), 45);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&fresh);
+}
+
+/// A backup before a rotation and one after, at one destination, each
+/// restore whole: the pool names an object by the key's fingerprint, so
+/// the resealed segment is a new object and the old backup's is still
+/// the old one (until 0.97.0 the size alone said "present").
+#[test]
+fn backups_across_a_key_rotation_each_restore_whole() {
+    let d = dir("rotate-backup");
+    let dest = dir("rotate-backup-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut db = Db::open(&d, opts(Some(master(12)))).unwrap();
+    setup(&mut db, 30);
+    let m = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let before: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    drop(db);
+    let w = celastro::cipher::rotate_data_key(&d, &master(12)).unwrap();
+    assert!(w.files > 0);
+    // And the ring retired: the second backup's KEY holds the new key
+    // alone, so its restore opens nothing under the old one.
+    assert_eq!(celastro::cipher::retire_keys(&d, &master(12)).unwrap(), 1);
+    let mut db = Db::open(&d, opts(Some(master(12)))).unwrap();
+    db.insert("items", doc(200)).unwrap();
+    ack(&mut db, "FLUSH items");
+    let m = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let after: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
+    drop(db);
+    // `setup(30)`: thirty rows, one deleted, five more; then one after.
+    for (ts, want) in [(before, 34), (after, 35)] {
+        let fresh = dir(&format!("rotate-backup-fresh-{ts}"));
+        let mut r = Db::open(&fresh, opts(Some(master(12)))).unwrap();
+        let v = ack(&mut r, &format!("VERIFY BACKUP '{}' AS OF {ts}", dest.display()));
+        assert!(v.contains("every one as recorded"), "{v}");
+        let m = ack(&mut r, &format!("RESTORE FROM '{}' AS OF {ts}", dest.display()));
+        assert!(m.contains("restored"), "{m}");
+        assert_eq!(ids(&mut r, "SELECT id FROM items LIMIT 100").len(), want, "{m}");
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// A write-ahead log that opens to no frame under the directory's key --
+/// another database's log put in its place, under the same master, which
+/// is what a copy by hand from another node's directory is -- refuses the
+/// open whole rather than emptying the log as a torn tail (0.97.0; the
+/// catalog opens, so the log is the first file that does not).
+#[test]
+fn a_log_under_another_key_refuses_the_open_and_is_not_emptied() {
+    let (a, b) = (dir("foreign-log-a"), dir("foreign-log-b"));
+    for d in [&a, &b] {
+        let mut db = Db::open(d, opts(Some(master(13)))).unwrap();
+        db.execute(CREATE).unwrap();
+        for i in 0..5 {
+            db.insert("items", doc(i)).unwrap();
+        }
+    }
+    let wal = |d: &std::path::Path| d.join("collections/items/shard-0000/wal.log");
+    let own = std::fs::read(wal(&a)).unwrap();
+    let foreign = std::fs::read(wal(&b)).unwrap();
+    assert!(!own.is_empty() && !foreign.is_empty());
+    std::fs::write(wal(&a), &foreign).unwrap();
+    let e = Db::open(&a, opts(Some(master(13)))).err().expect("a foreign log").to_string();
+    assert!(e.contains("does not open under this database's key"), "{e}");
+    assert_eq!(std::fs::read(wal(&a)).unwrap(), foreign, "nothing was cut");
+    std::fs::write(wal(&a), &own).unwrap();
+    let mut db = Db::open(&a, opts(Some(master(13)))).unwrap();
+    assert_eq!(ids(&mut db, "SELECT id FROM items LIMIT 100").len(), 5);
+    drop(db);
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 #[test]
 fn a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended() {
     let d = dir("torn");
@@ -311,8 +414,10 @@ fn a_torn_wal_tail_stops_the_replay_where_the_last_whole_record_ended() {
 
 /// An encrypted backup's record is sealed under its data key with the
 /// object's key as its identity: it does not read in the clear, a byte
-/// changed in it refuses the restore, and a record in the clear -- what
-/// every backup wrote before 0.88.0 -- still restores.
+/// changed in it refuses the restore, and a record in the clear beside
+/// the backup's KEY -- what every backup wrote before 0.88.0, and what a
+/// hand on the bucket could put there -- is refused as a downgrade
+/// unless the pin says an old node wrote it.
 #[test]
 fn a_backup_record_is_sealed_and_a_changed_one_is_refused() {
     let src = dir("record-src");
@@ -348,7 +453,10 @@ fn a_backup_record_is_sealed_and_a_changed_one_is_refused() {
     std::fs::write(&record_path, &changed).unwrap();
     let e = restore("record-changed").unwrap_err().to_string();
     assert!(e.contains("BACKUP does not open"), "{e}");
-    // The record in the clear, as before 0.88.0: still read.
+    // The record in the clear beside the backup's KEY: what a node before
+    // 0.88.0 wrote, and what whoever writes the bucket could put there to
+    // name other objects. Refused as a downgrade (0.97.0), naming the pin
+    // that reads a backup an old node really wrote.
     let key = std::fs::read(ts_dir.join("KEY")).unwrap();
     let cipher = celastro::cipher::Cipher::unwrap(&key, &master(7)).unwrap();
     let ts_name = ts_dir.file_name().unwrap().to_string_lossy().to_string();
@@ -356,7 +464,8 @@ fn a_backup_record_is_sealed_and_a_changed_one_is_refused() {
     let plain = cipher.open_file(&celastro::cipher::Ids::same(&identity), &sealed).unwrap();
     assert!(plain.starts_with(b"celastro backup\nversion 2\n"));
     std::fs::write(&record_path, &plain).unwrap();
-    assert!(restore("record-plain").unwrap().contains("rows-same=true"));
+    let e = restore("record-plain").unwrap_err().to_string();
+    assert!(e.contains("refused as a downgrade") && e.contains("CELASTRO_SEAL_IDENTITY=2"), "{e}");
     for p in [&src, &backups] {
         let _ = std::fs::remove_dir_all(p);
     }
@@ -624,14 +733,18 @@ fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
     let _ = std::fs::remove_dir_all(&p);
 }
 
-/// A ring with nothing behind it retires itself at the next open.
+/// A ring with nothing behind it is kept by the open and retired by
+/// `key retire`.
 ///
 /// The ring exists so an archived object sealed under an older data key
-/// still opens. With no index at the archived tier there is no such object,
-/// so keeping the old keys only widens what a stolen KEY and master open.
-/// The catalog answers that, so the check costs no store access.
+/// still opens. Until 0.96.0 the open retired a ring the catalog said
+/// nothing needed -- and the catalog was wrong once a segment had moved
+/// back from the archived tier under the old key, so the open locked it
+/// out. The open changes no key now; retiring is the operator's `key
+/// retire`, which walks the archive first and ends in the call made
+/// here.
 #[test]
-fn a_key_ring_with_no_archived_index_retires_itself_at_the_next_open() {
+fn a_key_ring_with_no_archived_index_is_kept_by_the_open_and_retired_by_the_command() {
     let d = dir("ring-self-retire");
     let m = master(11);
     {
@@ -639,32 +752,34 @@ fn a_key_ring_with_no_archived_index_retires_itself_at_the_next_open() {
         db.execute("CREATE COLLECTION docs (id TEXT PRIMARY KEY, n INT)").unwrap();
         db.execute("INSERT INTO docs VALUES ('{\"id\":\"a\",\"n\":1}')").unwrap();
     }
-    // A rotation would only keep a ring with an archived index, so the ring
-    // is put there by hand: this is about what the next open does with one.
+    // A rotation keeps the ring; it is put there by hand here: this is
+    // about what the next open does with one.
     let wrapped = std::fs::read(d.join("KEY")).unwrap();
     let current = celastro::cipher::Cipher::unwrap(&wrapped, &m).unwrap();
     let mut with_ring = current.without_previous();
     with_ring.keep_previous(&celastro::cipher::Cipher::generate().unwrap());
     std::fs::write(d.join("KEY"), with_ring.wrap(&m).unwrap()).unwrap();
-    assert_eq!(
+    let ring_on_disk = || {
         celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m)
             .unwrap()
-            .previous_keys(),
-        1,
-        "the ring is there before the open"
-    );
+            .previous_keys()
+    };
+    assert_eq!(ring_on_disk(), 1, "the ring is there before the open");
 
-    let mut db = Db::open(&d, opts(Some(m))).unwrap();
-    assert_eq!(db.data_key_ring_size(), 0, "the open retired a ring nothing needs");
-    // And it wrote that through, so the next open does not do it again.
-    assert_eq!(
-        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m)
-            .unwrap()
-            .previous_keys(),
-        0,
-        "KEY on disk no longer keeps the ring"
-    );
+    {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        assert_eq!(db.data_key_ring_size(), 1, "the open keeps the ring: retiring is a command");
+        assert_eq!(ring_on_disk(), 1, "and wrote nothing over KEY");
+        let out = db.execute("SELECT count(*) FROM docs").unwrap();
+        assert!(format!("{out:?}").contains('1'), "{out:?}");
+    }
+    // The command, with the database closed (it takes the directory lock):
+    // nothing is under the previous key, so the ring goes.
+    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1, "one key retired");
+    assert_eq!(ring_on_disk(), 0, "KEY on disk no longer keeps the ring");
     // The data is still there, which is the thing a wrong retirement breaks.
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert_eq!(db.data_key_ring_size(), 0);
     let out = db.execute("SELECT count(*) FROM docs").unwrap();
     assert!(format!("{out:?}").contains('1'), "{out:?}");
 }

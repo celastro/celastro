@@ -209,6 +209,15 @@ pub fn forget_tickets() {
     ticket_store(|t| t.clear());
 }
 
+/// Forget the tickets of one server: what a test in a process of tests
+/// does between its own servers, since clearing the store would take
+/// another test's ticket between its first connection and its second.
+#[cfg(test)]
+fn forget_tickets_of(addr: std::net::SocketAddr) {
+    let addr = addr.to_string();
+    ticket_store(|t| t.retain(|k, _| !k.contains(&addr)));
+}
+
 /// How many tickets this process holds.
 pub fn tickets_held() -> usize {
     ticket_store(|t| t.len())
@@ -236,13 +245,24 @@ fn now_secs() -> u64 {
 /// today's key and opens under today's or yesterday's (a ticket lives a
 /// day), so a TLS key that leaks opens the tickets of two days, not of
 /// its whole life.
-fn ticket_key(key: &KeyPair, client_anchors: Option<&[Certificate]>, day: u64) -> Secret<32> {
+fn ticket_key(
+    key: &KeyPair,
+    client_anchors: Option<&[Certificate]>,
+    day: u64,
+    revoked: &[x509::Revoked],
+) -> Secret<32> {
     let salt: &[u8] = if client_anchors.is_some() {
-        b"celastro tls ticket v3 mtls"
+        b"celastro tls ticket v4 mtls"
     } else {
-        b"celastro tls ticket v3"
+        b"celastro tls ticket v4"
     };
-    let mut ikm = [0u8; 72];
+    // The revocation list is in the key: a list that changes changes the
+    // key, so every ticket out stops opening and the next handshake is a
+    // full one, which is where a revoked certificate is refused. Without
+    // this a peer that resumed at least daily never presented its
+    // certificate again, and a revocation bit only at its restart
+    // (0.87.0 through 0.96.0).
+    let mut ikm = [0u8; 104];
     ikm[..32].copy_from_slice(&key.seed);
     ikm[32..40].copy_from_slice(&day.to_be_bytes());
     if let Some(anchors) = client_anchors {
@@ -250,11 +270,25 @@ fn ticket_key(key: &KeyPair, client_anchors: Option<&[Certificate]>, day: u64) -
         for a in anchors {
             ders.extend_from_slice(&a.der);
         }
-        ikm[40..].copy_from_slice(&sha256(&ders));
+        ikm[40..72].copy_from_slice(&sha256(&ders));
     }
+    ikm[72..].copy_from_slice(&revoked_digest(revoked));
     let out = hkdf::extract(salt, &ikm);
     crate::cipher::wipe(&mut ikm);
     out
+}
+
+/// The revocation list as one digest, for the ticket key and the client's
+/// ticket store: any change of the list is a change of both.
+pub(crate) fn revoked_digest(revoked: &[x509::Revoked]) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    for r in revoked {
+        bytes.extend_from_slice(&(r.issuer.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&r.issuer);
+        bytes.extend_from_slice(&(r.serial.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&r.serial);
+    }
+    sha256(&bytes)
 }
 
 /// Today, as the ticket key counts days.
@@ -990,11 +1024,12 @@ impl TlsStream {
         // the certificate flight is skipped. Anything short of that -- no
         // offer, another node's ticket, a stale one -- is a full handshake,
         // for which the client has to accept our signature.
-        let tkey: Secret<32> = ticket_key(key, client_anchors, ticket_day());
+        let tkey: Secret<32> = ticket_key(key, client_anchors, ticket_day(), revoked);
         let psk: Option<Secret<32>> = match &hello.psk {
             Some(offer) if hello.psk_dhe => {
                 match open_ticket(&tkey, &offer.identity).or_else(|| {
-                    let yesterday = ticket_key(key, client_anchors, ticket_day().saturating_sub(1));
+                    let yesterday =
+                        ticket_key(key, client_anchors, ticket_day().saturating_sub(1), revoked);
                     open_ticket(&yesterday, &offer.identity)
                 }) {
                     // A ticket this side sealed while asking for a client
@@ -1269,10 +1304,14 @@ impl TlsStream {
         for a in anchors {
             anchor_bytes.extend_from_slice(&a.der);
         }
+        // The revocation list in the store's key too: a list that changes
+        // makes every ticket held a stranger, so the next connection is a
+        // full handshake, where a revoked server is refused.
         let store_key = format!(
-            "{host}|{}|{}",
+            "{host}|{}|{}|{}",
             self.sock.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
-            super::hex(&sha256(&anchor_bytes)[..8])
+            super::hex(&sha256(&anchor_bytes)[..8]),
+            super::hex(&revoked_digest(revoked)[..8])
         );
         let now = now_secs();
         let ticket: Option<Ticket> = ticket_store(|t| t.get(&store_key).cloned())
@@ -2058,7 +2097,14 @@ impl Read for TlsStream {
                             HS_KEY_UPDATE => {
                                 // The peer's next generation of keys, and
                                 // ours if it asked (RFC 8446 §4.6.3): the
-                                // one byte, and nothing after it.
+                                // one byte, and nothing after it -- in the
+                                // record either: a key change aligns with a
+                                // record boundary (§5.1), so a message after
+                                // it in the same record was sent under keys
+                                // the sender had already changed.
+                                if i + 4 + len != body.len() {
+                                    return Err(err("a KeyUpdate that does not end its record"));
+                                }
                                 match (msg.len(), msg.first().copied()) {
                                     (1, Some(0)) => self.next_read_keys()?,
                                     (1, Some(1)) => {
@@ -2146,7 +2192,7 @@ mod tests {
         cert.extend_from_slice(&list);
         let key =
             KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
-        let tkey = ticket_key(&key, None, ticket_day());
+        let tkey = ticket_key(&key, None, ticket_day(), &[]);
         let ticket = seal_ticket(&tkey, &[9u8; 32], now_secs(), 7, None).unwrap();
         let mut nst = Vec::new();
         nst.extend_from_slice(&86_400u32.to_be_bytes());
@@ -2483,9 +2529,9 @@ mod tests {
         let ca_b =
             x509::parse(&pem::decode_all(&other.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
         let day = ticket_day();
-        let plain = ticket_key(&key, None, day);
-        let under_a = ticket_key(&key, Some(std::slice::from_ref(&ca_a)), day);
-        let under_b = ticket_key(&key, Some(std::slice::from_ref(&ca_b)), day);
+        let plain = ticket_key(&key, None, day, &[]);
+        let under_a = ticket_key(&key, Some(std::slice::from_ref(&ca_a)), day, &[]);
+        let under_b = ticket_key(&key, Some(std::slice::from_ref(&ca_b)), day, &[]);
         assert!(!plain.ct_eq(&under_a) && !under_a.ct_eq(&under_b));
         let now = now_secs();
         let names = vec!["node-1".to_string()];
@@ -2619,6 +2665,108 @@ mod tests {
                 assert!(heard.is_err(), "the client hears the refusal on its next read");
             }
         }
+    }
+
+    /// A ticket and the client's store are bound to the revocation list: a
+    /// second connection resumes, and once the list names the peer the
+    /// third does not -- it is a full handshake, and it is refused.
+    #[test]
+    fn a_change_of_the_revocation_list_ends_resumption_and_the_full_handshake_refuses() {
+        let m = x509::make("localhost", &[], &["127.0.0.1".parse().unwrap()], 30).unwrap();
+        let chain_der = pem::decode_all(&m.cert, "CERTIFICATE").unwrap();
+        let key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.key, "PRIVATE KEY").unwrap()[0]).unwrap();
+        let ca_key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.ca_key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+        let anchor = x509::parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let leaf = x509::parse(&chain_der[0]).unwrap();
+        let now = now_secs() as i64;
+        let revoking = pem::encode(
+            "X509 CRL",
+            &x509::issue_crl(&anchor, &ca_key, &[&leaf.serial], now - 60, now + 86_400),
+        );
+        let (revoked, _) =
+            x509::revocations_from_pem(&revoking, std::slice::from_ref(&anchor)).unwrap();
+        // One server, four connections at one address, so each finds the
+        // ticket the one before left in the store. The list changes under
+        // the third on the server's side alone: the client still offers
+        // its ticket, and the server, its ticket key changed with the
+        // list, cannot open it -- a full handshake, where the client's
+        // certificate is seen and refused. Under the fourth both sides
+        // have the list, as a reload of the CRL file on each changes it.
+        let lists: Vec<(Vec<x509::Revoked>, Vec<x509::Revoked>)> = vec![
+            (Vec::new(), Vec::new()),
+            (Vec::new(), Vec::new()),
+            (Vec::new(), revoked.clone()),
+            (revoked.clone(), revoked),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cd, k, a, ls) = (chain_der.clone(), key.clone(), anchor.clone(), lists.clone());
+        let server = std::thread::spawn(move || {
+            let mut served = Vec::new();
+            for (_, l) in &ls {
+                let (sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+                let mut s = TlsStream::server(
+                    sock,
+                    ServerSide {
+                        chain_der: &cd,
+                        key: &k,
+                        client_anchors: Some(std::slice::from_ref(&a)),
+                        revoked: l,
+                    },
+                );
+                let r = s.handshake().map(|_| s.resumed()).map_err(|e| e.to_string());
+                if r.is_ok() {
+                    let _ = s.write_all(b"x");
+                    let _ = s.close_notify();
+                }
+                served.push(r);
+            }
+            served
+        });
+        let mut heard = Vec::new();
+        for (list, _) in &lists {
+            let sock = TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+            let mut c = TlsStream::client(
+                sock,
+                ClientSide {
+                    anchors: std::slice::from_ref(&anchor),
+                    host: "127.0.0.1",
+                    chain_der: Some(&chain_der),
+                    key: Some(&key),
+                    revoked: list,
+                },
+            );
+            // The ticket comes after the handshake: a read takes it in.
+            let r = c.handshake().map_err(|e| e.to_string()).and_then(|()| {
+                let mut b = [0u8; 1];
+                c.read(&mut b).map(|_| c.resumed()).map_err(|e| e.to_string())
+            });
+            let _ = c.close_notify();
+            heard.push(r);
+        }
+        let served = server.join().unwrap();
+        assert_eq!(served[0], Ok(false), "the first connection is a full handshake");
+        assert_eq!(heard[0], Ok(false));
+        assert_eq!(served[1], Ok(true), "the second resumes");
+        assert_eq!(heard[1], Ok(true));
+        // The third: the server's list alone. The ticket offered does not
+        // open under the changed key, and the full handshake refuses the
+        // client's certificate; a server whose ticket key ignored the list
+        // would resume, and never see the certificate.
+        let third = format!("{:?} {:?}", served[2], heard[2]);
+        assert!(served[2].is_err(), "{third}");
+        assert!(served[2].as_ref().unwrap_err().contains("is revoked"), "{third}");
+        // The fourth: both sides. Whichever side saw the other's
+        // certificate first refused it; the other heard an alert.
+        let fourth = format!("{:?} {:?}", served[3], heard[3]);
+        assert!(served[3].is_err() && heard[3].is_err(), "{fourth}");
+        assert!(fourth.contains("is revoked"), "{fourth}");
+        forget_tickets_of(addr);
     }
 
     /// The four tightenings of 0.85.0, each a refusal where the transcript
@@ -3189,7 +3337,7 @@ mod tests {
         let (addr, server) = start(chain_der.clone(), key.clone(), Some(vec![anchor.clone()]), 3);
         assert_eq!(talk(addr, "127.0.0.1", Some(&chain_der), Some(&key)), Ok(b"hello".to_vec()));
         assert_ne!(talk(addr, "localhost", None, None), Ok(b"hello".to_vec()), "no certificate");
-        forget_tickets();
+        forget_tickets_of(addr);
         assert_ne!(
             talk(addr, "localhost", Some(&other_chain), Some(&other_key)),
             Ok(b"hello".to_vec()),
@@ -3270,7 +3418,11 @@ mod tests {
         };
         let tag = |a: &Certificate| crate::crypto::hex(&sha256(&a.der)[..8]);
         let (addr, server) = start(chain_der.clone(), key.clone(), 3);
-        let key1 = format!("127.0.0.1|{addr}|{}", tag(&anchor));
+        let key1 = format!(
+            "127.0.0.1|{addr}|{}|{}",
+            tag(&anchor),
+            crate::crypto::hex(&revoked_digest(&[])[..8])
+        );
         assert!(!talk(addr, &anchor, "127.0.0.1"), "the first handshake is full");
         // Other tests in this process hold tickets of their own, so the
         // check is for this server's, not for the count.
@@ -3291,7 +3443,11 @@ mod tests {
         // Make the client hold a ticket under the new server's store key by
         // moving the one it has.
         let (addr2, server2) = start(other_chain, other_key, 2);
-        let key2 = format!("127.0.0.1|{addr2}|{}", tag(&other_anchor));
+        let key2 = format!(
+            "127.0.0.1|{addr2}|{}|{}",
+            tag(&other_anchor),
+            crate::crypto::hex(&revoked_digest(&[])[..8])
+        );
         ticket_store(|t| {
             let ticket = t.remove(&key1).expect("a ticket from the first server");
             t.insert(key2.clone(), ticket);
@@ -3313,11 +3469,20 @@ mod tests {
         let (addr3, server3) = start(chain_der, key, 1);
         ticket_store(|t| {
             let ticket = t.remove(&key2).unwrap();
-            t.insert(format!("127.0.0.1|{addr3}|{}", tag(&anchor)), ticket);
+            t.insert(
+                format!(
+                    "127.0.0.1|{addr3}|{}|{}",
+                    tag(&anchor),
+                    crate::crypto::hex(&revoked_digest(&[])[..8])
+                ),
+                ticket,
+            );
         });
         assert!(!talk(addr3, &anchor, "127.0.0.1"));
         assert_eq!(server3.join().unwrap(), vec![false]);
-        forget_tickets();
+        for a in [addr, addr2, addr3] {
+            forget_tickets_of(a);
+        }
     }
 
     #[test]

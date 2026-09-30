@@ -258,6 +258,12 @@ impl VectorStore {
         n: usize,
         keep: impl Fn(f32) -> bool,
     ) -> (Bitmap, VectorReport) {
+        if query.len() != self.dims {
+            return (
+                Bitmap::new(self.len()),
+                VectorReport { tier: Some(self.tier()), ..Default::default() },
+            );
+        }
         let admit = self.admit_bitmap(doc_filter);
         let survivors = admit.popcount();
         let report = VectorReport {
@@ -307,7 +313,10 @@ impl VectorStore {
     ) -> (Vec<(u32, f32)>, VectorReport) {
         let mut report = VectorReport { tier: Some(self.tier()), ..Default::default() };
         let n = self.len();
-        if n == 0 || k == 0 {
+        // A query of another width than this index -- an index re-made with
+        // other dims over segments sealed under the old -- matches nothing
+        // here rather than indexing past a code's end.
+        if n == 0 || k == 0 || query.len() != self.dims {
             return (Vec::new(), report);
         }
         let admit = self.admit_bitmap(doc_filter);

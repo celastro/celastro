@@ -2678,11 +2678,21 @@ fn a_changed_follower_list_is_a_new_term_and_reaches_a_node_that_missed_it() {
     // A new holder is a new term too.
     let m = a.ack(&format!("MOVE SHARD 0 OF items TO '{}'", b.url));
     assert!(m.contains("map switched"), "{m}");
+    // The same tablet everywhere, followers included: the target computes
+    // the switch the peers do, the old holder among its followers -- a
+    // shard moved onto its own follower had no follower at all on the
+    // target while every peer said it had (0.97.0).
+    let mut seen = Vec::new();
     for n in [&a, &b, &c] {
         let g = n.db.read().unwrap();
         let t = &g.catalog.placement["items"][0];
         assert_eq!((t.node.as_str(), t.term), (b.url.as_str(), 2), "{}", n.url);
+        let mut f = t.followers.clone();
+        f.sort();
+        seen.push((n.url.clone(), f));
     }
+    assert!(seen.iter().all(|(_, f)| f == &seen[0].1), "the follower lists differ: {seen:?}");
+    assert!(seen[0].1.contains(&a.url) && !seen[0].1.contains(&b.url), "{seen:?}");
     for n in [a, b, c] {
         let d = n.dir.clone();
         drop(n);

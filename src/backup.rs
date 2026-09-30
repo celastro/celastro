@@ -328,6 +328,22 @@ impl LogArchive {
         Ok(out)
     }
 
+    /// The last instant the shard's archived logs reach, over every
+    /// timeline and copy the archive holds for it: what a node reports as
+    /// its recovery point from the open on, before this process has
+    /// shipped anything. `None` with no log there.
+    pub(crate) fn reach_of(&self, collection: &str, shard: usize) -> Result<Option<Timestamp>> {
+        let prefix = self.target.key(&self.prefix(collection, shard));
+        let mut reach = None;
+        for key in self.target.store.list(&prefix)? {
+            let name = key.rsplit('/').next().unwrap_or("");
+            if let Some((_, _, _, last)) = parse_log_name(name) {
+                reach = reach.max(Some(last));
+            }
+        }
+        Ok(reach)
+    }
+
     /// Copy one log under `seq`, as the bytes it is -- under the shard's
     /// cipher when there is one, which the backup's KEY opens at a restore
     /// -- replayed first for the instants it spans. Nothing for an empty
@@ -383,8 +399,11 @@ impl LogArchive {
                     continue;
                 }
                 let name = k.rsplit('/').next().unwrap_or("");
-                if let Some((tl, s, _, _)) = parse_log_name(name) {
-                    if tl == timeline && s == seq {
+                if let Some((tl, s, _, other_last)) = parse_log_name(name) {
+                    // Only a shorter copy goes: a longer one is the rotation's
+                    // whole, or a later tick's, landed while this one was on
+                    // its way, and a restore takes the longest anyway.
+                    if tl == timeline && s == seq && other_last < last {
                         let _ = self.target.store.delete(&k);
                     }
                 }
@@ -596,7 +615,13 @@ fn run(
             shards += 1;
             let sdir = format!("{name}/shard-{index:04}");
             for h in &ex.sealed {
-                let key = format!("pool/{sdir}/{:016x}.seg", h.id());
+                // Under a key the pool object is named by the key's
+                // fingerprint too: the same segment under another key is
+                // another object, never trusted for its size alone.
+                let key = match cipher.as_deref() {
+                    Some(c) => format!("pool/{sdir}/{:016x}.{}.seg", h.id(), c.fingerprint()),
+                    None => format!("pool/{sdir}/{:016x}.seg", h.id()),
+                };
                 // A segment on disk streams from its file, hashed on the
                 // way: the copy holds no segment whole, so a node's memory
                 // during a backup does not follow its largest segment. One
@@ -726,7 +751,7 @@ fn run(
                 shards.iter().map(move |(index, _)| format!("{name}/shard-{index:04}"))
             })
             .collect();
-        let (pruned, freed) = prune(&target, &mine, keep, &held)?;
+        let (pruned, freed) = prune(&target, &mine, keep, &held, cipher.as_deref())?;
         ack.push_str(&format!("; kept {keep}, removed {pruned} older backup(s) and {freed} pool segment(s) nobody references"));
     }
     Ok(Outcome::Ack(ack))
@@ -743,7 +768,13 @@ fn run(
 /// ones this node alone writes; another node's backup in flight cannot be
 /// putting segments there. A shard that moved away is swept by its new
 /// holder, whose records name what it needs.
-fn prune(target: &Target, mine: &str, keep: usize, held: &[String]) -> Result<(usize, usize)> {
+fn prune(
+    target: &Target,
+    mine: &str,
+    keep: usize,
+    held: &[String],
+    cipher: Option<&crate::cipher::Cipher>,
+) -> Result<(usize, usize)> {
     let all = instants(target, mine)?;
     let drop: Vec<u64> =
         if all.len() > keep { all[..all.len() - keep].to_vec() } else { Vec::new() };
@@ -756,13 +787,22 @@ fn prune(target: &Target, mine: &str, keep: usize, held: &[String]) -> Result<(u
         }
         pruned += 1;
     }
-    // What every remaining backup at the destination still names.
+    // What every remaining backup at the destination still names. A
+    // record is sealed since 0.88.0, so it is opened first; a record that
+    // does not open -- another node's under a key this one does not hold,
+    // or damaged -- names everything: the pool is not swept at all
+    // rather than swept of segments a backup needs (until 0.97.0 a sealed
+    // record contributed nothing, and one KEEP removed every segment of
+    // every backup at the destination).
     let mut referenced = std::collections::BTreeSet::new();
     for node in nodes(target)? {
         let theirs = format!("nodes/{node}/");
         for ts in instants(target, &theirs)? {
-            let record =
-                target.store.get(&target.key(&format!("{theirs}backups/{}/BACKUP", ts_key(ts))))?;
+            let record_key = format!("{theirs}backups/{}/BACKUP", ts_key(ts));
+            let record = target.store.get(&target.key(&record_key))?;
+            let Ok(record) = open_record(&record, cipher, &record_key) else {
+                return Ok((pruned, 0));
+            };
             for line in String::from_utf8_lossy(&record).lines() {
                 if let Some((key, _)) = line.split_once('\t') {
                     if key.starts_with("pool/") {
@@ -898,7 +938,8 @@ pub(crate) fn fetch(
     // the backup's own data key, which its `KEY` object holds under the
     // master: read before the record, since the record is what names
     // everything else.
-    let record = if plain_record(&record) {
+    let record_in_the_clear = plain_record(&record);
+    let record = if record_in_the_clear {
         record
     } else {
         let wrapped = target.store.get(&target.key(&format!("{own}KEY"))).map_err(|e| {
@@ -938,6 +979,21 @@ pub(crate) fn fetch(
             }
         }
     }
+    // A record in the clear at a destination whose backup carries a KEY
+    // is a downgrade -- whoever writes the bucket could name other
+    // objects under it -- unless plain records are what this node still
+    // writes, pinned (`CELASTRO_SEAL_IDENTITY`).
+    if record_in_the_clear
+        && !crate::cipher::legacy_writes_pinned()
+        && target.store.size(&target.key(&format!("{own}KEY")))?.is_some()
+    {
+        return Err(Error::Storage(format!(
+            "backup {ts} at {} carries a KEY but its record is in the clear: refused as a \
+             downgrade (a record is sealed since 0.88.0; set CELASTRO_SEAL_IDENTITY=2 only for a \
+             backup a node before that wrote)",
+            target.display
+        )));
+    }
     let catalog = target.store.get(&target.key(&format!("{own}CATALOG")))?;
     let key = if files.iter().any(|(k, _, _)| *k == format!("{own}KEY")) {
         Some(target.store.get(&target.key(&format!("{own}KEY")))?)
@@ -952,7 +1008,12 @@ pub(crate) fn fetch(
         let (coll, shard, rest) = if let Some(r) = key.strip_prefix("pool/") {
             let mut it = r.splitn(3, '/');
             match (it.next(), it.next(), it.next()) {
-                (Some(c), Some(s), Some(name)) => (c, s, format!("segments/{name}")),
+                // `<id>.seg`, or `<id>.<fingerprint>.seg` since 0.97.0: the
+                // local file is the id's.
+                (Some(c), Some(s), Some(name)) => {
+                    let id = name.split('.').next().unwrap_or("");
+                    (c, s, format!("segments/{id}.seg"))
+                }
                 _ => continue,
             }
         } else if let Some(r) = key.strip_prefix(&own) {
@@ -969,6 +1030,23 @@ pub(crate) fn fetch(
         let Some(index) = shard.strip_prefix("shard-").and_then(|n| n.parse::<usize>().ok()) else {
             continue;
         };
+        // Only what a shard writes lands in a shard's directory: a record
+        // naming anything else -- a path with `..`, an absolute one, another
+        // name -- is refused whole rather than written where it points.
+        let hex16 = |s: &str| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let shaped = match rest.split_once('/') {
+            Some(("segments", f)) => f.strip_suffix(".seg").is_some_and(hex16),
+            Some(("deletes", f)) => f.strip_suffix(".dlog").is_some_and(hex16),
+            None => rest == "RANGE" || rest == "MANIFEST",
+            _ => false,
+        };
+        if !shaped {
+            return Err(Error::Storage(format!(
+                "backup {ts} at {} names `{rest}` under {coll}/{shard}, which no shard writes: \
+                 refused",
+                target.display
+            )));
+        }
         let entry = match collections.iter_mut().find(|(n, _)| n == coll) {
             Some(e) => e,
             None => {

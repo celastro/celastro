@@ -20,7 +20,7 @@
 //! catch-up and not a node's memory.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -170,6 +170,10 @@ pub struct Shipper {
     pub shard: usize,
     pub term: u64,
     pub confirm: Confirm,
+    /// The floor on holders (`CELASTRO_MIN_HOLDERS`), at the
+    /// acknowledgement too: a write is acknowledged only once this node
+    /// and enough followers have it, whatever the rule waited for.
+    min_holders: AtomicUsize,
     inner: Mutex<Vec<Follower>>,
     cv: Condvar,
     stop: AtomicBool,
@@ -232,6 +236,7 @@ impl Shipper {
         followers: Vec<(String, Arc<crate::wire::Node>)>,
         confirm: Confirm,
         dir: Option<std::path::PathBuf>,
+        min_holders: usize,
     ) -> Arc<Shipper> {
         let inner = followers
             .into_iter()
@@ -254,6 +259,7 @@ impl Shipper {
             shard,
             term,
             confirm,
+            min_holders: AtomicUsize::new(min_holders.max(1)),
             inner: Mutex::new(inner),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -277,6 +283,7 @@ impl Shipper {
             shard: 0,
             term: 0,
             confirm: Confirm::All,
+            min_holders: AtomicUsize::new(1),
             inner: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             stop: AtomicBool::new(true),
@@ -309,6 +316,7 @@ impl Shipper {
             shard: 0,
             term: 0,
             confirm: Confirm::All,
+            min_holders: AtomicUsize::new(1),
             inner: Mutex::new(vec![f]),
             cv: Condvar::new(),
             stop: AtomicBool::new(true),
@@ -360,6 +368,11 @@ impl Shipper {
 
     /// Followers fed from the backlog now: the ones a write reaches as it
     /// is acknowledged, and so the ones that count towards the floor.
+    /// The floor changed after the open (a test's): this shipper's copy.
+    pub fn set_min_holders(&self, n: usize) {
+        self.min_holders.store(n.max(1), Ordering::Relaxed);
+    }
+
     pub fn live_followers(&self) -> usize {
         self.inner
             .lock()
@@ -379,17 +392,21 @@ impl Shipper {
         let item = Arc::new(item);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         for f in g.iter_mut() {
-            // A follower not yet asked where it stands is caught up from
-            // there when it answers; nothing is kept for it meanwhile.
-            if f.state == FollowerState::Unknown {
-                continue;
-            }
+            // Kept for every follower, the ones not yet asked where they
+            // stand included: an item pushed while a follower was away was
+            // dropped until 0.97.0, and a catch-up cut below the horizon
+            // while the item's write was still in flight never carried it
+            // -- a follower live and "caught up" without the row, and under
+            // quorum the row counted as on a majority.
             if f.backlog.len() >= BACKLOG_CAP {
-                f.backlog.clear();
+                // Over the cap the oldest half goes -- covered by the
+                // catch-up that follows, being long durable and visible --
+                // and the newest stay, so nothing in flight is lost.
+                let drop = f.backlog.len() / 2;
+                f.backlog.drain(..drop);
                 f.catchup.clear();
                 f.state = FollowerState::Unknown;
                 f.last_error = Some("backlog over its cap; catching up again".into());
-                continue;
             }
             f.backlog.push_back(item.clone());
         }
@@ -494,7 +511,14 @@ impl Shipper {
                 Confirm::Quorum => g.iter().filter(|f| f.acked >= ts).count() >= needed,
                 Confirm::None => true,
             };
-            if confirmed {
+            // The floor, whatever the rule: this node and the followers
+            // that confirmed hold it, and the acknowledgement waits until
+            // enough do -- a follower that dropped to away between the
+            // check before the append and now does not make the rule's
+            // wait shorter than the floor.
+            let holders = 1 + g.iter().filter(|f| f.acked >= ts).count();
+            let floor = self.min_holders.load(Ordering::Relaxed);
+            if confirmed && holders >= floor {
                 return Ok(());
             }
             let wait_for = match deadline {
@@ -661,6 +685,14 @@ impl Shipper {
                 }
             }
             Err(e) => {
+                // A higher term in the answer fences this shipper as it
+                // does on a ship: the failover that promoted the follower
+                // left it away, so its refusal arrives here first, and
+                // until 0.97.0 it was logged and re-asked while the old
+                // holder went on acknowledging on its own disk.
+                if let Some(f) = fence_of(&e) {
+                    *self.fenced.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+                }
                 self.note_error(url, &e);
                 self.cv.notify_all();
             }
@@ -708,8 +740,9 @@ impl Shipper {
                 }
                 let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(f) = g.iter_mut().find(|f| f.url == url) {
+                    // The backlog stays: the catch-up covers what was
+                    // durable and visible at its cut, the backlog the rest.
                     f.state = FollowerState::Unknown;
-                    f.backlog.clear();
                     f.catchup.clear();
                     f.caught_up_mark = None;
                 }
@@ -775,6 +808,31 @@ mod tests {
     /// Only a live follower holds the acknowledgement: one not yet asked,
     /// or catching up, leaves the write on this disk alone, said by the
     /// health; a live one behind the write is waited for, to the budget.
+    /// A follower's answer to "where do you stand" that names a higher
+    /// term fences the shipper as a ship's answer does: the path a failover
+    /// leaves the shipper on, where the old holder went on acknowledging
+    /// on its own disk until the sweep demoted it.
+    #[test]
+    fn a_higher_term_in_the_ask_answer_fences_the_shipper() {
+        let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
+        let sh = Shipper::new(
+            "items",
+            0,
+            3,
+            vec![("tcp://127.0.0.1:1".into(), node)],
+            Confirm::All,
+            None,
+            1,
+        );
+        assert!(sh.wait(20, Some(200)).is_ok(), "no live follower: acknowledged on this disk");
+        let higher = Error::Plan(
+            "shard 0 of `items`: this node holds it at term 4, the shipper is term 3".into(),
+        );
+        sh.asked("tcp://127.0.0.1:1", Err(higher));
+        let e = sh.wait(30, Some(200)).unwrap_err().to_string();
+        assert!(e.contains("behind a promotion") && e.contains("term 4"), "{e}");
+    }
+
     #[test]
     fn a_follower_away_or_catching_up_does_not_hold_the_acknowledgement() {
         let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
@@ -785,6 +843,7 @@ mod tests {
             vec![("tcp://127.0.0.1:1".into(), node)],
             Confirm::All,
             None,
+            1,
         );
         let set = |state: FollowerState| {
             let mut g = sh.inner.lock().unwrap();
@@ -824,6 +883,7 @@ mod tests {
             vec![("tcp://127.0.0.1:1".into(), mk())],
             Confirm::All,
             None,
+            1,
         );
         {
             let mut g = sh.inner.lock().unwrap();
@@ -864,6 +924,7 @@ mod tests {
             vec![("tcp://127.0.0.1:1".into(), mk())],
             Confirm::None,
             None,
+            1,
         );
         let higher = Error::Plan(
             "shard 0 of `items`: this node follows term 5, the shipper is term 3".into(),
@@ -884,6 +945,7 @@ mod tests {
             vec![("tcp://127.0.0.1:1".into(), mk()), ("tcp://127.0.0.1:2".into(), mk())],
             Confirm::Quorum,
             None,
+            1,
         );
         {
             let mut g = sh.inner.lock().unwrap();

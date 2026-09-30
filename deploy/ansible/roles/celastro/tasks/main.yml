@@ -35,7 +35,8 @@
     celastro_wanted: >-
       {{ [celastro_version, celastro_binary, celastro_port, celastro_bind, celastro_wire_port,
           celastro_dir, celastro_role, celastro_cluster, celastro_wire_addr, celastro_attach,
-          celastro_tls_dir, celastro_client_auth, celastro_master_key != "", celastro_env]
+          celastro_tls_dir, celastro_client_auth, celastro_master_key != "", celastro_env,
+          celastro_token | hash('sha256'), celastro_wire_token | hash('sha256')]
          | to_json | hash('sha256') }}
 
 - name: The last install's mark

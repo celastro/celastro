@@ -18,8 +18,7 @@ describes them. What differs is who writes that down and starts it.
 ## The binary, and `celastro install`
 
 Each release on GitHub carries `celastro-<version>-linux-amd64.tar.gz`
-and `-arm64.tar.gz` (the binary, `celastro-cli`, the licence and the
-notice) with a `SHA256SUMS`: the same static binaries the image
+and `-arm64.tar.gz` (the binary, the licence and the notice) with a `SHA256SUMS`: the same static binaries the image
 `ghcr.io/celastro/celastro:<version>` runs, taken out of it. On the host:
 
 ```sh

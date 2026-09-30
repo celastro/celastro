@@ -48,6 +48,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $names = append $names (printf "%s-%d.%s" $name $i $name) -}}
 {{- $names = append $names (printf "%s-%d.%s.%s.svc" $name $i $name $.Release.Namespace) -}}
 {{- end -}}
+{{- /* The coordinators too: a data pod verifies a coordinator by its URL's
+       host, and under client certificates the coordinator's claimed address
+       must be a name of the shared certificate. */ -}}
+{{- $coord := printf "%s-coord" $name -}}
+{{- range $i := until (int .Values.coordinators.replicas) -}}
+{{- $names = append $names (printf "%s-%d.%s" $coord $i $coord) -}}
+{{- $names = append $names (printf "%s-%d.%s.%s.svc" $coord $i $coord $.Release.Namespace) -}}
+{{- end -}}
 {{- join "," $names -}}
 {{- end -}}
 

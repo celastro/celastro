@@ -179,6 +179,14 @@ impl SegmentHandle {
         self.vis.clear();
     }
 
+    /// The mark at `ord` taken back if it is the one placed at `ts`.
+    pub(crate) fn unmark_deleted(&self, ord: u32, ts: Timestamp) {
+        if self.deletes.write().unwrap().unmark(ord, ts) {
+            self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            self.vis.clear();
+        }
+    }
+
     /// Rows a rewrite would drop: deleted or superseded at `t`, and the
     /// ones outside the shard's range since a split.
     pub fn dead_count(&self, t: Timestamp) -> usize {
@@ -1775,6 +1783,21 @@ impl Wal {
             Some(c) => match read_optional(path)? {
                 Some(b) if !b.is_empty() => {
                     let log = c.open_log(&ids, &b);
+                    // A log that opens to no frame at all is not a torn tail
+                    // to cut: it is a log under another key -- a KEY put
+                    // back beside newer data, another database's under the
+                    // same master -- and emptying it would lose every record
+                    // since the last seal before the manifest could refuse
+                    // the open. Refused whole (0.97.0) -- when the header is
+                    // whole: one torn or zero-extended is a crash's, and is
+                    // cut as a torn tail as it always was.
+                    if log.opened == 0 && crate::cipher::first_frame_whole(&b) {
+                        return Err(Error::Storage(format!(
+                            "{}: the write-ahead log does not open under this database's key; \
+                             nothing was changed",
+                            path.display()
+                        )));
+                    }
                     // A torn or foreign tail ends the replay; what would
                     // be appended after it would be unreadable until the
                     // next flush, so the tail is cut here and the log
@@ -1831,6 +1854,11 @@ impl Wal {
         let Some(c) = cipher else { return Ok(true) };
         let Some(b) = read_optional(path)? else { return Ok(true) };
         let log = c.open_log(ids, &b);
+        // A non-empty log that opens to nothing is under another key, not a
+        // whole copy: a restore must not count it and replay nothing.
+        if !b.is_empty() && log.opened == 0 {
+            return Ok(false);
+        }
         Ok(log.log_id.is_none() || log.complete)
     }
 
@@ -1928,9 +1956,17 @@ impl Wal {
     pub(crate) fn rollback(&mut self, mark: WalMark) -> Result<()> {
         let mut st = self.group.lock();
         st.low_water = st.low_water.min(mark.len);
-        // Nothing the cut takes off the log may reach a follower.
+        // Nothing the cut takes off the log may reach a follower -- nor an
+        // archive: the synced length comes down with the cut, so a copy of
+        // the live log never carries bytes a sync no longer covers.
         st.ship.retain(|(seq, _, _)| *seq <= mark.appended);
-        self.file.set_len(mark.len)?;
+        st.synced_len = st.synced_len.min(mark.len);
+        // Never longer than the file is: a sync that failed cut the file
+        // to what its last good sync covered, which can be below the mark
+        // -- a fresh log's unsynced header -- and a cut to the mark from
+        // there would extend the file with zeros, a header no key opens.
+        let len = self.file.metadata()?.len().min(mark.len);
+        self.file.set_len(len)?;
         self.records = mark.records;
         Ok(())
     }
@@ -2002,7 +2038,15 @@ impl Wal {
             return Err(LogSync::refused(&self.path, e));
         }
         let (target, len) = (st.appended, self.file.metadata()?.len());
-        durable::sync_data(&self.file, &self.path)?;
+        if let Err(e) = durable::sync_data(&self.file, &self.path) {
+            // As a settle that fails: the group takes no more appends, the
+            // log is cut to what the last good sync covered, nothing cut
+            // may reach a follower. `recover_log` is the way back.
+            st.failed = Some(e.to_string());
+            let _ = self.file.set_len(st.synced_len);
+            st.ship.clear();
+            return Err(e);
+        }
         st.synced = st.synced.max(target);
         st.synced_len = len;
         LogSync::ship_synced(&mut st);
@@ -2052,13 +2096,12 @@ impl Wal {
             if crc32(body) != crc {
                 break;
             }
-            i = j + len;
             let mut k = 0usize;
-            let kind = body[k];
+            let Some(&kind) = body.get(k) else { break };
             k += 1;
             let Some(key) = get_str(body, &mut k) else { break };
             let Some(ts) = get_u64(body, &mut k) else { break };
-            let has_doc = body[k];
+            let Some(&has_doc) = body.get(k) else { break };
             k += 1;
             let doc = if has_doc == 1 {
                 match crate::variant::decode(body, &mut k) {
@@ -2068,10 +2111,14 @@ impl Wal {
             } else {
                 None
             };
-            let supersedes = body[k] == 1;
+            let Some(&sup) = body.get(k) else { break };
+            let supersedes = sup == 1;
             k += 1;
             let segment_id = get_u64(body, &mut k).unwrap_or(0);
             out.push(WalRecord { kind, key, ts, doc, supersedes, segment_id });
+            // Counted only now: a record that did not decode is where the
+            // parse ends, for `check` as for the replay.
+            i = j + len;
         }
         (out, i)
     }
@@ -2148,6 +2195,10 @@ pub struct ShardOpts {
     /// The floor on how many nodes hold an acknowledged write
     /// (`CELASTRO_MIN_HOLDERS`): see [`crate::replication::holders_check`].
     pub min_holders: usize,
+    /// The row caps (`CELASTRO_MAX_ROWS`, `CELASTRO_MAX_ROWS_HARD`): what a
+    /// statement forwarded to this shard is bounded by here, as the
+    /// coordinator bounded it there (`crate::engine::bound_select_with`).
+    pub row_caps: (usize, usize),
     /// The object store the `archived` tier lives in, and the key prefix.
     /// `None` keeps the local `archive/` directory as the stand-in.
     pub archive: Option<crate::objstore::ArchiveHandle>,
@@ -2290,6 +2341,10 @@ pub struct Shard {
     pub(crate) clock: Arc<Hlc>,
     dir: Option<PathBuf>,
     wal: Option<Wal>,
+    /// The supersede marks of records whose sync is deferred and not yet
+    /// covered by one: `(sequence, where, instant)`, taken back if the sync
+    /// fails (`recover_log`).
+    unsynced_marks: Vec<(u64, Loc, Timestamp)>,
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
     pub(crate) flushes: u64,
@@ -2392,6 +2447,7 @@ impl Shard {
             memtable,
             frozen: Vec::new(),
             pending_seals: Vec::new(),
+            unsynced_marks: Vec::new(),
             unsealed_wals: Vec::new(),
             wal_seq: 1,
             timeline: 0,
@@ -2495,6 +2551,134 @@ impl Shard {
         }
     }
 
+    /// Replayed records applied: what the open does with a log's records,
+    /// and what a recovery does again in place.
+    /// `observe`: whether the catalog's counts see each record -- the
+    /// open's first sight of them -- or not, on a recovery in place, where
+    /// the writes that made the records observed them already.
+    fn apply_replayed(&mut self, records: Vec<WalRecord>, observe: bool) -> Result<()> {
+        for r in records {
+            self.clock.observe(r.ts);
+            match r.kind {
+                WAL_INSERT => {
+                    // A crash between writing the segments and truncating the
+                    // WAL replays inserts whose documents are already sealed,
+                    // so replay has to converge on the post-seal state rather
+                    // than add to it.
+                    //
+                    // The question is whether THIS record's effect is already
+                    // on disk, and the answer is "the key already carries a
+                    // version at or after this record's ts". At: the seal wrote
+                    // this very version. After: a later version of the key is
+                    // sealed and this one was superseded before the seal — the
+                    // version an unpinned seal deliberately forgets, which
+                    // replay must not resurrect. Either way, re-applying the
+                    // record makes the key live twice.
+                    //
+                    // `>=`, not `==`, for that second case, and
+                    // `latest_version` rather than `locate(key, MAX_TS)` for a
+                    // third: a seal under a pinned `gc_horizon` emits one
+                    // segment per version layer, so the key's newest version is
+                    // no longer the only one on disk. Superseding whatever is
+                    // VISIBLE then wrote a tombstone onto the newest layer at
+                    // the OLDEST record's timestamp — below that version's own
+                    // commit — and left the older layer live beside the
+                    // memtable copy it had just re-inserted, so every key read
+                    // twice at exactly the horizon the pin exists to preserve.
+                    //
+                    // This rests on the WAL being truncated by the seal as a
+                    // whole: a record whose ts is BELOW a sealed version of the
+                    // same key was necessarily in the memtable when that seal
+                    // ran, so the seal either wrote it into a layer or
+                    // collapsed it on purpose. There is no third case.
+                    let prev = self.latest_version(&r.key);
+                    if prev.map(|(_, ts)| ts >= r.ts).unwrap_or(false) {
+                        continue;
+                    }
+                    // A genuine post-seal write: supersede the newest version,
+                    // which is now strictly older than this record.
+                    if let Some((loc, _)) = prev {
+                        self.mark_superseded(loc, r.ts);
+                    }
+                    if let Some(d) = r.doc {
+                        // Into the live view and the unsealed tally, exactly
+                        // as the insert that wrote the record did. The
+                        // persisted catalog did not count this record: it
+                        // persists sealed documents only, so that this
+                        // observation is the record's first and not its
+                        // second. See `Shard::sealed`.
+                        if observe {
+                            self.coll.observe_doc(&d);
+                        }
+                        self.unsealed.observe_doc(&d);
+                        self.memtable.insert(r.key, r.ts, d)?;
+                    }
+                }
+                WAL_DELETE => {
+                    // The version live at the delete's own instant, not the
+                    // newest: a copy's log can hold a later version of the
+                    // key before an earlier delete of it, the catch-up
+                    // coming in key order and the backlog after it.
+                    if let Some(loc) = self.locate(&r.key, r.ts) {
+                        self.mark_superseded(loc, r.ts);
+                    }
+                }
+                WAL_SHIP_MARK => {
+                    self.ship_ts = self.ship_ts.max(r.ts);
+                    self.caught_up = true;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A log whose sync failed takes no writes and holds reads at the
+    /// instant before, until the node restarts and replays it -- or, since
+    /// 0.97.0, until the disk answers again: the next write on the shard
+    /// probes the log with the sync that failed, and when that lands the
+    /// shard reopens the log in place -- a fresh group over the file as the
+    /// failure cut it, the memtable rebuilt from what the log holds -- which
+    /// is what a restart would have done, and the write goes on. The rows
+    /// the cut took were acknowledged to nobody: their statements were
+    /// refused. `Ok(true)` when a recovery ran; the refusal, naming both
+    /// failures, when the probe fails too.
+    pub(crate) fn recover_log(&mut self) -> Result<bool> {
+        let Some(why) = self.wal.as_ref().and_then(|w| w.group.failure()) else { return Ok(false) };
+        let Some(dir) = self.dir.clone() else { return Ok(false) };
+        let path = dir.join("wal.log");
+        if let Some(w) = &self.wal {
+            durable::sync_data(&w.file, &path).map_err(|e| {
+                Error::Storage(format!(
+                    "the write-ahead log {} failed to sync ({why}) and still does ({e}); its shard \
+                     takes no writes until the disk answers",
+                    path.display()
+                ))
+            })?;
+        }
+        // The marks the cut records placed on sealed and frozen versions,
+        // taken back: the deaths they recorded were acknowledged to nobody.
+        let synced = self.wal.as_ref().map_or(0, |w| w.group.lock().synced);
+        let marks = std::mem::take(&mut self.unsynced_marks);
+        for (seq, loc, ts) in marks {
+            if seq > synced {
+                self.unmark_superseded(loc, ts);
+            }
+        }
+        let ids = self.file_ids("wal.log");
+        let records = Wal::replay(&path, &self.opts.cipher, &ids)?;
+        self.wal = Some(Wal::open(&path, self.opts.cipher.clone(), ids)?);
+        // The memtable's bytes given back to the node's budget before it
+        // goes, as a seal gives them back: nothing else does.
+        self.memtable.release_budget();
+        self.memtable = Memtable::new(&self.coll, self.opts.budget.clone());
+        self.unsealed = PathTally::default();
+        // The records were observed by the writes that made them: the
+        // catalog's counts are not to see them twice.
+        self.apply_replayed(records, false)?;
+        Ok(true)
+    }
+
     pub(crate) fn attach_dir(&mut self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir.join("segments"))?;
         fs::create_dir_all(dir.join("archive"))?;
@@ -2502,6 +2686,11 @@ impl Shard {
         // The directory first: the log's identity under the cipher is the
         // directory's name, and the log is opened under it.
         self.dir = Some(dir.to_path_buf());
+        // A copy of the live log cut short -- a ship's, an archive's -- is
+        // a leftover, not a framed file for `check` to name.
+        for leftover in ["wal.ship.part", "wal.archive.part"] {
+            let _ = fs::remove_file(dir.join(leftover));
+        }
         self.wal = Some(Wal::open(
             &dir.join("wal.log"),
             self.opts.cipher.clone(),
@@ -2728,6 +2917,42 @@ impl Shard {
         best
     }
 
+    /// A supersede mark for a record whose sync is deferred: placed now,
+    /// and kept with the record's sequence until a sync covers it, so a
+    /// sync that fails can take the mark back (`recover_log`) as the cut
+    /// takes the record off the log. Without this a refused update left
+    /// its mark on the sealed version, and the recovery's horizon made
+    /// the key read as absent -- an acknowledged row lost to a statement
+    /// the client was told failed.
+    fn mark_superseded_unsynced(&mut self, seq: Option<u64>, target: Loc, ts: Timestamp) {
+        self.mark_superseded(target, ts);
+        if let Some(seq) = seq {
+            if self.unsynced_marks.len() >= 256 {
+                let synced = self.wal.as_ref().map_or(0, |w| w.group.lock().synced);
+                self.unsynced_marks.retain(|(s, _, _)| *s > synced);
+            }
+            self.unsynced_marks.push((seq, target, ts));
+        }
+    }
+
+    /// The mark `mark_superseded` placed, taken back: only if the entry is
+    /// that mark's (its instant), so a stale location takes nothing else.
+    fn unmark_superseded(&mut self, target: Loc, ts: Timestamp) {
+        match target {
+            Loc::Mem(ord) => self.memtable.unmark_deleted(ord, ts),
+            Loc::Frozen(i, ord) => {
+                if let Some(f) = self.frozen.get(i) {
+                    f.unmark_deleted(ord, ts);
+                }
+            }
+            Loc::Seg(sid, ord) => {
+                if let Some(h) = self.segments.iter().find(|h| h.id() == sid) {
+                    h.unmark_deleted(ord, ts);
+                }
+            }
+        }
+    }
+
     fn mark_superseded(&mut self, target: Loc, ts: Timestamp) {
         match target {
             Loc::Mem(ord) => self.memtable.mark_deleted(ord, ts),
@@ -2753,6 +2978,15 @@ impl Shard {
     /// The floor on holders (`CELASTRO_MIN_HOLDERS`), before a write is
     /// logged: this node and the followers fed live now.
     fn holders_check(&self) -> Result<()> {
+        if self.opts.min_holders > 1
+            && self.shipper.as_ref().is_some_and(|s| s.confirm == crate::replication::Confirm::None)
+        {
+            return Err(Error::Plan(format!(
+                "shard {} of `{}`: CELASTRO_MIN_HOLDERS is {} and the collection's confirm rule \
+                 is 'none', which waits for nobody; the floor needs 'all' or 'quorum'",
+                self.index, self.coll.name, self.opts.min_holders
+            )));
+        }
         let live = self.shipper.as_ref().map(|s| s.live_followers()).unwrap_or(0);
         crate::replication::holders_check(&self.coll.name, self.index, live, self.opts.min_holders)
     }
@@ -2760,6 +2994,11 @@ impl Shard {
     /// The floor changed after the open (a test's): this shard's copy.
     pub(crate) fn set_min_holders(&mut self, n: usize) {
         self.opts.min_holders = n.max(1);
+    }
+
+    /// The row caps changed after the open (a test's): this shard's copy.
+    pub(crate) fn set_row_caps(&mut self, caps: (usize, usize)) {
+        self.opts.row_caps = caps;
     }
 
     pub(crate) fn insert(&mut self, mut doc: Value) -> Result<Timestamp> {
@@ -2776,6 +3015,7 @@ impl Shard {
         self.validate_indexable(&doc)?;
         let ts = self.clock.now();
         let prev = self.locate(&key, MAX_TS);
+        let mut unsynced = None;
         if let Some(w) = self.wal.as_mut() {
             let mark = w.mark()?;
             let record = WalRecord {
@@ -2794,10 +3034,14 @@ impl Shard {
             let defer = self.defer_sync;
             if let Err(e) = w.append(&record).and_then(|_| if defer { Ok(()) } else { w.sync() }) {
                 let _ = w.rollback(mark);
+                if w.group.failure().is_some() {
+                    self.clock.fail();
+                }
                 return Err(e);
             }
             if defer {
                 let (log, seq) = w.pending();
+                unsynced = Some(seq);
                 self.clock.begin(ts);
                 self.pending.push(PendingSync { log, seq, first: ts });
             }
@@ -2821,7 +3065,7 @@ impl Shard {
             // rejected document does not live again on the next reopen.
         }
         if let Some(p) = prev {
-            self.mark_superseded(p, ts);
+            self.mark_superseded_unsynced(unsynced, p, ts);
         }
         self.coll.observe_doc(&doc);
         self.unsealed.observe_doc(&doc);
@@ -2870,6 +3114,7 @@ impl Shard {
         &mut self,
         docs: Vec<(String, Value)>,
     ) -> Result<Vec<Timestamp>> {
+        let mut unsynced = None;
         self.holders_check()?;
         self.writes.fetch_add(docs.len() as u64, AtomicOrdering::Relaxed);
         let mut prepared: Vec<(String, Timestamp, Value, Option<Loc>)> =
@@ -2921,10 +3166,14 @@ impl Shard {
             // told had failed does not come back on the next reopen.
             if let Err(e) = written {
                 let _ = w.rollback(mark);
+                if w.group.failure().is_some() {
+                    self.clock.fail();
+                }
                 return Err(e);
             }
             if defer {
                 let (log, seq) = w.pending();
+                unsynced = Some(seq);
                 let first = prepared.iter().map(|p| p.1).min().unwrap_or(0);
                 self.clock.begin(first);
                 self.pending.push(PendingSync { log, seq, first });
@@ -2946,7 +3195,7 @@ impl Shard {
         let mut out = Vec::with_capacity(prepared.len());
         for (key, ts, doc, prev) in prepared {
             if let Some(p) = prev {
-                self.mark_superseded(p, ts);
+                self.mark_superseded_unsynced(unsynced, p, ts);
             }
             self.coll.observe_doc(&doc);
             self.unsealed.observe_doc(&doc);
@@ -2995,6 +3244,7 @@ impl Shard {
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<Option<Timestamp>> {
+        let mut unsynced = None;
         self.holders_check()?;
         self.writes.fetch_add(1, AtomicOrdering::Relaxed);
         let ts = self.clock.now();
@@ -3017,10 +3267,14 @@ impl Shard {
             let defer = self.defer_sync;
             if let Err(e) = w.append(&record).and_then(|_| if defer { Ok(()) } else { w.sync() }) {
                 let _ = w.rollback(mark);
+                if w.group.failure().is_some() {
+                    self.clock.fail();
+                }
                 return Err(e);
             }
             if defer {
                 let (log, seq) = w.pending();
+                unsynced = Some(seq);
                 self.clock.begin(ts);
                 self.pending.push(PendingSync { log, seq, first: ts });
             }
@@ -3028,7 +3282,7 @@ impl Shard {
                 w.ship_after_sync(sh.clone(), ship_item(&record));
             }
         }
-        self.mark_superseded(prev, ts);
+        self.mark_superseded_unsynced(unsynced, prev, ts);
         Ok(Some(ts))
     }
 
@@ -3049,6 +3303,7 @@ impl Shard {
     /// is deleted once; a key not there is not counted. The keys that were
     /// there, with their instants.
     pub(crate) fn delete_many(&mut self, keys: &[String]) -> Result<Vec<(String, Timestamp)>> {
+        let mut unsynced = None;
         self.holders_check()?;
         self.writes.fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
         let mut seen = BTreeSet::new();
@@ -3088,10 +3343,14 @@ impl Shard {
             };
             if let Err(e) = written {
                 let _ = w.rollback(mark);
+                if w.group.failure().is_some() {
+                    self.clock.fail();
+                }
                 return Err(e);
             }
             if defer {
                 let (log, seq) = w.pending();
+                unsynced = Some(seq);
                 let first = prepared.iter().map(|p| p.0.ts).min().unwrap_or(0);
                 self.clock.begin(first);
                 self.pending.push(PendingSync { log, seq, first });
@@ -3104,7 +3363,7 @@ impl Shard {
         }
         let mut out = Vec::with_capacity(prepared.len());
         for (record, prev) in prepared {
-            self.mark_superseded(prev, record.ts);
+            self.mark_superseded_unsynced(unsynced, prev, record.ts);
             out.push((record.key, record.ts));
         }
         Ok(out)
@@ -3321,6 +3580,14 @@ impl Shard {
                 }
                 handle.segment.unload_all();
                 let bytes = fs::read(&from)?;
+                // Under the current key as it goes: an object sealed under a
+                // key the ring has since dropped would not open there, and
+                // one that comes back local under an old key would not open
+                // here once the ring goes (0.97.0).
+                let bytes = match &self.opts.cipher {
+                    Some(c) => c.reseal_file(&self.file_ids(&name), &bytes)?,
+                    None => bytes,
+                };
                 h.store.put(&key, &bytes)?;
                 // Confirmed before the local file goes: the store's size
                 // for the key and its tail read back -- the footer, its
@@ -3351,6 +3618,10 @@ impl Shard {
             } else if is_remote {
                 handle.segment.unload_all();
                 let bytes = h.store.get(&key)?;
+                let bytes = match &self.opts.cipher {
+                    Some(c) => c.reseal_file(&self.file_ids(&name), &bytes)?,
+                    None => bytes,
+                };
                 publish(&local, &bytes)?;
                 sync_dir(&dir.join("segments"))?;
                 handle
@@ -4394,77 +4665,7 @@ impl Shard {
                 let _ = fs::remove_file(&p);
             }
         }
-        for r in records {
-            s.clock.observe(r.ts);
-            match r.kind {
-                WAL_INSERT => {
-                    // A crash between writing the segments and truncating the
-                    // WAL replays inserts whose documents are already sealed,
-                    // so replay has to converge on the post-seal state rather
-                    // than add to it.
-                    //
-                    // The question is whether THIS record's effect is already
-                    // on disk, and the answer is "the key already carries a
-                    // version at or after this record's ts". At: the seal wrote
-                    // this very version. After: a later version of the key is
-                    // sealed and this one was superseded before the seal — the
-                    // version an unpinned seal deliberately forgets, which
-                    // replay must not resurrect. Either way, re-applying the
-                    // record makes the key live twice.
-                    //
-                    // `>=`, not `==`, for that second case, and
-                    // `latest_version` rather than `locate(key, MAX_TS)` for a
-                    // third: a seal under a pinned `gc_horizon` emits one
-                    // segment per version layer, so the key's newest version is
-                    // no longer the only one on disk. Superseding whatever is
-                    // VISIBLE then wrote a tombstone onto the newest layer at
-                    // the OLDEST record's timestamp — below that version's own
-                    // commit — and left the older layer live beside the
-                    // memtable copy it had just re-inserted, so every key read
-                    // twice at exactly the horizon the pin exists to preserve.
-                    //
-                    // This rests on the WAL being truncated by the seal as a
-                    // whole: a record whose ts is BELOW a sealed version of the
-                    // same key was necessarily in the memtable when that seal
-                    // ran, so the seal either wrote it into a layer or
-                    // collapsed it on purpose. There is no third case.
-                    let prev = s.latest_version(&r.key);
-                    if prev.map(|(_, ts)| ts >= r.ts).unwrap_or(false) {
-                        continue;
-                    }
-                    // A genuine post-seal write: supersede the newest version,
-                    // which is now strictly older than this record.
-                    if let Some((loc, _)) = prev {
-                        s.mark_superseded(loc, r.ts);
-                    }
-                    if let Some(d) = r.doc {
-                        // Into the live view and the unsealed tally, exactly
-                        // as the insert that wrote the record did. The
-                        // persisted catalog did not count this record: it
-                        // persists sealed documents only, so that this
-                        // observation is the record's first and not its
-                        // second. See `Shard::sealed`.
-                        s.coll.observe_doc(&d);
-                        s.unsealed.observe_doc(&d);
-                        s.memtable.insert(r.key, r.ts, d)?;
-                    }
-                }
-                WAL_DELETE => {
-                    // The version live at the delete's own instant, not the
-                    // newest: a copy's log can hold a later version of the
-                    // key before an earlier delete of it, the catch-up
-                    // coming in key order and the backlog after it.
-                    if let Some(loc) = s.locate(&r.key, r.ts) {
-                        s.mark_superseded(loc, r.ts);
-                    }
-                }
-                WAL_SHIP_MARK => {
-                    s.ship_ts = s.ship_ts.max(r.ts);
-                    s.caught_up = true;
-                }
-                _ => {}
-            }
-        }
+        s.apply_replayed(records, true)?;
         if let Some(c) = ceiling {
             // Cut: caught up to the ceiling and no further, whatever the
             // marks said, and the file says the same for the next open.
@@ -4740,6 +4941,25 @@ impl Shard {
             }
         }
         self.catchup_floor = self.catchup_floor.max(forgotten);
+        // The marks placed on the inputs since the build read them: a
+        // delete, or an update, that landed while the build ran off the
+        // lock went into an input's log alone, and the install retired
+        // that log with its input -- the row came back live (through
+        // 0.96.0). Collected again here, under the lock; a mark the build
+        // carried is carried twice, to the same instant.
+        let mut carried: Vec<CarriedDelete> = carried_deletes.to_vec();
+        for h in self.segments.iter().filter(|h| input_ids.contains(&h.id())) {
+            let log = h.deletes.read().unwrap();
+            for (ord, dts) in log.iter() {
+                if dts == crate::time::MAX_TS {
+                    continue;
+                }
+                let key = h.segment.ordinals.key(ord).unwrap_or("").to_string();
+                let commit_ts = h.segment.ordinals.commit_ts[ord as usize];
+                carried.push((key, commit_ts, dts));
+            }
+        }
+        let carried_deletes = &carried;
         let mut handles = Vec::new();
         for seg in outputs {
             self.adopt_segment(&seg);
@@ -7256,6 +7476,12 @@ mod tests {
         );
         assert_eq!(s.num_docs(MAX_TS), count, "the rejected document is in the memtable");
 
+        // The log takes no writes until it is recovered: a delete now is
+        // refused naming the log, without a sync, and the arming stays.
+        let e = s.delete(&key).unwrap_err().to_string();
+        assert!(e.contains("takes no more writes"), "{e}");
+        assert!(s.recover_log().unwrap(), "the log is recovered in place");
+
         // The delete leg of the same claim.
         durability_probe::fail_next(Op::WalSync, &log);
         let e = s.delete(&key).unwrap_err();
@@ -7278,12 +7504,81 @@ mod tests {
              the log"
         );
 
-        // And the arming is one shot, so this is the control: the same insert
-        // with nothing armed goes through.
+        // A log whose sync failed takes no writes until it is recovered:
+        // the same insert with nothing armed is refused naming the log,
+        // and once the log is reopened in place -- what the engine does
+        // at the next statement -- it goes through.
         let mut third = doc(1);
         third.set_path("body", Value::Str("rewritten".into())).unwrap();
+        let e = s.insert(third.clone()).unwrap_err().to_string();
+        assert!(e.contains("takes no more writes"), "{e}");
+        // A probe that fails too is the refusal, naming both failures.
+        durability_probe::fail_next(Op::WalSync, &log);
+        let e = s.recover_log().unwrap_err().to_string();
+        assert!(e.contains("and still does"), "{e}");
+        assert!(s.recover_log().unwrap(), "the disk answers: the log is recovered in place");
+        assert_eq!(
+            s.get(&key, MAX_TS).unwrap().unwrap(),
+            before,
+            "the recovered log holds the first insert only"
+        );
         s.insert(third).unwrap();
         assert_ne!(s.get(&key, MAX_TS).unwrap().unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rollback after a sync that failed never makes the log longer: a
+    /// fresh log's header is unsynced (`synced_len` 0), so the failed sync
+    /// cuts the file to nothing, and a cut back to the statement's mark
+    /// from there would extend it with zeros -- a header no key opens,
+    /// which the open then refused as another key's, and the database
+    /// was locked out until an operator removed the log.
+    #[test]
+    fn a_rollback_after_a_failed_sync_never_grows_the_log() {
+        let dir = test_dir("rollback-grow");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let cipher = Some(Arc::new(crate::cipher::Cipher::generate().unwrap()));
+        let ids: crate::cipher::Ids = "t/wal.log".into();
+        let mut w = Wal::open(&log, cipher.clone(), ids.clone()).unwrap();
+        // A seal's rotation: the fresh log's header is on the file and no
+        // sync covers it yet -- the group's synced length is zero.
+        w.rotate(1).unwrap();
+        let header = fs::metadata(&log).unwrap().len();
+        assert!(header > 0, "a fresh log has a header");
+        assert_eq!(w.synced_len(), 0, "and no sync covers it yet");
+        let mark = w.mark().unwrap();
+        let rec = WalRecord {
+            kind: WAL_INSERT,
+            key: "k".into(),
+            ts: 7,
+            doc: Some(crate::json::parse(r#"{"id":"k"}"#).unwrap()),
+            supersedes: false,
+            segment_id: 0,
+        };
+        w.append(&rec).unwrap();
+        durability_probe::fail_next(Op::WalSync, &log);
+        assert!(w.sync().is_err());
+        let _ = w.rollback(mark);
+        let after = fs::metadata(&log).unwrap().len();
+        assert_eq!(
+            after,
+            w.synced_len(),
+            "the log holds bytes past what a sync covers: the rollback grew the cut log"
+        );
+        assert_eq!(after, 0);
+        drop(w);
+        // And the log opens again, empty: a crash's leftovers, not a
+        // foreign key's.
+        let w = Wal::open(&log, cipher.clone(), ids.clone()).unwrap();
+        assert_eq!(Wal::replay(&log, &cipher, &ids).unwrap().len(), 0);
+        drop(w);
+        // A log zero-extended by a crash -- a length and a header of
+        // zeros -- is cut as a torn tail, not refused as another key's.
+        fs::write(&log, [0u8; 96]).unwrap();
+        let w = Wal::open(&log, cipher.clone(), ids.clone()).unwrap();
+        assert_eq!(Wal::replay(&log, &cipher, &ids).unwrap().len(), 0);
+        drop(w);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -176,7 +176,15 @@ impl Scope {
                 c
             }
             Statement::Insert(i) => vec![i.collection.as_str()],
-            Statement::Delete(d) => vec![d.collection.as_str()],
+            Statement::Delete(d) => {
+                // The predicate runs as a select would: its walks cross
+                // edge collections the token must open too.
+                let mut c = vec![d.collection.as_str()];
+                if let Some(e) = &d.predicate {
+                    predicate_edges(e, &mut c);
+                }
+                c
+            }
             Statement::Flush { collection }
             | Statement::Compact { collection }
             | Statement::ShowSegments { collection } => vec![collection.as_str()],
@@ -187,20 +195,22 @@ impl Scope {
     }
 }
 
+/// The edge collections a predicate's walks cross.
+fn predicate_edges<'a>(e: &'a sql::Expr, out: &mut Vec<&'a str>) {
+    match e {
+        sql::Expr::Hops { via, .. } => out.push(via.as_str()),
+        sql::Expr::And(v) | sql::Expr::Or(v) => v.iter().for_each(|x| predicate_edges(x, out)),
+        sql::Expr::Not(x) => predicate_edges(x, out),
+        _ => {}
+    }
+}
+
 /// The edge collections a select's walks cross, in `WHERE` and in a
 /// `hops(...)` source.
 fn select_edges(sel: &sql::Select) -> Vec<&str> {
-    fn walk<'a>(e: &'a sql::Expr, out: &mut Vec<&'a str>) {
-        match e {
-            sql::Expr::Hops { via, .. } => out.push(via.as_str()),
-            sql::Expr::And(v) | sql::Expr::Or(v) => v.iter().for_each(|x| walk(x, out)),
-            sql::Expr::Not(x) => walk(x, out),
-            _ => {}
-        }
-    }
     let mut out = Vec::new();
     if let Some(e) = &sel.predicate {
-        walk(e, &mut out);
+        predicate_edges(e, &mut out);
     }
     if let Some(sql::OrderBy::Hybrid(h)) = &sel.order {
         for s in &h.sources {
@@ -241,6 +251,8 @@ struct Session {
 /// How long a session lives unused, and how many the console keeps.
 const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
 const MAX_SESSIONS: usize = 256;
+/// Sessions one token may hold at once: a browser or two, not the table.
+const MAX_SESSIONS_PER_TOKEN: usize = 16;
 const SESSION_COOKIE: &str = "celastro_session";
 
 impl Sessions {
@@ -251,6 +263,19 @@ impl Sessions {
         let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         m.retain(|_, s| now.duration_since(s.last) < SESSION_IDLE);
+        // A token's own sessions first: a holder of any token could
+        // otherwise open the table's worth and log every operator out.
+        while m.values().filter(|s| s.token == token).count() >= MAX_SESSIONS_PER_TOKEN {
+            let oldest = m
+                .iter()
+                .filter(|(_, s)| s.token == token)
+                .min_by_key(|(_, s)| s.last)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => m.remove(&k),
+                None => break,
+            };
+        }
         while m.len() >= MAX_SESSIONS {
             let oldest = m.iter().min_by_key(|(_, s)| s.last).map(|(k, _)| k.clone());
             match oldest {
@@ -2013,26 +2038,39 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
 /// Is this the console's own origin?
 ///
 /// Serialised origins are `scheme://host:port` and nothing else, so the two
-/// spellings of loopback with this server's port are the whole allow-list.
-/// `null`, a file URL, an https origin and any other port are all somebody
-/// else. The comparison ignores case in the host because host names are
+/// spellings of loopback with this server's port, under either scheme,
+/// are the whole allow-list. `null`, a file URL and any other port are
+/// all somebody else. The scheme tells no foreign page from this one:
+/// one server listens at the port, in the clear or under TLS, and a page
+/// it served carries its scheme -- until 0.97.0 only `http://` was ours,
+/// and a console serving TLS refused every POST its own page made. The
+/// comparison ignores case in the host because host names are
 /// case-insensitive; it cannot admit an origin the exact match would not.
 fn origin_is_ours(origin: &str, port: u16) -> bool {
-    let ours = [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}")];
-    ours.iter().any(|o| origin.eq_ignore_ascii_case(o))
+    let Some(rest) = origin_host_part(origin) else { return false };
+    let ours = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    ours.iter().any(|o| rest.eq_ignore_ascii_case(o))
 }
 
-/// On a network the console's own origin is `http://` and whatever `Host`
-/// the same request named: the name the client reached it by, which is the
-/// name a page it served would carry as its origin. `https` is not ours --
-/// the console serves none -- and neither is any other host, so a form on
-/// a page from elsewhere is refused exactly as on loopback.
+/// On a network the console's own origin is whatever `Host` the same
+/// request named, under either scheme: the name the client reached it
+/// by, which is the name a page it served would carry as its origin --
+/// `https://` when the console serves TLS or stands behind an ingress
+/// that does. Any other host is not ours, so a form on a page from
+/// elsewhere is refused exactly as on loopback.
 fn origin_is_host(origin: &str, host: &str) -> bool {
-    let (scheme, rest) = match origin.is_char_boundary(7) {
-        true => origin.split_at(7),
-        false => return false,
-    };
-    scheme.eq_ignore_ascii_case("http://") && rest.eq_ignore_ascii_case(host.trim())
+    origin_host_part(origin).is_some_and(|rest| rest.eq_ignore_ascii_case(host.trim()))
+}
+
+/// The `host:port` of an origin under `http://` or `https://`; none for
+/// any other scheme or spelling (`null`, a file URL).
+fn origin_host_part(origin: &str) -> Option<&str> {
+    for scheme in ["https://", "http://"] {
+        if origin.get(..scheme.len()).is_some_and(|s| s.eq_ignore_ascii_case(scheme)) {
+            return Some(&origin[scheme.len()..]);
+        }
+    }
+    None
 }
 
 /// `application/json`, with or without parameters (`; charset=utf-8`).
@@ -2313,6 +2351,10 @@ fn reconcile_interval() -> Option<Duration> {
 pub(crate) struct Grants {
     since: Mutex<Instant>,
     last: Mutex<std::collections::BTreeMap<String, Instant>>,
+    /// The highest term this steward issued per shard: a promotion whose
+    /// answer was lost is not re-issued at the same term to another
+    /// follower (two holders at one term, kept and named for ever).
+    issued: Mutex<std::collections::BTreeMap<(String, usize), u64>>,
 }
 
 impl Grants {
@@ -2321,13 +2363,27 @@ impl Grants {
     }
 
     fn starting_at(since: Instant) -> Grants {
-        Grants { since: Mutex::new(since), last: Mutex::new(std::collections::BTreeMap::new()) }
+        Grants {
+            since: Mutex::new(since),
+            last: Mutex::new(std::collections::BTreeMap::new()),
+            issued: Mutex::new(std::collections::BTreeMap::new()),
+        }
     }
 
     /// This node is steward as of now (elected): the clock the hold-off
     /// counts from starts again.
     fn restart(&self) {
         *self.since.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+
+    /// The term the next promotion of `shard` is issued at: past the map's
+    /// and past any this steward issued before, whether or not the answer
+    /// came back.
+    fn next_term(&self, collection: &str, shard: usize, seen: u64) -> u64 {
+        let mut m = self.issued.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry((collection.to_string(), shard)).or_insert(0);
+        *e = (*e).max(seen) + 1;
+        *e
     }
 
     /// A renewal reached `node` now.
@@ -2344,7 +2400,12 @@ impl Grants {
     fn promotion_wait(&self, holder: &str, lease: Duration, now: Instant) -> Option<Duration> {
         let last = self.last.lock().unwrap_or_else(|p| p.into_inner()).get(holder).copied();
         let since = *self.since.lock().unwrap_or_else(|p| p.into_inner());
-        let mut left = lease.saturating_sub(now.saturating_duration_since(since));
+        // A lease and a quarter since this steward started: the previous
+        // steward may have renewed a holder's lease up to half a lease
+        // after losing its majority, and the election took a random slice
+        // more -- a lease alone left the margin to that slice.
+        let holdoff = lease + lease / 4;
+        let mut left = holdoff.saturating_sub(now.saturating_duration_since(since));
         if let Some(at) = last {
             left = left.max(lease.saturating_sub(now.saturating_duration_since(at)));
         }
@@ -2756,9 +2817,12 @@ fn steward_sweep(
             let g = read(db);
             (g.region_of(&holder), g.confirm_of(&collection) == crate::replication::Confirm::Quorum)
         };
-        let rank = |f: &str, at: u64| -> (bool, u64) {
+        // The most recent copy first: a follower away from the holder
+        // while another was live missed acknowledged writes, whatever its
+        // region; the region only breaks a tie.
+        let rank = |f: &str, at: u64| -> (u64, bool) {
             let same = !quorum && holder_region.is_some() && read(db).region_of(f) == holder_region;
-            (same, at)
+            (at, same)
         };
         let mut best: Option<(String, u64)> = None;
         for f in &followers {
@@ -2805,18 +2869,21 @@ fn steward_sweep(
             );
             continue;
         };
+        // The term from the ledger, whichever copy is promoted: a
+        // promotion whose answer was lost is not re-issued at the same
+        // term to another follower.
+        let next = grants.next_term(&collection, shard, term);
         let answer = if f == me {
             // The steward's own copy: promoted here, the map carried with
             // the lock let go.
-            let out = write(db).promote_shard(&collection, shard, &me, Some(term + 1), false, true);
+            let out = write(db).promote_shard(&collection, shard, &me, Some(next), false, true);
             out.and_then(|o| o.finished_with(db)).map(|o| match o {
                 Outcome::Ack(m) => m,
                 other => format!("{other:?}"),
             })
         } else {
             let Some((_, node)) = peers.iter().find(|(u, _)| u == &f) else { continue };
-            let sql =
-                format!("LOCAL PROMOTE SHARD {shard} OF {collection} ON '{f}' TERM {}", term + 1);
+            let sql = format!("LOCAL PROMOTE SHARD {shard} OF {collection} ON '{f}' TERM {next}");
             let _deadline = crate::deadline::arm(Some(30_000));
             node.statement(&sql, &[])
         };
@@ -2993,19 +3060,27 @@ fn compaction_step(db: &RwLock<Db>) -> bool {
                 )
             }
             (Ok(false), _) => {}
-            (Err(e), _) => crate::log::warn(
-                "compaction_not_installed",
-                &[("what", what.clone()), ("error", e.to_string())],
-            ),
+            (Err(e), _) => {
+                crate::log::warn(
+                    "compaction_not_installed",
+                    &[("what", what.clone()), ("error", e.to_string())],
+                );
+                // Not at once: a disk that is full is still full, and the
+                // planner would hand the same job straight back.
+                std::thread::sleep(Duration::from_secs(1));
+            }
         },
         Ok(None) => {}
         Err(e) if crate::signal::interrupted(&e) => {
             crate::log::info("compaction_interrupted", &[("what", what.clone())])
         }
-        Err(e) => crate::log::warn(
-            "compaction_failed",
-            &[("what", what.clone()), ("error", e.to_string())],
-        ),
+        Err(e) => {
+            crate::log::warn(
+                "compaction_failed",
+                &[("what", what.clone()), ("error", e.to_string())],
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
     true
 }
@@ -3893,6 +3968,20 @@ fn text_json(kind: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A term is issued once: a second promotion of the shard, the first's
+    /// answer lost and the map still at the old term, is issued past the
+    /// first, whichever copy it goes to; a term the map has moved past is
+    /// passed too.
+    #[test]
+    fn a_term_is_issued_once_past_the_map_and_past_the_last_issued() {
+        use super::Grants;
+        let g = Grants::starting_at(std::time::Instant::now());
+        assert_eq!(g.next_term("c", 0, 3), 4);
+        assert_eq!(g.next_term("c", 0, 3), 5, "the map still says 3; the answer was lost");
+        assert_eq!(g.next_term("c", 0, 9), 10, "the map moved past what was issued");
+        assert_eq!(g.next_term("c", 1, 3), 4, "another shard's ledger is its own");
+    }
+
     /// A promotion waits out the lease: from the steward's start, and
     /// from its last renewal to the holder, whichever is later.
     #[test]
@@ -3904,17 +3993,22 @@ mod tests {
         let g = Grants::starting_at(t0);
         // Just started: nothing may be promoted for a whole lease, granted
         // or not -- the previous process at this address may have granted.
+        // A lease and a quarter since the start (75 s here): the previous
+        // steward may have renewed a holder half a lease past losing its
+        // majority, and the election took a slice more.
         let w = g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(20)).unwrap();
-        assert!(w > Duration::from_secs(39) && w <= Duration::from_secs(40), "{w:?}");
-        assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(61)).is_none());
+        assert!(w > Duration::from_secs(54) && w <= Duration::from_secs(55), "{w:?}");
+        assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(61)).is_some());
+        assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(76)).is_none());
         // Granted at +50: the holder's lease runs to +110.
         g.last.lock().unwrap().insert("tcp://h:1".into(), t0 + Duration::from_secs(50));
         let w = g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(70)).unwrap();
         assert!(w > Duration::from_secs(39) && w <= Duration::from_secs(40), "{w:?}");
         assert!(g.promotion_wait("tcp://h:1", lease, t0 + Duration::from_secs(110)).is_none());
         // Another holder, never granted by this process: due once the
-        // process is a lease old.
-        assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(70)).is_none());
+        // process is a lease and a quarter old.
+        assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(70)).is_some());
+        assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(76)).is_none());
     }
 
     /// The metrics page names every counter once, typed, and counts what
@@ -4193,9 +4287,16 @@ mod tests {
             .unwrap());
             assert!(matches!(dispatch_for(&bad, &tokens, 8787, reach), Err(Reject::Unauthorized)));
         }
-        // The table is bounded: past the cap the oldest session goes.
-        for _ in 0..(MAX_SESSIONS + 5) {
+        // One token's share is bounded: past sixteen its own oldest goes,
+        // and nobody else's -- a holder of any token cannot log the
+        // operators out.
+        for _ in 0..(MAX_SESSIONS_PER_TOKEN + 5) {
             sessions.open(token).unwrap();
+        }
+        assert_eq!(sessions.count(), MAX_SESSIONS_PER_TOKEN, "the operator's own is one of them");
+        // The table is bounded: past the cap the oldest session goes.
+        for i in 0..(MAX_SESSIONS + 5) {
+            sessions.open(&format!("other-token-{i:04}")).unwrap();
         }
         assert_eq!(sessions.count(), MAX_SESSIONS);
         // Under TLS the cookie is Secure.
@@ -4469,11 +4570,22 @@ mod tests {
             Reach::Network
         )
         .is_ok());
+        // Under TLS, or behind an ingress that terminates it, the page's
+        // origin is https at the same host: this console's.
+        assert!(dispatch_for(
+            &post("https://celastro-console:8787"),
+            &Tokens::operator("tok"),
+            PORT,
+            Reach::Network
+        )
+        .is_ok());
         for foreign in [
             "http://evil.example",
-            "https://celastro-console:8787",
+            "https://evil.example",
             "null",
             "http://celastro-console:9000",
+            "https://celastro-console:9000",
+            "ftp://celastro-console:8787",
         ] {
             assert_eq!(
                 dispatch_for(&post(foreign), &Tokens::operator("tok"), PORT, Reach::Network).err(),
@@ -5723,15 +5835,25 @@ mod tests {
         assert!(matches!(dispatch(&post(&mine), "tok", PORT), Ok(Action::Query(_))));
         let local = format!("Origin: http://localhost:{}\r\n{json}", PORT);
         assert!(matches!(dispatch(&post(&local), "tok", PORT), Ok(Action::Query(_))));
+        // The console under TLS: its own page's origin is https, and one
+        // server listens at the port, so that page is this console's.
+        for origin in [format!("https://127.0.0.1:{}", PORT), format!("HTTPS://localhost:{}", PORT)]
+        {
+            let text = format!("Origin: {origin}\r\n{json}");
+            assert!(
+                matches!(dispatch(&post(&text), "tok", PORT), Ok(Action::Query(_))),
+                "{origin}"
+            );
+        }
         // What a page somewhere else sends.
         for origin in [
             "http://evil.example".to_string(),
             "https://evil.example".to_string(),
             "null".to_string(),
+            "file://".to_string(),
             format!("http://127.0.0.1:{}", PORT + 1),
-            // The scheme is part of the origin: an https page on this host is
-            // not this console.
-            format!("https://127.0.0.1:{}", PORT),
+            format!("https://127.0.0.1:{}", PORT + 1),
+            format!("ftp://127.0.0.1:{}", PORT),
         ] {
             let text = format!("Origin: {origin}\r\n{json}");
             let refused = dispatch(&post(&text), "tok", PORT).err();
@@ -5849,6 +5971,13 @@ mod tests {
             &mut db,
             rw,
             "SELECT id FROM notes WHERE id WITHIN 1 HOP OF 'n1' VIA other LIMIT 5"
+        )));
+        // A delete's predicate walks as a select does: the same refusal,
+        // or the count would say what the walk reached.
+        assert!(forbidden(&run(
+            &mut db,
+            rw,
+            "DELETE FROM notes WHERE id WITHIN 1 HOP OF 'n1' VIA other"
         )));
         assert!(forbidden(&run(&mut db, rw, "SHOW HEALTH")));
         assert!(forbidden(&run(&mut db, rw, "SHOW CATALOG")));

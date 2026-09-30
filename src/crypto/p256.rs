@@ -7,14 +7,14 @@ use super::sha2::{sha256, sha384};
 use super::weierstrass::{hexbig, Affine, Curve};
 
 fn curve() -> Curve {
-    Curve {
-        p: hexbig("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"),
-        n: hexbig("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
-        b: hexbig("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
-        gx: hexbig("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
-        gy: hexbig("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
-        bytes: 32,
-    }
+    Curve::new(
+        hexbig("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"),
+        hexbig("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
+        hexbig("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
+        hexbig("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
+        hexbig("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
+        32,
+    )
 }
 
 /// A P-256 public key from its uncompressed encoding `04 || x || y`.

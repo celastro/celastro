@@ -19,24 +19,33 @@ struct Point {
 }
 
 fn d() -> Fe {
-    // -121665 / 121666
-    Fe::from_u64(121665).neg().mul(Fe::from_u64(121666).invert())
+    static ONCE: std::sync::OnceLock<Fe> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        // -121665 / 121666
+        Fe::from_u64(121665).neg().mul(Fe::from_u64(121666).invert())
+    })
 }
 
 fn sqrt_m1() -> Fe {
-    // 2^((p-1)/4) = 2^(2 * (p-5)/8 + 1)
-    Fe::from_u64(2).pow_p58().square().mul(Fe::from_u64(2))
+    static ONCE: std::sync::OnceLock<Fe> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        // 2^((p-1)/4) = 2^(2 * (p-5)/8 + 1)
+        Fe::from_u64(2).pow_p58().square().mul(Fe::from_u64(2))
+    })
 }
 
 fn base() -> Point {
-    // y = 4/5, x positive.
-    let y = Fe::from_u64(4).mul(Fe::from_u64(5).invert());
-    decode(&{
-        let mut b = y.to_bytes();
-        b[31] &= 0x7f;
-        b
+    static ONCE: std::sync::OnceLock<Point> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        // y = 4/5, x positive.
+        let y = Fe::from_u64(4).mul(Fe::from_u64(5).invert());
+        decode(&{
+            let mut b = y.to_bytes();
+            b[31] &= 0x7f;
+            b
+        })
+        .expect("the base point decodes")
     })
-    .expect("the base point decodes")
 }
 
 impl Point {
@@ -102,6 +111,10 @@ fn decode(b: &[u8; 32]) -> Option<Point> {
     let mut yb = *b;
     yb[31] &= 0x7f;
     let y = Fe::from_bytes(&yb);
+    // RFC 8032 §5.1.3 step 1: a y at or past p is no encoding.
+    if y.to_bytes() != yb {
+        return None;
+    }
     // x^2 = (y^2 - 1) / (d y^2 + 1)
     let y2 = y.square();
     let u = y2.sub(Fe::ONE);

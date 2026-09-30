@@ -179,6 +179,17 @@ impl DeleteLog {
         }
     }
 
+    /// The mark at `ord` taken back, if it is the one placed at `ts`: what
+    /// a write whose log record was cut does, since the death it recorded
+    /// was acknowledged to nobody. `true` when an entry went.
+    pub fn unmark(&mut self, ord: u32, ts: Timestamp) -> bool {
+        if self.entries.get(&ord) == Some(&ts) {
+            self.entries.remove(&ord);
+            return true;
+        }
+        false
+    }
+
     pub fn delete_ts(&self, ord: u32) -> Timestamp {
         self.entries.get(&ord).copied().unwrap_or(MAX_TS)
     }

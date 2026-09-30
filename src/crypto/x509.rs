@@ -653,42 +653,72 @@ pub fn chain_reaches_anchor_with(
             chain.len()
         )));
     }
-    let mut current = leaf;
-    for depth in 0..chain.len().max(1) {
-        // `depth` intermediates stand below whatever signs `current`.
-        let allows = |ca: &Certificate| ca.path_len.map_or(true, |n| depth as u32 <= n);
-        if anchors.iter().any(|a| current.signed_by(a) && a.valid_at(now) && allows(a)) {
-            return Ok(());
-        }
-        if anchors.iter().any(|a| current.signed_by(a) && a.valid_at(now)) {
-            return Err(refuse(format!(
-                "the chain has {depth} intermediate(s) under an anchor whose pathLenConstraint \
-                 allows fewer"
-            )));
-        }
-        let Some(next) = chain.get(depth + 1) else { break };
-        // An intermediate is a CA whose key usage, when it names any,
-        // allows it to sign certificates.
-        if !(next.is_ca
-            && next.valid_at(now)
-            && next.may_sign_certificates()
-            && current.signed_by(next))
+    // The names first, no signature checked: from the leaf up, each link
+    // names the next as its issuer, until one names an anchor -- the
+    // nearest valid anchor of that name. Then the signatures, from the
+    // anchor down, so the first one verified is the anchor's over the top
+    // link: a chain of keys a peer made up costs one verification and not
+    // eight (a P-384 verification is real work; before 0.97.0 a peer could
+    // spend seconds of this node's CPU per attempt on a chain that led
+    // nowhere). A self-issued link -- a CA's key rolled, subject and issuer
+    // the same name -- counts for no depth (RFC 5280 §6.1.4).
+    let mut top = 0usize;
+    let anchor = loop {
+        let current = &chain[top];
+        // Among the anchors of that name (a CA rotated keeps its name), the
+        // one whose key signed this link: a verification per such anchor,
+        // bounded by the anchors, never by the chain.
+        if let Some(a) = anchors
+            .iter()
+            .filter(|a| current.issuer == a.subject && a.valid_at(now))
+            .find(|a| current.signed_by(a))
         {
+            break a;
+        }
+        let Some(next) = chain.get(top + 1) else {
+            return Err(refuse("the chain does not reach a certificate this node trusts".into()));
+        };
+        if current.issuer != next.subject {
+            return Err(refuse(
+                "the chain does not link: a certificate is not issued by the next".into(),
+            ));
+        }
+        top += 1;
+    };
+    let self_issued = |c: &Certificate| c.subject == c.issuer;
+    let mut signer: &Certificate = anchor;
+    for k in (0..=top).rev() {
+        let link = &chain[k];
+        if !link.signed_by(signer) {
             return Err(refuse(
                 "the chain does not link: a certificate is not signed by the next".into(),
             ));
         }
-        if !allows(next) {
-            return Err(refuse(format!(
-                "the chain has {depth} intermediate(s) under a CA whose pathLenConstraint \
-                 allows {}",
-                next.path_len.unwrap_or(0)
-            )));
+        // The intermediates below `signer` -- the link and what follows
+        // it, the leaf not among them -- against its pathLenConstraint; a
+        // self-issued one is not counted (RFC 5280 §4.2.1.9).
+        let below = chain[1..=k].iter().filter(|c| !self_issued(c)).count() as u32;
+        if let Some(n) = signer.path_len {
+            if below > n {
+                return Err(refuse(format!(
+                    "the chain has {below} intermediate(s) under a CA whose pathLenConstraint \
+                     allows {n}"
+                )));
+            }
         }
-        is_not_revoked(next, revoked)?;
-        current = next;
+        if k > 0 {
+            // An intermediate is a CA whose key usage, when it names any,
+            // allows it to sign certificates.
+            if !(link.is_ca && link.valid_at(now) && link.may_sign_certificates()) {
+                return Err(refuse(
+                    "the chain does not link: a certificate is not signed by the next".into(),
+                ));
+            }
+            is_not_revoked(link, revoked)?;
+        }
+        signer = link;
     }
-    Err(refuse("the chain does not reach a certificate this node trusts".into()))
+    Ok(())
 }
 
 /// Refused when a revocation list the anchors signed names `cert`.
@@ -1507,6 +1537,54 @@ mod tests {
     /// it, and an intermediate allowing none refuses a chain that puts
     /// another under it. The constraint is honoured on anchors and links
     /// alike (RFC 5280 §4.2.1.9; H8's C7).
+    /// The signatures are checked from the anchor down once the names
+    /// have found it: a leaf that names a genuine intermediate as its
+    /// issuer but was signed by some other key is refused at that link.
+    #[test]
+    fn a_link_the_next_did_not_sign_is_refused_once_the_anchor_is_found() {
+        let now = crate::time::now_micros() / 1_000_000;
+        let (t0, t1) = (now - 3600, now + 86_400);
+        let (rk, ik, lk, other) = (
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+        );
+        let ca = |cn: &str, kp: &KeyPair, issuer_cn: &str, issuer: &KeyPair| {
+            let spec = Spec {
+                common_name: cn,
+                dns_names: &[],
+                ip_addresses: &[],
+                not_before: t0,
+                not_after: t1,
+                is_ca: true,
+                path_len: None,
+            };
+            parse(&issue(&spec, kp, issuer_cn, issuer).unwrap()).unwrap()
+        };
+        let names = vec!["localhost".to_string()];
+        let leaf_by = |signer: &KeyPair| {
+            let spec = Spec {
+                common_name: "leaf",
+                dns_names: &names,
+                ip_addresses: &[],
+                not_before: t0,
+                not_after: t1,
+                is_ca: false,
+                path_len: None,
+            };
+            parse(&issue(&spec, &lk, "inter", signer).unwrap()).unwrap()
+        };
+        let root = ca("root", &rk, "root", &rk);
+        let inter = ca("inter", &ik, "root", &rk);
+        let anchors = std::slice::from_ref(&root);
+        verify_chain(&[leaf_by(&ik), inter.clone()], anchors, "localhost", now).unwrap();
+        let e = verify_chain(&[leaf_by(&other), inter], anchors, "localhost", now)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not signed by the next"), "{e}");
+    }
+
     #[test]
     fn a_path_length_constraint_bounds_the_intermediates_below_a_ca() {
         let now = crate::time::now_micros() / 1_000_000;

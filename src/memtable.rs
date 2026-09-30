@@ -222,6 +222,11 @@ impl Memtable {
         self.deletes.write().unwrap().mark(ord, ts);
     }
 
+    /// The mark at `ord` taken back if it is the one placed at `ts`.
+    pub fn unmark_deleted(&self, ord: u32, ts: Timestamp) {
+        self.deletes.write().unwrap().unmark(ord, ts);
+    }
+
     pub fn is_deleted_at(&self, ord: u32, t: Timestamp) -> bool {
         self.deletes.read().unwrap().is_deleted_at(ord, t)
     }

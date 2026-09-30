@@ -50,6 +50,9 @@ pub struct Hlc {
     /// A write's log failed to sync: its rows stay applied and hidden, the
     /// horizon stays below them until a restart, and nothing waits on it.
     failed: std::sync::atomic::AtomicBool,
+    /// The first instants of the writes whose sync failed: ended by
+    /// `recover`, once their logs are open again.
+    failed_firsts: Mutex<Vec<Timestamp>>,
 }
 
 impl Default for Hlc {
@@ -66,6 +69,7 @@ impl Hlc {
             horizon: AtomicU64::new(MAX_TS),
             settled: Condvar::new(),
             failed: std::sync::atomic::AtomicBool::new(false),
+            failed_firsts: Mutex::new(Vec::new()),
         }
     }
 
@@ -201,6 +205,26 @@ impl Hlc {
     pub fn fail(&self) {
         let _f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
         self.failed.store(true, Ordering::Release);
+    }
+
+    /// A write in flight whose sync failed: kept aside so a recovery can
+    /// end it (`recover`) once its log is reopened -- until then reads stay
+    /// below it, since what it wrote is on no disk.
+    pub fn fail_pending(&self, first: Timestamp) {
+        let _f = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        self.failed_firsts.lock().unwrap_or_else(|p| p.into_inner()).push(first);
+        self.failed.store(true, Ordering::Release);
+    }
+
+    /// Every log is open again: the writes that never settled end, reads
+    /// go on, and read-your-writes waits again.
+    pub fn recover(&self) {
+        let firsts =
+            std::mem::take(&mut *self.failed_firsts.lock().unwrap_or_else(|p| p.into_inner()));
+        for first in firsts {
+            self.end(first);
+        }
+        self.failed.store(false, Ordering::Release);
         self.settled.notify_all();
     }
 

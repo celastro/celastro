@@ -58,12 +58,7 @@ ENV RUSTFLAGS="-C strip=symbols"
 # and the builder has no reason to reach the network, so a dependency that ever
 # appears in Cargo.toml fails here, loudly, instead of quietly resolving.
 # --locked refuses to rewrite Cargo.lock, which CONTRIBUTING.md requires.
-#
-# `celastro` is the tool; `celastro-cli` is the same source under the name it
-# had until 0.40.0, kept for a release or two so a chart or a script that
-# still says it keeps working. Each is a static binary with its own copy of
-# std, so the image is about twice what it will be once the alias goes.
-RUN cargo build --release --locked --offline --bin celastro --bin celastro-cli
+RUN cargo build --release --locked --offline --bin celastro
 
 # The licence and the copyright notice are staged here rather than COPYed
 # straight into `scratch` so their mode is fixed by this file instead of by
@@ -95,8 +90,6 @@ LABEL org.opencontainers.image.title="celastro" \
 # process write access to its own executable, which is a capability with no use
 # and one obvious misuse.
 COPY --from=build /src/target/release/celastro /celastro
-# The old name, for a chart or a script from before 0.41.0; goes away later.
-COPY --from=build /src/target/release/celastro-cli /celastro-cli
 
 # AGPL-3.0-only asks that the licence and the notices travel with the object
 # code they cover (§4), and this image is that object code plus nothing — the

@@ -158,6 +158,45 @@ pub const RECOVERY_WARN_SECS: u64 = 3_600;
 pub const MAX_ROWS: usize = 10_000;
 pub const MAX_ROWS_HARD: usize = 1_000_000;
 
+/// [`Db::bound_select`] with the caps in hand: what the wire applies to a
+/// statement a coordinator forwarded, from the shard's options, so a
+/// shard bounds what it is asked for by the same rule as the node that
+/// asked.
+pub fn bound_select_with(sel: &Select, caps: (usize, usize)) -> Result<(Select, bool)> {
+    let (max_rows, hard) = caps;
+    let grouped = sel.group_by.is_some()
+        || sel.projections.iter().any(|p| matches!(p, Projection::Aggregate { .. }));
+    // An OFFSET sizes what every shard retains as much as a LIMIT does:
+    // one past the ceiling is refused, not held.
+    if sel.offset > hard {
+        return Err(Error::Plan(format!(
+            "OFFSET {} is past CELASTRO_MAX_ROWS_HARD ({hard}); page with a cursor (search_after) \
+             instead",
+            sel.offset
+        )));
+    }
+    let mut out = sel.clone();
+    let capped = match sel.limit {
+        // A `DELETE ... WHERE` selects with no limit at all, on purpose:
+        // the rows it names are the rows it deletes, every one, and a cut
+        // here deleted the first million and acknowledged the statement as
+        // whole (0.96.0). The sentinel is the statement's own, not a
+        // client's -- the parser refuses a LIMIT that large.
+        Some(usize::MAX) => false,
+        Some(l) if l > hard => {
+            out.limit = Some(hard);
+            true
+        }
+        Some(_) => false,
+        None if grouped => {
+            out.limit = Some(max_rows);
+            true
+        }
+        None => true,
+    };
+    Ok((out, capped))
+}
+
 /// `(CELASTRO_MAX_ROWS, CELASTRO_MAX_ROWS_HARD)`, or the defaults; the hard
 /// one is never below the other, and neither is zero.
 pub fn row_caps_from_env() -> (usize, usize) {
@@ -1357,32 +1396,10 @@ impl Db {
             // this node is data this directory never had.
             db.catalog.born_micros = lifecycle::now_micros(&db.clock);
         }
-        // A ring with nothing behind it retires itself. The ring exists so
-        // an archived object sealed under an older key still opens; with no
-        // index at the archived tier there is no such object, and keeping
-        // the old keys only widens what a stolen KEY and master open. This
-        // costs no store access -- the catalog answers it -- so the walk
-        // that `key retire` does is not needed for the easy case.
-        if let (Some(c), Some(master)) = (&db.cipher, &db.opts.master_key) {
-            let archived = db
-                .catalog
-                .collections
-                .values()
-                .any(|c| c.indexes.iter().any(|i| i.tier == crate::residency::Tier::Archived));
-            if c.previous_keys() > 0 && !archived {
-                let dropped = c.previous_keys();
-                let fresh = c.without_previous();
-                crate::shard::atomic_write(&dir.join("KEY"), &fresh.wrap(master)?)?;
-                db.cipher = Some(std::sync::Arc::new(fresh));
-                crate::log::info(
-                    "data_key_ring_retired",
-                    &[
-                        ("dropped", dropped.to_string()),
-                        ("why", "no index is at the archived tier".to_string()),
-                    ],
-                );
-            }
-        }
+        // A ring is retired by `key retire`, whose walk sees the store and
+        // the local segments alike: an open that dropped the ring on the
+        // catalog's word -- no index archived -- locked out segments that
+        // had come back local under an old key (0.97.0).
         // A drop is complete once the collection's directory has been renamed
         // aside; the catalog catches up here if the process ended between
         // that rename and the catalog's publication. See `drop_collection`.
@@ -1414,6 +1431,18 @@ impl Db {
         let names: Vec<String> = db.shards.keys().cloned().collect();
         for name in names {
             db.absorb_shard_catalogs(&name)?;
+        }
+        // The recovery point from the open on: what the archive already
+        // reaches for each shard held here, so `SHOW HEALTH` does not say
+        // "nothing since this process started" of an archive that is
+        // full. One listing per shard; an archive that does not answer
+        // leaves the line at nothing, and the open goes on.
+        if let Some(a) = db.log_archive.clone() {
+            for s in db.shards.values_mut().flat_map(|v| v.iter_mut()) {
+                if let Ok(Some(reach)) = a.reach_of(&s.coll.name, s.index) {
+                    s.note_archived_reach(reach);
+                }
+            }
         }
         Ok(db)
     }
@@ -1539,10 +1568,35 @@ impl Db {
             residency: Some(self.residency.clone()),
             placement: self.opts.placement.clone(),
             min_holders: self.min_holders,
+            row_caps: (self.max_rows, self.max_rows_hard),
             archive: self.archive.clone(),
             log_archive: self.log_archive.clone(),
             cipher: self.cipher.clone(),
         }
+    }
+
+    /// A log whose sync failed, recovered in place once the disk answers:
+    /// every held shard with a failed group is probed (`Shard::recover_log`),
+    /// and once none is failed the clock lets the reads it held back go
+    /// and the writes that will never settle end. Run before a write when
+    /// the clock says a sync failed; a probe that fails is the refusal.
+    pub fn recover_failed_logs(&mut self) -> Result<()> {
+        if !self.clock.failed() {
+            return Ok(());
+        }
+        let mut recovered = 0usize;
+        for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
+            if s.recover_log()? {
+                recovered += 1;
+            }
+        }
+        if self.log_syncs().2.is_none() {
+            self.clock.recover();
+            if recovered > 0 {
+                crate::log::info("log_recovered", &[("shards", recovered.to_string())]);
+            }
+        }
+        Ok(())
     }
 
     /// The floor on holders for every shard held here, and for the ones
@@ -1552,6 +1606,9 @@ impl Db {
         self.min_holders = n.max(1);
         for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
             s.set_min_holders(n);
+            if let Some(sh) = &s.shipper {
+                sh.set_min_holders(n);
+            }
         }
     }
 
@@ -2423,7 +2480,8 @@ impl Db {
         if let (_, _, Some(e)) = self.log_syncs() {
             out.push_str(&format!(
                 "write-ahead log: a sync FAILED ({e}); its shard takes no writes and reads here \
-                 are held at the instant before it -- restart the node to replay the log\n"
+                 are held at the instant before it -- the next write reopens the log once the \
+                 disk answers; a restart replays it\n"
             ));
         }
         out.push_str(&self.recovery_line());
@@ -2730,6 +2788,9 @@ impl Db {
     pub fn set_row_caps(&mut self, max_rows: usize, hard: usize) {
         self.max_rows = max_rows.max(1);
         self.max_rows_hard = hard.max(self.max_rows);
+        for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
+            s.set_row_caps((self.max_rows, self.max_rows_hard));
+        }
     }
 
     /// A select bounded: a `LIMIT` past `CELASTRO_MAX_ROWS_HARD` is taken as
@@ -2738,23 +2799,8 @@ impl Db {
     /// the node's, not the statement's: the reply then says `more` when
     /// the cut left rows behind, so nobody takes a bounded answer for the
     /// whole.
-    pub fn bound_select(&self, sel: &Select) -> (Select, bool) {
-        let grouped = sel.group_by.is_some()
-            || sel.projections.iter().any(|p| matches!(p, Projection::Aggregate { .. }));
-        let mut out = sel.clone();
-        let capped = match sel.limit {
-            Some(l) if l > self.max_rows_hard => {
-                out.limit = Some(self.max_rows_hard);
-                true
-            }
-            Some(_) => false,
-            None if grouped => {
-                out.limit = Some(self.max_rows);
-                true
-            }
-            None => true,
-        };
-        (out, capped)
+    pub fn bound_select(&self, sel: &Select) -> Result<(Select, bool)> {
+        bound_select_with(sel, (self.max_rows, self.max_rows_hard))
     }
 
     /// The store behind the `archived` tier from now on, for the shards
@@ -2845,7 +2891,7 @@ impl Db {
                 "no log archive set".to_string(),
                 backup.is_some_and(|ts| now - crate::time::physical_micros(ts) > warn),
             ),
-            (true, None) => ("no archived log since this process started".to_string(), true),
+            (true, None) => ("no archived log yet".to_string(), true),
             (true, Some(ts)) => {
                 let at = crate::time::physical_micros(ts);
                 (
@@ -4297,6 +4343,17 @@ impl Db {
         let mut map = if old.len() == tablets.len() { old.clone() } else { tablets.to_vec() };
         map[shard] = tablets[shard].clone();
         let (was, old_term) = old.get(shard).map(|t| (t.node.clone(), t.term)).unwrap_or_default();
+        // The followers as every peer computes them from the same switch:
+        // the old holder follows, this node no longer does. The plan's
+        // entry names this node already, so `place_shard` below sees no
+        // change here and would leave the list as the plan had it -- a
+        // shard moved onto its own follower then had no follower at all on
+        // the target, and every peer said it had (0.97.0).
+        if !was.is_empty() && was != me {
+            let t = &mut map[shard];
+            t.followers.retain(|f| f != &me && f != &was);
+            t.followers.push(was.clone());
+        }
         self.adopt_shard(coll, &map, shard, incoming)?;
         self.place_shard(&coll.name, shard, &me)?;
         // The plan's entry names this node already, so `place_shard` saw no
@@ -4981,6 +5038,7 @@ impl Db {
                         conns,
                         confirm,
                         s.dir().map(|d| d.to_path_buf()),
+                        self.min_holders,
                     ),
                 ));
             }
@@ -6159,6 +6217,7 @@ impl Db {
     // ------------------------------------------------------------- writes
 
     pub fn insert(&mut self, collection: &str, doc: Value) -> Result<Timestamp> {
+        self.recover_failed_logs()?;
         // A document whose shard is elsewhere is forwarded HERE, under
         // whatever lock the caller holds: this is the embedded API, one
         // process and its own shards. In a cluster, an `INSERT` statement
@@ -6193,6 +6252,7 @@ impl Db {
     /// statement order within a shard; the last timestamp is what the
     /// acknowledgement names.
     pub fn insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Timestamp> {
+        self.recover_failed_logs()?;
         self.insert_many_local(collection, docs)
     }
 
@@ -6478,6 +6538,7 @@ impl Db {
     }
 
     pub fn delete_key(&mut self, collection: &str, key: &str) -> Result<bool> {
+        self.recover_failed_logs()?;
         let _deadline = self.arm_default_deadline();
         self.catalog.get(collection)?;
         match self.owner_of(collection, key)? {
@@ -7274,6 +7335,7 @@ impl Db {
     /// work -- without a statement's text to parse.
     pub fn insert_documents(&mut self, collection: &str, docs: Vec<Value>) -> Result<Outcome> {
         self.refuse_if_directory_gone()?;
+        self.recover_failed_logs()?;
         let _deadline = self.arm_default_deadline();
         self.apply_touches()?;
         let stmt = Statement::Insert(sql::Insert { collection: collection.to_string(), docs });
@@ -7366,6 +7428,10 @@ impl Db {
         let stmt = sql::parse(sql, params)?;
         if !Db::is_read(&stmt) {
             self.refuse_if_directory_gone()?;
+            // A write, not a read: a read under a disk that stopped
+            // answering is held at the instant before the failure, not
+            // refused by a probe of the disk.
+            self.recover_failed_logs()?;
         }
         // Every statement runs under the default deadline, not only a SELECT
         // (which re-arms with its own WITH). A forwarded write or a DDL that
@@ -7746,7 +7812,10 @@ impl Db {
                 Statement::Select(sel) => {
                     Ok(Outcome::Explain(self.explain_select(&sel, sql, params, analyze)?))
                 }
-                other => self.run_one(other, sql, params, true),
+                // Not run: until 0.97.0 `EXPLAIN DELETE ...` deleted, and
+                // `EXPLAIN DROP ...` dropped on this node alone, the
+                // fan-out having no holders for an EXPLAIN.
+                _ => Err(Error::Plan("EXPLAIN takes a SELECT".into())),
             },
             Statement::CreateCollection(c) => {
                 let pk = c
@@ -9009,7 +9078,7 @@ impl Db {
     ) -> Result<QueryResult> {
         // Bounded first, so every use of the limit below -- the candidate
         // depth, what each shard is asked for, the cut -- sees the bound.
-        let (bounded, capped) = self.bound_select(sel);
+        let (bounded, capped) = self.bound_select(sel)?;
         let sel = &bounded;
         // Every walk first: `WITHIN k HOPS OF` is resolved to a key set here,
         // at the same pinned instant as everything after it, and bound into
@@ -10053,7 +10122,7 @@ impl Confirmation {
                     newest = newest.max(Some(p.first));
                 }
                 Err(e) => {
-                    self.clock.fail();
+                    self.clock.fail_pending(p.first);
                     failed.get_or_insert(e);
                 }
             }
@@ -10202,7 +10271,14 @@ fn insert_many_in_chunks(
 ) -> Result<(usize, Timestamp, Result<()>)> {
     let (mut taken, mut last) = (0usize, 0);
     for part in docs.chunks(chunk.max(1)) {
-        let (t, ts, stopped) = n.insert_many(collection, part)?;
+        // Past the first chunk a call that fails leaves what landed in the
+        // answer, as a chunk that stopped does: the rows before it are on
+        // the holder and confirmed, and a retry re-inserts them idempotently.
+        let (t, ts, stopped) = match n.insert_many(collection, part) {
+            Ok(r) => r,
+            Err(e) if taken > 0 => return Ok((taken, last, Err(e))),
+            Err(e) => return Err(e),
+        };
         taken += t;
         last = last.max(ts);
         if let Err(e) = stopped {
@@ -10713,7 +10789,7 @@ mod tests {
         }
         let h = db.show_health();
         assert!(
-            h.contains("recovery: no backup since this process started; no archived log since this process started STALE"),
+            h.contains("recovery: no backup since this process started; no archived log yet STALE"),
             "{h}"
         );
         let (backup, reach, archive_set) = db.recovery_point();
@@ -10732,6 +10808,79 @@ mod tests {
         let h = db.show_health();
         std::env::remove_var("CELASTRO_RECOVERY_WARN");
         assert!(h.contains("STALE"), "{h}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A log whose sync failed takes no writes; the next write after the
+    /// disk answers again reopens the log in place: the refused row is
+    /// gone with the cut, the rows before it are there, the new one lands,
+    /// and the health report no longer says FAILED.
+    #[test]
+    fn a_log_whose_sync_failed_recovers_in_place_once_the_disk_answers() {
+        let dir =
+            std::env::temp_dir().join(format!("celastro-log-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let row = |k: &str| Value::obj(vec![("id".into(), Value::Str(k.into()))]);
+        db.insert("notes", row("k1")).unwrap();
+        let wal = dir.join("collections/notes/shard-0000/wal.log");
+        assert!(wal.exists());
+        crate::shard::durability_probe::fail_next(
+            crate::shard::durability_probe::Op::WalSync,
+            &wal,
+        );
+        let e = db.insert("notes", row("k2")).unwrap_err().to_string();
+        assert!(e.contains("injected WalSync failure"), "{e}");
+        assert!(db.show_health().contains("a sync FAILED"), "{}", db.show_health());
+        // The disk answers again: the next write recovers the log in place.
+        db.insert("notes", row("k3")).unwrap();
+        assert!(!db.show_health().contains("FAILED"), "{}", db.show_health());
+        let mut ids: Vec<String> = db
+            .query("SELECT id FROM notes LIMIT 10")
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.key.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["k1".to_string(), "k3".to_string()],
+            "the refused row is gone, the rest there"
+        );
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(
+            db.query("SELECT id FROM notes LIMIT 10").unwrap().rows.len(),
+            2,
+            "and a reopen agrees"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recovery point survives a restart: a node that shipped a log,
+    /// reopened, reports the archive's reach from the open on rather than
+    /// "no archived log since this process started".
+    #[test]
+    fn the_archives_reach_is_read_at_open() {
+        let root = std::env::temp_dir().join(format!("celastro-reach-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, archive) = (root.join("data"), root.join("archive"));
+        std::fs::create_dir_all(&archive).unwrap();
+        let opts =
+            || DbOpts { log_archive: Some(archive.display().to_string()), ..DbOpts::default() };
+        let mut db = Db::open(&dir, opts()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("notes", Value::obj(vec![("id".into(), Value::Str("n1".into()))])).unwrap();
+        db.execute(&format!("BACKUP LOG TO '{}'", archive.display())).unwrap();
+        let shipped = db.recovery_point().1.expect("shipped");
+        drop(db);
+        let db = Db::open(&dir, opts()).unwrap();
+        assert_eq!(db.recovery_point().1, Some(shipped), "the reach from the open on");
+        assert!(db.show_health().contains("archived logs reach "), "{}", db.show_health());
         drop(db);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -14217,26 +14366,40 @@ mod tests {
 
     /// A group sync that fails is not retried: the statement is refused, its
     /// row is never read, the log is cut back so a reopen does not bring it
-    /// back, the shard takes no more writes, and the health says so.
+    /// back, and the health says so until the next statement, which
+    /// recovers the log in place (0.97.0; before, the shard took no more
+    /// writes until a restart) and lands.
     #[test]
-    fn a_failed_group_sync_refuses_the_write_hides_it_and_stops_the_log() {
+    fn a_failed_group_sync_refuses_the_write_hides_it_and_the_next_recovers_the_log() {
         let (dir, mut db) = group_commit_db("gc-failed");
         let log = dir.join("collections/items/shard-0000/wal.log");
+        // k0 sealed: the failed statement below is an update of it, whose
+        // supersede mark on the sealed version the recovery must take
+        // back, or k0 -- acknowledged -- reads as absent afterwards.
+        db.execute("FLUSH items").unwrap();
+        let n_of_k0 = |db: &mut Db| {
+            let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
+            r.rows.first().and_then(|r| r.doc.path("n").and_then(|v| v.as_i64()))
+        };
         let pending = db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":1}')"#).unwrap();
+        let pending0 = db.execute(r#"INSERT INTO items VALUES ('{"id":"k0","n":9}')"#).unwrap();
         durability_probe::fail_next(Op::WalSync, &log);
         let e = pending.finished().unwrap_err();
         assert!(e.to_string().contains("injected"), "{e}");
+        assert!(pending0.finished().is_err(), "the same group, the same failure");
         assert_eq!(ids(&mut db), ["k0"], "a write whose sync failed is read");
-        let e = db
-            .execute(r#"INSERT INTO items VALUES ('{"id":"k2","n":2}')"#)
-            .and_then(|o| o.finished())
-            .unwrap_err();
-        assert!(e.to_string().contains("takes no more writes"), "{e}");
+        assert_eq!(n_of_k0(&mut db), Some(0));
         assert!(db.show_health().contains("sync FAILED"), "{}", db.show_health());
-        assert_eq!(ids(&mut db), ["k0"]);
+        db.execute(r#"INSERT INTO items VALUES ('{"id":"k2","n":2}')"#)
+            .and_then(|o| o.finished())
+            .expect("the disk answers again: the next statement recovers the log and lands");
+        assert!(!db.show_health().contains("FAILED"), "{}", db.show_health());
+        assert_eq!(ids(&mut db), ["k0", "k2"]);
+        assert_eq!(n_of_k0(&mut db), Some(0), "the refused update's mark on the sealed k0 stayed");
         drop(db);
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
-        assert_eq!(ids(&mut db), ["k0"], "the refused write came back on the reopen");
+        assert_eq!(ids(&mut db), ["k0", "k2"], "the refused write came back on the reopen");
+        assert_eq!(n_of_k0(&mut db), Some(0));
         let _ = fs::remove_dir_all(&dir);
     }
 

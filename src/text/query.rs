@@ -34,7 +34,7 @@ pub enum TextQuery {
 impl TextQuery {
     pub fn parse(input: &str, analyzer: Analyzer) -> Result<TextQuery> {
         let toks = lex(input)?;
-        let mut p = QParser { toks, i: 0, analyzer };
+        let mut p = QParser { toks, i: 0, analyzer, depth: 0 };
         let q = p.or_expr()?;
         if p.i != p.toks.len() {
             return Err(Error::Sql(format!(
@@ -208,7 +208,14 @@ struct QParser {
     toks: Vec<Tok>,
     i: usize,
     analyzer: Analyzer,
+    /// Nested `NOT`s and parentheses so far: a query of a few hundred
+    /// thousand `-` or `(` walked the stack past its end and aborted the
+    /// node (0.97.0); the SQL parser has the same bound on its expressions.
+    depth: usize,
 }
+
+/// The most `NOT`s and parentheses a text query may nest.
+const MAX_QUERY_DEPTH: usize = 128;
 
 impl QParser {
     fn peek(&self) -> Option<&Tok> {
@@ -265,10 +272,23 @@ impl QParser {
         })
     }
 
+    fn deeper(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_QUERY_DEPTH {
+            return Err(Error::Sql(format!(
+                "text_match query nests deeper than {MAX_QUERY_DEPTH}"
+            )));
+        }
+        Ok(())
+    }
+
     fn unary(&mut self) -> Result<TextQuery> {
         if self.peek() == Some(&Tok::Not) {
             self.i += 1;
-            return Ok(TextQuery::Not(Box::new(self.unary()?)));
+            self.deeper()?;
+            let q = self.unary()?;
+            self.depth -= 1;
+            return Ok(TextQuery::Not(Box::new(q)));
         }
         self.primary()
     }
@@ -277,7 +297,9 @@ impl QParser {
         match self.peek().cloned() {
             Some(Tok::LParen) => {
                 self.i += 1;
+                self.deeper()?;
                 let q = self.or_expr()?;
+                self.depth -= 1;
                 if self.peek() != Some(&Tok::RParen) {
                     return Err(Error::Sql("unbalanced parentheses in text_match query".into()));
                 }
@@ -330,6 +352,22 @@ fn fold_prefix(analyzer: Analyzer, w: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A query that nests past the bound is refused by name; one within
+    /// it parses. Before the bound, a few hundred thousand `(` or `-`
+    /// walked the stack past its end and aborted the node.
+    #[test]
+    fn a_query_that_nests_too_deep_is_refused() {
+        let analyzer = crate::text::analyzer::Analyzer::parse("english");
+        let deep = format!("{}x{}", "(".repeat(200), ")".repeat(200));
+        let e = TextQuery::parse(&deep, analyzer).unwrap_err().to_string();
+        assert!(e.contains("nests deeper than 128"), "{e}");
+        let nots = format!("{}x", "-".repeat(200));
+        let e = TextQuery::parse(&nots, analyzer).unwrap_err().to_string();
+        assert!(e.contains("nests deeper than 128"), "{e}");
+        let fine = format!("{}x{}", "(".repeat(100), ")".repeat(100));
+        assert!(TextQuery::parse(&fine, analyzer).is_ok());
+    }
 
     #[test]
     fn fuzz_text_query_parsing_never_panics() {

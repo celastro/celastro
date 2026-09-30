@@ -13,10 +13,9 @@
 
 FROM --platform=$BUILDPLATFORM alpine:3.24 AS stage
 COPY celastro /celastro
-COPY celastro-cli /celastro-cli
 COPY LICENSE /LICENSE
 COPY COPYRIGHT /COPYRIGHT
-RUN chmod 0755 /celastro /celastro-cli && chmod 0644 /LICENSE /COPYRIGHT \
+RUN chmod 0755 /celastro && chmod 0644 /LICENSE /COPYRIGHT \
     && mkdir -p /data && chown 65532:65532 /data && touch /data/.keep \
     && chown 65532:65532 /data/.keep
 
@@ -26,7 +25,6 @@ LABEL org.opencontainers.image.title="celastro" \
       org.opencontainers.image.source="https://github.com/celastro/celastro" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
 COPY --from=stage /celastro /celastro
-COPY --from=stage /celastro-cli /celastro-cli
 COPY --from=stage /LICENSE /LICENSE
 COPY --from=stage /COPYRIGHT /COPYRIGHT
 COPY --from=stage --chown=65532:65532 /data /data

@@ -186,6 +186,13 @@ destination want different prefixes, or different buckets. A ring
 that nothing can need -- no index is at the archived tier at all -- is
 dropped by the next open without being asked, and logged.
 
+**`key rotate <DIR>`** keeps the previous key in the ring until `key
+retire` says nothing is under it (0.97.0; before, the ring was kept only
+while an index sat at the archived tier, and an object that came back
+local, a backup's segment or a log copy shipped under the old key stayed
+under it). It takes the directory's lock: run against a served
+directory it refuses, naming the process.
+
 **`check <DIR>`** reads every file and names what does not check, with
 nothing written: what to run on a volume you doubt. Under a key (a `KEY`
 in the directory) it opens every frame; in the clear it reads every
@@ -454,7 +461,7 @@ rows and the cut left rows behind (0.96.0).
 `attached` how many peers it has verified, and `busy:true` that the
 database lock was held when it was asked (alive, not ready). It says
 `ok:false` when the data directory is gone, or when a write-ahead log
-failed to sync (the node needs a restart). `/api/metrics` is the text
+failed to sync (the next write recovers it once the disk answers, or a restart does). `/api/metrics` is the text
 format a Prometheus scraper reads: statements and their time by kind,
 refusals, answers short of a shard and the shards they missed
 (`celastro_shards_missing_total`), compactions, connections,

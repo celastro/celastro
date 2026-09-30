@@ -926,7 +926,13 @@ impl Node {
                     s.set_nodelay(true)?;
                     // Verified by the name the URL gave, which is the name
                     // in the peer's certificate: the pod's, in a cluster.
-                    let host = self.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&self.addr);
+                    let host = self
+                        .addr
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(&self.addr)
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
                     return tls::connect(self.tls.as_ref(), s, host);
                 }
                 Err(e) => last = Some(e),
@@ -2601,6 +2607,10 @@ fn handle(
                     let analyze = get_bool(body, &mut j)?;
                     let frontiers = get_frontiers(body, &mut j)?;
                     let sel = walk::bind_hops(&select_of(&sql, &params)?, &frontiers);
+                    // Bounded here by this shard's caps, as the coordinator
+                    // bounded it there: a shard trusts no statement's LIMIT
+                    // past its own ceiling.
+                    let (sel, _) = crate::engine::bound_select_with(&sel, sh.opts.row_caps)?;
                     let k = sel.limit.unwrap_or(10);
                     let planned = exec::plan_sources(&coll, &sel, k)?;
                     let req = CandidatesRequest {

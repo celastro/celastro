@@ -402,6 +402,37 @@ body's hash, which refuses a body that does not match; this refuses an
 acknowledgement nothing stands behind, a proxy's 200 for a body it
 dropped.
 
+**What an acknowledgement promises (0.97.0, stated in one place).** An
+`ok` for a served statement -- the console's `/api/query`, the wire's
+`Statement`, each ingest batch -- and for the wire's inserts and deletes
+means: every row of the statement this node holds has its record appended
+to its shard's write-ahead log and that log `fdatasync`ed, inline or by
+the group sync the statement settled before answering, or is in a
+segment whose manifest was published; a refused row leaves no record (the
+statement is cut back to its mark); the rows routed to other holders were
+acknowledged by each under this same rule before this `ok`, and a holder
+that refused turns the whole answer into an error naming its rows. Beyond
+this disk, per shard written: under `confirm = 'all'` (the default) every
+follower that was live when the wait ran has answered, after its own
+`fdatasync`, an instant at or past the statement's last on that shard; a
+follower away or catching up holds nothing yet, and the item is kept for
+it in the holder's backlog until it is live again (never dropped: over the
+cap the oldest half goes, covered by the catch-up that follows). Under
+`'quorum'`, at least a majority of the copies have answered such an
+instant -- two copies means the one follower, one copy means nobody.
+Under `'none'`, nothing beyond this disk. Whatever the rule,
+`CELASTRO_MIN_HOLDERS=n` makes the acknowledgement wait until this node
+and enough followers have the write, and refuses before the append when
+fewer could; under `'none'` a floor above one is refused by name. A
+shipper fenced by a higher term refuses rather than acknowledges, on a
+ship's answer and on an ask's alike; a wait that reaches the statement's
+deadline is an error saying the write is on this disk. After an `ok` a
+read on this node sees the write, within the deadline; a log whose sync
+failed holds reads below the failed write and takes no writes until the
+next write finds the disk answering and reopens it in place. The
+embedded `Db::insert` returns once durable on this disk; the followers'
+confirmation is the caller's through `Db::confirmation().wait()`.
+
 A backup is exact at its instant, and since 0.78.0 an instant between
 backups is reachable too. With `CELASTRO_LOG_ARCHIVE` set, a seal's build
 copies the write-ahead log it rotated to the archive -- off the lock,
@@ -1795,11 +1826,19 @@ replacement is seen only once it is durable, as when the sync was under
 the lock, and a write is acknowledged only once a read would see it, so
 a client reads its own write. A seal that runs with a write in flight
 keeps the version that write replaces, as a pinned backup horizon makes
-it, and compaction collects below the same bound. A sync that fails is
+it, and compaction collects below the same bound; a compaction's install
+collects its inputs' delete marks again under the lock, since a delete
+that landed while the build ran off the lock is in an input's log alone
+(through 0.96.0 the install carried the build's marks and retired that
+log with the input, and the row came back live). A sync that fails is
 not retried -- a page cache that failed one cannot be trusted with a
 second -- so the log is cut back to what its last good sync covered, the
 shard takes no more writes, reads stay below the failed write, and the
-health says to restart, which replays the log. A record reaches the
+health says so. The next write probes the disk with the sync that failed
+and, when it answers, reopens the log in place (`Shard::recover_log`: a
+fresh group over the file as the cut left it, the memtable rebuilt from
+what the log holds), which is what a restart did and still does; a read
+never probes, it is held, not refused. A record reaches the
 followers only once its sync has made it durable here, in the log's
 order whichever settle made the sync (`Wal::ship_after_sync`): 0.76.0
 pushed it to the shipper at the append, so a follower could hold a row a
@@ -2137,7 +2176,10 @@ to be replayed twice, or in another timeline's slot (H8's R9). The
 key with the object's key as its identity (0.88.0), so the list of
 objects and their hashes cannot be rewritten to name others, nor an
 older record moved to a newer instant, by whoever can write the bucket;
-a record in the clear, what every backup wrote before, is still read.
+a record in the clear beside the backup's `KEY`, what every backup wrote
+before, is refused as a downgrade since 0.97.0 -- the same hand could
+put one there -- unless `CELASTRO_SEAL_IDENTITY=2` says this node still
+writes them; a plain database's record is in the clear and read.
 What no seal closes: an older backup put back whole, `LATEST` and all,
 is a rollback only a clock outside the bucket detects -- `LATEST` stays
 in the clear for that reason, a hash of the record in it would bind
@@ -2826,7 +2868,8 @@ guarantee:
 | visibility under deletes and updates | `mvcc::tests::*`, `shard::tests::*` |
 | segments survive a reopen | `a_database_survives_reopen` |
 | an acknowledged write is on the disk, and every step is in the order the guarantee needs | `shard::tests::the_three_fsyncs_are_syscalls_and_not_bookkeeping` (the floor under the rest: each fsync helper is handed a descriptor the kernel refuses to sync and has to report it, so none of them can be satisfied by bookkeeping), `shard::tests::an_insert_appends_its_wal_record_and_then_makes_it_durable`, `shard::tests::a_batch_of_inserts_is_appended_whole_and_synced_once`, `engine::tests::a_statement_of_many_documents_syncs_once_per_insert_batch` (a statement of many documents: every record appended, one sync, then the rows; a document that cannot be taken keeps the whole batch out of the log; a key recurring in the batch is two versions in order), `shard::tests::an_insert_that_supersedes_a_document_syncs_the_record_that_supersedes_it`, `shard::tests::a_delete_makes_its_wal_record_durable_before_it_returns`, `shard::tests::a_publication_syncs_the_bytes_then_renames_then_syncs_the_name` (a directory synced BEFORE its rename is a directory synced for nothing), `shard::tests::a_seal_publishes_the_delete_logs_durably_and_before_the_manifest`, `shard::tests::a_seal_publishes_the_manifest_before_it_empties_the_wal`, `engine::tests::creating_a_collection_makes_the_directories_that_hold_it_durable` (the directory entries: an fsynced file whose directory was never synced is a file nothing names), `engine::tests::the_tablet_map_is_published_durably_and_a_damaged_one_is_refused` (and that an empty line in it is an unbounded end, not the bound `""`, which is a shard owning no keys), `engine::tests::every_publication_fsyncs_the_directory_it_renamed_into` (the same claim stated once over the whole event log rather than once per file, so the call site written next is covered without a test of its own) |
-| a write that could not be made durable is reported rather than acknowledged | `shard::tests::a_wal_sync_that_fails_is_reported_and_leaves_the_shard_as_it_was`, `shard::tests::a_seal_whose_manifest_cannot_be_published_keeps_the_wal`, `shard::tests::a_publication_that_failed_after_the_rename_is_retried_rather_than_believed`, `engine::tests::a_catalog_that_disappeared_is_republished_rather_than_skipped`, `shard::tests::a_manifest_that_was_replaced_underneath_the_shard_is_republished`, `shard::tests::a_delete_log_that_was_removed_underneath_the_shard_is_republished` (the delete-log half of the same skip, where believing the cache brings every deleted document back), `engine::tests::a_catalog_publication_that_failed_after_the_rename_is_retried` (the catalog's own copy of the claim: a publication that failed after the rename must not be cached as published) |
+| a write that could not be made durable is reported rather than acknowledged | `shard::tests::a_wal_sync_that_fails_is_reported_and_leaves_the_shard_as_it_was`, `shard::tests::a_seal_whose_manifest_cannot_be_published_keeps_the_wal`, `shard::tests::a_publication_that_failed_after_the_rename_is_retried_rather_than_believed`, `engine::tests::a_catalog_that_disappeared_is_republished_rather_than_skipped`, `shard::tests::a_manifest_that_was_replaced_underneath_the_shard_is_republished`, `shard::tests::a_delete_log_that_was_removed_underneath_the_shard_is_republished` (the delete-log half of the same skip, where believing the cache brings every deleted document back), `engine::tests::a_catalog_publication_that_failed_after_the_rename_is_retried` (the catalog's own copy of the claim: a publication that failed after the rename must not be cached as published), `shard::tests::a_rollback_after_a_failed_sync_never_grows_the_log` (a rollback after a failed sync never extends the cut log; a zero-extended header is cut, not refused), `engine::tests::a_failed_group_sync_refuses_the_write_hides_it_and_the_next_recovers_the_log` (the recovery in place: the cut rows gone, their marks on sealed versions taken back, the next statement lands) |
+| a delete that lands on a compaction's input while the build runs is carried at the install | `compaction::tests::a_delete_during_the_build_is_carried_at_the_install` |
 | a publication that fails leaves the shard describing what is on the disk, and no id it has spoken for is handed out again | `shard::tests::a_seal_whose_manifest_publication_fails_installs_nothing`, `shard::tests::a_compaction_whose_publication_fails_keeps_its_inputs_and_retires_them_on_the_retry` (the same claim at the other call site, and the leak that rode on it: inputs a failed compaction dropped are named by no manifest and unlinked by nothing), `shard::tests::a_reopen_does_not_hand_out_a_segment_id_the_disk_already_holds` (the manifest is not the whole record of which ids are spoken for, and the segment that reuses one inherits the delete log of the segment that was never published), `shard::tests::an_attach_to_a_populated_directory_refuses_the_ids_it_already_holds` (the guard is on the directory, not on one of the two ways into it), `shard::tests::a_reopen_reads_every_directory_a_segment_id_can_be_hiding_in` (a tiered segment's file is in `archive/` and a delete log in neither of the other two), `shard::tests::a_reopen_reclaims_the_files_of_a_publication_that_never_landed` (the other side of the same coin: the outputs a failed publication abandoned are unlinked at the one moment nothing can be holding them, and what the manifest names is left alone) |
 | a file the open could not read is reported, never read as absent | `engine::tests::a_catalog_that_cannot_be_read_fails_the_open_rather_than_opening_empty`, `shard::tests::a_manifest_that_cannot_be_read_fails_the_open_rather_than_opening_empty`, `shard::tests::a_delete_log_that_cannot_be_read_fails_the_open_rather_than_resurrecting` (each pins both halves: absent still opens, unreadable fails naming the file -- a short or corrupt file was already refused, so an unreadable one was the only failure the open believed) |
 | a damaged delete log is refused, never read as a shorter one | `shard::tests::a_damaged_delete_log_fails_the_open_rather_than_losing_a_deletion` (every truncation and every flipped bit of a published log fails the open naming the file), `mvcc::tests::a_framed_delete_log_refuses_every_truncation_and_every_flipped_byte` (the count and the checksum are separately load-bearing: a log that lost a record and was re-signed is refused by the count), `shard::tests::a_delete_log_written_before_the_frame_opens_and_is_rewritten_framed`, `mvcc::tests::a_delete_log_without_the_frame_still_decodes` (an existing database opens, and the next publication closes its unframed window) |
@@ -2883,7 +2926,7 @@ guarantee:
 | a header-only log and a rotated log pass the check and the rotation | `cipher::tests::a_header_only_log_and_a_rotated_log_pass_the_check_and_the_rotation` |
 | an object of exactly one frame is opened as its own last frame | `cipher::tests::an_object_of_exactly_one_frame_is_opened_as_what_it_is` |
 | one key wraps as a `CELK3` ring of one; `CELK1`/`CELK2` still read and are marked for rewriting | `cipher::tests::a_ring_entry_cannot_be_moved_or_spliced_back` |
-| an encrypted backup's record is sealed; a byte changed refuses the restore; a record in the clear still restores | `encryption::a_backup_record_is_sealed_and_a_changed_one_is_refused` |
+| an encrypted backup's record is sealed; a byte changed refuses the restore; a record in the clear beside the backup's KEY is refused as a downgrade | `encryption::a_backup_record_is_sealed_and_a_changed_one_is_refused` |
 | an archived log copied to another number is refused by name; put back, the restore is whole | `pitr::a_restore_refuses_an_archived_log_moved_to_another_slot` |
 | P-384 ECDSA against every Wycheproof vector; PKCS#1 v1.5 with SHA-384 likewise | `wycheproof::ecdsa_p384_agrees_with_wycheproof_on_every_vector`, `wycheproof::rsa_pkcs1_sha384_agrees_with_wycheproof_on_every_vector` |
 | a P-384 chain, a P-256 chain signed with SHA-384 and a SHA-384 RSA chain from openssl verify, with the two SHA-384 TLS schemes | `x509::tests::rsa_and_p256_chains_and_signatures_from_openssl_verify` |
@@ -2892,7 +2935,7 @@ guarantee:
 | the page carries its token in a meta tag, escaped, and links its assets bare | `serve::tests::the_page_carries_its_token_in_a_meta_tag_and_its_assets_as_plain_paths` |
 | a host may call itself by thirty-two addresses and no more; another host's first is not counted against it | `engine::tests::a_host_may_call_itself_by_so_many_addresses_and_no_more`, `tls::a_caller_under_client_certificates_may_claim_only_the_names_its_certificate_has` |
 | an archive response past the bounds is refused, not held | `objstore::tests::a_response_past_the_bounds_is_refused_not_held` |
-| a CA's pathLenConstraint bounds the intermediates below it, on anchors and links | `x509::tests::a_path_length_constraint_bounds_the_intermediates_below_a_ca` |
+| a CA's pathLenConstraint bounds the intermediates below it, on anchors and links; a link the next did not sign is refused once the anchor is found by name | `x509::tests::a_path_length_constraint_bounds_the_intermediates_below_a_ca`, `x509::tests::a_link_the_next_did_not_sign_is_refused_once_the_anchor_is_found` |
 | a revoked certificate is refused; a list another CA signed revokes nothing; openssl's list parses | `x509::tests::a_revoked_certificate_is_refused_and_an_unvouched_list_revokes_nothing` |
 | a revoked client certificate is refused at the handshake, naming the revocation | `tls13::tests::a_revoked_client_certificate_is_refused_at_the_handshake` |
 | a write the disk refuses names the log; the statement's cut leaves nothing of it | `shard::tests::an_append_the_disk_refuses_names_the_log_and_leaves_nothing_of_the_record` |
@@ -2922,7 +2965,7 @@ guarantee:
 | a coordinator holds no shards, takes none, hears every definition, and answers what a data node answers | `wire::a_coordinator_holds_no_shards_and_answers_over_the_data_nodes` (created at the coordinator: three shards over two data nodes and none here; an index made at a data node in the coordinator's catalog; every query answering what one process answers; a move and a placement naming it refused; a rebalance skipping it; `SHOW HEALTH` naming the roles) |
 | retention removes older backups and only the pool segments nobody names | `backup::keep_removes_older_backups_and_the_pool_segments_nobody_references` (`tests/backup.rs`: three backups, `KEEP 2`; the oldest instant gone and refused `AS OF`, the newest restores and verifies, a pool segment only the oldest named is gone and one the newer ones share is kept) |
 | what a byte search of a running process finds after the secret paths have run: none of a file key, none of the X25519 scalar, none of a derived block, one copy of a traffic secret after a handshake | `cipher::core_dump::a_file_key_is_not_left_in_memory`, `::the_x25519_scalar_is_not_left_in_memory`, `::an_hkdf_block_is_not_left_in_memory`, `::a_secret_returned_by_value_can_leave_one_copy` (the residue, bounded rather than asserted away), `tls13::tests::a_traffic_secret_is_not_left_in_memory_after_a_handshake` (all `#[ignore]`d: release only, and they read `/proc/self/mem`) |
-| the data-key ring is not dropped while an archived object still needs it, and re-sealing finishes a rotation | `cipher::archive_ring_tests::the_walk_finds_what_is_still_under_a_previous_key`, `::an_object_under_no_key_at_all_is_named`, `::re_sealing_puts_every_object_under_the_current_key`, `::re_sealing_twice_is_re_sealing_once`, `encryption::a_key_ring_with_no_archived_index_retires_itself_at_the_next_open` |
+| the data-key ring is not dropped while an archived object still needs it, and re-sealing finishes a rotation | `cipher::archive_ring_tests::the_walk_finds_what_is_still_under_a_previous_key`, `::an_object_under_no_key_at_all_is_named`, `::re_sealing_puts_every_object_under_the_current_key`, `::re_sealing_twice_is_re_sealing_once`, `encryption::a_key_ring_with_no_archived_index_is_kept_by_the_open_and_retired_by_the_command` |
 | a repeat backup does not re-read what it is not copying, and its record is unchanged by that | `backup::a_repeat_backup_takes_its_hashes_from_the_last_record_instead_of_reading_the_pool` (the recalled hashes equal the ones they replace, a new segment is still hashed from its file, and the restore still verifies) |
 | the operator's token is not printed, and a per-run token still is | `serve::tests::a_network_bind_refuses_a_weak_token_and_keeps_the_one_it_is_given` (the URL carries neither `?t=` nor the token), `serve::tests::a_per_run_token_stays_in_the_url_it_is_the_only_way_to_learn_it` |
 | a backup's record carries a checksum per object; `VERIFY BACKUP` reads everything back, a restore checks as it writes, and a flipped byte is named and refused | `backup::verify_backup_reads_every_object_back_and_a_flipped_byte_is_named_and_refused` (`tests/backup.rs`: the verify's ack, a pool segment with one byte flipped named by VERIFY and refused by RESTORE with nothing adopted, a version-1 record verified by size with a note) |
@@ -2980,7 +3023,7 @@ src/
   backup.rs                      BACKUP TO and RESTORE FROM over the object store trait
   signal.rs deadline.rs          SIGTERM for PID 1; the per-statement deadline
   bin/celastro.rs                the command: serve, exec, run, repl, demo, catalog, health,
-                                 export, import, send, key, tls; `celastro-cli` is its old name
+                                 export, import, send, key, tls
 tests/
   integration.rs                 end-to-end behaviour
   tiering.rs                     tiers, residency, lifecycle policies

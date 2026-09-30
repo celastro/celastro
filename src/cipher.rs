@@ -235,6 +235,21 @@ impl Cipher {
         self.previous.len()
     }
 
+    /// Sixteen hex digits naming the current data key without revealing
+    /// it: what a backup's pool key carries, so an object sealed under one
+    /// key is never taken for the same object under another (a segment
+    /// resealed by a rotation keeps its id and its length, and a pool that
+    /// trusted the size restored old-key bytes against a new-key record,
+    /// 0.97.0).
+    pub fn fingerprint(&self) -> String {
+        let mut labelled = Vec::with_capacity(64);
+        labelled.extend_from_slice(b"celastro pool key fingerprint v1");
+        labelled.extend_from_slice(&self.data_key);
+        let h = crate::crypto::sha2::sha256(&labelled);
+        crate::cipher::wipe(&mut labelled);
+        crate::crypto::hex(&h[..8])
+    }
+
     /// Keep `old`'s current key and ring behind this one's: what a rotation
     /// does when the archived tier's objects stay under the old key.
     pub fn keep_previous(&mut self, old: &Cipher) {
@@ -652,6 +667,18 @@ impl Cipher {
         let last = (off + len - 1) / CHUNK as u64;
         (first * FRAME as u64, (last - first + 1) * FRAME as u64)
     }
+}
+
+/// Whether `log` begins with a whole frame that is not blank: a header
+/// under some key, this database's or another's. A first frame torn
+/// short or zero-extended is a crash's and not one; `Wal::open` cuts it
+/// as a torn tail, and refuses a whole one that opens under no key.
+pub(crate) fn first_frame_whole(log: &[u8]) -> bool {
+    if log.len() < 4 {
+        return false;
+    }
+    let len = u32::from_le_bytes([log[0], log[1], log[2], log[3]]) as usize;
+    len >= NONCE + TAG && log.len() >= 4 + len && log[4..4 + len].iter().any(|&b| b != 0)
 }
 
 impl Cipher {
@@ -1484,6 +1511,9 @@ fn is_plain_file(name: &str) -> bool {
     // frame called every shard with an archive damaged (found by H6's
     // migration drill).
     matches!(name, "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED" | "ARCHIVED")
+        // A copy cut short by a crash: a ship's, an archive's, a publish's.
+        || name.ends_with(".part")
+        || name.ends_with(".tmp")
 }
 
 /// A shard's log: a frame per record, the record's ordinal in the AAD.
@@ -1706,6 +1736,10 @@ pub const KEY_NEXT: &str = "KEY.next";
 /// its objects are under the old key where a rotation does not reach, and
 /// `retire_keys` drops the ring once they are not.
 pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walked> {
+    // The directory's lock, held to the end: a node serving it meanwhile
+    // would write under the old key past the walk, and those files would
+    // never open again (0.97.0).
+    let _lock = crate::dirlock::take(dir)?;
     let key_path = dir.join("KEY");
     let wrapped = std::fs::read(&key_path).map_err(|e| {
         Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))
@@ -1729,7 +1763,14 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
             .collections
             .values()
             .any(|c| c.indexes.iter().any(|i| i.tier == crate::residency::Tier::Archived));
-        if archived && new.previous.is_empty() {
+        // Kept whether or not an index is archived (0.97.0): an archived
+        // log copy shipped under the old key, a backup's segments under it
+        // and an object that comes back local are all still under it, and
+        // `key retire` is the operator's word that nothing is. A ring is
+        // only what a stolen KEY and master open, and they open the current
+        // key anyway.
+        let _ = archived;
+        if new.previous.is_empty() {
             new.keep_previous(&old);
         }
     }
@@ -2004,6 +2045,7 @@ pub fn reseal_archive(
 }
 
 pub fn retire_keys(dir: &std::path::Path, master: &[u8; 32]) -> Result<usize> {
+    let _lock = crate::dirlock::take(dir)?;
     let key_path = dir.join("KEY");
     let wrapped = std::fs::read(&key_path).map_err(|e| {
         Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))

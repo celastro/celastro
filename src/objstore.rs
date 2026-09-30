@@ -432,7 +432,8 @@ impl ObjectStore for S3Store {
             let mut buf = vec![0u8; 1 << 16];
             let mut left = len;
             while left > 0 {
-                let n = f.read(&mut buf)?;
+                let want = left.min(buf.len() as u64) as usize;
+                let n = f.read(&mut buf[..want])?;
                 if n == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -684,7 +685,7 @@ impl ObjectStore for DirStore {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = p.with_extension("part");
+        let tmp = p.with_extension("tmp");
         let copied = (|| -> std::io::Result<(u64, [u8; 32])> {
             let mut src = std::fs::File::open(path)?;
             let mut dst = std::fs::File::create(&tmp)?;

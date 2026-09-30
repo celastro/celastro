@@ -37,6 +37,9 @@ fn block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     for i in 0..16 {
         out[4 * i..4 * i + 4].copy_from_slice(&s[i].wrapping_add(init[i]).to_le_bytes());
     }
+    // The key words were the state's: gone with the frame, not left in it.
+    s = [0u32; 16];
+    std::hint::black_box(&s);
     out
 }
 
@@ -213,7 +216,10 @@ fn tag(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> [u8; 
     mac_data.resize(mac_data.len().div_ceil(16) * 16, 0);
     mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
     mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
-    poly1305(&otk, &mac_data)
+    let t = poly1305(&otk, &mac_data);
+    let mut otk = otk;
+    crate::cipher::wipe(&mut otk);
+    t
 }
 
 /// Encrypt `plaintext` in place and return the 16-byte tag.
