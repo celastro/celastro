@@ -114,6 +114,13 @@ log's cut header with zeros, which the open then refused as another
 key's; and a log zero-extended by a crash is cut as a torn tail, as it
 always was, rather than refused.
 
+**A restart after the clock stepped back is not the older process.** A
+node's epoch, which the zombie fence compares, was its start instant; a
+clock corrected backwards (or the clockjump drill's offset lifted) made
+a restarted node older than the one its peers had seen, and they refused
+it for as long as the clock lagged -- an hour in the drill. The epoch is
+one past the directory's last (`EPOCH`) when the clock says less.
+
 **The recovery point from the open on.** A node reopened reports how far
 the archive reaches for each shard it holds from its open, read from the
 archive's listing, rather than "no archived log since this process

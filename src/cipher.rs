@@ -1535,7 +1535,11 @@ fn is_plain_file(name: &str) -> bool {
     // in the clear like the rest of these, and a walk that took it for a
     // frame called every shard with an archive damaged (found by H6's
     // migration drill).
-    matches!(name, "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED" | "ARCHIVED")
+    // `EPOCH` (the last epoch a process here answered with, 0.97.0) too.
+    matches!(
+        name,
+        "LOCK" | "KEY" | "KEY.next" | "STEWARD" | "CONFIRMED" | "SHIPPED" | "ARCHIVED" | "EPOCH"
+    )
         // A copy cut short by a crash: a ship's, an archive's, a publish's.
         || name.ends_with(".part")
         || name.ends_with(".tmp")

@@ -608,7 +608,11 @@ never sees it (a read through it lists the shard as missing, since its
 volume is empty). That was the divergence, and 0.50.0 closes the half of it
 that needs no wire change: a node asks a fresh connection for a hello
 before the first statement goes down it and refuses an epoch older than
-the newest it has seen at the address (`Node::check_fresh`), so a write
+the newest it has seen at the address (`Node::check_fresh`) -- a
+process's epoch is its start instant or one past its directory's last
+(`EPOCH`, since 0.97.0: a clock stepped back made a restarted node the
+"older process" to its peers for as long as the clock lagged, an hour in
+the clockjump drill) -- so a write
 toward the old process is refused rather than taken. The drill's flipped
 assertion failed once more first: the write rode a pooled connection that
 a hello had just shown to be the older process, so a hello that shows one

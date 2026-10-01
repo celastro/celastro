@@ -197,6 +197,26 @@ pub fn bound_select_with(sel: &Select, caps: (usize, usize)) -> Result<(Select, 
     Ok((out, capped))
 }
 
+/// The epoch this process answers with at `dir`: its start instant, or
+/// one past the last epoch a process at this directory had, whichever is
+/// later -- kept in `EPOCH`. The zombie fence compares epochs, and a
+/// clock that stepped back (a bad clock corrected, the drill's offset
+/// lifted) made a restarted node's epoch older than the one its peers had
+/// seen, so they refused it as the older process until the clock passed
+/// it: an hour, in the clockjump drill. Its own directory's last word is
+/// what a restart counts from.
+fn next_epoch(dir: &Path, now: u64) -> Result<u64> {
+    let path = dir.join("EPOCH");
+    let last = match fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    let epoch = now.max(last.saturating_add(1));
+    crate::shard::atomic_write(&path, epoch.to_string().as_bytes())?;
+    Ok(epoch)
+}
+
 /// `(CELASTRO_MAX_ROWS, CELASTRO_MAX_ROWS_HARD)`, or the defaults; the hard
 /// one is never below the other, and neither is zero.
 pub fn row_caps_from_env() -> (usize, usize) {
@@ -1379,6 +1399,7 @@ impl Db {
         fs::create_dir_all(dir)?;
         db.lock = Some(crate::dirlock::take(dir)?);
         db.dir = Some(dir.to_path_buf());
+        db.epoch = next_epoch(dir, db.epoch)?;
         db.cipher = open_key(dir, &db.opts)?;
         // Absent is a fresh database. Unreadable is not: read as absent it
         // opened a database with no collections, and the next DDL published
@@ -10857,6 +10878,30 @@ mod tests {
             2,
             "and a reopen agrees"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart after the clock stepped back answers with an epoch past
+    /// the directory's last, not with its start instant: the zombie fence
+    /// would have refused it as the older process for as long as the
+    /// clock lagged the epoch its peers had seen.
+    #[test]
+    fn a_restart_after_the_clock_stepped_back_takes_the_next_epoch() {
+        let dir = std::env::temp_dir().join(format!("celastro-epoch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir, DbOpts::default()).unwrap();
+        let first = db.epoch();
+        assert_eq!(std::fs::read_to_string(dir.join("EPOCH")).unwrap().trim(), first.to_string());
+        drop(db);
+        // The last process at this directory had its clock an hour ahead.
+        let ahead = first + 3_600_000_000;
+        std::fs::write(dir.join("EPOCH"), ahead.to_string()).unwrap();
+        let db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.epoch(), ahead + 1, "one past the directory's last, not the clock's now");
+        drop(db);
+        let db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(db.epoch(), ahead + 2);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
