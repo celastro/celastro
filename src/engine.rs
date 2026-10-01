@@ -2886,11 +2886,23 @@ impl Db {
         (backup, reach, self.log_archive.is_some())
     }
 
+    /// The archive's lag: how far the archived logs stand behind the newest
+    /// write applied on any shard held here, in physical microseconds --
+    /// zero when nothing was written since the last ship. `None` with no
+    /// log archive set. Until 0.97.0 the lag was the reach's age, which
+    /// grew on an idle node and marked it STALE after an hour of quiet.
+    pub fn archive_lag_micros(&self) -> Option<i64> {
+        if self.log_archive.is_none() {
+            return None;
+        }
+        Some(self.shards.values().flatten().map(|s| s.archive_lag_micros()).max().unwrap_or(0))
+    }
+
     /// `SHOW HEALTH`'s recovery line: what a restore could reach if this
     /// node were lost now, and `STALE` when that is further back than
     /// `CELASTRO_RECOVERY_WARN` seconds (an hour by default) -- the
-    /// archived logs' reach when a log archive is set, the last backup's
-    /// age otherwise.
+    /// archive's lag behind the newest write when a log archive is set,
+    /// the last backup's age otherwise.
     fn recovery_line(&self) -> String {
         let (backup, reach, archive) = self.recovery_point();
         let now = crate::time::now_micros();
@@ -2922,7 +2934,7 @@ impl Db {
                 let at = crate::time::physical_micros(ts);
                 (
                     format!("archived logs reach {} ({})", crate::time::format_micros(at), ago(at)),
-                    now - at > warn,
+                    self.archive_lag_micros().unwrap_or(0) > warn,
                 )
             }
         };
@@ -10909,6 +10921,30 @@ mod tests {
         assert_eq!(db.epoch(), ahead + 2);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The archive's lag is measured to the newest write, not to the clock:
+    /// zero once the log is shipped, however long the node then sits
+    /// idle, and the distance to the next write once there is one.
+    #[test]
+    fn the_archive_lag_is_the_newest_writes_distance_from_the_reach() {
+        let root = std::env::temp_dir().join(format!("celastro-lag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, archive) = (root.join("data"), root.join("archive"));
+        std::fs::create_dir_all(&archive).unwrap();
+        let opts = DbOpts { log_archive: Some(archive.display().to_string()), ..DbOpts::default() };
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        let row = |k: &str| Value::obj(vec![("id".into(), Value::Str(k.into()))]);
+        db.insert("notes", row("n1")).unwrap();
+        assert!(db.archive_lag_micros().unwrap() > 0, "a write and nothing shipped: the lag is it");
+        db.execute(&format!("BACKUP LOG TO '{}'", archive.display())).unwrap();
+        assert_eq!(db.archive_lag_micros(), Some(0), "shipped to the newest write: no lag, idle or not");
+        assert!(!db.show_health().contains("STALE"), "{}", db.show_health());
+        db.insert("notes", row("n2")).unwrap();
+        assert!(db.archive_lag_micros().unwrap() > 0, "a write past the reach");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The recovery point survives a restart: a node that shipped a log,

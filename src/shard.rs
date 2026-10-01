@@ -2373,6 +2373,10 @@ pub struct Shard {
     /// recovery point `SHOW HEALTH` reports. Nothing since the start until
     /// the first ship.
     pub(crate) archived_reach: Option<Timestamp>,
+    /// The newest write this shard applied -- its own or a holder's
+    /// shipped -- for the archive's lag: how far behind that the archived
+    /// logs reach, nothing when nothing was written since.
+    pub(crate) last_write_ts: Timestamp,
     /// Group commit: a write appends and applies, and leaves its log's sync
     /// in `pending` for the caller to settle with the database's lock let go
     /// ([`LogSync`]). Off, the write syncs before it returns, as the embedded
@@ -2466,6 +2470,7 @@ impl Shard {
             flushes: 0,
             seal_failures: 0,
             archived_reach: None,
+            last_write_ts: 0,
             last_seal_error: None,
             defer_sync: false,
             pending: Vec::new(),
@@ -2559,6 +2564,7 @@ impl Shard {
     fn apply_replayed(&mut self, records: Vec<WalRecord>, observe: bool) -> Result<()> {
         for r in records {
             self.clock.observe(r.ts);
+            self.note_write(r.ts);
             match r.kind {
                 WAL_INSERT => {
                     // A crash between writing the segments and truncating the
@@ -3070,6 +3076,7 @@ impl Shard {
         self.coll.observe_doc(&doc);
         self.unsealed.observe_doc(&doc);
         self.memtable.insert(key, ts, doc)?;
+        self.note_write(ts);
         self.seal_if_due();
         Ok(ts)
     }
@@ -3200,6 +3207,7 @@ impl Shard {
             self.coll.observe_doc(&doc);
             self.unsealed.observe_doc(&doc);
             self.memtable.insert(key, ts, doc)?;
+            self.note_write(ts);
             out.push(ts);
         }
         // After every document, not between them: a seal that fails in the
@@ -3283,6 +3291,7 @@ impl Shard {
             }
         }
         self.mark_superseded_unsynced(unsynced, prev, ts);
+        self.note_write(ts);
         Ok(Some(ts))
     }
 
@@ -3364,6 +3373,7 @@ impl Shard {
         let mut out = Vec::with_capacity(prepared.len());
         for (record, prev) in prepared {
             self.mark_superseded_unsynced(unsynced, prev, record.ts);
+            self.note_write(record.ts);
             out.push((record.key, record.ts));
         }
         Ok(out)
@@ -3696,6 +3706,23 @@ impl Shard {
     }
 
     /// A ship off the lock landed: the reach it moved to, never back.
+    /// A write applied at `ts`: the newest the archive's lag is measured to.
+    fn note_write(&mut self, ts: Timestamp) {
+        self.last_write_ts = self.last_write_ts.max(ts);
+    }
+
+    /// How far the archived logs stand behind the newest write applied
+    /// here, in physical microseconds: zero when idle, and the whole
+    /// history when nothing was shipped yet.
+    pub(crate) fn archive_lag_micros(&self) -> i64 {
+        if self.last_write_ts == 0 {
+            return 0;
+        }
+        let newest = crate::time::physical_micros(self.last_write_ts);
+        let reach = self.archived_reach.map_or(0, crate::time::physical_micros);
+        (newest - reach).max(0)
+    }
+
     pub(crate) fn note_archived_reach(&mut self, reach: Timestamp) {
         self.archived_reach = self.archived_reach.max(Some(reach));
     }
@@ -4779,6 +4806,7 @@ impl Shard {
         }
         for r in applied {
             self.clock.observe(r.ts);
+            self.note_write(r.ts);
             match r.kind {
                 WAL_INSERT => {
                     let prev = self.latest_version(&r.key);

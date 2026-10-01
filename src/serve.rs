@@ -586,14 +586,16 @@ fn metrics_text(db: &Db) -> String {
             age(ts),
         );
     }
-    if let Some(ts) = reach {
+    if let (Some(_), Some(lag)) = (reach, db.archive_lag_micros()) {
         line(
             "celastro_archive_lag_seconds",
             "gauge",
-            "Seconds between now and the instant the archived logs of every shard held here \
-             reach: what a restore to the archive would lose if this node were lost now.",
+            "Seconds of acknowledged writes the archived logs of the shards held here do not \
+             reach yet -- what a restore to the archive would lose if this node were lost now: \
+             the newest write's instant less the archive's reach, zero when idle. Alert on it \
+             growing past the cadence.",
             "",
-            age(ts),
+            (lag / 1_000_000).to_string(),
         );
     }
     // The latency histogram. It goes through `line` like everything else,

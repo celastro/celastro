@@ -123,6 +123,14 @@ one past the directory's last (`EPOCH`) when the clock says less; under
 `CELASTRO_SEAL_IDENTITY=3` or lower the file is not written, since a
 node before this release names it as damage.
 
+**The archive's lag is measured to the newest write.**
+`celastro_archive_lag_seconds`, and the recovery line's `STALE`, took
+the archived logs' reach against the clock, so an idle node reported a
+lag growing by the second and went STALE after an hour of quiet (the
+monitoring drill, on its first run with the gauge). The lag is the
+newest acknowledged write's instant less the reach now: zero when idle,
+the whole history until the first ship.
+
 **The recovery point from the open on.** A node reopened reports how far
 the archive reaches for each shard it holds from its open, read from the
 archive's listing, rather than "no archived log since this process
