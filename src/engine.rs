@@ -2934,7 +2934,8 @@ impl Db {
                 let at = crate::time::physical_micros(ts);
                 (
                     format!("archived logs reach {} ({})", crate::time::format_micros(at), ago(at)),
-                    self.archive_lag_micros().unwrap_or(0) > warn,
+                    // At or past the threshold, so `0` marks every report.
+                    self.archive_lag_micros().unwrap_or(0) >= warn,
                 )
             }
         };
@@ -10841,7 +10842,7 @@ mod tests {
         db.execute(&format!("BACKUP TO '{}'", backups.display())).unwrap().finished().unwrap();
         let h = db.show_health();
         assert!(h.contains("recovery: last backup ") && h.contains(" s ago ("), "{h}");
-        // Past the threshold: the reach stands where it was, and now says so.
+        // `0` marks every report: the lag, nothing since the ship, is at it.
         std::env::set_var("CELASTRO_RECOVERY_WARN", "0");
         let h = db.show_health();
         std::env::remove_var("CELASTRO_RECOVERY_WARN");
