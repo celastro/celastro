@@ -509,17 +509,125 @@ pub fn https_request(
     );
     let request = http_text(server_name, req);
     s.write_all(request.as_bytes()).map_err(Error::Io)?;
-    let mut raw = Vec::new();
-    // A stream that ends without a close_notify is an error (0.87.0),
-    // with what came before it in `raw`: an answer the headers frame is
-    // whole whatever ended the stream; one framed by the end alone is
-    // taken only from a stream that ended properly.
-    let cut = match s.read_to_end(&mut raw) {
-        Ok(_) => false,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => true,
-        Err(e) => return Err(Error::Io(e)),
-    };
+    let (raw, cut) = read_bounded_response(&mut s)?;
     parse_response(&raw, cut)
+}
+
+/// The most an answer's head may be, and the most a body may declare or
+/// stream: a response is read head first, then exactly what the head
+/// frames, refused as soon as a bound is passed (0.98.0; before, the
+/// whole stream was buffered -- to 4 GiB -- before the framing was
+/// looked at, so an endpoint that streamed past its length cost the
+/// client that much memory).
+pub const MAX_RESPONSE_HEAD: usize = 64 << 10;
+pub const MAX_RESPONSE_BODY: usize = 256 << 20;
+
+/// An HTTP/1.1 answer read in two parts: the head, bounded, then the body
+/// as the head frames it -- `Content-Length` bytes exactly, the chunks of
+/// a chunked body until the last, or everything to the end when the head
+/// frames nothing -- bounded by `MAX_RESPONSE_BODY`. `cut` says a stream
+/// ended without a proper close (a TLS stream without its close_notify,
+/// 0.87.0): an answer the head frames is whole whatever ended the stream;
+/// one framed by the end alone is taken only from a stream that ended
+/// properly.
+fn read_bounded_response<R: Read>(s: &mut R) -> Result<(Vec<u8>, bool)> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 16 << 10];
+    let mut cut = false;
+    let head_end = loop {
+        if let Some(p) = find(&raw, b"\r\n\r\n") {
+            break p + 4;
+        }
+        if raw.len() > MAX_RESPONSE_HEAD {
+            return Err(Error::Plan(format!(
+                "the server's answer has a head past {MAX_RESPONSE_HEAD} bytes"
+            )));
+        }
+        match s.read(&mut buf) {
+            Ok(0) => return parse_cut(raw, true),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return parse_cut(raw, true),
+            Err(e) => return Err(Error::Io(e)),
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    let lower = head.to_ascii_lowercase();
+    let content_length: Option<usize> = lower
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok());
+    let chunked = lower
+        .lines()
+        .any(|l| l.strip_prefix("transfer-encoding:").is_some_and(|v| v.contains("chunked")));
+    if let Some(n) = content_length {
+        if n > MAX_RESPONSE_BODY {
+            return Err(Error::Plan(format!(
+                "the server's answer declares {n} bytes, past the {MAX_RESPONSE_BODY} this client \
+                 reads"
+            )));
+        }
+    }
+    // The body: to the declared length, to the last chunk, or to the end.
+    loop {
+        let body_len = raw.len() - head_end;
+        let done = match (content_length, chunked) {
+            (Some(n), _) => body_len >= n,
+            (None, true) => chunks_end(&raw[head_end..]),
+            (None, false) => false,
+        };
+        if done {
+            if let Some(n) = content_length {
+                raw.truncate(head_end + n);
+            }
+            break;
+        }
+        if body_len > MAX_RESPONSE_BODY {
+            return Err(Error::Plan(format!(
+                "the server's answer streams past the {MAX_RESPONSE_BODY} bytes this client reads"
+            )));
+        }
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                cut = true;
+                break;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok((raw, cut))
+}
+
+fn parse_cut(raw: Vec<u8>, cut: bool) -> Result<(Vec<u8>, bool)> {
+    Ok((raw, cut))
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether a chunked body's bytes end with its last chunk (`0\r\n\r\n`,
+/// trailers allowed between).
+fn chunks_end(body: &[u8]) -> bool {
+    let mut i = 0usize;
+    loop {
+        let Some(line_end) = find(&body[i..], b"\r\n") else { return false };
+        let size_text = String::from_utf8_lossy(&body[i..i + line_end]);
+        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
+            .unwrap_or(usize::MAX);
+        if size == usize::MAX {
+            return false;
+        }
+        i += line_end + 2;
+        if size == 0 {
+            return find(&body[i..], b"\r\n").is_some();
+        }
+        if body.len() < i + size + 2 {
+            return false;
+        }
+        i += size + 2;
+    }
 }
 
 /// How many TLS handshakes this process has served that resumed from a
@@ -540,8 +648,7 @@ pub fn http_request(
     let mut sock = dial(addr, timeout)?;
     let request = http_text(host, req);
     sock.write_all(request.as_bytes()).map_err(Error::Io)?;
-    let mut raw = Vec::new();
-    sock.read_to_end(&mut raw).map_err(Error::Io)?;
+    let (raw, _) = read_bounded_response(&mut sock)?;
     parse_response(&raw, false)
 }
 
@@ -606,7 +713,11 @@ fn parse_response(raw: &[u8], cut: bool) -> Result<(u16, String)> {
         if rest.len() < n {
             return Err(Error::Plan("the server's answer was cut short of its length".into()));
         }
-        rest[..n].to_string()
+        // By bytes, as the length counts; a length that lands inside a
+        // character is a malformed answer, not a panic.
+        rest.get(..n)
+            .ok_or_else(|| Error::Plan("the server's length ends inside a character".into()))?
+            .to_string()
     } else if cut {
         return Err(Error::Plan(
             "the server's answer had no length and the connection was cut before it ended".into(),
@@ -646,8 +757,11 @@ fn dechunk(text: &str) -> String {
         if size == 0 || after.len() < size {
             break;
         }
-        out.push_str(&after[..size]);
-        rest = after[size..].strip_prefix("\r\n").unwrap_or("");
+        // A chunk that ends inside a character ends the reading: a
+        // malformed answer, not a panic.
+        let Some(piece) = after.get(..size) else { break };
+        out.push_str(piece);
+        rest = after.get(size..).unwrap_or("").strip_prefix("\r\n").unwrap_or("");
     }
     out
 }

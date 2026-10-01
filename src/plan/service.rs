@@ -245,7 +245,9 @@ impl ShardService for Local<'_> {
     }
 
     fn manifest_version(&self) -> u64 {
-        self.shard.manifest_version
+        // The layout's version, which a freeze moves too: what the
+        // deferred fetch compares (0.98.0).
+        self.shard.layout_version()
     }
 
     fn may_hold(&self, prefix: &str) -> bool {

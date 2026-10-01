@@ -190,6 +190,14 @@ impl<'a> Parser<'a> {
         if self.eat_kw("REBALANCE") {
             return Ok(Statement::Rebalance { collection: self.ident()? });
         }
+        if self.eat_kw("ABORT") {
+            self.expect_kw("MOVE")?;
+            self.expect_kw("SHARD")?;
+            let shard = self.usize_literal()?;
+            self.expect_kw("OF")?;
+            let collection = self.ident()?;
+            return Ok(Statement::AbortMove { collection, shard });
+        }
         if self.eat_kw("SPLIT") {
             self.expect_kw("SHARD")?;
             let shard = self.usize_literal()?;
@@ -2226,6 +2234,12 @@ mod tests {
         match parse("MOVE SHARD 2 OF items TO 'tcp://c:9000'", &[]).unwrap() {
             Statement::MoveShard { collection, shard, to } => {
                 assert_eq!((collection.as_str(), shard, to.as_str()), ("items", 2, "tcp://c:9000"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("ABORT MOVE SHARD 2 OF items", &[]).unwrap() {
+            Statement::AbortMove { collection, shard } => {
+                assert_eq!((collection.as_str(), shard), ("items", 2));
             }
             other => panic!("{other:?}"),
         }

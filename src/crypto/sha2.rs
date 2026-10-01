@@ -1,7 +1,7 @@
-//! SHA-256 and SHA-512 from FIPS 180-4, and HMAC-SHA-256 from RFC 2104: the
-//! TLS key schedule's hash, Ed25519's, and the S3 signer's.
+//! SHA-256, SHA-384 and SHA-512 from FIPS 180-4, and HMAC-SHA-256 from
+//! RFC 2104: the TLS key schedule's hashes, Ed25519's, the chain
+//! verifier's for a P-384 or RSA signature, and the S3 signer's.
 
-/// HMAC-SHA-256, RFC 2104.
 /// HMAC-SHA-256 into `out`, with everything that touched the key erased
 /// before it returns: the padded key, both pads, and the two message
 /// buffers, all of which are key material and all of which used to be

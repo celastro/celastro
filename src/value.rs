@@ -69,6 +69,21 @@ impl ValueType {
 }
 
 impl Value {
+    /// About how many bytes this value takes encoded: what bounds a batch
+    /// of documents by size rather than by count alone. An estimate, not
+    /// the wire's exact length.
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            Value::Null | Value::Bool(_) => 1,
+            Value::Int(_) | Value::Float(_) | Value::Timestamp(_) => 9,
+            Value::Str(s) => 5 + s.len(),
+            Value::Array(v) => 5 + v.iter().map(Value::approx_bytes).sum::<usize>(),
+            Value::Object(m) => {
+                5 + m.iter().map(|(k, x)| 5 + k.len() + x.approx_bytes()).sum::<usize>()
+            }
+        }
+    }
+
     pub fn obj(fields: Vec<(String, Value)>) -> Value {
         let mut f = fields;
         f.sort_by(|a, b| a.0.cmp(&b.0));

@@ -26,6 +26,15 @@ const MAX_CHAIN: usize = 8;
 /// bits of the SHA-256 of the public key (RFC 7093, method 1).
 const OID_SKID: &[u8] = &[0x55, 0x1d, 0x0e];
 const OID_AKID: &[u8] = &[0x55, 0x1d, 0x23];
+/// The CRL extensions this reader takes whole: a CRL number and the
+/// authority key identifier on the list; a reason code and an invalidity
+/// date on an entry. Any other extension marked critical -- a delta
+/// indicator, an issuing distribution point, a certificate issuer -- is a
+/// list this reader would read as more than it is, and is refused (RFC
+/// 5280 §5.2, since 0.98.0).
+const OID_CRL_NUMBER: &[u8] = &[0x55, 0x1d, 0x14];
+const OID_REASON_CODE: &[u8] = &[0x55, 0x1d, 0x15];
+const OID_INVALIDITY_DATE: &[u8] = &[0x55, 0x1d, 0x18];
 
 /// A key's identifier, as the two extensions carry it.
 pub fn key_identifier(public: &[u8]) -> Vec<u8> {
@@ -566,6 +575,7 @@ impl Certificate {
 /// Verify a peer's chain against the trust anchors: the leaf (first) must
 /// name `host` and be valid at `now`; each certificate must be signed by
 /// the next, or by an anchor; every non-anchor signer must be a CA.
+#[cfg(test)]
 pub fn verify_chain(
     chain: &[Certificate],
     anchors: &[Certificate],
@@ -606,6 +616,7 @@ pub fn verify_chain_with(
 /// [`verify_chain`] without the name: the leaf is valid now, fit for
 /// `purpose`, and the chain links up to a certificate in `anchors`. What a
 /// server checks of a client's certificate, which names no host to match.
+#[cfg(test)]
 pub fn chain_reaches_anchor(
     chain: &[Certificate],
     anchors: &[Certificate],
@@ -614,18 +625,7 @@ pub fn chain_reaches_anchor(
     chain_reaches_anchor_with(chain, anchors, &[], now, Purpose::ClientAuth)
 }
 
-/// [`chain_reaches_anchor`] with the leaf's purpose named; a server's chain
-/// goes through [`verify_chain`], which names `ServerAuth`.
-pub fn chain_reaches_anchor_for(
-    chain: &[Certificate],
-    anchors: &[Certificate],
-    now: i64,
-    purpose: Purpose,
-) -> Result<()> {
-    chain_reaches_anchor_with(chain, anchors, &[], now, purpose)
-}
-
-/// [`chain_reaches_anchor_for`] with a revocation list, and the one walk
+/// the chain walk with a revocation list, and the one walk
 /// every verification is: the leaf valid, fit and not revoked; each link
 /// signed by the next, a CA that may sign, valid, not revoked, and whose
 /// `pathLenConstraint`, when it names one, allows the intermediates below
@@ -748,6 +748,8 @@ pub struct Revoked {
 #[derive(Clone, Debug)]
 pub struct Crl {
     pub issuer: Vec<u8>,
+    /// Parsed for the record; nothing reads it yet.
+    #[allow(dead_code)]
     pub this_update: i64,
     pub next_update: Option<i64>,
     pub serials: Vec<Vec<u8>>,
@@ -757,6 +759,25 @@ pub struct Crl {
 }
 
 /// Parse a DER `CertificateList`.
+/// A sequence of extensions, each `oid [critical] value`: a critical one
+/// not among `known` is refused by name, as a certificate's is.
+fn crl_extensions_known(mut exts: &[u8], known: &[&[u8]], on: &str) -> Result<()> {
+    while !exts.is_empty() {
+        let (ext, rest) = der::expect(exts, SEQUENCE)?;
+        exts = rest;
+        let (oid, ext_rest) = der::expect(ext, OID)?;
+        let (critical, _) = der::optional(ext_rest, BOOLEAN)?;
+        if der_bool(critical)? && !known.contains(&oid) {
+            return Err(refuse(format!(
+                "a critical extension on {on} of the CRL this reader does not take ({}): a \
+                 delta or partitioned list, or an indirect one, would be read as more than it is",
+                super::hex(oid)
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_crl(der_bytes: &[u8]) -> Result<Crl> {
     let (list, rest) = der::expect(der_bytes, SEQUENCE)?;
     if !rest.is_empty() {
@@ -801,15 +822,23 @@ pub fn parse_crl(der_bytes: &[u8]) -> Result<Crl> {
             let (entry, after) = der::expect(entries, SEQUENCE)?;
             entries = after;
             let (serial, entry_rest) = der::expect(entry, INTEGER)?;
-            let (_revoked_at, _) = time(entry_rest)?;
+            let (_revoked_at, entry_rest) = time(entry_rest)?;
+            if entry_rest.first() == Some(&SEQUENCE) {
+                let (exts, _) = der::expect(entry_rest, SEQUENCE)?;
+                crl_extensions_known(exts, &[OID_REASON_CODE, OID_INVALIDITY_DATE], "an entry")?;
+            }
             serials.push(trim_serial(serial));
         }
         rest
     } else {
         rest
     };
-    // crlExtensions [0], passed over: a CRL number, an authority key id.
-    let (_exts, rest) = der::optional(rest, 0xa0)?;
+    // crlExtensions [0]: read for what is critical.
+    let (exts, rest) = der::optional(rest, 0xa0)?;
+    if let Some(exts) = exts {
+        let (exts, _) = der::expect(exts, SEQUENCE)?;
+        crl_extensions_known(exts, &[OID_CRL_NUMBER, OID_AKID], "the list")?;
+    }
     if !rest.is_empty() {
         return Err(bad("bytes after the CRL's extensions"));
     }
@@ -846,12 +875,25 @@ pub fn revocations_from_pem(
     if blocks.is_empty() {
         return Err(bad("no X509 CRL block in the file"));
     }
+    // A CA that issues leaves under an anchor may revoke them with a list
+    // it signs itself: its certificate rides in the file as a CERTIFICATE
+    // block, and counts when it is a CA an anchor signed (0.98.0; before,
+    // only an anchor's list was taken, so a leaf an intermediate issued
+    // could not be revoked).
+    let issuers: Vec<Certificate> = pem::decode_all(text, "CERTIFICATE")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| parse(d).ok())
+        .filter(|c| c.is_ca && anchors.iter().any(|a| c.signed_by(a)))
+        .collect();
     for (i, der_bytes) in blocks.iter().enumerate() {
         let crl = parse_crl(der_bytes)?;
-        if !anchors.iter().any(|a| crl.signed_by(a)) {
+        let vouched =
+            anchors.iter().any(|a| crl.signed_by(a)) || issuers.iter().any(|c| crl.signed_by(c));
+        if !vouched {
             return Err(refuse(format!(
-                "CRL {} is not signed by a CA this node trusts; a list nobody vouches for revokes \
-                 nothing",
+                "CRL {} is not signed by a CA this node trusts, nor by a CA in the file that \
+                 one trusted signed; a list nobody vouches for revokes nothing",
                 i + 1
             )));
         }
@@ -867,6 +909,7 @@ pub fn revocations_from_pem(
 /// revoking `serials`, valid from `this_update` to `next_update`: what a
 /// test, or an operator with the CA's key in hand, revokes a certificate
 /// with. The issuer's name is the certificate's subject, byte for byte.
+#[cfg(test)]
 pub fn issue_crl(
     issuer: &Certificate,
     key: &KeyPair,
@@ -874,19 +917,51 @@ pub fn issue_crl(
     this_update: i64,
     next_update: i64,
 ) -> Vec<u8> {
+    issue_crl_with_extensions(issuer, key, serials, this_update, next_update, &[])
+}
+
+/// `issue_crl` with CRL extensions: each an OID, whether critical, and
+/// the DER of its value, under `crlExtensions [0]`.
+#[cfg(test)]
+pub fn issue_crl_with_extensions(
+    issuer: &Certificate,
+    key: &KeyPair,
+    serials: &[&[u8]],
+    this_update: i64,
+    next_update: i64,
+    extensions: &[(&[u8], bool, &[u8])],
+) -> Vec<u8> {
     let entries: Vec<Vec<u8>> = serials
         .iter()
         .map(|s| der::sequence(&[&der::integer(s), &time_der(this_update)]))
         .collect();
     let refs: Vec<&[u8]> = entries.iter().map(|e| e.as_slice()).collect();
-    let tbs = der::sequence(&[
-        &der::integer(&[1]),
-        &der::ed25519_algorithm(),
-        &issuer.subject,
-        &time_der(this_update),
-        &time_der(next_update),
-        &der::sequence(&refs),
-    ]);
+    let exts: Vec<Vec<u8>> = extensions
+        .iter()
+        .map(|(oid, critical, value)| {
+            let mut parts: Vec<Vec<u8>> = vec![der::tlv(OID, oid)];
+            if *critical {
+                parts.push(der::tlv(BOOLEAN, &[0xff]));
+            }
+            parts.push(der::tlv(OCTET_STRING, value));
+            let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+            der::sequence(&refs)
+        })
+        .collect();
+    let mut parts: Vec<Vec<u8>> = vec![
+        der::integer(&[1]),
+        der::ed25519_algorithm(),
+        issuer.subject.clone(),
+        time_der(this_update),
+        time_der(next_update),
+        der::sequence(&refs),
+    ];
+    if !exts.is_empty() {
+        let ext_refs: Vec<&[u8]> = exts.iter().map(|e| e.as_slice()).collect();
+        parts.push(der::tlv(0xa0, &der::sequence(&ext_refs)));
+    }
+    let part_refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let tbs = der::sequence(&part_refs);
     let sig = ed25519::sign(&key.seed, &tbs);
     der::sequence(&[&tbs, &der::ed25519_algorithm(), &der::bit_string(&sig)])
 }
@@ -1537,6 +1612,100 @@ mod tests {
     /// it, and an intermediate allowing none refuses a chain that puts
     /// another under it. The constraint is honoured on anchors and links
     /// alike (RFC 5280 §4.2.1.9; H8's C7).
+    /// A critical CRL extension this reader does not take -- an issuing
+    /// distribution point, a delta indicator -- is refused by name; a
+    /// non-critical unknown one and a critical CRL number are read.
+    #[test]
+    fn a_critical_crl_extension_this_reader_does_not_take_is_refused() {
+        let m = make("localhost", &[], &[], 30).unwrap();
+        let ca = parse(&pem::decode_all(&m.ca_cert, "CERTIFICATE").unwrap()[0]).unwrap();
+        let ca_key =
+            KeyPair::from_pkcs8_der(&pem::decode_all(&m.ca_key, "PRIVATE KEY").unwrap()[0])
+                .unwrap();
+        let now = crate::time::now_micros() / 1_000_000;
+        let idp: &[u8] = &[0x55, 0x1d, 0x1c];
+        let delta: &[u8] = &[0x55, 0x1d, 0x1b];
+        let number = der::integer(&[7]);
+        let refused = |exts: &[(&[u8], bool, &[u8])]| {
+            let crl = issue_crl_with_extensions(&ca, &ca_key, &[], now - 60, now + 3600, exts);
+            revocations_from_pem(&pem::encode("X509 CRL", &crl), std::slice::from_ref(&ca))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(refused(&[]).is_ok());
+        assert!(refused(&[(OID_CRL_NUMBER, true, &number)]).is_ok(), "a critical CRL number");
+        assert!(refused(&[(idp, false, &der::sequence(&[]))]).is_ok(), "non-critical: passed over");
+        let e = refused(&[(idp, true, &der::sequence(&[]))]).unwrap_err();
+        assert!(e.contains("critical extension on the list") && e.contains("551d1c"), "{e}");
+        let e = refused(&[(delta, true, &number)]).unwrap_err();
+        assert!(e.contains("551d1b"), "{e}");
+    }
+
+    /// A CRL an intermediate signs is taken when the intermediate's
+    /// certificate rides in the file and an anchor signed it; a leaf it
+    /// issued is revoked by it. One signed by a CA the file does not
+    /// carry, or that no anchor signed, is refused.
+    #[test]
+    fn a_crl_an_intermediate_signs_is_taken_with_its_certificate_in_the_file() {
+        let now = crate::time::now_micros() / 1_000_000;
+        let (t0, t1) = (now - 3600, now + 86_400);
+        let (rk, ik, lk, stranger) = (
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+            KeyPair::generate().unwrap(),
+        );
+        let ca = |cn: &str, kp: &KeyPair, issuer_cn: &str, issuer: &KeyPair| {
+            let spec = Spec {
+                common_name: cn,
+                dns_names: &[],
+                ip_addresses: &[],
+                not_before: t0,
+                not_after: t1,
+                is_ca: true,
+                path_len: None,
+            };
+            issue(&spec, kp, issuer_cn, issuer).unwrap()
+        };
+        let root_der = ca("root", &rk, "root", &rk);
+        let inter_der = ca("inter", &ik, "root", &rk);
+        let stranger_der = ca("stranger", &stranger, "stranger", &stranger);
+        let (root, inter) = (parse(&root_der).unwrap(), parse(&inter_der).unwrap());
+        let names = vec!["localhost".to_string()];
+        let spec = Spec {
+            common_name: "leaf",
+            dns_names: &names,
+            ip_addresses: &[],
+            not_before: t0,
+            not_after: t1,
+            is_ca: false,
+            path_len: None,
+        };
+        let leaf = parse(&issue(&spec, &lk, "inter", &ik).unwrap()).unwrap();
+        let crl = issue_crl(&inter, &ik, &[&leaf.serial], now - 60, now + 3600);
+        let crl_pem = pem::encode("X509 CRL", &crl);
+        let anchors = std::slice::from_ref(&root);
+        let e = revocations_from_pem(&crl_pem, anchors).unwrap_err().to_string();
+        assert!(e.contains("not signed by a CA this node trusts"), "{e}");
+        let with_inter = format!("{crl_pem}{}", pem::encode("CERTIFICATE", &inter_der));
+        let (revoked, _) = revocations_from_pem(&with_inter, anchors).unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert!(verify_chain(&[leaf.clone(), inter.clone()], anchors, "localhost", now).is_ok());
+        let e = verify_chain_with(&[leaf, inter], anchors, &revoked, "localhost", now)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is revoked"), "{e}");
+        // A stranger's certificate in the file vouches for nothing.
+        let stranger_crl =
+            issue_crl(&parse(&stranger_der).unwrap(), &stranger, &[], now - 60, now + 3600);
+        let text = format!(
+            "{}{}",
+            pem::encode("X509 CRL", &stranger_crl),
+            pem::encode("CERTIFICATE", &stranger_der)
+        );
+        assert!(revocations_from_pem(&text, anchors).is_err());
+    }
+
     /// The signatures are checked from the anchor down once the names
     /// have found it: a leaf that names a genuine intermediate as its
     /// issuer but was signed by some other key is refused at that link.

@@ -15,8 +15,19 @@
 # them afterwards with `ATTACH NODE` from any console, or use
 # ../ssh/celastro-cluster.sh, which takes the addresses on its command
 # line once the machines exist.
+# The tokens are not in this file: user-data is readable by anything on
+# the machine that can reach the metadata service, and by whoever can
+# read the instance. This file names a URL the environment file is
+# fetched from at boot -- a presigned object, a secrets endpoint on the
+# private network -- and that file is removed once the install ran, or
+# did not (0.98.0). The environment file's lines are the ones under
+# `celastro-install.env.example` below.
 write_files:
-  - path: /root/celastro-install.env
+  - path: /root/celastro-install.url
+    permissions: "0600"
+    content: |
+      https://change-this-to-where-the-environment-file-is-fetched-from
+  - path: /root/celastro-install.env.example
     permissions: "0600"
     content: |
       CELASTRO_VERSION=0.97.0
@@ -37,6 +48,9 @@ write_files:
 runcmd:
   - |
     set -eu
+    trap 'rm -f /root/celastro-install.env /root/celastro-install.url' EXIT
+    umask 077
+    curl -fsS -o /root/celastro-install.env "$(cat /root/celastro-install.url)"
     . /root/celastro-install.env
     case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "no release for $(uname -m)" >&2; exit 1 ;; esac
     base="https://github.com/celastro/celastro/releases/download/v$CELASTRO_VERSION"
@@ -53,4 +67,3 @@ runcmd:
     # shellcheck disable=SC2086
     CELASTRO_TOKEN="$CELASTRO_TOKEN" CELASTRO_WIRE_TOKEN="$CELASTRO_WIRE_TOKEN" \
       /usr/local/bin/celastro install $flags $CELASTRO_INSTALL_FLAGS
-    rm -f /root/celastro-install.env

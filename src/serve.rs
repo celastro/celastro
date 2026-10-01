@@ -1169,6 +1169,16 @@ impl Server {
                         Ok(s) => s,
                         Err(_) => return,
                     };
+                    // The slot goes back on every way out, a panic's
+                    // included: a worker that panicked kept its slot and
+                    // the count of active connections drifted up (0.98.0).
+                    struct Slot<'a>(&'a AtomicUsize);
+                    impl Drop for Slot<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+                        }
+                    }
+                    let _slot = Slot(active);
                     match server.serve_one(s, db) {
                         Ok(Next::Serve) => {}
                         Ok(Next::Stop) => stop.store(true, AtomicOrdering::Release),
@@ -1176,7 +1186,6 @@ impl Server {
                             crate::log::warn("connection_dropped", &[("error", e.to_string())])
                         }
                     }
-                    active.fetch_sub(1, AtomicOrdering::AcqRel);
                 });
             }
             let outcome = loop {
@@ -1225,7 +1234,11 @@ impl Server {
                     }
                 }
             };
-            // The workers end when the channel does.
+            // The workers end when the channel does; the maintenance
+            // threads end on the flag, which is set here too, since an
+            // accept loop that gave up left them looping and `run` never
+            // returned -- a process with no listener, alive (0.98.0).
+            stop.store(true, AtomicOrdering::Release);
             drop(tx);
             outcome
         })
@@ -1237,12 +1250,6 @@ impl Server {
         // again: a sixteen-byte token is not guessed at line rate.
         COUNTERS.connections.fetch_add(1, AtomicOrdering::Relaxed);
         let peer = stream.peer_addr().ok().map(|a| a.ip());
-        if let Some(ip) = peer {
-            let wait = throttle(|t| t.penalty(ip, Instant::now()));
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
-        }
         let stream = tls::accept(self.tls.as_ref(), stream)?;
         // The read side is armed per read, from the deadline, by `Wire::arm`.
         let deadlines = Deadlines::from_now();
@@ -1261,6 +1268,14 @@ impl Server {
         }
         if served.response.status == 401 {
             if let Some(ip) = peer {
+                // The penalty delays this refusal, not every request from
+                // the address: a client with the right token behind the
+                // same proxy as one guessing is answered at once (0.98.0;
+                // before, the wait came before the request was read).
+                let wait = throttle(|t| t.penalty(ip, Instant::now()));
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
                 throttle(|t| t.refused(ip, Instant::now()));
             }
         }
@@ -1283,7 +1298,7 @@ enum Next {
 
 /// What to do about a failed `accept`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backoff {
+pub(crate) enum Backoff {
     /// Retry immediately: nothing was actually wrong.
     Now,
     /// Retry after a pause.
@@ -1305,7 +1320,7 @@ enum Backoff {
 /// they retry at once and do not count towards giving up. Otherwise a flood of
 /// half-open connections would shut the console down, which is the outcome the
 /// flood was after.
-fn accept_backoff(kind: ErrorKind, consecutive: u32) -> Backoff {
+pub(crate) fn accept_backoff(kind: ErrorKind, consecutive: u32) -> Backoff {
     match kind {
         ErrorKind::WouldBlock | ErrorKind::Interrupted => Backoff::Now,
         ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => Backoff::Now,
@@ -2643,7 +2658,18 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
                 let handles: Vec<_> = sends
                     .into_iter()
                     .filter_map(|(to, msg)| {
-                        let (_, node) = peers.iter().find(|(u, _)| *u == to)?;
+                        // A member of the group this node has no connection
+                        // to -- not attached, or its name not resolved yet
+                        // -- gets nothing, and the log says so: a group
+                        // whose member is never reached elects without it
+                        // (0.98.0; before, the send was skipped silently).
+                        let Some((_, node)) = peers.iter().find(|(u, _)| *u == to) else {
+                            crate::log::warn(
+                                "steward_member_unreached",
+                                &[("member", to.clone()), ("reason", "not attached".into())],
+                            );
+                            return None;
+                        };
                         let (node, me, grants) = (node.clone(), me.clone(), grants);
                         Some(scope.spawn(move || {
                             let _deadline =
@@ -3081,6 +3107,11 @@ fn compaction_step(db: &RwLock<Db>) -> bool {
                 "compaction_failed",
                 &[("what", what.clone()), ("error", e.to_string())],
             );
+            // An index backfill that cannot build is set aside, so the
+            // planner hands out the merges behind it; anything else is
+            // tried again after a moment.
+            let why = e.to_string();
+            let _ = locked(db, |g| g.compaction_set_aside(&ticket, &why));
             std::thread::sleep(Duration::from_secs(1));
         }
     }
@@ -3396,6 +3427,9 @@ fn health_json(db: &Db) -> String {
     // Verified since start, for a readiness probe: a node that has not yet
     // reached its peers can coordinate nothing that lives on them.
     let attached = db.attached_count();
+    // Peers answering now, for a readiness probe asking for a majority:
+    // within three sweeps of the reconciler.
+    let answering = db.answering_count(std::time::Duration::from_secs(90));
     // A node whose data directory is gone is not well, whatever else it can
     // still answer from memory: the probe that asks should restart it, and
     // the restart will say the directory is missing where it can be seen.
@@ -3412,7 +3446,7 @@ fn health_json(db: &Db) -> String {
         );
     }
     format!(
-        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections},"node":{node},"attached":{attached}}}"#
+        r#"{{"ok":true,"name":"celastro","version":{version},"source":{source},"license":{license},"copyright":{copyright},"collections":{collections},"node":{node},"answering":{answering},"attached":{attached}}}"#
     )
 }
 
@@ -3432,9 +3466,19 @@ pub fn probe_health(port: u16, tls: Option<&Arc<Tls>>) -> Result<bool> {
 /// compares, so a readiness probe can wait for a node's peers. `Ok(0)` for
 /// a console whose answer does not carry the count.
 pub fn probe_attached(port: u16, tls: Option<&Arc<Tls>>) -> Result<u64> {
+    probe_count(port, tls, r#""attached":"#)
+}
+
+/// How many attached peers answered the console on `port` lately, from
+/// the same answer: what `celastro health --majority-of T` compares.
+pub fn probe_answering(port: u16, tls: Option<&Arc<Tls>>) -> Result<u64> {
+    probe_count(port, tls, r#""answering":"#)
+}
+
+fn probe_count(port: u16, tls: Option<&Arc<Tls>>, field: &str) -> Result<u64> {
     let raw = probe(port, tls)?;
     let n = raw
-        .split_once(r#""attached":"#)
+        .split_once(field)
         .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
         .and_then(|d| d.parse().ok())
         .unwrap_or(0);
@@ -3726,6 +3770,9 @@ fn changes_response(head: &Head, collection: &str, db: &RwLock<Db>) -> Response 
 /// Documents an ingest writes in one statement: the console's own
 /// `INSERT` of this many, which `DbOpts::insert_batch` then syncs in chunks.
 const INGEST_BATCH: usize = 1000;
+/// An ingest batch is cut by bytes too (0.98.0): a thousand lines of a
+/// mebibyte each were parsed and held before the first write.
+const INGEST_BATCH_BYTES: usize = 32 << 20;
 
 /// `POST /api/ingest/<collection>`: the body is NDJSON, a document a line,
 /// read a line at a time under the connection's deadline -- so it may be
@@ -3752,6 +3799,7 @@ fn ingest_response<W: Wire>(
     let mut left = head.content_length;
     let mut line: Vec<u8> = Vec::new();
     let mut batch: Vec<Value> = Vec::new();
+    let mut batch_bytes = 0usize;
     let (mut documents, mut batches, mut last_ts) = (0usize, 0usize, 0u64);
     let (mut lineno, mut batch_first) = (0usize, 1usize);
     let failed = |io: &mut W, left: usize, msg: String, documents: usize, batches: usize| {
@@ -3813,7 +3861,10 @@ fn ingest_response<W: Wire>(
         line.clear();
         if !text.is_empty() {
             match json::parse(&text) {
-                Ok(doc) => batch.push(doc),
+                Ok(doc) => {
+                    batch_bytes += doc.approx_bytes();
+                    batch.push(doc)
+                }
                 Err(e) => {
                     // What was read before the bad line lands first, so
                     // the count is where to resume.
@@ -3835,8 +3886,12 @@ fn ingest_response<W: Wire>(
                 }
             }
         }
-        if batch.len() >= INGEST_BATCH || (done && !batch.is_empty()) {
+        if batch.len() >= INGEST_BATCH
+            || batch_bytes >= INGEST_BATCH_BYTES
+            || (done && !batch.is_empty())
+        {
             let pending = std::mem::take(&mut batch);
+            batch_bytes = 0;
             match write_batch(db, collection, pending) {
                 Ok((n, ts)) => {
                     documents += n;
@@ -3912,6 +3967,12 @@ fn run_sql_untimed(db: &RwLock<Db>, sql: &str) -> (Response, usize) {
         let out = g.read(sql);
         let touched = g.touches_pending();
         drop(g);
+        // A read that left work for after the lock -- `SHOW HEALTH`'s
+        // dials, since 0.98.0 -- is finished here, holding nothing.
+        let out = match out {
+            Ok(o @ Outcome::Deferred(_)) => o.finished_with(db),
+            other => other,
+        };
         // An index the read faulted in counts as used, and a demoted one is
         // promoted: that needs the write lock, taken now when nobody holds
         // the lock, so it lands in the request that caused it; with other

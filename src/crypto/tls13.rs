@@ -204,11 +204,6 @@ fn ticket_store<T>(f: impl FnOnce(&mut HashMap<String, Ticket>) -> T) -> T {
     f(g.get_or_insert_with(HashMap::new))
 }
 
-/// Forget every ticket: what a test does between servers.
-pub fn forget_tickets() {
-    ticket_store(|t| t.clear());
-}
-
 /// Forget the tickets of one server: what a test in a process of tests
 /// does between its own servers, since clearing the store would take
 /// another test's ticket between its first connection and its second.
@@ -219,6 +214,7 @@ fn forget_tickets_of(addr: std::net::SocketAddr) {
 }
 
 /// How many tickets this process holds.
+#[cfg(test)]
 pub fn tickets_held() -> usize {
     ticket_store(|t| t.len())
 }
@@ -646,11 +642,13 @@ impl TlsStream {
 
     /// Whether the handshake resumed from a ticket rather than running in
     /// full. Meaningful once the handshake has happened.
+    #[cfg(test)]
     pub fn resumed(&self) -> bool {
         self.resumed
     }
 
     /// Whether the handshake went through a HelloRetryRequest.
+    #[cfg(test)]
     pub fn retried(&self) -> bool {
         self.retried
     }

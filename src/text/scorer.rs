@@ -711,6 +711,59 @@ pub struct Compiled<'a> {
 /// natural implementation — one exclusion bitmap threaded through the whole
 /// compile — silently does exactly that, so `(alpha -beta) OR gamma` drops the
 /// `gamma` documents that happen to contain `beta`.
+/// The documents of a set, each scored one: what a negated negation
+/// yields, where no posting list carries a rank for it.
+pub struct SetScorer {
+    bits: Bitmap,
+    at: u32,
+}
+
+impl SetScorer {
+    pub fn new(bits: Bitmap) -> SetScorer {
+        let mut s = SetScorer { bits, at: 0 };
+        s.at = s.next_from(0);
+        s
+    }
+
+    fn next_from(&self, from: u32) -> u32 {
+        let n = self.bits.len() as u32;
+        let mut i = from;
+        while i < n {
+            if self.bits.get(i as usize) {
+                return i;
+            }
+            i += 1;
+        }
+        EXHAUSTED
+    }
+}
+
+impl Scorer for SetScorer {
+    fn doc(&self) -> u32 {
+        self.at
+    }
+    fn advance(&mut self, target: u32) -> u32 {
+        if self.at != EXHAUSTED && target > self.at {
+            self.at = self.next_from(target);
+        } else if self.at != EXHAUSTED && target <= self.at {
+            // Already at or past the target.
+        }
+        self.at
+    }
+    fn score(&mut self) -> f32 {
+        1.0
+    }
+    fn max_score(&self) -> f32 {
+        1.0
+    }
+    fn block_max_score(&self) -> f32 {
+        1.0
+    }
+    fn block_last(&self) -> u32 {
+        EXHAUSTED.saturating_sub(1)
+    }
+}
+
 pub struct ExcludingScorer<'a> {
     inner: Box<dyn Scorer + 'a>,
     excluded: Bitmap,
@@ -946,6 +999,18 @@ fn build<'a>(
         }
         TextQuery::Not(inner) => {
             let b = build(inner, src, vis, stats, params, avgdl, truncated)?;
+            // A negation of a negation is the matching set again, as
+            // `query.rs` promises of `--x`: the inner exclusion set, scored
+            // flat (through 0.97.0 the outer `Not` of a scorerless subtree
+            // excluded nothing and matched every row -- `quick --lazy`
+            // dropped its constraint, `-(-a -b)` answered everything).
+            if b.scorer.is_none() && b.negation_only {
+                return Ok(Built {
+                    scorer: Some(Box::new(SetScorer::new(b.excluded))),
+                    excluded: Bitmap::new(n),
+                    negation_only: false,
+                });
+            }
             let mut ex = Bitmap::new(n);
             if let Some(s) = b.scorer {
                 let mut s = if b.excluded.is_empty() {

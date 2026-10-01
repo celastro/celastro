@@ -27,9 +27,16 @@ metadata:
     helm.sh/hook-weight: "-10"
     helm.sh/hook-delete-policy: before-hook-creation
 rules:
+  # Reading is scoped to the one Secret the Job makes; creating cannot be
+  # scoped by name (the API checks names on existing objects only), so
+  # the Role lets the Job create a Secret and read none but its own.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create"]
+    resourceNames: [{{ include "celastro.fullname" . | quote | replace "\"" "" | printf "%s-tls" | quote }}]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

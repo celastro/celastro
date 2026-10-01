@@ -302,10 +302,12 @@ impl<'a> TermDict<'a> {
                 break;
             }
             let Some(suffix) = get_str(blocks, &mut i) else { break };
-            let mut term = String::with_capacity(shared as usize + suffix.len());
-            // `shared` comes from the file; an unchecked slice panics on a
-            // corrupt dictionary rather than reporting it.
+            // `shared` comes from the file: checked against the previous
+            // term before anything is reserved for it (a count of a
+            // terabyte asked the allocator and aborted, 0.98.0), and an
+            // unchecked slice would panic on a corrupt dictionary.
             let Some(head) = prev.get(..shared as usize) else { break };
+            let mut term = String::with_capacity(head.len() + suffix.len());
             term.push_str(head);
             term.push_str(&suffix);
             let doc_freq = get_uvarint(blocks, &mut i).unwrap_or(0) as u32;
@@ -600,18 +602,26 @@ impl<'a> PostingCursor<'a> {
         let m = self.meta[self.block];
         let mut i = m.pos_off as usize;
         let mut out = Vec::new();
-        for j in 0..=self.idx.min(m.count as usize - 1) {
-            let n = get_uvarint(self.pos_data, &mut i).unwrap_or(0) as usize;
+        // The counts come from the file: a count past the bytes behind it
+        // is damage, and the loops end where the bytes do rather than
+        // spinning on a varint that is no longer there (0.98.0).
+        let left = |i: usize| self.pos_data.len().saturating_sub(i);
+        for j in 0..=self.idx.min((m.count as usize).saturating_sub(1)) {
+            let Some(n) = get_uvarint(self.pos_data, &mut i) else { break };
+            let n = (n as usize).min(left(i));
             if j == self.idx {
                 let mut p = 0u32;
                 for _ in 0..n {
-                    p += get_uvarint(self.pos_data, &mut i).unwrap_or(0) as u32;
+                    let Some(d) = get_uvarint(self.pos_data, &mut i) else { break };
+                    p = p.wrapping_add(d as u32);
                     out.push(p);
                 }
                 return out;
             }
             for _ in 0..n {
-                get_uvarint(self.pos_data, &mut i);
+                if get_uvarint(self.pos_data, &mut i).is_none() {
+                    return out;
+                }
             }
         }
         out

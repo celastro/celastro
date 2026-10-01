@@ -40,7 +40,7 @@
 //! to pass.
 
 use crate::lock::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -117,6 +117,12 @@ const POOL_SLOTS: usize = 8;
 struct Slot {
     stream: Option<Box<dyn Stream>>,
     last_used: Instant,
+    /// The epoch of the process behind `stream`, from the hello that
+    /// opened it or the last one over it; 0 until a hello said. Per
+    /// connection, since 0.98.0: one epoch for the whole pool was set by
+    /// the newest dial, so an older connection was never told apart from
+    /// it and kept carrying writes to a superseded process.
+    epoch: u64,
 }
 /// How long the listener is waited on before `stop` and the shutdown flag
 /// are read again; a connection ends the wait at once (`signal::wait_readable`).
@@ -206,6 +212,42 @@ pub mod fault {
             false
         }
     }
+    static STALL_NEXT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+    /// Send the next frame of the call named `call` in two halves with a
+    /// pause of `ms` between them: a stall inside a frame, as a WAN
+    /// link's retransmission gap makes one.
+    pub fn stall_next(call: &str, ms: u64) {
+        *STALL_NEXT.lock().unwrap_or_else(|p| p.into_inner()) = Some((call.to_string(), ms));
+    }
+    pub(super) fn take_stall(call: Call) -> Option<std::time::Duration> {
+        let mut g = STALL_NEXT.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some((name, ms)) if name == call.name() => {
+                let d = std::time::Duration::from_millis(*ms);
+                *g = None;
+                Some(d)
+            }
+            _ => None,
+        }
+    }
+    static HOLD_NEXT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+    /// Hold the next call named `call` for `ms` with its pooled connection
+    /// taken, before its frame is sent: what makes a second caller dial a
+    /// second connection.
+    pub fn hold_next(call: &str, ms: u64) {
+        *HOLD_NEXT.lock().unwrap_or_else(|p| p.into_inner()) = Some((call.to_string(), ms));
+    }
+    pub(super) fn take_hold(call: Call) -> Option<std::time::Duration> {
+        let mut g = HOLD_NEXT.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some((name, ms)) if name == call.name() => {
+                let d = std::time::Duration::from_millis(*ms);
+                *g = None;
+                Some(d)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Call {
@@ -224,6 +266,10 @@ impl Call {
                 | Call::BeginMove
                 | Call::AbortMove
                 | Call::FenceMove
+                // A pull sent again after a reset started a second copy
+                // over the first's directory (0.98.0): once sent, its
+                // caller hears it did not answer and aborts the move.
+                | Call::PullShard
         )
     }
 
@@ -325,6 +371,17 @@ pub fn token_from_env() -> Option<String> {
     std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty())
 }
 
+/// The longest wire token: a request frame's head (`FRAME_HEAD`) carries
+/// the token whole before the frame is admitted, so a longer one could
+/// never be admitted -- two nodes configured with it would never speak
+/// (refused at configuration since 0.98.0).
+pub const MAX_TOKEN_LEN: usize = 512;
+
+/// Whether a wire token fits the frame's head.
+pub fn token_fits(token: &str) -> bool {
+    token.len() <= MAX_TOKEN_LEN
+}
+
 /// A second token the wire accepts from a peer, `CELASTRO_WIRE_TOKEN_ALSO`:
 /// what makes a rotation roll. A rotation by rolling update alone
 /// deadlocks -- the first pod on the new token can attach nobody, is never
@@ -344,10 +401,31 @@ fn truncated() -> Error {
 // ------------------------------------------------------------------ frames
 
 fn write_frame(w: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_FRAME as usize {
+        // Refused here rather than at the receiver after all of it was
+        // sent (0.98.0).
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("wire: a frame of {} bytes is past the limit of {MAX_FRAME}", payload.len()),
+        ));
+    }
     let mut buf = Vec::with_capacity(4 + payload.len());
     put_u32(&mut buf, payload.len() as u32);
     buf.extend_from_slice(payload);
     w.write_all(&buf)?;
+    w.flush()
+}
+
+/// `write_frame` in two halves with a pause between: a test's stall.
+fn write_frame_stalled(w: &mut impl Write, payload: &[u8], pause: Duration) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    put_u32(&mut buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+    let half = buf.len() / 2;
+    w.write_all(&buf[..half])?;
+    w.flush()?;
+    std::thread::sleep(pause);
+    w.write_all(&buf[half..])?;
     w.flush()
 }
 
@@ -375,10 +453,58 @@ const FRAME_HEAD: usize = 1024;
 /// as its head alone and `false`: `handle` refuses it naming the token,
 /// as it always has, and the connection is then dropped, the rest of the
 /// frame unread. `handle` checks the token again over an admitted frame.
-fn read_request_frame(r: &mut impl Read, identity: &Identity) -> std::io::Result<(Vec<u8>, bool)> {
+/// How long a frame may pause between bytes once begun: a stall inside a
+/// frame, not idleness. The idle poll (`IDLE_POLL`) is for a connection
+/// between frames; until 0.98.0 it was the only timeout, so a pause of
+/// half a second inside a large frame -- a retransmission gap on a WAN
+/// link -- lost the bytes read so far and the rest was parsed as a new
+/// frame: garbage, the connection closed, and a write reported as "may
+/// have landed" that was never read whole.
+const FRAME_STALL: Duration = Duration::from_secs(60);
+
+fn read_request_frame(
+    s: &mut Box<dyn Stream>,
+    identity: &Identity,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    // The length, a byte at a time under the idle poll: a timeout with
+    // nothing read is idleness; once a byte is in, the frame has begun
+    // and the rest is read under the stall allowance, whichever the
+    // record layer underneath delivers it in.
     let mut len = [0u8; 4];
-    r.read_exact(&mut len)?;
-    let n = u32::from_le_bytes(len) as usize;
+    let mut got = 0usize;
+    while got < 4 {
+        match s.read(&mut len[got..]) {
+            Ok(0) => return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "wire: closed")),
+            Ok(k) => {
+                if got == 0 {
+                    s.set_read_timeout(Some(FRAME_STALL))?;
+                }
+                got += k;
+            }
+            Err(e) if got == 0 => return Err(e),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                let _ = s.set_read_timeout(Some(IDLE_POLL));
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "wire: the frame stalled"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let r = read_request_body(s, identity, u32::from_le_bytes(len) as usize);
+    let _ = s.set_read_timeout(Some(IDLE_POLL));
+    r.map_err(|e| {
+        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+            std::io::Error::new(ErrorKind::InvalidData, "wire: the frame stalled")
+        } else {
+            e
+        }
+    })
+}
+
+fn read_request_body(
+    r: &mut impl Read,
+    identity: &Identity,
+    n: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
     if n > MAX_FRAME as usize {
         return Err(std::io::Error::new(ErrorKind::InvalidData, "wire: frame too large"));
     }
@@ -821,11 +947,6 @@ pub struct Node {
     /// the address -- a pod replaced while its predecessor still runs --
     /// and is refused before a statement reaches it.
     max_epoch: std::sync::atomic::AtomicU64,
-    /// The epoch of the process behind the pooled connection, from the
-    /// hello that checked it; zero when unknown. A connection to a process
-    /// older than the newest seen since is dropped before the next call,
-    /// which then dials afresh and is refused.
-    conn_epoch: std::sync::atomic::AtomicU64,
     /// The newest wire version the peer's hello said it accepts; zero
     /// until a hello, which means 4.
     peer_wire: std::sync::atomic::AtomicU8,
@@ -889,14 +1010,13 @@ impl Node {
             addr,
             token,
             slots: (0..POOL_SLOTS)
-                .map(|_| Mutex::new(Slot { stream: None, last_used: Instant::now() }))
+                .map(|_| Mutex::new(Slot { stream: None, last_used: Instant::now(), epoch: 0 }))
                 .collect(),
             tls,
             dial_failed: Mutex::new(None),
 
             peer_format: std::sync::atomic::AtomicU8::new(0),
             max_epoch: std::sync::atomic::AtomicU64::new(0),
-            conn_epoch: std::sync::atomic::AtomicU64::new(0),
             peer_wire: std::sync::atomic::AtomicU8::new(0),
             identity: None,
         })
@@ -990,7 +1110,7 @@ impl Node {
     /// connections are pooled. What it refuses is the zombie: two processes
     /// at one address, the old one reached through a stale name, taking a
     /// write the new one never sees.
-    fn check_fresh(&self, s: &mut Box<dyn Stream>) -> Result<()> {
+    fn check_fresh(&self, s: &mut Box<dyn Stream>) -> Result<u64> {
         let req = self.request(Call::Hello, "", 0, &[]);
         s.set_read_timeout(Some(within_deadline(CONNECT_TIMEOUT)))?;
         write_frame(s, &req)?;
@@ -1008,9 +1128,8 @@ impl Node {
                 )));
             }
             self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
-            self.conn_epoch.store(h.epoch, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(h.epoch)
     }
 
     fn call(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Result<Vec<u8>> {
@@ -1034,14 +1153,29 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        let guard = &mut slot.stream;
-        // A pooled connection to a process an older hello has since shown to
-        // be superseded is let go here; the redial below asks again.
-        let conn = self.conn_epoch.load(Ordering::Relaxed);
-        if guard.is_some() && conn > 0 && conn < self.max_epoch.load(Ordering::Relaxed) {
-            *guard = None;
+        let slot: &mut Slot = &mut slot;
+        // A pooled connection to a process a hello has since shown to be
+        // superseded -- over any connection to the address -- is let go
+        // here; the redial below asks again and is refused.
+        if slot.stream.is_some()
+            && slot.epoch > 0
+            && slot.epoch < self.max_epoch.load(Ordering::Relaxed)
+        {
+            slot.stream = None;
+            slot.epoch = 0;
         }
         let idle = slot.last_used.elapsed();
+        if let Some(d) = fault::take_hold(call) {
+            std::thread::sleep(d);
+            if crate::deadline::remaining_ms() == Some(0) {
+                return Err(Error::Deadline(self.refusal(
+                    call,
+                    collection,
+                    shard,
+                    "(the statement's deadline passed before the call was sent)",
+                )));
+            }
+        }
         let guard = &mut slot.stream;
         // A call that writes is not sent again once sent, so it goes out
         // on a connection shown live a moment ago: an idle one is asked
@@ -1050,7 +1184,7 @@ impl Node {
         let revalidate = if call.idempotent() { POOL_REVALIDATE } else { WRITE_REVALIDATE };
         if call != Call::Hello && idle > revalidate {
             if let Some(s) = guard.as_mut() {
-                let fresh = s
+                let hello = s
                     .set_read_timeout(Some(within_deadline(REVALIDATE_TIMEOUT)))
                     .and_then(|_| {
                         write_frame(s, &self.request(Call::Hello, "", 0, &[]))?;
@@ -1058,10 +1192,22 @@ impl Node {
                     })
                     .ok()
                     .and_then(|resp| decode_response(resp).ok())
-                    .and_then(|b| self.decode_hello(&b).ok())
-                    .is_some();
+                    .and_then(|b| self.decode_hello(&b).ok());
+                // Live, and the process it reaches not superseded: a hello
+                // that names an older epoch than the newest seen at the
+                // address is the zombie answering, and the connection goes.
+                let fresh = match hello {
+                    Some(h) if h.epoch > 0 => {
+                        let max = self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed).max(h.epoch);
+                        slot.epoch = h.epoch;
+                        h.epoch >= max
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
                 if !fresh {
                     *guard = None;
+                    slot.epoch = 0;
                 }
             }
         }
@@ -1086,11 +1232,14 @@ impl Node {
                             // A hello asks for itself; every other call
                             // asks who answers first.
                             if call != Call::Hello {
-                                if let Err(e) = self.check_fresh(&mut s) {
-                                    let why = format!("({e})");
-                                    return Err(Error::Deadline(
-                                        self.refusal(call, collection, shard, &why),
-                                    ));
+                                match self.check_fresh(&mut s) {
+                                    Ok(epoch) => slot.epoch = epoch,
+                                    Err(e) => {
+                                        let why = format!("({e})");
+                                        return Err(Error::Deadline(
+                                            self.refusal(call, collection, shard, &why),
+                                        ));
+                                    }
                                 }
                             }
                             *guard = Some(s);
@@ -1120,20 +1269,40 @@ impl Node {
             let s = guard.as_mut().expect("connected above");
             let timeout = deadline_ms.map(|ms| Duration::from_millis(ms.max(1)));
             let mut sent = false;
-            let r = s.set_read_timeout(timeout).and_then(|_| write_frame(s, &req)).and_then(|_| {
-                sent = true;
-                if fault::take(call) {
-                    return Err(std::io::Error::new(
-                        ErrorKind::ConnectionReset,
-                        "dropped after the frame was sent, as a test asked",
-                    ));
-                }
-                read_frame(s)
-            });
+            let stall = fault::take_stall(call);
+            let r = s
+                .set_read_timeout(timeout)
+                .and_then(|_| match stall {
+                    Some(pause) => write_frame_stalled(s, &req, pause),
+                    None => write_frame(s, &req),
+                })
+                .and_then(|_| {
+                    sent = true;
+                    if fault::take(call) {
+                        return Err(std::io::Error::new(
+                            ErrorKind::ConnectionReset,
+                            "dropped after the frame was sent, as a test asked",
+                        ));
+                    }
+                    read_frame(s)
+                });
             match r {
                 Ok(resp) => {
                     slot.last_used = Instant::now();
-                    return decode_response(resp);
+                    let body = decode_response(resp)?;
+                    // A hello's answer names the process behind this very
+                    // connection: recorded on it, and the newest seen at
+                    // the address raised, so the next call over an older
+                    // one lets it go.
+                    if call == Call::Hello {
+                        if let Ok(h) = self.decode_hello(&body) {
+                            if h.epoch > 0 {
+                                slot.epoch = h.epoch;
+                                self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    return Ok(body);
                 }
                 Err(e) => {
                     *guard = None;
@@ -1197,11 +1366,13 @@ impl Node {
         // been seen: the next call dials afresh and is refused.
         if h.epoch > 0 {
             let max = self.max_epoch.fetch_max(h.epoch, Ordering::Relaxed).max(h.epoch);
-            self.conn_epoch.store(h.epoch, Ordering::Relaxed);
             if h.epoch < max {
                 for m in &self.slots {
                     if let Ok(mut g) = m.try_lock() {
-                        g.stream = None;
+                        if g.epoch > 0 && g.epoch < max {
+                            g.stream = None;
+                            g.epoch = 0;
+                        }
                     }
                 }
             }
@@ -1863,13 +2034,14 @@ pub fn serve_with_also(
             })
             .expect("a thread for the replication driver");
     }
-    let (moves, followed, held, lease, identity) = {
+    let (moves, followed, held, lease, peers, identity) = {
         let g = db.read().unwrap_or_else(|p| p.into_inner());
         (
             g.moves(),
             g.followed(),
             g.held_terms(),
             g.lease(),
+            g.peers_seen(),
             Arc::new(Identity {
                 node: g.node().map(String::from),
                 role: g.role(),
@@ -1880,6 +2052,7 @@ pub fn serve_with_also(
             }),
         )
     };
+    let mut accept_failures: u32 = 0;
     let max_connections: usize = env_num("CELASTRO_WIRE_MAX_CONNECTIONS", WIRE_MAX_CONNECTIONS);
     let idle: u64 = env_num("CELASTRO_WIRE_IDLE_SECS", WIRE_IDLE_SECS);
     let idle = (idle > 0).then(|| Duration::from_secs(idle));
@@ -1921,12 +2094,14 @@ pub fn serve_with_also(
                 let followed = followed.clone();
                 let held = held.clone();
                 let lease = lease.clone();
+                let peers = peers.clone();
                 let identity = identity.clone();
                 let open = open.clone();
                 open.fetch_add(1, Ordering::Relaxed);
+                accept_failures = 0;
                 std::thread::spawn(move || {
                     serve_connection(
-                        s, &db, &moves, &followed, &held, &lease, &identity, &stop, idle,
+                        s, &db, &moves, &followed, &held, &lease, &peers, &identity, &stop, idle,
                     );
                     open.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -1934,7 +2109,28 @@ pub fn serve_with_also(
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 crate::signal::wait_readable(&listener, ACCEPT_WAIT);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // As the console's loop: an error that repeats by itself
+                // (the descriptor table full, a connection aborted before
+                // it was taken) is waited out, and only a run of them ends
+                // the wire. Until 0.98.0 the first ended it, for the life
+                // of the process, with the console green.
+                crate::log::warn("wire_accept_failed", &[("error", e.to_string())]);
+                match crate::serve::accept_backoff(e.kind(), accept_failures + 1) {
+                    crate::serve::Backoff::Now => accept_failures = 0,
+                    crate::serve::Backoff::After(pause) => {
+                        accept_failures += 1;
+                        std::thread::sleep(pause);
+                    }
+                    crate::serve::Backoff::GiveUp => {
+                        crate::log::error(
+                            "wire_accept_failing",
+                            &[("failures", (accept_failures + 1).to_string())],
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
         }
     }
 }
@@ -1949,6 +2145,36 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Moves = Mutex<BTreeMap<(String, usize), Arc<crate::engine::MoveOut>>>;
+
+/// The pulls in progress on this process, by target node, collection and
+/// shard: a second pull of a shard whose incoming directory is live is
+/// refused rather than started over the first (0.98.0). The entry goes
+/// with the guard, on every way out.
+static PULLS: Mutex<BTreeSet<(String, String, usize)>> = Mutex::new(BTreeSet::new());
+
+#[derive(Debug)]
+struct Pulling(String, String, usize);
+
+impl Pulling {
+    fn begin(me: &str, collection: &str, shard: usize) -> Result<Pulling> {
+        let key = (me.to_string(), collection.to_string(), shard);
+        let mut g = PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        if !g.insert(key.clone()) {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}` is being pulled onto {me} already; a second pull \
+                 is refused until the first ends"
+            )));
+        }
+        Ok(Pulling(key.0, key.1, key.2))
+    }
+}
+
+impl Drop for Pulling {
+    fn drop(&mut self) {
+        let mut g = PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        g.remove(&(self.0.clone(), self.1.clone(), self.2));
+    }
+}
 
 /// What a hello says of this process, fixed for its life: answered
 /// without the database lock when a statement holds it, since a peer's
@@ -1981,6 +2207,7 @@ fn serve_connection(
     followed: &crate::engine::Followed,
     held: &crate::engine::HeldTerms,
     lease: &crate::engine::Lease,
+    peers: &crate::engine::PeersSeen,
     identity: &Identity,
     stop: &AtomicBool,
     idle: Option<Duration>,
@@ -2024,7 +2251,17 @@ fn serve_connection(
             Err(_) => return,
         };
         let mut resp = Vec::new();
-        match handle(db, moves, followed, held, lease, identity, peer_names.as_deref(), &frame) {
+        match handle(
+            db,
+            moves,
+            followed,
+            held,
+            lease,
+            peers,
+            identity,
+            peer_names.as_deref(),
+            &frame,
+        ) {
             Ok(body) => {
                 resp.push(0);
                 resp.extend_from_slice(&body);
@@ -2128,6 +2365,7 @@ fn handle(
     followed: &crate::engine::Followed,
     held: &crate::engine::HeldTerms,
     lease: &crate::engine::Lease,
+    peers: &crate::engine::PeersSeen,
     identity: &Identity,
     peer_names: Option<&[String]>,
     frame: &[u8],
@@ -2169,9 +2407,11 @@ fn handle(
                 )));
             }
         }
-        if let Ok(g) = db.try_read() {
-            g.observe_caller(node, *epoch)?;
-        }
+        // Off the database lock (since 0.98.0): under `try_read` the
+        // check ran only when no writer held or waited for the lock,
+        // which under load was seldom, and a superseded process's write
+        // went through unfenced.
+        crate::engine::observe_caller(peers, node, *epoch)?;
     }
     let call = Call::from_u8(get_u8(frame, &mut i)?)
         .ok_or_else(|| Error::Storage("wire: unknown call".into()))?;
@@ -2313,6 +2553,7 @@ fn handle(
                     g.tls(),
                 )
             };
+            let _pulling = Pulling::begin(&me, &collection, shard)?;
             let source = Arc::new(Node::new(&from, Some(token), tls)?);
             let files = source.begin_move(&collection, shard, &me)?;
             // The copy holds no lock: a write forwarded through this node
@@ -2413,7 +2654,9 @@ fn handle(
             unreachable!("answered above")
         }
         Call::AbortMove => {
-            db.exclusive().abort_move(&collection, shard);
+            // By order: the operator's statement, or a coordinator whose
+            // move failed, either way a target to hold off for the grace.
+            db.exclusive().abort_move_by_order(&collection, shard);
         }
         Call::Hello => unreachable!("answered above"),
         Call::Catalog => {
@@ -2870,9 +3113,9 @@ mod tests {
                 g.insert("items", d).unwrap();
             }
         }
-        let (moves, followed, held, lease) = {
+        let (moves, followed, held, lease, peers) = {
             let g = db.read().unwrap();
-            (g.moves(), g.followed(), g.held_terms(), g.lease())
+            (g.moves(), g.followed(), g.held_terms(), g.lease(), g.peers_seen())
         };
         let identity = Identity {
             node: Some("tcp://127.0.0.1:1".into()),
@@ -2925,7 +3168,7 @@ mod tests {
         // Every one of them whole first: answered, or refused for a reason
         // the codec names -- never a panic.
         for f in &frames {
-            let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, f);
+            let _ = handle(&db, &moves, &followed, &held, &lease, &peers, &identity, None, f);
         }
         let mut rng = Rng::new(0x5eed_f00d);
         let mut runs = 0usize;
@@ -2958,13 +3201,14 @@ mod tests {
                         }
                     }
                 }
-                let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, &m);
+                let _ = handle(&db, &moves, &followed, &held, &lease, &peers, &identity, None, &m);
                 let _ = handle(
                     &db,
                     &moves,
                     &followed,
                     &held,
                     &lease,
+                    &peers,
                     &identity,
                     Some(&["127.0.0.1".to_string()]),
                     &m,
@@ -2974,7 +3218,7 @@ mod tests {
         }
         // And the head-only frame a refused peer leaves the handler with.
         hello.truncate(hello.len().min(FRAME_HEAD));
-        let _ = handle(&db, &moves, &followed, &held, &lease, &identity, None, &hello);
+        let _ = handle(&db, &moves, &followed, &held, &lease, &peers, &identity, None, &hello);
         assert!(runs >= 1500);
     }
 
@@ -2993,6 +3237,12 @@ mod tests {
             token: "the-token".to_string(),
             also: Some("the-next-token".to_string()),
         };
+        // The length as the server reads it, then the body through the
+        // same reader the server uses past it.
+        let read_test_frame = |bytes: &[u8], identity: &Identity| {
+            let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            read_request_body(&mut &bytes[4..], identity, n)
+        };
         let frame_with = |token: &str, declared: usize, present: usize| -> Vec<u8> {
             let mut body = vec![WIRE_VERSION];
             put_str(&mut body, token);
@@ -3004,23 +3254,23 @@ mod tests {
         };
         // Declared 100,000, only 2,000 present, no token: the head alone.
         let bytes = frame_with("neither", 100_000, 2_000);
-        let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+        let (frame, admitted) = read_test_frame(&bytes, &identity).unwrap();
         assert!(!admitted);
         assert_eq!(frame.len(), FRAME_HEAD);
         // The token, or the rotation's second one, and the whole frame.
         for t in ["the-token", "the-next-token"] {
             let bytes = frame_with(t, 3_000, 3_000);
-            let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+            let (frame, admitted) = read_test_frame(&bytes, &identity).unwrap();
             assert!(admitted, "{t}");
             assert_eq!(frame.len(), 3_000);
         }
         // Admitted but short of what it declared: the read ends short,
         // as it always did.
         let bytes = frame_with("the-token", 3_000, 2_000);
-        assert!(read_request_frame(&mut &bytes[..], &identity).is_err());
+        assert!(read_test_frame(&bytes, &identity).is_err());
         // A frame smaller than the head, refused: all of it comes back.
         let bytes = frame_with("neither", 40, 40);
-        let (frame, admitted) = read_request_frame(&mut &bytes[..], &identity).unwrap();
+        let (frame, admitted) = read_test_frame(&bytes, &identity).unwrap();
         assert!(!admitted);
         assert_eq!(frame.len(), 40);
     }
@@ -3109,6 +3359,19 @@ mod tests {
         });
     }
     use super::*;
+
+    /// A second pull of a shard onto this node while the first is in
+    /// progress is refused; the entry goes with the first's guard.
+    #[test]
+    fn a_second_pull_of_a_shard_in_progress_is_refused() {
+        let first = Pulling::begin("tcp://me:1", "items", 3).unwrap();
+        let e = Pulling::begin("tcp://me:1", "items", 3).unwrap_err().to_string();
+        assert!(e.contains("is being pulled onto tcp://me:1 already"), "{e}");
+        Pulling::begin("tcp://me:1", "items", 4).unwrap();
+        Pulling::begin("tcp://other:1", "items", 3).unwrap();
+        drop(first);
+        Pulling::begin("tcp://me:1", "items", 3).unwrap();
+    }
 
     #[test]
     fn addresses_are_tcp_host_port_and_nothing_else() {

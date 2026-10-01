@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, Collection, ColumnDef, IndexDef, IndexKind, PathTally, Tablet};
 use crate::codec::{crc32, put_u32};
@@ -151,6 +152,20 @@ pub fn recovery_warn_secs() -> u64 {
 
 /// The default of `CELASTRO_RECOVERY_WARN`.
 pub const RECOVERY_WARN_SECS: u64 = 3_600;
+
+/// A move's copy may take this long by default (`CELASTRO_MOVE_TIMEOUT`).
+pub const MOVE_TIMEOUT_SECS: u64 = 3_600;
+
+/// After an abort, no move of the shard begins for this long.
+pub const MOVE_ABORT_GRACE: Duration = Duration::from_secs(30);
+
+pub fn move_timeout_secs() -> u64 {
+    std::env::var("CELASTRO_MOVE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(MOVE_TIMEOUT_SECS)
+}
 
 /// The defaults of `CELASTRO_MAX_ROWS` and `CELASTRO_MAX_ROWS_HARD`: the
 /// rows a `GROUP BY` with no `LIMIT` answers, and the most any `LIMIT` is
@@ -292,6 +307,55 @@ fn host_of(url: &str) -> String {
     host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()
 }
 
+/// What the health report sends and hears from a peer: the draft's dials,
+/// every peer at once, holding no lock.
+pub struct HealthDraft {
+    out: String,
+    here: String,
+    up: std::collections::BTreeSet<String>,
+    conns: Vec<(String, Result<Arc<crate::wire::Node>>)>,
+    remaining: Option<u64>,
+}
+
+/// Every peer at once, as the scatter asks shards: a hello costs its
+/// round trip and a peer that hangs costs the deadline, and in turn a
+/// hundred of them were a hundred round trips while one that hung held
+/// the report for a deadline per peer. Each thread arms what was left of
+/// the statement's deadline at the draft; the answers come back in the
+/// order asked, with what each dial took.
+pub(crate) fn health_dial(draft: &HealthDraft) -> Vec<(u128, Result<crate::wire::Hello>)> {
+    let dial = |conn: &Result<Arc<crate::wire::Node>>| {
+        let started = std::time::Instant::now();
+        let answer = match conn {
+            Ok(n) => n.hello(),
+            Err(e) => Err(Error::Plan(e.to_string())),
+        };
+        (started.elapsed().as_millis(), answer)
+    };
+    // The draft's deadline, armed here: this thread is not the statement's,
+    // and a dial with no deadline waited forever on a peer that accepts
+    // and never answers (the first run of the test for this).
+    let remaining = draft.remaining;
+    if draft.conns.len() < 2 {
+        let _deadline = crate::deadline::arm(remaining);
+        return draft.conns.iter().map(|(_, c)| dial(c)).collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = draft
+            .conns
+            .iter()
+            .map(|(_, c)| {
+                let dial = &dial;
+                scope.spawn(move || {
+                    let _deadline = crate::deadline::arm(remaining);
+                    dial(c)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a health dial panicked")).collect()
+    })
+}
+
 /// What `SHOW HEALTH` and the sweep have seen of a peer's hello.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerSeen {
@@ -300,6 +364,9 @@ pub struct PeerSeen {
     pub epoch: u64,
     /// The peer's clock minus this node's at the last hello, microseconds.
     pub skew_micros: i64,
+    /// When the peer last answered a hello, for readiness: a peer that
+    /// answered within the sweep's interval or so counts as answering.
+    pub last_answered: Option<Instant>,
 }
 
 /// What a message says about a node a definition did not reach.
@@ -1259,6 +1326,19 @@ pub struct Db {
     /// (`CELASTRO_MIN_HOLDERS`, read at open): what every shard's options
     /// carry.
     min_holders: usize,
+    /// How long a move's copy may take (`CELASTRO_MOVE_TIMEOUT` seconds,
+    /// read at open; an hour): the pull call's deadline, after which the
+    /// pin is released and the move fails. Until 0.98.0 the copy had no
+    /// deadline and a target that stopped answering pinned the source for
+    /// good.
+    move_timeout: Duration,
+    /// The shards whose move was aborted by order, when, and the target
+    /// it was moving to: a `begin_move` to that target within
+    /// `move_abort_grace` of the abort is refused, so a target that
+    /// stopped answering cannot pin the shard again once the source was
+    /// told to let go; a move to any other node goes.
+    recently_aborted: BTreeMap<(String, usize), (Instant, String)>,
+    move_abort_grace: Duration,
     /// The row caps (`CELASTRO_MAX_ROWS`, `CELASTRO_MAX_ROWS_HARD`, read at
     /// open): what a `GROUP BY` with no `LIMIT` gets, and the most any
     /// `LIMIT` is taken as. See [`Db::bound_select`].
@@ -1283,7 +1363,7 @@ pub struct Db {
     epoch: u64,
     /// What every hello from every peer has shown, by address. A mutex
     /// because `SHOW HEALTH` observes under the read lock.
-    peers_seen: Mutex<BTreeMap<String, PeerSeen>>,
+    peers_seen: PeersSeen,
     /// The epoch as claimed, in a cell the wire's frames read: the real
     /// one, or what [`Db::pretend`] said.
     epoch_cell: Arc<std::sync::atomic::AtomicU64>,
@@ -1364,6 +1444,9 @@ impl Db {
             sim: None,
             wire_token: crate::wire::token_from_env(),
             min_holders: crate::replication::min_holders_from_env(),
+            move_timeout: Duration::from_secs(move_timeout_secs()),
+            recently_aborted: BTreeMap::new(),
+            move_abort_grace: MOVE_ABORT_GRACE,
             max_rows: row_caps_from_env().0,
             max_rows_hard: row_caps_from_env().1,
             nodes: Mutex::new(BTreeMap::new()),
@@ -1371,7 +1454,7 @@ impl Db {
             not_adopted: BTreeSet::new(),
             epoch: crate::time::now_micros().max(0) as u64,
             epoch_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            peers_seen: Mutex::new(BTreeMap::new()),
+            peers_seen: Arc::new(Mutex::new(BTreeMap::new())),
             pretend_epoch: None,
             pretend_clock_micros: 0,
             moves: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -1628,6 +1711,13 @@ impl Db {
     /// The floor on holders for every shard held here, and for the ones
     /// opened from now on: what a test sets in place of the environment,
     /// which is read once at open and is one per process.
+    /// The move's copy deadline and the abort's grace, set in place of the
+    /// environment and the default: what a test does.
+    pub fn set_move_timing(&mut self, timeout: Duration, abort_grace: Duration) {
+        self.move_timeout = timeout;
+        self.move_abort_grace = abort_grace;
+    }
+
     pub fn set_min_holders(&mut self, n: usize) {
         self.min_holders = n.max(1);
         for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
@@ -2483,7 +2573,20 @@ impl Db {
     /// shards with their holder and whether that holder answered -- what an
     /// operator asks first when a statement is refused naming a shard. One
     /// line each, a summary last.
+    /// `SHOW HEALTH`: the report, with every peer dialled; what the
+    /// embedded API answers inline. The statement runs it as deferred
+    /// work: the draft under the lock, the dials with it released, the
+    /// finish under the lock again (0.98.0; before, one partitioned peer
+    /// held every statement for the deadline, and the console polls the
+    /// report every ten seconds).
     pub fn show_health(&self) -> String {
+        let draft = self.health_draft();
+        let answers = health_dial(&draft);
+        self.health_finish(draft, answers)
+    }
+
+    /// The report's local half and the peers to dial, under the lock.
+    pub(crate) fn health_draft(&self) -> HealthDraft {
         let here = self.opts.node.clone().unwrap_or_else(|| "local".to_string());
         let mut out = String::new();
         let (seal_failures, last_seal) = self.seal_failures();
@@ -2594,36 +2697,21 @@ impl Db {
                 }
             }
         }
-        let peers: Vec<&String> = known.iter().filter(|url| **url != here).collect();
-        // Every peer at once, as the scatter asks shards: a hello costs its
-        // round trip and a peer that hangs costs the deadline, and in turn
-        // a hundred of them were a hundred round trips while one that hung
-        // held the report for a deadline per peer. Each thread arms what is
-        // left of the statement's deadline, which is thread-local; the
-        // answers come back in the order asked, with what each dial took.
-        let remaining = crate::deadline::remaining_ms();
-        let dial = |url: &String| {
-            let started = std::time::Instant::now();
-            let answer = self.node_conn(url).and_then(|n| n.hello());
-            (started.elapsed().as_millis(), answer)
-        };
-        let answers: Vec<(u128, Result<crate::wire::Hello>)> = if peers.len() < 2 {
-            peers.iter().map(|url| dial(url)).collect()
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = peers
-                    .iter()
-                    .map(|url| {
-                        let dial = &dial;
-                        scope.spawn(move || {
-                            let _deadline = crate::deadline::arm(remaining);
-                            dial(url)
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().expect("a health dial panicked")).collect()
-            })
-        };
+        let peers: Vec<String> = known.iter().filter(|url| **url != here).cloned().collect();
+        let conns: Vec<(String, Result<Arc<crate::wire::Node>>)> =
+            peers.into_iter().map(|url| (self.node_conn(&url), url)).map(|(c, u)| (u, c)).collect();
+        HealthDraft { out, here, up, conns, remaining: crate::deadline::remaining_ms() }
+    }
+
+    /// The report's second half: what the dials said, and the shards'
+    /// reach, under the lock again.
+    pub(crate) fn health_finish(
+        &self,
+        draft: HealthDraft,
+        answers: Vec<(u128, Result<crate::wire::Hello>)>,
+    ) -> String {
+        let HealthDraft { mut out, here, mut up, conns, .. } = draft;
+        let peers: Vec<&String> = conns.iter().map(|(u, _)| u).collect();
         for (url, (took, answer)) in peers.iter().zip(answers) {
             let url = *url;
             match answer {
@@ -3088,7 +3176,7 @@ impl Db {
             })
             .map(|(i, _)| i)
             .collect();
-        let have: Vec<usize> = self
+        let mut have: Vec<usize> = self
             .followed
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -3099,6 +3187,37 @@ impl Db {
         for i in have.iter().filter(|i| !wanted.contains(i)) {
             self.drop_followed(collection, *i);
         }
+        // A copy kept across a change of holder starts over: what it took
+        // from the old holder past the new one's position at the
+        // promotion is on no other node, and kept it would come back if
+        // this copy were promoted in turn (0.98.0; before, a third copy
+        // kept its position and the new holder shipped from there).
+        let reset: Vec<usize> = {
+            let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            wanted
+                .iter()
+                .copied()
+                .filter(|i| have.contains(i))
+                .filter(|i| {
+                    g.get(&(collection.to_string(), *i)).is_some_and(|c| {
+                        let f = c.lock().unwrap_or_else(|p| p.into_inner());
+                        f.term != tablets[*i].term && f.shard.ship_ts > 0
+                    })
+                })
+                .collect()
+        };
+        for i in &reset {
+            crate::log::info(
+                "followed_copy_reset",
+                &[
+                    ("collection", collection.to_string()),
+                    ("shard", i.to_string()),
+                    ("term", tablets[*i].term.to_string()),
+                ],
+            );
+            self.drop_followed(collection, *i);
+        }
+        have.retain(|i| !reset.contains(i));
         {
             // The terms and the ranges as the map says them now, for the
             // copies kept. The range moves at a split or a merge, and a
@@ -3450,40 +3569,19 @@ impl Db {
         }
     }
 
-    /// A call's caller, from a version-5 frame: refused when a newer process
-    /// has been seen at its address, which is a zombie calling -- the pod
-    /// replaced while its predecessor still runs, forwarding its writes.
-    /// A newer epoch than seen raises the record, as a hello's would.
-    pub fn observe_caller(&self, node: &str, epoch: u64) -> Result<()> {
-        if epoch == 0 {
-            return Ok(());
-        }
-        let mut seen = guard(&self.peers_seen);
-        // A caller may name itself by any port on a host its certificate
-        // names (a certificate names no ports), and each name is a record
-        // here: bounded per host, so a token holder with a certificate
-        // cannot grow this table without limit, one address a call.
-        if !seen.contains_key(node) {
-            let host = host_of(node);
-            let on_host = seen.keys().filter(|k| host_of(k) == host).count();
-            if on_host >= MAX_ADDRESSES_PER_HOST {
-                return Err(Error::Plan(format!(
-                    "a call from {node}: {on_host} addresses on {host} have called already, the \
-                     most a host is allowed; a node names itself by one address"
-                )));
-            }
-        }
-        let entry = seen.entry(node.to_string()).or_default();
-        if entry.epoch > 0 && epoch < entry.epoch {
-            return Err(Error::Plan(format!(
-                "a call from an older process at {node}: it started at {} while one started at {} \
-                 was seen there; two processes share the address, and this one is refused",
-                crate::time::format_micros(epoch as i64),
-                crate::time::format_micros(entry.epoch as i64)
-            )));
-        }
-        entry.epoch = entry.epoch.max(epoch);
-        Ok(())
+    /// How many documents a followed copy holds, for a test: `None` when
+    /// this node does not follow the shard.
+    pub fn followed_count(&self, collection: &str, shard: usize) -> Option<usize> {
+        let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+        let c = g.get(&(collection.to_string(), shard))?;
+        let f = c.lock().unwrap_or_else(|p| p.into_inner());
+        Some(f.shard.num_docs(crate::time::MAX_TS))
+    }
+
+    /// The table of peers seen, shared with the wire's threads so a
+    /// caller's epoch is checked with no database lock held.
+    pub fn peers_seen(&self) -> PeersSeen {
+        self.peers_seen.clone()
     }
 
     /// What has been seen of a peer, if a hello from it was observed.
@@ -3491,6 +3589,66 @@ impl Db {
         guard(&self.peers_seen).get(url).copied()
     }
 
+    /// How many attached peers answered a hello within `within`: what a
+    /// readiness probe asking for a majority reads, where "every peer
+    /// since start" (`attached_count`) made one dead pod keep every
+    /// restarted pod unready and stalled a rollout (0.98.0).
+    pub fn answering_count(&self, within: Duration) -> usize {
+        let seen = guard(&self.peers_seen);
+        self.catalog
+            .nodes
+            .iter()
+            .filter(|n| !self.is_self(n))
+            .filter(|n| {
+                seen.get(*n).and_then(|p| p.last_answered).is_some_and(|t| t.elapsed() <= within)
+            })
+            .count()
+    }
+}
+
+/// What the engine has seen of its peers, by address: shared with the
+/// wire like `Moves` and `Followed`, since the fence's server half
+/// (`observe_caller`) must run with no database lock held.
+pub type PeersSeen = Arc<Mutex<BTreeMap<String, PeerSeen>>>;
+
+/// A call's caller, from a version-5 frame: refused when a newer process
+/// has been seen at its address, which is a zombie calling -- the pod
+/// replaced while its predecessor still runs, forwarding its writes.
+/// A newer epoch than seen raises the record, as a hello's would. Holds
+/// the peers' own lock alone.
+pub fn observe_caller(peers: &PeersSeen, node: &str, epoch: u64) -> Result<()> {
+    if epoch == 0 {
+        return Ok(());
+    }
+    let mut seen = guard(peers);
+    // A caller may name itself by any port on a host its certificate
+    // names (a certificate names no ports), and each name is a record
+    // here: bounded per host, so a token holder with a certificate
+    // cannot grow this table without limit, one address a call.
+    if !seen.contains_key(node) {
+        let host = host_of(node);
+        let on_host = seen.keys().filter(|k| host_of(k) == host).count();
+        if on_host >= MAX_ADDRESSES_PER_HOST {
+            return Err(Error::Plan(format!(
+                "a call from {node}: {on_host} addresses on {host} have called already, the \
+                     most a host is allowed; a node names itself by one address"
+            )));
+        }
+    }
+    let entry = seen.entry(node.to_string()).or_default();
+    if entry.epoch > 0 && epoch < entry.epoch {
+        return Err(Error::Plan(format!(
+            "a call from an older process at {node}: it started at {} while one started at {} \
+                 was seen there; two processes share the address, and this one is refused",
+            crate::time::format_micros(epoch as i64),
+            crate::time::format_micros(entry.epoch as i64)
+        )));
+    }
+    entry.epoch = entry.epoch.max(epoch);
+    Ok(())
+}
+
+impl Db {
     /// Take note of what a peer's hello says about it, against what earlier
     /// ones said. The notes name what an operator should know: an older
     /// process answering at the address (two processes, one address -- a
@@ -3500,6 +3658,7 @@ impl Db {
         let mut notes = Vec::new();
         let mut seen = guard(&self.peers_seen);
         let entry = seen.entry(url.to_string()).or_default();
+        entry.last_answered = Some(Instant::now());
         if hello.epoch > 0 {
             if entry.epoch > 0 && hello.epoch < entry.epoch {
                 notes.push(format!(
@@ -4117,6 +4276,19 @@ impl Db {
         to: &str,
     ) -> Result<Vec<(String, u64)>> {
         let key = (collection.to_string(), shard);
+        // Not within the grace of an abort: a target that stopped
+        // answering and comes back to pin the shard again, after the
+        // operator told the source to let go, is refused.
+        if let Some((at, aborted_to)) = self.recently_aborted.get(&key) {
+            if aborted_to == to && at.elapsed() < self.move_abort_grace {
+                return Err(Error::Plan(format!(
+                    "shard {shard} of `{collection}`: its move to {to} was aborted {} s ago; no \
+                     move to it begins within {} s of the abort",
+                    at.elapsed().as_secs(),
+                    self.move_abort_grace.as_secs()
+                )));
+            }
+        }
         {
             let moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(m) = moves.get(&key) {
@@ -4180,10 +4352,62 @@ impl Db {
     /// Let go of a pinned move: the shard takes writes again and its files
     /// are its own. What a coordinator does when the pull failed.
     pub fn abort_move(&mut self, collection: &str, shard: usize) {
-        self.moves
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&(collection.to_string(), shard));
+        let key = (collection.to_string(), shard);
+        self.moves.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+    }
+
+    /// `abort_move` by order -- the operator's statement, or a coordinator
+    /// whose move failed -- which also holds the aborted target off the
+    /// shard for the grace: a target that stopped answering and comes
+    /// back to pin it again is refused; a move to any other node goes.
+    pub fn abort_move_by_order(&mut self, collection: &str, shard: usize) {
+        let key = (collection.to_string(), shard);
+        let to =
+            self.moves.lock().unwrap_or_else(|p| p.into_inner()).remove(&key).map(|m| m.to.clone());
+        if let Some(to) = to {
+            self.recently_aborted.insert(key, (Instant::now(), to));
+        }
+        let grace = self.move_abort_grace;
+        self.recently_aborted.retain(|_, (at, _)| at.elapsed() < grace);
+    }
+
+    /// `ABORT MOVE SHARD i OF c`, from wherever it is issued: the pin on
+    /// the source released -- here when this node is the source, over the
+    /// wire otherwise, as deferred work holding no lock -- so the shard
+    /// takes writes again; the target's copy fails at its next read, and
+    /// no move of the shard begins within the grace.
+    pub fn abort_move_statement(&mut self, collection: &str, shard: usize) -> Result<Outcome> {
+        let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
+            Error::Plan(format!("collection `{collection}` has no placement map"))
+        })?;
+        let Some(t) = tablets.get(shard) else {
+            return Err(Error::Plan(format!(
+                "`{collection}` has {} shard(s); there is no shard {shard}",
+                tablets.len()
+            )));
+        };
+        let from = if t.node.is_empty() {
+            self.opts.node.clone().unwrap_or_default()
+        } else {
+            t.node.clone()
+        };
+        let note = format!(
+            "the move of shard {shard} of `{collection}` is aborted: the pin on {} is released, \
+             and no move to the aborted target begins for {} s",
+            if from.is_empty() { "this node" } else { &from },
+            self.move_abort_grace.as_secs()
+        );
+        if from.is_empty() || self.is_self(&from) {
+            self.abort_move_by_order(collection, shard);
+            return Ok(Outcome::Ack(note));
+        }
+        let source = self.wire_node(&from)?;
+        let (collection, shard_i) = (collection.to_string(), shard);
+        Ok(Outcome::Deferred(Deferred::new(move || {
+            let _deadline = crate::deadline::arm(Some(10_000));
+            source.abort_move(&collection, shard_i)?;
+            Ok(Outcome::Ack(note))
+        })))
     }
 
     /// `MOVE SHARD i OF c TO 'node'`, from wherever it was issued: the
@@ -4271,6 +4495,7 @@ impl Db {
             source,
             target,
             deadline_ms: crate::deadline::remaining_ms(),
+            timeout_ms: self.move_timeout.as_millis() as u64,
         })
     }
 
@@ -4292,8 +4517,10 @@ impl Db {
                 }
             }
         };
-        // A copy takes what it takes.
-        let _no_deadline = crate::deadline::arm(None);
+        // A copy takes what it takes, within the move's own deadline: a
+        // target that stops answering is a move that fails, its pin
+        // released, rather than a shard pinned for good.
+        let _deadline = crate::deadline::arm(Some(plan.timeout_ms));
         match plan.target.pull_shard(&plan.coll, &plan.new, plan.shard, &plan.from) {
             Ok(switched) => Ok(Outcome::Ack(format!(
                 "shard {} of `{}` moved from {} to {}; {} file(s), {switched}",
@@ -4337,7 +4564,12 @@ impl Db {
         fs::create_dir_all(incoming.join("deletes"))?;
         fs::create_dir_all(incoming.join("archive"))?;
         for (name, len) in files {
-            let mut bytes = Vec::with_capacity(*len as usize);
+            // Streamed to the file as the chunks arrive, one sync at the
+            // end, then named: the copy holds no file whole, so a segment
+            // larger than the target's memory moves (until 0.98.0 each
+            // file was buffered whole before it was written).
+            let (final_path, part) = (incoming.join(name), incoming.join(format!("{name}.part")));
+            let mut f = fs::File::create(&part)?;
             let mut off = 0u64;
             while off < *len {
                 let want = (*len - off).min(MOVE_CHUNK);
@@ -4348,9 +4580,11 @@ impl Db {
                     )));
                 }
                 off += chunk.len() as u64;
-                bytes.extend_from_slice(&chunk);
+                std::io::Write::write_all(&mut f, &chunk)?;
             }
-            crate::shard::atomic_write(&incoming.join(name), &bytes)?;
+            crate::shard::durable::sync_data(&f, &part)?;
+            drop(f);
+            fs::rename(&part, &final_path)?;
         }
         crate::shard::sync_dir(&incoming)?;
         Ok(incoming)
@@ -4609,6 +4843,14 @@ impl Db {
                     })?
             }
         };
+        // A median that holds a newline would break the RANGE file's two
+        // lines: refused as a given key with one is, naming the way out.
+        if at.contains('\n') {
+            return Err(Error::Plan(format!(
+                "shard {shard} of `{collection}`: its median key holds a newline; give `SPLIT \
+                 SHARD ... AT` a key without one"
+            )));
+        }
         let at = at.as_str();
         Self::inside_range(collection, shard, &t, at)?;
         let new = Self::split_map(&tablets, shard, at);
@@ -4894,9 +5136,12 @@ impl Db {
             &cdir.join(format!("shard-{a:04}")).join("RANGE"),
             format!("{lo_text}\n{hi_text}").as_bytes(),
         )?;
-        let _ = fs::remove_dir_all(cdir.join(format!("shard-{b:04}")));
+        // The catalog first, the directory after: a crash between the two
+        // leaves a directory nothing names, which the open reclaims, rather
+        // than a catalog naming a shard whose directory is gone (0.98.0).
         self.catalog.placement.insert(collection.to_string(), new.clone());
         self.persist_catalog()?;
+        let _ = fs::remove_dir_all(cdir.join(format!("shard-{b:04}")));
         let peers = self.every_peer(&new)?;
         let switch = Switch { sql: format!("MERGE SHARDS {a} AND {b} OF {collection}"), peers };
         let ack = format!(
@@ -6092,7 +6337,49 @@ impl Db {
         // versions and never block on it (§10). Here that means the shards get
         // the new definition and the next flush picks it up.
         let name = idx.name.clone();
+        // A vector index over rows already sealed: every sealed vector has
+        // to fit it, or the backfill fails on every pass; checked here,
+        // naming the row (0.98.0).
+        if let IndexKind::Vector { dims, .. } = &idx.kind {
+            if let Some(shards) = self.shards.get(collection) {
+                for s in shards {
+                    for h in &s.segments {
+                        let n = h.segment.num_docs() as u32;
+                        for ord in 0..n {
+                            if h.is_deleted_at(ord, crate::time::MAX_TS) {
+                                continue;
+                            }
+                            let d = h.segment.document(ord)?;
+                            let Some(v) = d.path(&idx.path) else { continue };
+                            let Some(f) = crate::segment::extract_vector(v) else { continue };
+                            let key = h.segment.ordinals.key(ord).unwrap_or("").to_string();
+                            if f.len() != *dims {
+                                return Err(Error::Schema(format!(
+                                    "`{}` of `{key}` has {} dimensions but the index declares \
+                                     {dims}: fix or delete the row first",
+                                    idx.path,
+                                    f.len()
+                                )));
+                            }
+                            if let Some(bad) = f.iter().find(|x| !x.is_finite()) {
+                                return Err(Error::Schema(format!(
+                                    "`{}` of `{key}` has a non-finite component ({bad}): fix or \
+                                     delete the row first",
+                                    idx.path
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.catalog.add_index(collection, idx)?;
+        // A new definition: what a backfill set aside is tried again.
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                s.backfill_set_aside.clear();
+            }
+        }
         // Creation time is what a `SINCE CREATION` rule measures, and an index
         // starts its idle clock now rather than at epoch — otherwise every
         // index is instantly overdue the moment a policy is written.
@@ -6722,6 +7009,33 @@ impl Db {
         None
     }
 
+    /// A reserved compaction whose build failed: an index backfill is set
+    /// aside on its shard, so the planner does not hand the same failing
+    /// job back on every pass and starve every merge behind it; other
+    /// jobs are planned again as before (a full disk clears).
+    pub fn compaction_set_aside(&mut self, ticket: &CompactionTicket, why: &str) {
+        if !ticket.reserved.backfill {
+            return;
+        }
+        if let Some(s) =
+            self.shards.get_mut(&ticket.collection).and_then(|v| v.get_mut(ticket.shard))
+        {
+            for id in &ticket.reserved.inputs {
+                s.backfill_set_aside.insert(*id);
+            }
+            crate::log::warn(
+                "index_backfill_set_aside",
+                &[
+                    ("collection", ticket.collection.clone()),
+                    ("shard", ticket.shard.to_string()),
+                    ("segments", format!("{:?}", ticket.reserved.inputs)),
+                    ("error", why.to_string()),
+                    ("until", "CREATE INDEX or COMPACT".into()),
+                ],
+            );
+        }
+    }
+
     /// Build a reserved compaction: no `Db` is involved, so no lock is held
     /// while the segments are merged.
     pub fn compaction_build(ticket: &CompactionTicket) -> Result<Option<compaction::Built>> {
@@ -6903,6 +7217,12 @@ impl Db {
     }
 
     pub fn compact(&mut self, collection: &str) -> Result<usize> {
+        // The operator's word: a backfill set aside is tried again.
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                s.backfill_set_aside.clear();
+            }
+        }
         let opts = self.opts.compaction;
         let shards = self
             .shards
@@ -7424,6 +7744,10 @@ impl Db {
                 let mut parts = c.splitn(3, '|');
                 let bad = || Error::Plan(format!("`{c}` is not a change stream cursor"));
                 let upto: Timestamp = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+                // Clamped to the horizon: a cursor from another node, or a
+                // hand-made one, past this node's instant would read rows
+                // not yet visible here and skip them for good (0.98.0).
+                let upto = upto.min(self.read_ts());
                 let shard: usize = parts.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
                 let key = parts.next().filter(|k| !k.is_empty()).map(String::from);
                 (upto, shard, key)
@@ -7620,7 +7944,15 @@ impl Db {
             Statement::Select(sel) => Ok(Outcome::Rows(self.run_select(&sel, sql, params, false)?)),
             // Dials every peer: under the write lock that held every
             // reader on the node for as long as a peer took to answer.
-            Statement::ShowHealth => Ok(Outcome::Ack(self.show_health())),
+            Statement::ShowHealth => {
+                // The dials off the lock: the draft here, the peers asked
+                // holding nothing, the finish under the lock again.
+                let draft = self.health_draft(); // the read path
+                Ok(Outcome::Deferred(Deferred::then_under_lock(move || {
+                    let answers = health_dial(&draft);
+                    Ok(Resume::new(move |db| Ok(Outcome::Ack(db.health_finish(draft, answers)))))
+                })))
+            }
             Statement::BackupStatus { ts } => Ok(Outcome::Ack(self.backup_status(ts))),
             Statement::Local(inner) => self.run_read(*inner, sql, params),
             Statement::Explain { analyze, inner } => match *inner {
@@ -8040,6 +8372,10 @@ impl Db {
                 }
                 Ok(Outcome::Ack(out))
             }
+            // Inline on the exclusive path: the embedded API and the command
+            // line hold no lock to let go of, and cannot take one again for
+            // the finish. The served read path (`run_read`) dials off the
+            // lock as deferred work.
             Statement::ShowHealth => Ok(Outcome::Ack(self.show_health())),
             Statement::ShowCatalog { collection } => {
                 let names: Vec<String> = match collection {
@@ -8205,6 +8541,9 @@ impl Db {
             }
             Statement::MoveShard { collection, shard, to } => {
                 self.move_shard(&collection, shard, &to)
+            }
+            Statement::AbortMove { collection, shard } => {
+                self.abort_move_statement(&collection, shard)
             }
             Statement::Rebalance { collection } => self.rebalance(&collection),
             Statement::PlaceShard { collection, shard, node } => {
@@ -9890,7 +10229,15 @@ pub fn apply_election_actions(
                     if let Err(e) =
                         crate::shard::atomic_write(&d.join(STEWARD_FILE), body.as_bytes())
                     {
-                        crate::log::warn("steward_not_persisted", &[("error", e.to_string())]);
+                        // A vote or a claim this node cannot remember across
+                        // a restart is not sent: sent, it could be given
+                        // twice in one term (0.98.0).
+                        crate::log::warn(
+                            "steward_not_persisted",
+                            &[("error", e.to_string()), ("sends", "dropped".into())],
+                        );
+                        sends.clear();
+                        return sends;
                     }
                 }
             }
@@ -10292,6 +10639,29 @@ fn carry_statement(
     (done, failures)
 }
 
+/// `docs` in runs of at most `count` documents and about `bytes` of them
+/// (one at least): a frame of five hundred large documents outgrew the
+/// wire's limit before 0.98.0, refused at the holder after all of it was
+/// sent.
+fn chunks_by_count_and_bytes(docs: &[Value], count: usize, bytes: usize) -> Vec<&[Value]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut size = 0usize;
+    for (i, d) in docs.iter().enumerate() {
+        let b = d.approx_bytes();
+        if i > start && (i - start >= count || size + b > bytes) {
+            out.push(&docs[start..i]);
+            start = i;
+            size = 0;
+        }
+        size += b;
+    }
+    if start < docs.len() {
+        out.push(&docs[start..]);
+    }
+    out
+}
+
 /// Write documents to their holders, holder by holder at once, holding
 /// nothing; the latest commit instant. A holder that refuses is the
 /// statement's failure, after every holder was tried, naming it.
@@ -10307,7 +10677,7 @@ fn insert_many_in_chunks(
     chunk: usize,
 ) -> Result<(usize, Timestamp, Result<()>)> {
     let (mut taken, mut last) = (0usize, 0);
-    for part in docs.chunks(chunk.max(1)) {
+    for part in chunks_by_count_and_bytes(docs, chunk.max(1), crate::replication::BATCH_BYTES) {
         // Past the first chunk a call that fails leaves what landed in the
         // answer, as a chunk that stopped does: the rows before it are on
         // the holder and confirmed, and a retry re-inserts them idempotently.
@@ -10580,6 +10950,8 @@ pub struct MovePlan {
     target: Arc<crate::wire::Node>,
     /// What was left of the statement's budget at the plan, for the pin.
     deadline_ms: Option<u64>,
+    /// The copy's own deadline (`CELASTRO_MOVE_TIMEOUT`).
+    timeout_ms: u64,
 }
 
 /// A compaction reserved on one shard: what the console's maintenance
@@ -10793,12 +11165,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let db = Db::open(&dir, DbOpts::default()).unwrap();
         for port in 0..MAX_ADDRESSES_PER_HOST {
-            db.observe_caller(&format!("tcp://h.example:{}", 7000 + port), 5).unwrap();
+            observe_caller(&db.peers_seen(), &format!("tcp://h.example:{}", 7000 + port), 5)
+                .unwrap();
         }
-        let e = db.observe_caller("tcp://H.EXAMPLE:9999", 5).unwrap_err().to_string();
+        let e =
+            observe_caller(&db.peers_seen(), "tcp://H.EXAMPLE:9999", 5).unwrap_err().to_string();
         assert!(e.contains("32 addresses on h.example"), "{e}");
-        db.observe_caller("tcp://h.example:7000", 6).unwrap();
-        db.observe_caller("tcp://other.example:1", 5).unwrap();
+        observe_caller(&db.peers_seen(), "tcp://h.example:7000", 6).unwrap();
+        observe_caller(&db.peers_seen(), "tcp://other.example:1", 5).unwrap();
         assert_eq!(host_of("tcp://[::1]:7876"), "::1");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
@@ -14464,7 +14838,14 @@ mod tests {
         let log = dir.join("collections/items/shard-0000/wal.log");
         // k0 sealed: the failed statement below is an update of it, whose
         // supersede mark on the sealed version the recovery must take
-        // back, or k0 -- acknowledged -- reads as absent afterwards.
+        // back, or k0 -- acknowledged -- reads as absent afterwards. Two
+        // segments, so a compaction between the failure and the recovery
+        // publishes a delete log: the mark must not be in it.
+        db.execute("FLUSH items").unwrap();
+        db.execute(r#"INSERT INTO items VALUES ('{"id":"kx","n":5}')"#)
+            .unwrap()
+            .finished()
+            .unwrap();
         db.execute("FLUSH items").unwrap();
         let n_of_k0 = |db: &mut Db| {
             let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
@@ -14476,19 +14857,29 @@ mod tests {
         let e = pending.finished().unwrap_err();
         assert!(e.to_string().contains("injected"), "{e}");
         assert!(pending0.finished().is_err(), "the same group, the same failure");
-        assert_eq!(ids(&mut db), ["k0"], "a write whose sync failed is read");
+        assert_eq!(ids(&mut db), ["k0", "kx"], "a write whose sync failed is read");
         assert_eq!(n_of_k0(&mut db), Some(0));
         assert!(db.show_health().contains("sync FAILED"), "{}", db.show_health());
+        // A publication now -- the manifests, as the console persists after
+        // every statement -- writes the delete logs with the refused
+        // update's mark left out of them (0.98.0); a reopen below reads
+        // what was published.
+        db.persist().unwrap();
+        db.compact("items").unwrap();
         db.execute(r#"INSERT INTO items VALUES ('{"id":"k2","n":2}')"#)
             .and_then(|o| o.finished())
             .expect("the disk answers again: the next statement recovers the log and lands");
         assert!(!db.show_health().contains("FAILED"), "{}", db.show_health());
-        assert_eq!(ids(&mut db), ["k0", "k2"]);
+        assert_eq!(ids(&mut db), ["k0", "k2", "kx"]);
         assert_eq!(n_of_k0(&mut db), Some(0), "the refused update's mark on the sealed k0 stayed");
         drop(db);
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
-        assert_eq!(ids(&mut db), ["k0", "k2"], "the refused write came back on the reopen");
-        assert_eq!(n_of_k0(&mut db), Some(0));
+        assert_eq!(ids(&mut db), ["k0", "k2", "kx"], "the refused write came back on the reopen");
+        assert_eq!(
+            n_of_k0(&mut db),
+            Some(0),
+            "and the published delete log carried no phantom mark"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -14497,6 +14888,62 @@ mod tests {
     /// them, a manifest. A merge's output is the size of its inputs, and
     /// writing one under the lock held every writer for nine seconds on a
     /// sustained insert load.
+    /// A vote or a claim this node cannot persist is not sent: a persist
+    /// that fails drops the sends of its batch of actions, where a vote
+    /// given and forgotten across a restart could be given twice in one
+    /// term.
+    #[test]
+    fn a_vote_whose_persist_failed_is_not_sent() {
+        use crate::steward::{Action, Msg};
+        let root =
+            std::env::temp_dir().join(format!("celastro-vote-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A directory that is a file: nothing persists under it.
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let actions = || {
+            vec![
+                Action::Persist { term: 1, voted_for: Some("tcp://n1:1".to_string()) },
+                Action::Send {
+                    to: "tcp://n2:1".to_string(),
+                    msg: Msg::Vote { term: 1, candidate: "tcp://n1:1".to_string() },
+                },
+            ]
+        };
+        let mut g =
+            LeaseState { at: None, steward: None, term: 0, election: None, dir: Some(blocked) };
+        assert!(
+            apply_election_actions(&mut g, actions()).is_empty(),
+            "the vote went out unremembered"
+        );
+        let mut g = LeaseState {
+            at: None,
+            steward: None,
+            term: 0,
+            election: None,
+            dir: Some(root.clone()),
+        };
+        assert_eq!(apply_election_actions(&mut g, actions()).len(), 1, "persisted, the vote goes");
+        assert!(root.join(STEWARD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A holder's documents go in runs bounded by count and by bytes, one
+    /// document at least per run.
+    #[test]
+    fn a_holders_documents_are_chunked_by_count_and_by_bytes() {
+        let small: Vec<Value> = (0..10).map(Value::Int).collect();
+        let runs = chunks_by_count_and_bytes(&small, 4, 1 << 20);
+        assert_eq!(runs.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![4, 4, 2]);
+        let big: Vec<Value> = (0..5).map(|_| Value::Str("x".repeat(3 << 20))).collect();
+        let runs = chunks_by_count_and_bytes(&big, 100, 8 << 20);
+        assert_eq!(runs.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![2, 2, 1]);
+        let one: Vec<Value> = vec![Value::Str("x".repeat(40 << 20))];
+        assert_eq!(chunks_by_count_and_bytes(&one, 100, 8 << 20).len(), 1);
+        assert!(chunks_by_count_and_bytes(&[], 4, 8).is_empty());
+    }
+
     /// A batch forwarded to this node is checked whole before a byte is
     /// written, and then written as a statement's own documents are: each
     /// shard's share in chunks of `insert_batch`, one sync a chunk -- and
@@ -16378,6 +16825,263 @@ mod tests {
     /// method; alone it is refused, since alone it is the filter. `THEN
     /// WHERE` gives each hop its own edge filter, the plan says which, and
     /// a count that fits neither one-for-all nor one-per-hop is refused.
+    /// A negated negation matches again: `--x` is the rows with `x`,
+    /// `quick --lazy` keeps its second constraint, and `-(-a -b)` is the
+    /// rows with `a` or `b` -- not every row, as through 0.97.0.
+    #[test]
+    fn a_negated_negation_is_the_matching_set_again() {
+        let dir = tmp("double-negation");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, body TEXT)").unwrap();
+        db.execute("CREATE INDEX notes_body ON notes USING fulltext (body)").unwrap();
+        for (id, body) in [
+            ("ql", "quick lazy fox"),
+            ("q", "quick brown fox"),
+            ("l", "lazy dog"),
+            ("n", "nothing here"),
+        ] {
+            db.execute(&format!(r#"INSERT INTO notes VALUES ('{{"id":"{id}","body":"{body}"}}')"#))
+                .unwrap();
+        }
+        let ids = |db: &mut Db, q: &str| -> Vec<String> {
+            let sql = format!("SELECT id FROM notes WHERE text_match(body, '{q}') LIMIT 10");
+            let mut v: Vec<String> =
+                db.query(&sql).unwrap().rows.iter().map(|r| r.key.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&mut db, "--lazy"), vec!["l".to_string(), "ql".to_string()], "--x is x");
+        assert_eq!(ids(&mut db, "quick --lazy"), vec!["ql".to_string()], "both constraints");
+        assert_eq!(ids(&mut db, "quick -lazy"), vec!["q".to_string()]);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An automatic split whose median key holds a newline is refused
+    /// naming the way out, as a given key with one is: the RANGE file is
+    /// two lines, and a newline inside a key broke it.
+    #[test]
+    fn a_split_whose_median_holds_a_newline_is_refused() {
+        let dir = tmp("split-newline");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for k in ["a\nb", "a\nc", "a\nd"] {
+            db.insert("notes", Value::obj(vec![("id".into(), Value::Str(k.into()))])).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        let e = db.execute("SPLIT SHARD 0 OF notes").unwrap_err().to_string();
+        assert!(e.contains("median key holds a newline"), "{e}");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An index re-made over sealed rows with another metric (or width)
+    /// is a backfill: the coverage check compares the region's width and
+    /// metric, not the path alone, so the stale region is rewritten.
+    #[test]
+    fn an_index_re_made_with_another_metric_rewrites_the_sealed_segment() {
+        let dir = tmp("index-remade");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')",
+        )
+        .unwrap();
+        for i in 0..4 {
+            db.execute(&format!(
+                r#"INSERT INTO notes VALUES ('{{"id":"n{i}","emb":[{i}.0, 1.0]}}')"#
+            ))
+            .unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        db.execute("DROP INDEX notes_emb ON notes").unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'cosine')",
+        )
+        .unwrap();
+        let opts = db.opts.compaction;
+        {
+            let s = &db.shards.get("notes").unwrap()[0];
+            let job = compaction::plan(s, s.clock.peek(), &opts);
+            assert!(
+                matches!(
+                    job,
+                    Some(compaction::Job::Rewrite {
+                        reason: compaction::Reason::IndexBackfill,
+                        ..
+                    })
+                ),
+                "{job:?}"
+            );
+        }
+        db.compact("notes").unwrap();
+        {
+            let s = &db.shards.get("notes").unwrap()[0];
+            assert!(
+                compaction::plan(s, s.clock.peek(), &opts).is_none(),
+                "covered after the rewrite"
+            );
+        }
+        let r = db.query("SELECT id FROM notes ORDER BY emb <=> [1.0, 1.0] LIMIT 2").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A vector index over a sealed row that does not fit it is refused at
+    /// `CREATE INDEX`, naming the row: before, the backfill failed on every
+    /// pass and every merge behind it starved.
+    #[test]
+    fn a_vector_index_over_a_sealed_row_of_another_width_is_refused_by_key() {
+        let dir = tmp("index-badrow");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"ok","emb":[1.0, 2.0]}')"#).unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"wide","emb":[1.0, 2.0, 3.0]}')"#).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        let e = db
+            .execute(
+                "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`wide`") && e.contains("3 dimensions"), "{e}");
+        db.execute("DELETE FROM notes WHERE id = 'wide'").unwrap();
+        db.execute(
+            "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')",
+        )
+        .unwrap();
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A backfill set aside is not planned again until `COMPACT` or a
+    /// `CREATE INDEX` clears it, so the merges behind it run.
+    #[test]
+    fn a_backfill_set_aside_is_not_planned_again_until_compact() {
+        let dir = tmp("backfill-aside");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, body TEXT)").unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"a","body":"x"}')"#).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.execute("CREATE INDEX notes_body ON notes USING fulltext (body)").unwrap();
+        let opts = db.opts.compaction;
+        let ticket = db.compaction_reserve().expect("the backfill of the sealed segment");
+        assert!(ticket.reserved.backfill);
+        let id = ticket.reserved.inputs[0];
+        db.compaction_set_aside(&ticket, "a build that failed, as a test says");
+        {
+            let s = &db.shards.get("notes").unwrap()[0];
+            assert!(s.backfill_set_aside.contains(&id));
+            assert!(compaction::plan(s, s.clock.peek(), &opts).is_none(), "set aside: not planned");
+        }
+        db.compact("notes").unwrap();
+        let s = &db.shards.get("notes").unwrap()[0];
+        assert!(s.backfill_set_aside.is_empty(), "COMPACT tries it again");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A negated text match over a segment sealed before the index answers
+    /// nothing from it: the match is undefined there, where through 0.97.0
+    /// `NOT text_match` returned every row of such a segment, the matching
+    /// ones included.
+    #[test]
+    fn a_negated_text_match_answers_nothing_from_a_segment_sealed_before_the_index() {
+        let dir = tmp("not-text-unindexed");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, body TEXT)").unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"old-hit","body":"needle here"}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"old-miss","body":"nothing"}')"#).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        db.execute("CREATE INDEX notes_body ON notes USING fulltext (body)").unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"new-miss","body":"nothing"}')"#).unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"new-hit","body":"needle too"}')"#).unwrap();
+        let ids = |db: &mut Db, sql: &str| -> Vec<String> {
+            let mut v: Vec<String> =
+                db.query(sql).unwrap().rows.iter().map(|r| r.key.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM notes WHERE NOT text_match(body, 'needle') LIMIT 10"),
+            vec!["new-miss".to_string()],
+            "the sealed, unindexed rows are not in a negation's answer"
+        );
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM notes WHERE text_match(body, 'needle') LIMIT 10"),
+            vec!["new-hit".to_string()]
+        );
+        db.execute("COMPACT notes").unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM notes WHERE NOT text_match(body, 'needle') LIMIT 10"),
+            vec!["new-miss".to_string(), "old-miss".to_string()],
+            "once the backfill rewrote the segment, its rows answer"
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hop source over a partitioned collection ranks the rows the walk
+    /// reaches: the walk's keys resolve across partitions as the predicate
+    /// form's do (the second scan of 2026-09-30 claimed they vanished; this
+    /// is the check).
+    #[test]
+    fn a_hop_source_over_a_partitioned_collection_ranks_the_rows_the_walk_reaches() {
+        let dir = tmp("hops-partitioned");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute(
+            "CREATE COLLECTION pnodes (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, body TEXT) \
+             PARTITION BY (tenant)",
+        )
+        .unwrap();
+        db.execute("CREATE INDEX pnodes_body ON pnodes USING fulltext (body)").unwrap();
+        db.execute(
+            "CREATE COLLECTION pedges (id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL) \
+             WITH (nodes_of = 'pnodes')",
+        )
+        .unwrap();
+        db.execute("CREATE INDEX pedges_adj ON pedges USING adjacency (src, dst)").unwrap();
+        for (id, t) in [("a", "t1"), ("b", "t1"), ("c", "t2")] {
+            db.execute(&format!(
+                r#"INSERT INTO pnodes VALUES ('{{"id":"{id}","tenant":"{t}","body":"graph words"}}')"#
+            ))
+            .unwrap();
+        }
+        for (e, s, d) in [("e1", "a", "b"), ("e2", "b", "c")] {
+            db.execute(&format!(
+                r#"INSERT INTO pedges VALUES ('{{"id":"{e}","src":"{s}","dst":"{d}"}}')"#
+            ))
+            .unwrap();
+        }
+        let r = db
+            .query(
+                "SELECT id FROM pnodes ORDER BY hybrid(text_match(body, 'graph'), \
+                 hops(id WITHIN 2 HOPS OF 'a' VIA pedges)) LIMIT 5",
+            )
+            .unwrap();
+        let mut keys: Vec<String> = r.rows.iter().map(|x| x.key.clone()).collect();
+        keys.sort();
+        assert_eq!(keys.len(), 3, "every row matches the text, and none vanished: {keys:?}");
+        assert!(
+            keys.iter().any(|k| k.ends_with("b")) && keys.iter().any(|k| k.ends_with("c")),
+            "{keys:?}"
+        );
+        // The predicate form reaches the rows across partitions.
+        let r = db
+            .query("SELECT id FROM pnodes WHERE id WITHIN 2 HOPS OF 'a' VIA pedges LIMIT 5")
+            .unwrap();
+        assert_eq!(
+            r.rows.len(),
+            2,
+            "{:?}",
+            r.rows.iter().map(|x| x.key.clone()).collect::<Vec<_>>()
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_hop_source_ranks_nearer_nodes_higher_and_per_hop_filters_apply_in_order() {
         let dir = tmp("hop-source");

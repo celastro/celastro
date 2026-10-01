@@ -1043,6 +1043,12 @@ impl Catalog {
             for _ in 0..np {
                 let name = get_str(b, &mut i).ok_or_else(bad)?;
                 let nt = get_uvarint(b, &mut i).ok_or_else(bad)? as usize;
+                // A tablet is at least a node string and two options: a
+                // count past the bytes behind it is damage, not a
+                // reservation to make (0.98.0; a crafted count aborted).
+                if nt > b.len().saturating_sub(i) {
+                    return Err(bad());
+                }
                 let mut tablets = Vec::with_capacity(nt);
                 for _ in 0..nt {
                     let mut t = Tablet {

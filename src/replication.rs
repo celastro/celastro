@@ -65,7 +65,18 @@ pub enum FollowerState {
     /// where it stood, `upto` the instant the catch-up covers (fixed when
     /// the first chunk is cut), `cursor` the last key shipped, `reset`
     /// whether it started from nothing.
-    CatchingUp { from: Timestamp, upto: Timestamp, cursor: Option<String>, reset: bool, done: bool },
+    CatchingUp {
+        from: Timestamp,
+        upto: Timestamp,
+        cursor: Option<String>,
+        reset: bool,
+        done: bool,
+        /// The backlog overflowed while this catch-up ran, and the oldest
+        /// half went: a second pass from `upto` follows this one rather
+        /// than the live feed (0.98.0; before, the catch-up restarted
+        /// from the same instant and on a busy shard never finished).
+        overflowed: bool,
+    },
     /// Fed from the backlog as writes come.
     Live,
 }
@@ -80,6 +91,8 @@ pub struct Follower {
     /// Held back while a catch-up runs, since a live delete applied before
     /// the older row the catch-up carries would let the row come back.
     pub backlog: VecDeque<Arc<ShipItem>>,
+    /// About how many bytes `backlog` holds, for the cap by bytes.
+    pub backlog_bytes: usize,
     /// The catch-up chunk in flight, sent before anything in the backlog.
     pub catchup: VecDeque<Arc<ShipItem>>,
     pub last_error: Option<String>,
@@ -101,6 +114,11 @@ pub struct Follower {
 
 /// Items a follower's backlog may hold before it is sent back to a catch-up.
 pub const BACKLOG_CAP: usize = 100_000;
+
+/// The backlog kept for one follower is capped by bytes too (0.98.0):
+/// a follower away for hours on a shard of large rows held a backlog of
+/// a hundred thousand documents, gigabytes, resident on the holder.
+pub const BACKLOG_BYTES_CAP: usize = 256 << 20;
 
 /// Writes the floor on holders refused (`CELASTRO_MIN_HOLDERS`, see
 /// [`holders_check`]), for the metrics.
@@ -140,6 +158,33 @@ pub fn holders_check(collection: &str, shard: usize, live: usize, min: usize) ->
 }
 /// Items per frame.
 pub const BATCH: usize = 500;
+
+/// A batch is cut by bytes too (0.98.0): five hundred large documents
+/// never crossed the wire in one frame, and a frame past the wire's
+/// limit was refused at the receiver after the whole of it was sent.
+pub const BATCH_BYTES: usize = 32 << 20;
+
+/// The first items of `queue` up to `BATCH` of them and about
+/// `BATCH_BYTES` of documents, one at least.
+fn take_batch(queue: &VecDeque<Arc<ShipItem>>) -> Vec<Arc<ShipItem>> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for it in queue.iter().take(BATCH) {
+        bytes += it.approx_bytes();
+        if !out.is_empty() && bytes > BATCH_BYTES {
+            break;
+        }
+        out.push(it.clone());
+    }
+    out
+}
+
+impl ShipItem {
+    /// About how many bytes the item takes on the wire.
+    pub fn approx_bytes(&self) -> usize {
+        16 + self.key.len() + self.doc.as_ref().map_or(0, Value::approx_bytes)
+    }
+}
 
 /// What acknowledges a write to a shard, per collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +291,7 @@ impl Shipper {
                 state: FollowerState::Unknown,
                 acked: 0,
                 backlog: VecDeque::new(),
+                backlog_bytes: 0,
                 catchup: VecDeque::new(),
                 last_error: None,
                 retry_at: None,
@@ -304,6 +350,7 @@ impl Shipper {
             state: FollowerState::Live,
             acked: 0,
             backlog: VecDeque::new(),
+            backlog_bytes: 0,
             catchup: VecDeque::new(),
             last_error: None,
             retry_at: None,
@@ -357,6 +404,7 @@ impl Shipper {
                 cursor: None,
                 reset: false,
                 done: false,
+                overflowed: false,
             };
             f.catchup.clear();
         }
@@ -398,16 +446,27 @@ impl Shipper {
             // while the item's write was still in flight never carried it
             // -- a follower live and "caught up" without the row, and under
             // quorum the row counted as on a majority.
-            if f.backlog.len() >= BACKLOG_CAP {
-                // Over the cap the oldest half goes -- covered by the
-                // catch-up that follows, being long durable and visible --
-                // and the newest stay, so nothing in flight is lost.
+            if f.backlog.len() >= BACKLOG_CAP || f.backlog_bytes >= BACKLOG_BYTES_CAP {
+                // Over the cap the oldest half goes -- covered by a
+                // catch-up, being long durable and visible -- and the
+                // newest stay, so nothing in flight is lost. A catch-up
+                // already running goes on and a second pass from its
+                // `upto` follows it; a live follower is asked where it
+                // stands and caught up from there.
                 let drop = f.backlog.len() / 2;
+                let dropped: usize = f.backlog.iter().take(drop).map(|i| i.approx_bytes()).sum();
                 f.backlog.drain(..drop);
-                f.catchup.clear();
-                f.state = FollowerState::Unknown;
+                f.backlog_bytes = f.backlog_bytes.saturating_sub(dropped);
+                match &mut f.state {
+                    FollowerState::CatchingUp { overflowed, .. } => *overflowed = true,
+                    _ => {
+                        f.catchup.clear();
+                        f.state = FollowerState::Unknown;
+                    }
+                }
                 f.last_error = Some("backlog over its cap; catching up again".into());
             }
+            f.backlog_bytes += item.approx_bytes();
             f.backlog.push_back(item.clone());
         }
         drop(g);
@@ -600,17 +659,11 @@ impl Shipper {
                     .filter_map(|f| match &f.state {
                         FollowerState::Unknown => Some(Work::Ask(f.url.clone(), f.node.clone())),
                         FollowerState::CatchingUp { .. } if !f.catchup.is_empty() => {
-                            Some(Work::Send(
-                                f.url.clone(),
-                                f.node.clone(),
-                                f.catchup.iter().take(BATCH).cloned().collect(),
-                            ))
+                            Some(Work::Send(f.url.clone(), f.node.clone(), take_batch(&f.catchup)))
                         }
-                        FollowerState::Live if !f.backlog.is_empty() => Some(Work::Send(
-                            f.url.clone(),
-                            f.node.clone(),
-                            f.backlog.iter().take(BATCH).cloned().collect(),
-                        )),
+                        FollowerState::Live if !f.backlog.is_empty() => {
+                            Some(Work::Send(f.url.clone(), f.node.clone(), take_batch(&f.backlog)))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -679,6 +732,7 @@ impl Shipper {
                         cursor: None,
                         reset: !caught_up,
                         done: false,
+                        overflowed: false,
                     };
                     f.last_error = None;
                     f.backoff = Duration::from_millis(200);
@@ -706,13 +760,16 @@ impl Shipper {
             Ok((caught_up, at)) => {
                 let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(f) = g.iter_mut().find(|f| f.url == url) {
-                    let queue = if f.state == FollowerState::Live {
-                        &mut f.backlog
+                    if f.state == FollowerState::Live {
+                        for _ in 0..sent {
+                            if let Some(it) = f.backlog.pop_front() {
+                                f.backlog_bytes = f.backlog_bytes.saturating_sub(it.approx_bytes());
+                            }
+                        }
                     } else {
-                        &mut f.catchup
-                    };
-                    for _ in 0..sent {
-                        queue.pop_front();
+                        for _ in 0..sent {
+                            f.catchup.pop_front();
+                        }
                     }
                     f.acked = f.acked.max(at);
                     f.last_error = None;
@@ -721,8 +778,24 @@ impl Shipper {
                         && matches!(f.state, FollowerState::CatchingUp { done: true, .. })
                         && f.caught_up_mark.is_some_and(|m| at >= m)
                     {
-                        f.state = FollowerState::Live;
+                        let overflowed =
+                            matches!(f.state, FollowerState::CatchingUp { overflowed: true, .. });
                         f.caught_up_mark = None;
+                        if overflowed {
+                            // The backlog lost its oldest half meanwhile:
+                            // a second pass from where this one reached,
+                            // to now, rather than the live feed.
+                            f.state = FollowerState::CatchingUp {
+                                from: at,
+                                upto: 0,
+                                cursor: None,
+                                reset: false,
+                                done: false,
+                                overflowed: false,
+                            };
+                        } else {
+                            f.state = FollowerState::Live;
+                        }
                     }
                 }
                 drop(g);
@@ -853,7 +926,14 @@ mod tests {
         let t0 = Instant::now();
         set(FollowerState::Unknown);
         sh.wait(20, Some(2000)).unwrap();
-        set(FollowerState::CatchingUp { from: 0, upto: 0, cursor: None, reset: true, done: false });
+        set(FollowerState::CatchingUp {
+            from: 0,
+            upto: 0,
+            cursor: None,
+            reset: true,
+            done: false,
+            overflowed: false,
+        });
         sh.wait(20, Some(2000)).unwrap();
         assert!(t0.elapsed() < Duration::from_millis(500), "an away follower held the write");
         set(FollowerState::Live);
@@ -861,6 +941,104 @@ mod tests {
         let e = sh.wait(20, Some(200)).unwrap_err().to_string();
         assert!(e.contains("NOT confirmed"), "{e}");
         assert!(t0.elapsed() >= Duration::from_millis(200));
+        sh.stop();
+    }
+
+    /// A batch is cut by bytes as well as by count: thirty-three documents
+    /// of a mebibyte each go in two batches, and one document larger than
+    /// the bound goes alone.
+    #[test]
+    fn a_batch_is_cut_by_bytes_too() {
+        let big = |i: u64, mib: usize| {
+            Arc::new(ShipItem {
+                kind: SHIP_INSERT,
+                key: format!("k{i}"),
+                ts: i,
+                doc: Some(Value::Str("x".repeat(mib << 20))),
+            })
+        };
+        let queue: VecDeque<Arc<ShipItem>> = (0..40).map(|i| big(i, 1)).collect();
+        let first = take_batch(&queue);
+        // Each item is a mebibyte and a little over: thirty-one fit.
+        assert!((30..=32).contains(&first.len()), "{} of about thirty-two mebibytes", first.len());
+        let bytes: usize = first.iter().map(|i| i.approx_bytes()).sum();
+        assert!(bytes <= BATCH_BYTES + (1 << 20) + 64, "{bytes}");
+        let one: VecDeque<Arc<ShipItem>> = [big(0, 40), big(1, 1)].into_iter().collect();
+        assert_eq!(take_batch(&one).len(), 1, "a document past the bound goes alone");
+        let small: VecDeque<Arc<ShipItem>> = (0..700).map(|i| big(i, 0)).collect();
+        assert_eq!(take_batch(&small).len(), BATCH, "the count bound still holds");
+    }
+
+    /// A backlog that overflows while a catch-up runs does not restart it:
+    /// the catch-up goes on, and once the follower confirms it a second
+    /// pass from where it reached follows, covering what the backlog let
+    /// go; a live follower that overflows is asked where it stands.
+    #[test]
+    fn an_overflow_during_a_catch_up_is_followed_by_a_second_pass() {
+        let node = Arc::new(crate::wire::Node::new("tcp://127.0.0.1:1", Some("t"), None).unwrap());
+        let sh = Shipper::new(
+            "items",
+            0,
+            0,
+            vec![("tcp://127.0.0.1:1".into(), node)],
+            Confirm::All,
+            None,
+            1,
+        );
+        let item = |i: u64| ShipItem { kind: SHIP_INSERT, key: format!("k{i}"), ts: i, doc: None };
+        sh.set_catching_up("tcp://127.0.0.1:1", 5);
+        for i in 0..(BACKLOG_CAP as u64 + 3) {
+            sh.push(item(i));
+        }
+        {
+            let g = sh.inner.lock().unwrap();
+            assert!(
+                matches!(g[0].state, FollowerState::CatchingUp { overflowed: true, from: 5, .. }),
+                "{:?}",
+                g[0].state
+            );
+            assert!(g[0].backlog.len() < BACKLOG_CAP);
+        }
+        // The catch-up ends with the follower confirming it: a second pass
+        // from the confirmed instant, not the live feed.
+        sh.push_catchup("tcp://127.0.0.1:1", vec![item(100)], None, true);
+        {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].in_flight = true;
+            if let FollowerState::CatchingUp { upto, .. } = &mut g[0].state {
+                *upto = 100;
+            }
+            g[0].caught_up_mark = Some(100);
+        }
+        assert!(sh.sent("tcp://127.0.0.1:1", 1, Ok((true, 100))));
+        {
+            let g = sh.inner.lock().unwrap();
+            assert!(
+                matches!(
+                    g[0].state,
+                    FollowerState::CatchingUp {
+                        from: 100,
+                        upto: 0,
+                        overflowed: false,
+                        done: false,
+                        ..
+                    }
+                ),
+                "{:?}",
+                g[0].state
+            );
+        }
+        // And a live follower that overflows goes back to the ask.
+        {
+            let mut g = sh.inner.lock().unwrap();
+            g[0].state = FollowerState::Live;
+            g[0].backlog.clear();
+            g[0].backlog_bytes = 0;
+        }
+        for i in 0..(BACKLOG_CAP as u64 + 1) {
+            sh.push(item(i));
+        }
+        assert_eq!(sh.inner.lock().unwrap()[0].state, FollowerState::Unknown);
         sh.stop();
     }
 

@@ -108,6 +108,7 @@ impl Curve {
         Point { x: x3, y: y3, z: z3 }
     }
 
+    #[cfg(test)]
     fn mul(&self, k: &Big, q: &Point) -> Point {
         let mut r = Curve::infinity();
         let kb = k.to_be_bytes(self.bytes).expect("a scalar below n");

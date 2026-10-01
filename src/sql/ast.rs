@@ -142,6 +142,14 @@ pub enum Statement {
         shard: usize,
         to: String,
     },
+    /// `ABORT MOVE SHARD <i> OF <collection>` — let the source go of the
+    /// pin a move holds on the shard, from wherever it is issued: the
+    /// shard takes writes again, the target's copy fails at its next read,
+    /// and a new move within the abort's grace is refused (0.98.0).
+    AbortMove {
+        collection: String,
+        shard: usize,
+    },
     /// `REBALANCE <collection>` — the moves that put shard `i` on the
     /// `i`-th of this node and the attached ones, in attach order, as a
     /// `CREATE COLLECTION` with no nodes named would have.

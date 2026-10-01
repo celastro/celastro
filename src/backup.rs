@@ -755,8 +755,15 @@ fn run(
                 shards.iter().map(move |(index, _)| format!("{name}/shard-{index:04}"))
             })
             .collect();
-        let (pruned, freed) = prune(&target, &mine, keep, &held, cipher.as_deref())?;
+        let (pruned, freed, unopened) = prune(&target, &mine, keep, &held, cipher.as_deref())?;
         ack.push_str(&format!("; kept {keep}, removed {pruned} older backup(s) and {freed} pool segment(s) nobody references"));
+        if !unopened.is_empty() {
+            ack.push_str(&format!(
+                "; the pool was not swept: {} does not open under this node's key (a destination \
+                 shared by nodes under different data keys is pruned by none of them)",
+                unopened.join(", ")
+            ));
+        }
     }
     Ok(Outcome::Ack(ack))
 }
@@ -778,7 +785,7 @@ fn prune(
     keep: usize,
     held: &[String],
     cipher: Option<&crate::cipher::Cipher>,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, Vec<String>)> {
     let all = instants(target, mine)?;
     let drop: Vec<u64> =
         if all.len() > keep { all[..all.len() - keep].to_vec() } else { Vec::new() };
@@ -805,7 +812,12 @@ fn prune(
             let record_key = format!("{theirs}backups/{}/BACKUP", ts_key(ts));
             let record = target.store.get(&target.key(&record_key))?;
             let Ok(record) = open_record(&record, cipher, &record_key) else {
-                return Ok((pruned, 0));
+                // A record this node cannot open names segments it cannot
+                // see: the pool is not swept, and the reply says whose
+                // record (0.98.0; before, the sweep was skipped in silence,
+                // and a destination shared by nodes under different keys
+                // grew for good).
+                return Ok((pruned, 0, vec![record_key]));
             };
             for line in String::from_utf8_lossy(&record).lines() {
                 if let Some((key, _)) = line.split_once('\t') {
@@ -827,7 +839,7 @@ fn prune(
             }
         }
     }
-    Ok((pruned, freed))
+    Ok((pruned, freed, Vec::new()))
 }
 
 /// A backup read back and verified: its instant, its catalog and data key

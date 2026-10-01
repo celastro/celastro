@@ -267,10 +267,6 @@ impl Reducer {
         Reducer { m: m.clone(), mu, k }
     }
 
-    pub fn modulus(&self) -> &Big {
-        &self.m
-    }
-
     /// `x mod m` for any `x` below `m^2` by Barrett; beyond that, the slow
     /// way, which is never the product of two reduced values.
     pub fn reduce(&self, x: &Big) -> Big {
@@ -335,6 +331,7 @@ impl Big {
     }
 
     /// `self^-1 mod p` for a prime `p`, by Fermat.
+    #[cfg(test)]
     pub fn invmod_prime(&self, p: &Big) -> Big {
         let e = p.sub(&Big::from_u32(2));
         self.powmod(&e, p)

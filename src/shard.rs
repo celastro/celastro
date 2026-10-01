@@ -179,6 +179,11 @@ impl SegmentHandle {
         self.vis.clear();
     }
 
+    /// Whether `ord` is dead at `t`.
+    pub fn is_deleted_at(&self, ord: u32, t: Timestamp) -> bool {
+        self.deletes.read().unwrap().is_deleted_at(ord, t)
+    }
+
     /// The mark at `ord` taken back if it is the one placed at `ts`.
     pub(crate) fn unmark_deleted(&self, ord: u32, ts: Timestamp) {
         if self.deletes.write().unwrap().unmark(ord, ts) {
@@ -230,7 +235,17 @@ impl SegmentHandle {
     /// encoding is not empty for an empty log -- it carries its frame -- so
     /// the decision is taken on the entries, not on the bytes.
     pub(crate) fn encode_deletes(&self) -> Option<Vec<u8>> {
+        self.encode_deletes_without(&std::collections::BTreeSet::new())
+    }
+
+    /// The delete log as published: without the marks of writes whose sync
+    /// is pending, which a sync that fails takes back.
+    pub(crate) fn encode_deletes_without(
+        &self,
+        pending: &std::collections::BTreeSet<Timestamp>,
+    ) -> Option<Vec<u8>> {
         let d = self.deletes.read().unwrap();
+        let d = d.without_instants(pending);
         if d.is_empty() {
             None
         } else {
@@ -2321,6 +2336,9 @@ pub struct Shard {
     /// it.
     pub(crate) ship_ts: Timestamp,
     pub(crate) caught_up: bool,
+    /// Segments whose index backfill failed to build: skipped by the
+    /// planner until `CREATE INDEX` or `COMPACT` clears the set.
+    pub(crate) backfill_set_aside: BTreeSet<u64>,
     pub manifest_version: u64,
     pub(crate) next_segment_id: u64,
     pub(crate) opts: ShardOpts,
@@ -2458,6 +2476,7 @@ impl Shard {
             fork: None,
             segments: Vec::new(),
             manifest_version: 0,
+            backfill_set_aside: BTreeSet::new(),
             next_segment_id: 1,
             opts,
             #[cfg(test)]
@@ -2637,6 +2656,16 @@ impl Shard {
             }
         }
         Ok(())
+    }
+
+    /// The version of the unit layout a scan's handles name: the manifest's
+    /// version and how many memtables stand frozen, so a freeze moves it
+    /// too (0.98.0; the manifest alone let a freeze between a scan and its
+    /// fetch hand a handle another unit's document). From the structure
+    /// rather than a counter, so a shard reopened to the same layout -- a
+    /// restart with nothing frozen -- answers the same version.
+    pub fn layout_version(&self) -> u64 {
+        self.manifest_version.wrapping_mul(1 << 24).wrapping_add(self.frozen.len() as u64)
     }
 
     /// A log whose sync failed takes no writes and holds reads at the
@@ -2939,6 +2968,18 @@ impl Shard {
             }
             self.unsynced_marks.push((seq, target, ts));
         }
+    }
+
+    /// The instants of the supersede marks whose sync is still pending: a
+    /// publication leaves them out, since a sync that fails takes them
+    /// back and a mark on disk would outlive its record (0.98.0).
+    pub(crate) fn unsynced_instants(&self) -> std::collections::BTreeSet<Timestamp> {
+        let synced = self.wal.as_ref().map_or(u64::MAX, |w| w.group.lock().synced);
+        self.unsynced_marks
+            .iter()
+            .filter(|(seq, _, _)| *seq > synced)
+            .map(|(_, _, ts)| *ts)
+            .collect()
     }
 
     /// The mark `mark_superseded` placed, taken back: only if the entry is
@@ -3831,7 +3872,21 @@ impl Shard {
         if let Some(w) = self.wal.as_mut() {
             let seq = self.wal_seq;
             self.wal_seq += 1;
-            wals.push(w.rotate(seq)?);
+            match w.rotate(seq) {
+                Ok(p) => wals.push(p),
+                Err(e) => {
+                    // The list taken above goes back: a rotation that
+                    // fails must not lose the rotated logs of the seals
+                    // before it (0.98.0), which a reopen replays. And the
+                    // clock says the log failed, so the next write probes
+                    // and recovers it in place.
+                    self.unsealed_wals = wals;
+                    if self.wal.as_ref().is_some_and(|w| w.group.failure().is_some()) {
+                        self.clock.fail();
+                    }
+                    return Err(e);
+                }
+            }
         }
         let fresh = self.fresh_memtable();
         let frozen = Arc::new(std::mem::replace(&mut self.memtable, fresh));
@@ -3942,12 +3997,21 @@ impl Shard {
     /// disk filled during a seal and then emptied never sealed them.
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
         if let Some(tl) = built.timeline {
-            self.took_timeline(tl)?;
+            // As an install that fails below: the ticket goes back, or the
+            // frozen rows were never sealed before a restart (0.98.0).
+            if let Err(e) = self.took_timeline(tl) {
+                self.seal_requeue(t, &e);
+                return Err(e);
+            }
         }
         if let Some(reach) = built.archived_reach {
             self.archived_reach = self.archived_reach.max(Some(reach));
         }
-        let deletes = Shard::deletes_of(&t.frozen);
+        let mut deletes = Shard::deletes_of(&t.frozen);
+        // Not the marks of writes whose sync is pending: taken back if the
+        // sync fails, and a seal must not carry them into a segment.
+        let pending = self.unsynced_instants();
+        deletes.retain(|(_, _, dts)| !pending.contains(dts));
         let committed = self
             .handles_for(built.segments, &deletes, &built.written)
             .and_then(|h| self.commit_handles(h));
@@ -4428,8 +4492,9 @@ impl Shard {
         let Some(dir) = self.dir.as_ref() else { return Ok(()) };
         let ddir = dir.join("deletes");
         let mut published: Vec<(u64, Vec<u8>)> = Vec::new();
+        let pending = self.unsynced_instants();
         for h in segments {
-            let Some(d) = h.encode_deletes() else { continue };
+            let Some(d) = h.encode_deletes_without(&pending) else { continue };
             let p = ddir.join(format!("{:016x}.dlog", h.id()));
             if self.published_deletes.read().unwrap().get(&h.id()) == Some(&d)
                 && still_published(&p, &d)
@@ -4802,6 +4867,14 @@ impl Shard {
         };
         if let Err(e) = written {
             let _ = w.rollback(mark);
+            // A sync that failed here poisoned the group as a statement's
+            // does: the clock says so, and the next write probes and
+            // recovers the log in place (0.98.0; before, only the four
+            // statement paths set the flag, and a copy's failed sync was a
+            // restart's).
+            if w.group.failure().is_some() {
+                self.clock.fail();
+            }
             return Err(e);
         }
         for r in applied {
@@ -4975,11 +5048,16 @@ impl Shard {
         // that log with its input -- the row came back live (through
         // 0.96.0). Collected again here, under the lock; a mark the build
         // carried is carried twice, to the same instant.
+        let pending = self.unsynced_instants();
         let mut carried: Vec<CarriedDelete> = carried_deletes.to_vec();
+        carried.retain(|(_, _, dts)| !pending.contains(dts));
         for h in self.segments.iter().filter(|h| input_ids.contains(&h.id())) {
             let log = h.deletes.read().unwrap();
             for (ord, dts) in log.iter() {
                 if dts == crate::time::MAX_TS {
+                    continue;
+                }
+                if pending.contains(&dts) {
                     continue;
                 }
                 let key = h.segment.ordinals.key(ord).unwrap_or("").to_string();
@@ -7552,6 +7630,51 @@ mod tests {
         );
         s.insert(third).unwrap();
         assert_ne!(s.get(&key, MAX_TS).unwrap().unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A freeze moves the shard's layout version, so a scan's deferred
+    /// fetch made with the version before it is a snapshot gone (and is
+    /// retried), not a handle naming another unit's document.
+    #[test]
+    fn a_freeze_moves_the_layout_a_deferred_fetch_checks() {
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        for i in 0..5 {
+            s.insert(doc(i)).unwrap();
+        }
+        let ts = s.clock.peek();
+        let before = s.layout_version();
+        assert!(crate::plan::exec::documents_on(&s, before, ts, &[(0, 0)]).is_ok());
+        assert!(s.seal_freeze().unwrap(), "five rows freeze");
+        assert_ne!(s.layout_version(), before, "a freeze is a layout change");
+        let e = crate::plan::exec::documents_on(&s, before, ts, &[(0, 0)]).unwrap_err();
+        assert!(matches!(e, Error::SnapshotGone(_)), "{e}");
+        assert!(s.manifest_version == 0, "and no manifest was published for it");
+        assert_eq!(s.layout_version(), before + 1, "one memtable frozen, same manifest");
+    }
+
+    /// A seal's rotation that fails keeps the list of the logs rotated
+    /// before it: a reopen replays them with the live log, and the next
+    /// seal rotates again.
+    #[test]
+    fn a_rotation_that_fails_keeps_the_rotated_logs() {
+        let dir = test_dir("rotate-fail");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        // A rotated log a requeued seal put back: what the next freeze
+        // takes along, and must not lose when its own rotation fails.
+        s.unsealed_wals.push(dir.join("wal.000001.log"));
+        durability_probe::fail_next(Op::WalSync, &dir.join("wal.log"));
+        assert!(s.seal_freeze().is_err(), "the rotation's sync fails");
+        assert_eq!(s.unsealed_wals.len(), 1, "the list survived the failed rotation");
+        // The failed sync poisoned the log; recovered, the next freeze
+        // takes the list along into its ticket.
+        assert!(s.recover_log().unwrap());
+        assert_eq!(s.unsealed_wals.len(), 1, "the recovery keeps the list too");
+        assert!(s.seal_freeze().unwrap(), "the next freeze takes it along");
+        assert!(s.unsealed_wals.is_empty(), "into the ticket");
         let _ = fs::remove_dir_all(&dir);
     }
 

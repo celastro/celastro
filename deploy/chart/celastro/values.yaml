@@ -219,6 +219,9 @@ tuning: {}
 probes:
   periodSeconds: 10
   failureThreshold: 3
+  # The startup probe's allowance for an open that replays every log:
+  # periods before liveness begins (thirty of ten seconds, five minutes).
+  startupFailureThreshold: 30
   # The console answers one request at a time, so a probe behind a long
   # statement waits for it; one second, the default, was seen to time out.
   timeoutSeconds: 5

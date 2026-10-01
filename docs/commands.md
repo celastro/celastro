@@ -307,9 +307,13 @@ window's, from the latency histogram, reading `> 10 s` when the answer
 is past the widest bucket. [deploy/](../deploy/README.md#watching-it) is
 where a fleet and last week are drawn instead.
 
-**`health [--port N] [--attached N]`** exits 0 when a console is serving
-on loopback -- and, with `--attached N`, has verified `N` other nodes
-since it started. A container's liveness and readiness probes run it.
+**`health [--port N] [--attached N] [--majority-of T]`** exits 0 when a
+console is serving on loopback -- and, with `--attached N`, has verified
+`N` other nodes since it started; with `--majority-of T`, this node and
+the peers answering it now (within three reconciler sweeps) are a
+majority of a cluster of `T`. A container's liveness, startup and
+readiness probes run it; the chart's readiness asks for the majority,
+so one dead pod does not keep every restarted pod unready.
 
 ```sh
 celastro health --port 18787
@@ -458,7 +462,8 @@ A rows reply carries `more: true` when a bound the statement did not set
 rows and the cut left rows behind (0.96.0).
 
 `/api/health` needs no token: `ok:true` says the process answers,
-`attached` how many peers it has verified, and `busy:true` that the
+`attached` how many peers it has verified (`answering` how many answer
+now), and `busy:true` that the
 database lock was held when it was asked (alive, not ready). It says
 `ok:false` when the data directory is gone, or when a write-ahead log
 failed to sync (the next write recovers it once the disk answers, or a restart does). `/api/metrics` is the text

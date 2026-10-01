@@ -136,7 +136,7 @@ impl Ordinals {
 /// The only mutable per-segment state (§4.1). Replicated through Raft in the
 /// distributed build; here it is a file beside the segment, rewritten whole
 /// and published atomically by `Shard::persist_manifest`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DeleteLog {
     entries: BTreeMap<u32, Timestamp>,
 }
@@ -188,6 +188,23 @@ impl DeleteLog {
             return true;
         }
         false
+    }
+
+    /// This log without the marks placed at `instants`: what a publication
+    /// writes while a group's sync is pending, so a write that is then
+    /// refused leaves no mark on disk (0.98.0).
+    pub fn without_instants(&self, instants: &std::collections::BTreeSet<Timestamp>) -> DeleteLog {
+        if instants.is_empty() {
+            return self.clone();
+        }
+        DeleteLog {
+            entries: self
+                .entries
+                .iter()
+                .filter(|(_, ts)| !instants.contains(ts))
+                .map(|(o, t)| (*o, *t))
+                .collect(),
+        }
     }
 
     pub fn delete_ts(&self, ord: u32) -> Timestamp {

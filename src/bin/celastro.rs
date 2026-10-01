@@ -69,6 +69,7 @@ COMMANDS:
   catalog                    list collections and their indexes
   health [--port N]          exit 0 if a console is serving on 127.0.0.1:N
         [--attached N]           and has verified N other nodes since it started
+        [--majority-of T]        and, with itself, a majority of a cluster of T answer now
   export <COLLECTION> <DIR>  copy a collection, as of now, into a new database directory
   import <DIR>               adopt a collection an export wrote into this database
   key master <FILE>          write a new master key (64 hex digits) to FILE, readable by you only
@@ -236,6 +237,7 @@ enum Cmd {
     Health {
         port: u16,
         attached: Option<u64>,
+        majority_of: Option<u64>,
     },
     Export {
         collection: String,
@@ -313,6 +315,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut shard_bind: Option<String> = None;
     let mut bind: Option<IpAddr> = None;
     let mut attached: Option<u64> = None;
+    let mut majority_of: Option<u64> = None;
     let mut verb: Option<String> = None;
     // `-h` and `-V` are answered after the whole line is read rather than at
     // the moment they are seen, so that `celastro -h --json` honours the
@@ -394,6 +397,13 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 },
                 None => return Cli::Usage(missing_value(&name)),
             },
+            "--majority-of" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) if n > 0 => majority_of = Some(n),
+                    _ => return Cli::Usage(format!("`--majority-of` wants a count, not `{v}`")),
+                },
+                None => return Cli::Usage(missing_value(&name)),
+            },
             "--bind" => match value_for(inline.as_deref(), &args, &mut i) {
                 Some(v) => match v.parse::<IpAddr>() {
                     Ok(ip) => bind = Some(ip),
@@ -449,7 +459,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "repl" => Cmd::Repl,
         "demo" => Cmd::Demo,
         "catalog" => Cmd::Catalog,
-        "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached },
+        "health" => Cmd::Health { port: port.unwrap_or(DEFAULT_PORT), attached, majority_of },
         "send" => match rest.len() {
             2 => Cmd::Send { url: rest[0].clone(), sql: rest[1].clone() },
             _ => {
@@ -583,6 +593,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     }
     if attached.is_some() && !matches!(cmd, Cmd::Health { .. }) {
         return Cli::Usage("`--attached` only means something to `health`".to_string());
+    }
+    if majority_of.is_some() && !matches!(cmd, Cmd::Health { .. }) {
+        return Cli::Usage("`--majority-of` only means something to `health`".to_string());
     }
     if (check || force) && !matches!(cmd, Cmd::KeyRetire { .. }) {
         return Cli::Usage(
@@ -737,8 +750,8 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         Ok(t) => t.map(Arc::new),
         Err(e) => return fail(json, &e.to_string()),
     };
-    if let Cmd::Health { port, attached } = cmd {
-        return health(port, attached, tls.as_ref(), json);
+    if let Cmd::Health { port, attached, majority_of } = cmd {
+        return health(port, attached, majority_of, tls.as_ref(), json);
     }
     if let Cmd::TlsInit { dir, name, names, days } = cmd {
         return tls_init(&dir, &name, &names, days, json);
@@ -917,9 +930,30 @@ fn ack(json: bool, message: &str) {
 /// `health`: exit 0 when a console on `--port` answers that it is serving,
 /// 1 otherwise. A container's liveness and readiness probe, since the image
 /// has no shell and the console binds loopback.
-fn health(port: u16, attached: Option<u64>, tls: Option<&Arc<Tls>>, json: bool) -> i32 {
+fn health(
+    port: u16,
+    attached: Option<u64>,
+    majority_of: Option<u64>,
+    tls: Option<&Arc<Tls>>,
+    json: bool,
+) -> i32 {
     match celastro::serve::probe_health(port, tls) {
         Ok(true) => {
+            // Readiness as a majority: this node and the peers answering
+            // now make more than half of a cluster of `total`. One dead
+            // pod does not keep every restarted pod unready (0.98.0).
+            if let Some(total) = majority_of {
+                let answering = celastro::serve::probe_answering(port, tls).unwrap_or(0);
+                if (1 + answering) * 2 <= total {
+                    return fail(
+                        json,
+                        &format!(
+                            "serving on 127.0.0.1:{port}, but with {answering} peer(s) answering \
+                             this node is short of a majority of {total}"
+                        ),
+                    );
+                }
+            }
             // Readiness for a node of a cluster: serving is not enough while
             // the peers it was given have not answered it since it started,
             // because a statement it coordinates reaches shards it does not
@@ -955,6 +989,9 @@ fn forget_secrets() {
         celastro::serve::SCOPED_TOKENS_ENV,
         celastro::wire::TOKEN_ENV,
         celastro::wire::TOKEN_ALSO_ENV,
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
     ] {
         std::env::remove_var(v);
     }
@@ -1074,6 +1111,24 @@ fn serve(
     // stay: `BACKUP TO s3://` reads them at the statement.)
     let wire_token = celastro::wire::token_from_env();
     let wire_also = celastro::wire::token_also_from_env();
+    for (name, t) in [
+        (celastro::wire::TOKEN_ENV, wire_token.as_deref()),
+        (celastro::wire::TOKEN_ALSO_ENV, wire_also.as_deref()),
+    ] {
+        if let Some(t) = t {
+            if !celastro::wire::token_fits(t) {
+                return fail(
+                    json,
+                    &format!(
+                        "{name} is {} bytes; a wire token is at most {} (a peer could never admit \
+                         a longer one)",
+                        t.len(),
+                        celastro::wire::MAX_TOKEN_LEN
+                    ),
+                );
+            }
+        }
+    }
     forget_secrets();
     if open {
         // Not fatal: the URL is already printed, so a desktop without an opener
@@ -1112,10 +1167,16 @@ fn serve(
         );
         let (wire_db, wire_stop, wire_tls) = (shared.clone(), stop.clone(), tls.clone());
         std::thread::spawn(move || {
+            let stop = wire_stop.clone();
             if let Err(e) = celastro::wire::serve_with_also(
                 listener, wire_db, token, wire_also, wire_stop, wire_tls,
             ) {
-                eprintln!("celastro: the wire stopped: {e}");
+                // A node whose wire stopped serves its peers nothing: the
+                // process ends through the normal shutdown, and the probe
+                // that restarts it sees why (0.98.0; before, the console
+                // went on green with no wire for the life of the process).
+                eprintln!("celastro: the wire stopped: {e}; shutting down");
+                stop.store(true, std::sync::atomic::Ordering::Release);
             }
         });
         // CELASTRO_ATTACH: the peers this node attaches as they come up.
@@ -1578,7 +1639,10 @@ fn key_init(file: &Path, json: bool) -> i32 {
         Ok(w) => w,
         Err(e) => return fail(json, &format!("could not make the key: {e}")),
     };
-    if let Err(e) = std::fs::write(file, &wrapped) {
+    // Private, as `key master` and `tls init` write theirs: the wrapped
+    // key is the thing the docs say to hand every node, and 0644 left it
+    // readable by every local user (0.98.0).
+    if let Err(e) = write_private_bytes(file, &wrapped) {
         return fail(json, &format!("could not write {}: {e}", file.display()));
     }
     ack(json, &format!("wrote a data key, wrapped under the master key, to {}", file.display()));
@@ -2128,6 +2192,15 @@ fn tls_init(dir: &Path, name: &str, names: &[String], days: i64, json: bool) -> 
 
 /// A file that only its owner may read, when it is a key.
 fn write_private(path: &Path, text: &str, private: bool) -> std::io::Result<()> {
+    write_with_mode(path, text.as_bytes(), private)
+}
+
+/// A new file for the owner alone, with these bytes.
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_with_mode(path, bytes, true)
+}
+
+fn write_with_mode(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -2137,7 +2210,7 @@ fn write_private(path: &Path, text: &str, private: bool) -> std::io::Result<()> 
         o.mode(if private { 0o600 } else { 0o644 });
     }
     let mut f = o.open(path)?;
-    f.write_all(text.as_bytes())
+    f.write_all(bytes)
 }
 
 fn serve_json(server: &Server) -> Value {
@@ -2878,6 +2951,10 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
         o.archive.prefix = var("CELASTRO_ARCHIVE_PREFIX").unwrap_or_default();
         o.archive.region = var("CELASTRO_ARCHIVE_REGION").unwrap_or_default();
         o.archive.ca = var("CELASTRO_ARCHIVE_CA").map(PathBuf::from);
+        // The credentials once, here, and out of the environment below.
+        o.archive.access_key = var("AWS_ACCESS_KEY_ID");
+        o.archive.secret_key = var("AWS_SECRET_ACCESS_KEY");
+        o.archive.session_token = var("AWS_SESSION_TOKEN");
     }
     o.archive.dir = var("CELASTRO_ARCHIVE_DIR").map(PathBuf::from);
     o.backup_dir = var("CELASTRO_BACKUP_DIR").map(PathBuf::from);
@@ -3258,6 +3335,12 @@ mod tests {
     fn an_attached_count_reaches_health_and_nothing_else() {
         match parse(&["--attached", "2", "health"]) {
             Cli::Run { cmd: Cmd::Health { attached, .. }, .. } => assert_eq!(attached, Some(2)),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["health", "--majority-of", "3"]) {
+            Cli::Run { cmd: Cmd::Health { majority_of, .. }, .. } => {
+                assert_eq!(majority_of, Some(3))
+            }
             other => panic!("`--attached 2 health` must parse, got {other:?}"),
         }
         match parse(&["--attached", "two", "health"]) {

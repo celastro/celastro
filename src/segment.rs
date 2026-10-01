@@ -373,6 +373,13 @@ impl Segment {
         self.vectors.keys().cloned().collect()
     }
 
+    /// The width and metric the segment's vector region for `path` was
+    /// built with, from the footer: what the index coverage check compares
+    /// (0.98.0; before, a region of another width or metric covered).
+    pub fn vector_meta(&self, path: &str) -> Option<(usize, Metric)> {
+        self.vec_meta.get(path).copied()
+    }
+
     pub fn column_paths(&self) -> Vec<String> {
         self.columns.keys().cloned().collect()
     }
@@ -1233,8 +1240,11 @@ impl SegmentBuilder {
                 if let Some(v) = pd.doc.path(path) {
                     if let Some(mut f) = extract_vector(v) {
                         if f.len() != vs.dims {
+                            // Named by key: the row an operator has to fix
+                            // or drop (0.98.0; the path alone named nothing).
                             return Err(Error::Schema(format!(
-                                "`{path}` has {} dimensions but the index declares {}",
+                                "`{path}` of `{}` has {} dimensions but the index declares {}",
+                                pd.sort_key,
                                 f.len(),
                                 vs.dims
                             )));

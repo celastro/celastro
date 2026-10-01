@@ -144,6 +144,15 @@ fn doc(i: usize) -> Value {
     .unwrap()
 }
 
+/// `doc(i)` as an INSERT statement: what runs through `execute`, whose
+/// forwarded write is deferred work done by `finished()` with no lock held.
+fn insert_sql(i: usize) -> String {
+    format!(
+        r#"INSERT INTO items VALUES ('{{"id":"doc-{i:03}","tenant":"t{}","n":{i},"body":"x"}}')"#,
+        i % 3
+    )
+}
+
 const CREATE: &str = "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT) \
                       PARTITION BY (tenant) WITH (splits = ['t1', 't2'])";
 const INDEXES: &[&str] = &[
@@ -1571,6 +1580,332 @@ fn a_fresh_connection_to_an_older_process_is_refused() {
     }
 }
 
+/// The fence is per pooled connection: a hello over one connection to an
+/// address that names a newer process lets every older connection to it
+/// go, so a write never rides an older one to a superseded process.
+/// Until 0.98.0 the pool kept one epoch, set by the newest dial, and an
+/// older connection was never told apart from it.
+#[test]
+fn a_pooled_connection_to_a_superseded_process_is_let_go_whichever_connection_saw_the_newer() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fence3-a");
+    let b = Node::start("fence3-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    // Tenant t1's shard is b's: doc(1), doc(4), doc(7), doc(10) go over
+    // the wire. The first pools a connection to b, at b's epoch.
+    a.db.write().unwrap().insert("items", doc(1)).unwrap();
+    let epoch = b.db.read().unwrap().epoch();
+    // A newer process at b's address. The next write to it is held with
+    // its connection taken, so a second write dials a second connection,
+    // whose hello names the newer process.
+    b.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
+    celastro::wire::fault::hold_next("insert_many", 800);
+    let held = {
+        let db = a.db.clone();
+        std::thread::spawn(move || {
+            let p = db.write().unwrap().execute(&insert_sql(4)).unwrap();
+            p.finished().map(|_| ()).map_err(|e| e.to_string())
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let p = a.db.write().unwrap().execute(&insert_sql(7)).unwrap();
+    p.finished().unwrap();
+    // The older process answers on the connections it has.
+    b.db.write().unwrap().pretend(Some(epoch), 0);
+    held.join().unwrap().unwrap();
+    // The first connection, to the older process, is let go; the redial
+    // asks who answers and is refused.
+    let p = a.db.write().unwrap().execute(&insert_sql(10)).unwrap();
+    let e = p.finished().unwrap_err().to_string();
+    assert!(e.contains("an older process answers at") && e.contains("refused"), "{e}");
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The fence's server half holds no database lock: a call from an older
+/// process is refused while a writer holds the holder's lock. Until
+/// 0.98.0 the check ran only when the lock was free of writers, which
+/// under load was seldom, and the write went through.
+#[test]
+fn a_call_from_an_older_process_is_refused_while_a_writer_holds_the_lock() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fence4-a");
+    let b = Node::start("fence4-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    a.ack(CREATE);
+    a.db.write().unwrap().insert("items", doc(1)).unwrap();
+    let epoch = a.db.read().unwrap().epoch();
+    a.db.write().unwrap().pretend(Some(epoch + 5_000_000), 0);
+    a.db.write().unwrap().insert("items", doc(4)).unwrap();
+    assert_eq!(b.db.read().unwrap().peer_seen(&a.url).unwrap().epoch, epoch + 5_000_000);
+    // The older process calls while a writer holds b's lock for a second.
+    a.db.write().unwrap().pretend(Some(epoch), 0);
+    let holding = {
+        let db = b.db.clone();
+        std::thread::spawn(move || {
+            let _g = db.write().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let t0 = std::time::Instant::now();
+    let p = a.db.write().unwrap().execute(&insert_sql(7)).unwrap();
+    let e = p.finished().unwrap_err().to_string();
+    assert!(e.contains("a call from an older process at") && e.contains(&a.url), "{e}");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(900),
+        "refused before the lock was free"
+    );
+    holding.join().unwrap();
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A pause inside a frame is a stall, not idleness: a write whose frame
+/// arrives in two halves with a pause longer than the idle poll between
+/// them lands once and is acknowledged. Until 0.98.0 the idle poll was
+/// the only timeout the server read under, so the first half was lost
+/// at the poll and the second parsed as a frame of its own: garbage, the
+/// connection closed, the write reported as "may have landed".
+#[test]
+fn a_pause_inside_a_frame_is_not_idleness() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("stall-a");
+    let b = Node::start("stall-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    // doc(4) is tenant t1's, b's shard: over the wire, in two halves
+    // 700 ms apart -- past the server's half-second idle poll.
+    celastro::wire::fault::stall_next("insert_many", 700);
+    let p = a.db.write().unwrap().execute(&insert_sql(4)).unwrap();
+    p.finished().unwrap();
+    let r = a.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A pull whose connection resets after it was sent is not sent again:
+/// the coordinator hears the move may have landed and aborts it, rather
+/// than starting a second copy over the first's directory (0.98.0). The
+/// cluster is left with one holder of the shard either way, and a move
+/// afterwards goes through.
+#[test]
+fn a_pull_reset_after_it_was_sent_is_not_sent_again() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("pullreset-a");
+    let b = Node::start("pullreset-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    celastro::wire::fault::drop_after_next("pull_shard");
+    let e = a
+        .exec(&format!("MOVE SHARD 0 OF items TO '{}'", b.url))
+        .and_then(|o| o.finished())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("may have landed"), "{e}");
+    // Whichever side the copy ended on, one holds the shard, and the
+    // rows read whole through either node.
+    settle();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let holders = [&a, &b].iter().filter(|n| n.local_shards("items").contains(&0)).count();
+    assert_eq!(holders, 1, "a: {:?}, b: {:?}", a.local_shards("items"), b.local_shards("items"));
+    let r = a.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(30));
+    // The pin is released: once the abort's grace on the target is over, a
+    // move goes through, one way or the other.
+    for n in [&a, &b] {
+        n.db.write().unwrap().set_move_timing(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(500),
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let to = if a.local_shards("items").contains(&0) { &b.url } else { &a.url };
+    a.ack(&format!("MOVE SHARD 0 OF items TO '{to}'"));
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// `ABORT MOVE SHARD` releases the pin from wherever it is issued: the
+/// shard takes writes again, and no move of it begins within the grace.
+#[test]
+fn an_abort_releases_the_pin_from_any_node_and_holds_off_the_next_move() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("abort-a");
+    let b = Node::start("abort-b");
+    let c = Node::start("abort-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..9usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    // Shard 1 (tenant t1) is on b: pinned there by hand, as a move does.
+    let holder = [&a, &b, &c].into_iter().find(|n| n.local_shards("items").contains(&1)).unwrap();
+    holder.db.write().unwrap().set_move_timing(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_millis(1500),
+    );
+    holder.db.write().unwrap().begin_move("items", 1, &c.url).unwrap();
+    let e = a.db.write().unwrap().insert("items", doc(10)).unwrap_err().to_string();
+    assert!(e.contains("is moving to"), "{e}");
+    // Aborted from a, which is not the source: carried to the source.
+    let m = a.ack("ABORT MOVE SHARD 1 OF items");
+    assert!(m.contains("is aborted") && m.contains("released"), "{m}");
+    a.db.write().unwrap().insert("items", doc(10)).unwrap();
+    // Within the grace, the pin is refused -- a target that comes back
+    // late cannot take the shard; past it, a move goes through.
+    let e = holder.db.write().unwrap().begin_move("items", 1, &c.url).unwrap_err().to_string();
+    assert!(e.contains("was aborted") && e.contains("no move to it begins within"), "{e}");
+    std::thread::sleep(std::time::Duration::from_millis(1600));
+    a.ack(&format!("MOVE SHARD 1 OF items TO '{}'", c.url));
+    assert!(c.local_shards("items").contains(&1));
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A move's copy has a deadline: a target that does not answer within
+/// it is a move that fails, its pin released, rather than a shard pinned
+/// for good; the target's late pull is refused by the grace.
+#[test]
+fn a_move_whose_target_stops_answering_fails_at_its_deadline_and_releases_the_pin() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("movedl-a");
+    let b = Node::start("movedl-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    for i in 0..30usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.ack("FLUSH items");
+    a.db.write().unwrap().set_move_timing(
+        std::time::Duration::from_millis(1000),
+        std::time::Duration::from_secs(30),
+    );
+    // The pull is held for longer than the move's deadline before it is
+    // even sent: the coordinator gives up, the pin goes.
+    celastro::wire::fault::hold_next("pull_shard", 2500);
+    let t0 = std::time::Instant::now();
+    let e = a
+        .exec(&format!("MOVE SHARD 0 OF items TO '{}'", b.url))
+        .and_then(|o| o.finished())
+        .unwrap_err()
+        .to_string();
+    // Not the hour the copy may take: the hold and a moment.
+    assert!(t0.elapsed() < std::time::Duration::from_millis(4000), "{e}");
+    assert!(e.contains("deadline") || e.contains("did not answer"), "{e}");
+    a.db.write().unwrap().insert("items", doc(30)).unwrap();
+    // The late pull reaches b, whose pin on a is refused by the grace:
+    // the shard stays on a, whole.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(a.local_shards("items").contains(&0), "{:?}", a.local_shards("items"));
+    assert!(!b.local_shards("items").contains(&0), "{:?}", b.local_shards("items"));
+    let r = a.query("SELECT count(*) AS n FROM items").unwrap();
+    assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(31));
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// `SHOW HEALTH` dials its peers holding no lock: with a peer that never
+/// answers, a write on this node lands while the report waits out the
+/// deadline. Until 0.98.0 the dials ran under the read lock, and one
+/// partitioned peer held every statement for the deadline -- with the
+/// console polling the report every ten seconds.
+#[test]
+fn show_health_dials_its_peers_holding_no_lock() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("health-a");
+    let b = Node::start("health-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(CREATE);
+    a.db.write().unwrap().insert("items", doc(0)).unwrap();
+    // b goes away and a listener that accepts and never answers takes its
+    // port: the hello to it waits out the deadline, two seconds here.
+    let b_port: u16 = b.url.rsplit(':').next().unwrap().parse().unwrap();
+    let b_dir = b.dir.clone();
+    drop(b);
+    settle();
+    let hole = std::net::TcpListener::bind(("127.0.0.1", b_port)).unwrap();
+    hole.set_nonblocking(true).unwrap();
+    let plug = Arc::new(AtomicBool::new(true));
+    let holding = {
+        let plug = plug.clone();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            while plug.load(Ordering::Relaxed) {
+                if let Ok((s, _)) = hole.accept() {
+                    kept.push(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    a.db.write().unwrap().opts.statement_deadline_ms = Some(6000);
+    // The served read path, as the console runs a read: the draft under
+    // the shared lock, the dials with it released.
+    let report = {
+        let db = a.db.clone();
+        std::thread::spawn(move || {
+            let p = db.read().unwrap().read("SHOW HEALTH").unwrap();
+            p.finished_with(&db).map(|o| format!("{o:?}")).map_err(|e| e.to_string())
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Meanwhile a write on a's own shard (tenant t0) lands at once.
+    let t0 = std::time::Instant::now();
+    a.db.write().unwrap().insert("items", doc(3)).unwrap();
+    // At once; a report dialling under the lock held it for the dial's
+    // timeout, seconds.
+    assert!(t0.elapsed() < std::time::Duration::from_millis(500), "the report held the lock");
+    let r = report.join().unwrap().unwrap();
+    assert!(r.contains("DOWN") || r.contains("did not answer"), "{r}");
+    plug.store(false, Ordering::Relaxed);
+    holding.join().unwrap();
+    let d = a.dir.clone();
+    drop(a);
+    settle();
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&b_dir);
+}
+
 /// A move issued to the source while writes flow through the source: the
 /// copy holds no lock on either end, so a reader on the source never
 /// waits long, and the move ends in seconds.
@@ -2125,6 +2460,74 @@ fn a_write_is_confirmed_on_the_follower_and_a_follower_away_is_caught_up_on_retu
     let h = b.ack("SHOW HEALTH");
     assert!(h.contains("follows shard 0 of `items` at term 0: caught up"), "{h}");
     for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Three copies and a failover: the third copy, which kept following at
+/// its old position until 0.98.0, starts over under the new holder and
+/// ends caught up with it, holding exactly what the new holder holds.
+#[test]
+fn a_third_copy_starts_over_under_the_new_holder() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("three-a");
+    let b = Node::start("three-b");
+    let c = Node::start("three-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (nodes = ['{a}', '{b}', '{c}'], replicas = 3)"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .replace("{c}", &c.url)
+            .as_str(),
+    );
+    for i in 0..20usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"k{i:04}","n":{i}}}')"#));
+    }
+    let caught = |n: &Node, term: u64| -> bool {
+        n.ack("SHOW HEALTH")
+            .contains(&format!("follows shard 0 of `items` at term {term}: caught up"))
+    };
+    for _ in 0..50 {
+        if caught(&b, 0) && caught(&c, 0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        caught(&b, 0) && caught(&c, 0),
+        "b: {}\nc: {}",
+        b.ack("SHOW HEALTH"),
+        c.ack("SHOW HEALTH")
+    );
+    // a is lost; b is promoted; c learns the term and starts over.
+    let a_dir = a.dir.clone();
+    drop(a);
+    settle();
+    let m = b.ack(&format!("PROMOTE SHARD 0 OF items ON '{}'", b.url));
+    assert!(m.contains("promoted here at term 1"), "{m}");
+    b.ack(r#"INSERT INTO items VALUES ('{"id":"k0900","n":900}')"#);
+    // c learns the term as a node does at its attach (a served node's
+    // reconciler does the same every thirty seconds; a test has none).
+    c.ack(&format!("ATTACH NODE '{}'", b.url));
+    for _ in 0..450 {
+        if caught(&c, 1) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(caught(&c, 1), "the promotion said: {m}\nc: {}", c.ack("SHOW HEALTH"));
+    // c's copy was refilled from b: the row written after the promotion
+    // is on it, and the count agrees with the holder's.
+    let on_c = c.db.read().unwrap().followed_count("items", 0);
+    assert_eq!(on_c, Some(21), "{}", c.ack("SHOW HEALTH"));
+    let _ = std::fs::remove_dir_all(&a_dir);
+    for n in [b, c] {
         let d = n.dir.clone();
         drop(n);
         settle();

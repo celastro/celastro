@@ -10,10 +10,13 @@ pub const SET: u8 = 0x31;
 pub const INTEGER: u8 = 0x02;
 pub const BIT_STRING: u8 = 0x03;
 pub const OCTET_STRING: u8 = 0x04;
+#[allow(dead_code)] // the tag table is kept whole
 pub const NULL: u8 = 0x05;
 pub const OID: u8 = 0x06;
 pub const UTF8_STRING: u8 = 0x0c;
+#[allow(dead_code)] // the tag table is kept whole
 pub const PRINTABLE_STRING: u8 = 0x13;
+#[allow(dead_code)] // the tag table is kept whole
 pub const IA5_STRING: u8 = 0x16;
 pub const UTC_TIME: u8 = 0x17;
 pub const GENERALIZED_TIME: u8 = 0x18;

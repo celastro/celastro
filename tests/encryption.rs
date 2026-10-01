@@ -320,6 +320,36 @@ fn a_keep_on_an_encrypted_database_leaves_its_backup_restorable() {
     let _ = std::fs::remove_dir_all(&fresh);
 }
 
+/// A destination shared by two nodes under different data keys: a KEEP
+/// from one cannot open the other's record, sweeps nothing of the pool,
+/// and says so by name -- until 0.98.0 it was skipped in silence.
+#[test]
+fn a_keep_names_the_record_it_cannot_open() {
+    let (da, db_, dest) = (dir("keep-two-a"), dir("keep-two-b"), dir("keep-two-dest"));
+    std::fs::create_dir_all(&dest).unwrap();
+    let node = |o: DbOpts, n: &str| {
+        let mut o = o;
+        o.node = Some(n.to_string());
+        o
+    };
+    let mut a = Db::open(&da, node(opts(Some(master(21))), "tcp://a.example:1")).unwrap();
+    setup(&mut a, 10);
+    let mut b = Db::open(&db_, node(opts(Some(master(22))), "tcp://b.example:1")).unwrap();
+    setup(&mut b, 10);
+    ack(&mut b, &format!("BACKUP TO '{}'", dest.display()));
+    ack(&mut a, &format!("BACKUP TO '{}'", dest.display()));
+    a.insert("items", doc(100)).unwrap();
+    ack(&mut a, "FLUSH items");
+    let m = ack(&mut a, &format!("BACKUP TO '{}' KEEP 1", dest.display()));
+    assert!(m.contains("removed 1 older backup(s)"), "{m}");
+    assert!(m.contains("the pool was not swept") && m.contains("nodes/b.example_1/"), "{m}");
+    drop(a);
+    drop(b);
+    for d in [&da, &db_, &dest] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// A backup before a rotation and one after, at one destination, each
 /// restore whole: the pool names an object by the key's fingerprint, so
 /// the resealed segment is a new object and the old backup's is still

@@ -1,7 +1,8 @@
 //! The primitives an in-tree TLS 1.3 needs, and nothing more: SHA-256 and
-//! HMAC (the S3 signer's too), SHA-512, HKDF, ChaCha20-Poly1305, and the
-//! curve25519 pair — X25519 for key agreement, Ed25519 for signatures —
-//! with RSA and P-256 verification for what other issuers sign. Each is
+//! HMAC (the S3 signer's too), SHA-384 and SHA-512, HKDF, ChaCha20-Poly1305,
+//! and the curve25519 pair — X25519 for key agreement, Ed25519 for
+//! signatures — with RSA, P-256 and P-384 verification (over a Barrett
+//! reducer in `bignum`) for what other issuers sign. Each is
 //! written from its RFC and pinned against the vectors published there;
 //! none is a port of another library. Nothing here reaches up into the
 //! database: this module is the bottom of the tree.
@@ -19,7 +20,6 @@
 
 // The record layer and the handshake are the callers; until they land the
 // primitives are reached by their tests alone.
-#![allow(dead_code)]
 
 pub mod bignum;
 pub mod chacha20poly1305;

@@ -607,8 +607,17 @@ MERGE SHARDS 1 AND 3 OF notes;
 MOVE SHARD 3 OF notes TO 'tcp://127.0.0.1:7878';
 MERGE SHARDS 1 AND 3 OF notes;
 LOCAL PLACE SHARD 0 OF notes ON 'tcp://127.0.0.1:7877';
+ABORT MOVE SHARD 3 OF notes;
 DETACH NODE 'tcp://127.0.0.1:7879';
 ```
+
+A move's copy has a deadline, `CELASTRO_MOVE_TIMEOUT` seconds (an hour):
+a target that does not answer within it is a move that fails, its pin on
+the source released. `ABORT MOVE SHARD i OF c`, from wherever it is
+issued, releases the pin at once -- the shard takes writes again, the
+target's copy fails at its next read -- and no move of the shard to the
+aborted target begins within thirty seconds of the abort, so a target
+that comes back late cannot pin it again; a move to another node goes.
 
 ```
 shard 2 of `notes` moved from tcp://127.0.0.1:7879 to tcp://127.0.0.1:7877; 3 file(s), map switched here and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7879

@@ -417,7 +417,11 @@ follower that was live when the wait ran has answered, after its own
 `fdatasync`, an instant at or past the statement's last on that shard; a
 follower away or catching up holds nothing yet, and the item is kept for
 it in the holder's backlog until it is live again (never dropped: over the
-cap the oldest half goes, covered by the catch-up that follows). Under
+cap -- a hundred thousand items or 256 MiB -- the oldest half goes,
+covered by a catch-up: a catch-up already running goes on and a second
+pass from where it reached follows it, since 0.98.0, where before it
+restarted from the same instant and on a busy shard never finished).
+Under
 `'quorum'`, at least a majority of the copies have answered such an
 instant -- two copies means the one follower, one copy means nobody.
 Under `'none'`, nothing beyond this disk. Whatever the rule,
@@ -616,7 +620,11 @@ the clockjump drill) -- so a write
 toward the old process is refused rather than taken. The drill's flipped
 assertion failed once more first: the write rode a pooled connection that
 a hello had just shown to be the older process, so a hello that shows one
-now drops the connection it came over, and a pooled connection to a
+now drops the connection it came over -- and since 0.98.0 each pooled
+connection carries the epoch of the process behind it, so a hello over
+any connection that names a newer process lets every older one go, and
+the server half (`observe_caller`) runs with no database lock, where
+under `try_read` it ran only when no writer waited -- and a pooled connection to a
 process since superseded is dropped before the next call (0.50.1). The
 other half needed the caller's epoch in the frame, which is wire version
 5: after the token, the caller's address and epoch, and a holder that has
@@ -647,7 +655,16 @@ lock on both ends, as a backup's copy does: the checks and the pin under
 the coordinator's lock, then deferred work that has the target pull the
 pinned files holding nothing, adopt them under its lock, and switch the map
 on every node itself, the source last (`Db::move_begin`, `Db::move_run`,
-`Db::pull_files`, `Db::finish_move_here`). A rebalance pins its moves and
+`Db::pull_files`, `Db::finish_move_here`; the files stream to disk chunk
+by chunk with one sync at the end, so a segment larger than the target's
+memory moves; the pull is never sent twice -- a connection reset after
+it was sent is a move that failed, since a second copy over the first's
+directory could adopt a shard missing files -- and a second pull of a
+shard onto a node while the first runs is refused by name; the copy has
+a deadline, `CELASTRO_MOVE_TIMEOUT`, and `ABORT MOVE SHARD` releases the
+pin from any node, after which no move of the shard begins for thirty
+seconds, so a target that comes back late cannot pin it again; all
+0.98.0). A rebalance pins its moves and
 copies them one after another the same way, applying only each move's
 entry to a target's map, since a plan's map is as of its pin. The drill's
 third-node move is the check, and a test with writes flowing through the
@@ -876,7 +893,12 @@ one, and a catch-up begins by naming where the follower stands
 (`SHIP_CATCHING_UP`), so the copy holds that position until the
 catch-up is whole and one cut short starts again from there (0.79.0;
 before it a copy already caught up moved its position with every chunk,
-and a catch-up cut short skipped the rows the chunks after it held). Since 0.94.0 the operator can refuse instead:
+and a catch-up cut short skipped the rows the chunks after it held). A
+copy kept across a change of holder starts over under the new one
+(0.98.0): what it took from the old holder past the new one's position
+is on no other node, and would come back were that copy promoted in
+turn. A ship batch is cut by count and by bytes, 500 items or 32 MiB,
+as a holder's share of a statement is. Since 0.94.0 the operator can refuse instead:
 `CELASTRO_MIN_HOLDERS=n` refuses, before it is logged, a write that
 fewer than `n` nodes would hold -- the holder and the followers fed live
 at that moment -- naming the count, so nothing is acknowledged on one
@@ -1999,10 +2021,13 @@ naming the wait (0.58.4).
 chart's probes run `celastro health` inside the pod, which asks the
 console for `/api/health` — served without the token, by decision, and
 answered by reading the catalog, so it measures the database and not the
-process. With more than one pod the readiness probe adds `--attached
-replicas-1`: a pod is routed to only once it has verified every peer since it
-started, because a statement it coordinates reaches the shards it does not
-hold through them. The peers are dialled outside the database lock, which a
+process. With more than one pod the readiness probe adds `--majority-of
+replicas` (0.98.0; `--attached replicas-1` before): a pod is routed to
+only once it and the peers answering it now are a majority of the
+cluster, because a statement it coordinates reaches the shards it does
+not hold through them -- and every peer since start made one dead pod
+keep every restarted pod unready and stall a rollout. A `startupProbe`
+covers an open that replays every log before liveness begins. The peers are dialled outside the database lock, which a
 verification found the hard way: dialled under it, a peer not yet up held
 every probe behind a five-second connect timeout and the pod failed its own
 liveness check. The lock itself is tried, not taken: a statement holding
@@ -2078,7 +2103,9 @@ from 0.66.0, for a client whose first share is of another group. A
 handshake that failed leaves the stream dead, every later read or write of
 it an error (0.83.0): before that a failure left the stream without keys
 and usable, and the wire's serve loop, which takes a read timeout for an
-idle poll, read on after a peer that stayed silent past the poll and was
+idle poll (the frame's length under the poll, the rest under a stall
+allowance of a minute since 0.98.0, so a pause inside a frame is a stall
+and never the start of a new frame), read on after a peer that stayed silent past the poll and was
 handed the next frame in the clear -- a token holder could bypass the
 client-certificate requirement and the encryption by waiting half a
 second; the wire now runs the handshake before its first read, under a

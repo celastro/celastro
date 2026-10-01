@@ -101,7 +101,12 @@ pub fn covers_indexes(seg: &crate::segment::Segment, coll: &crate::catalog::Coll
     use crate::catalog::IndexKind;
     coll.indexes.iter().all(|i| match &i.kind {
         IndexKind::FullText { .. } => seg.text_paths().contains(&i.path),
-        IndexKind::Vector { .. } => seg.vector_paths().contains(&i.path),
+        // The width and the metric too: an index re-made with other dims
+        // or another metric over a sealed segment left its old region in
+        // place, and a query of the new width matched nothing in it.
+        IndexKind::Vector { dims, metric } => {
+            seg.vector_meta(&i.path).is_some_and(|(d, m)| d == *dims && m == *metric)
+        }
         IndexKind::Adjacency { to } => {
             let a = seg.adjacency_paths();
             a.contains(&i.path) && a.contains(to)
@@ -158,10 +163,15 @@ pub fn plan(shard: &Shard, t: Timestamp, opts: &CompactionOpts) -> Option<Job> {
     // collection of two large segments never has. Oldest first, one per
     // pass, so the backfill of a wide collection is a rolling rebuild like a
     // format upgrade and not a stall.
+    // A backfill whose build failed -- a sealed row the index cannot take
+    // -- is set aside (`Shard::backfill_set_aside`) so the merges and the
+    // shards after this one are not starved by a job that fails on every
+    // pass; `CREATE INDEX` and `COMPACT` clear the set (0.98.0).
     if let Some(h) = shard
         .segments
         .iter()
         .filter(|h| !covers_indexes(&h.segment, &shard.coll))
+        .filter(|h| !shard.backfill_set_aside.contains(&h.id()))
         .min_by_key(|h| h.id())
     {
         return Some(Job::Rewrite { input: h.id(), reason: Reason::IndexBackfill });
@@ -309,6 +319,9 @@ pub struct Reserved {
     /// Where the build writes its outputs, so the install under the lock
     /// does not: `None` for a shard in memory.
     pub(crate) disk: Option<crate::shard::SegmentDisk>,
+    /// Whether this is an index backfill: a build of one that fails is
+    /// set aside rather than planned again.
+    pub backfill: bool,
 }
 
 /// What `build` made, to be installed by the shard it was reserved on.
@@ -341,6 +354,7 @@ impl std::fmt::Debug for Reserved {
 pub fn reserve(shard: &mut Shard, opts: &CompactionOpts) -> Option<Reserved> {
     let now = shard.clock.visible(shard.clock.peek());
     let job = plan(shard, now, opts)?;
+    let backfill = matches!(job, Job::Rewrite { reason: Reason::IndexBackfill, .. });
     let (inputs, level) = match &job {
         Job::Rewrite { input, .. } => {
             let level = shard
@@ -370,6 +384,7 @@ pub fn reserve(shard: &mut Shard, opts: &CompactionOpts) -> Option<Reserved> {
         retain_from: shard.retain_from(now),
         segment_cap: opts.segment_cap,
         disk: shard.segment_disk(),
+        backfill,
     })
 }
 

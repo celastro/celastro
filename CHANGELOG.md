@@ -6,6 +6,207 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## Unreleased
+
+**The zombie fence, per connection and off the lock.** A node's pool to
+a peer kept one epoch, set by the newest dial, so an older pooled
+connection was never told apart from a fresh one and kept carrying
+writes to a superseded process at the address; each connection carries
+the epoch of the process behind it now, a hello over any of them that
+names a newer process lets the older ones go, and the idle
+revalidation's hello compares epochs rather than only answering. On the
+holder's side the caller's epoch was checked only when no writer held or
+waited for the database lock, which under load was seldom; the check
+runs with no database lock now.
+
+**A pause inside a frame is a stall, not idleness.** The wire's server
+read every byte under the half-second idle poll, so a pause inside a
+large frame -- a retransmission gap on a long link -- lost the bytes read
+so far and parsed the rest as a frame of its own: garbage, the
+connection closed, a write reported as "may have landed" that was never
+read whole. The length is read under the poll and the rest of the frame
+under a stall allowance of a minute; a frame that stalls past it ends
+the connection, and nothing of it is taken for a frame.
+
+**A move's pull is not sent twice, and holds no file whole.** A pull
+whose connection reset after it was sent was sent again, and the second
+handler began by removing the first's incoming directory under it: a
+shard adopted with files missing was possible. The pull is not resent
+(the coordinator hears the move may have landed and aborts it), a second
+pull of a shard onto a node while the first is in progress is refused by
+name, and the pulled files stream to disk chunk by chunk with one sync
+at the end -- a segment larger than the target's memory moves.
+
+**A move has a deadline and an abort.** The copy had no deadline, so a
+target that stopped answering mid-move pinned the source's shard for
+good, writes refused and no way out but a restart. The copy has one
+(`CELASTRO_MOVE_TIMEOUT`, an hour), after which the move fails and the
+pin is released; `ABORT MOVE SHARD i OF c` releases it at once from any
+node; and no move of the shard to the aborted target begins within
+thirty seconds of the abort, so a target that comes back late cannot pin
+it again.
+
+**A copy kept across a change of holder starts over.** A third copy of
+a shard kept its position when its holder was replaced, and the new
+holder shipped from there: what the copy had taken from the old holder
+past the new one's position at the promotion stayed in it, on no other
+node, and would have come back had that copy been promoted in turn. A
+followed copy whose term changes under it is dropped and refilled from
+the new holder.
+
+**A catch-up that overflows continues from where it reached.** At the
+backlog's cap a running catch-up was dropped and the follower asked
+again where it stood -- the same instant, since a follower stands still
+until its catch-up is whole -- so on a shard taking a few hundred writes
+a second the catch-up restarted forever. The catch-up goes on, and a
+second pass from where it reached follows it in place of the live feed,
+covering what the backlog let go; a live follower that overflows is
+asked where it stands, as before.
+
+**Batches by bytes.** A ship batch and a holder's share of a statement
+were cut by count alone, five hundred documents; five hundred large
+ones made a frame past the wire's limit, refused at the receiver after
+all of it was sent. Both are cut at about 32 MiB of documents too, one
+document at least.
+
+**An accept loop that gives up ends the process.** The wire's listener
+ended on the first accept error that was not a would-block (a full
+descriptor table, a connection aborted before it was taken), for the
+life of the process, the console still green; and the console's own
+loop, giving up after a run of such errors, left the maintenance
+threads looping and the process alive with no listener. The wire backs
+off and retries as the console does, and a loop that gives up sets the
+stop flag: the process ends through the normal shutdown, and the probe
+that restarts it sees why.
+
+**Readiness as a majority, and a startup allowance.** The chart's
+readiness demanded every peer since start, so one dead pod kept every
+restarted pod unready and a rollout stalled; `health --majority-of T`
+asks that this node and the peers answering it now be a majority of the
+cluster, which the chart's readiness probe runs, and the health answer
+carries `answering`. A `startupProbe` covers an open that replays every
+log (`probes.startupFailureThreshold`, thirty periods) before liveness
+begins.
+
+**Smaller, from the second scan.** `key init` writes the wrapped data
+key for the owner alone (it was 0644). A wire token longer than a
+frame's head carries is refused at configuration (two nodes with one
+could never speak). The archive client's answer is cut by bytes without
+a panic on a length inside a character. An ingest batch is bounded by
+bytes (32 MiB) as well as by lines. A frame past the wire's limit is
+refused at the sender. The backlog kept for an away follower is capped
+by bytes (256 MiB) as well as by count. The rotation's second wire
+token rides in the chart's Secret, the TLS Job's Role reads its own
+Secret alone, and cloud-init fetches its environment file from a URL
+rather than carrying the tokens in user-data, and removes it on every
+exit. A vote or a claim whose persist failed is not sent.
+
+**A scan's handles survive a freeze.** A remote scan names the rows it
+defers as a unit's index and an ordinal, and the fetch checked the
+manifest's version; a memtable frozen between the two moved the units
+without a publication, so a handle named another unit and the fetch
+handed back a document under the wrong key, or failed on an ordinal
+out of range. The fetch compares the shard's layout version, which a
+freeze moves too, and a scan the layout moved under is retried.
+
+**An index backfill that cannot build no longer starves compaction.** A
+vector index created over sealed rows that do not fit it (a row of
+another width, a component past what `f32` holds) failed its backfill on
+every pass, and since the planner hands out the first job it finds, the
+merges on that shard and every shard after it never ran. `CREATE INDEX`
+checks the sealed rows and refuses naming the row; a backfill whose
+build fails anyway is set aside until `COMPACT` or the next `CREATE
+INDEX`, and the build's error names the row. An index re-made with
+another width or metric over sealed rows is a backfill now (the
+coverage check compared the path alone, and the stale region stood). A
+negated `text_match` over a segment sealed before the index answers
+nothing from it, where it answered every row, the matching ones
+included, until the backfill rewrote the segment.
+
+**Two lows of the planner and the catalog.** A paged ranked query took
+its `OFFSET` after the fetch, so a candidate whose document was gone by
+then (deleted since, or on a shard reported missing) shifted the page
+by one and the next page repeated a row; the offset is taken by rank
+before the fetch. The catalog decoder reserved its tablet count straight
+from the file, an abort on a crafted or bit-flipped catalog from a peer
+or a restore; the count is checked against the bytes behind it.
+
+**`SHOW HEALTH` dials its peers holding no lock.** The report dialled
+every peer under the read lock, so one partitioned peer held every
+statement for the deadline -- and the console polls the report every
+ten seconds. On a served node the draft is made under the lock, the
+peers are asked with it released, and the report is finished under the
+lock again; the embedded API and the command line, holding no lock to
+let go of, dial as before.
+
+**Two lows of the text index.** A dictionary block's shared-prefix count
+was reserved before it was checked (a crafted region asked the allocator
+for a terabyte); it is checked first. A posting's position count is
+bounded by the bytes behind it, and the loops end where the bytes do
+rather than spinning on a varint that is no longer there.
+
+**The engine's lows.** `MERGE SHARDS` persists the catalog before it
+removes the merged shard's directory. An automatic `SPLIT SHARD` whose
+median key holds a newline is refused naming the way out, as a given
+key with one is. The console's refusal throttle delays the refusal
+rather than every request from the address, so a client with the right
+token behind the same proxy as one guessing is answered at once. A seal
+whose timeline take fails puts its ticket back, as an install that
+fails does; a rotation that fails keeps the rotated logs' list. The
+vector store checks that its three regions agree on the vector count at
+open. A console worker that panics releases its connection slot. The
+change-stream cursor's instant is clamped to this node's horizon. An
+`https://[::1]/` archive endpoint on the default port verifies the
+certificate against `::1`, not `:`; a ranged read of an empty object at
+an S3 endpoint is present-and-empty, as at a directory.
+
+**The bucket's credentials out of the environment.** The archive store
+re-read `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` at every `BACKUP TO 's3://'` and at open, so they
+stayed in the process's environment for its life where the other secrets
+were scrubbed at start. The binary reads them once into the archive
+options and scrubs them with the rest.
+
+**A `KEEP` that cannot open a peer's record says so.** A destination
+shared by nodes under different data keys was pruned by none of them,
+in silence; the reply names the record it could not open.
+
+**A failed sync off the statement paths recovers in place too.** A
+follower's apply or a seal's rotation whose sync failed poisoned the
+log with the clock saying nothing, so nothing probed it and only a
+restart recovered; both set the flag now, and the next write recovers
+the log as a statement's failure does.
+
+**Revocation lists: an intermediate's, and critical extensions.** A
+list had to be signed by an anchor, so a leaf an intermediate issued
+could not be revoked; a list signed by a CA whose certificate rides in
+the file as a `CERTIFICATE` block, and that an anchor signed, is taken.
+A critical extension this reader does not take -- a delta indicator, an
+issuing distribution point, a certificate issuer on an entry -- is
+refused by name, where it was passed over and the list read as whole.
+
+**The archive client reads the head before the body.** An answer was
+buffered whole before its framing was looked at, so an endpoint that
+streamed past its length cost the client that much memory; the head is
+read first, bounded at 64 KiB, then exactly the body it frames, bounded
+at 256 MiB, refused as soon as a bound is passed.
+
+**The cryptography module's headers** say what each file does today
+(SHA-384, P-384, the Barrett reducer), the doubled comments are one, and
+the blanket allowance for dead code is gone.
+
+**A negated negation matches again.** `text_match(body, '--x')`
+answered every row, `quick --lazy` dropped its second constraint and
+`-(-a -b)` answered everything: a `-` over a subtree that excluded
+rather than scored excluded nothing. It is the inner exclusion set now,
+scored flat.
+
+**A publication while a sync is pending carries no mark of it.** A seal,
+a compaction or a manifest publication between a group's failed sync
+and the next write persisted the refused writes' supersede marks into a
+delete log, where the recovery could not take them back; a publication
+leaves out the marks of writes whose sync is still pending.
+
 ## 0.97.0 — 2026-09-30
 
 **The readiness assessment's first pass (R5): what it found is fixed.**

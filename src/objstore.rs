@@ -105,6 +105,15 @@ pub struct ArchiveOpts {
     /// in the usual places; a container `FROM scratch` has none, so the
     /// chart mounts one.
     pub ca: Option<std::path::PathBuf>,
+    /// The bucket's credentials, read once by the binary at start from
+    /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`
+    /// and then scrubbed from the environment (0.98.0; the store re-read
+    /// them at every backup and open, so they stayed readable in the
+    /// process's environment for its life). Unset, the library reads the
+    /// environment itself.
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub session_token: Option<String>,
 }
 
 /// A store and the key prefix every object of this database carries. What
@@ -274,9 +283,16 @@ impl S3Store {
         };
         let (dial, host_header, https) = parse_endpoint(&endpoint)?;
         let tls = if https {
-            let host = host_header.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_header);
-            // An IPv6 literal's brackets are the URL's, not the name's.
-            let host = host.trim_start_matches('[').trim_end_matches(']');
+            // The name the certificate is checked against: an IPv6 literal
+            // is the bracketed part whole, with or without a port after it
+            // (`[::1]` on the default port split at its last colon into
+            // `[:` through 0.97.0); a name or an IPv4 address is what
+            // stands before the port.
+            let host: &str = if let Some(rest) = host_header.strip_prefix('[') {
+                rest.split(']').next().unwrap_or("")
+            } else {
+                host_header.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_header)
+            };
             Some(Arc::new(ArchiveTls {
                 anchors: archive_anchors(opts.ca.as_deref())?,
                 host: host.to_string(),
@@ -288,12 +304,16 @@ impl S3Store {
         if opts.bucket.is_empty() {
             return Err(Error::Storage("archive: no bucket configured".into()));
         }
-        let var = |name: &str| {
-            std::env::var(name).ok().filter(|v| !v.is_empty()).ok_or_else(|| {
-                Error::Storage(format!(
-                    "archive: {name} is not set; credentials come from the environment"
-                ))
-            })
+        let var = |name: &str, given: &Option<String>| {
+            given
+                .clone()
+                .filter(|v| !v.is_empty())
+                .or_else(|| std::env::var(name).ok().filter(|v| !v.is_empty()))
+                .ok_or_else(|| {
+                    Error::Storage(format!(
+                        "archive: {name} is not set; credentials come from the environment"
+                    ))
+                })
         };
         Ok(S3Store {
             endpoint,
@@ -305,9 +325,9 @@ impl S3Store {
             } else {
                 opts.region.clone()
             },
-            access_key: var("AWS_ACCESS_KEY_ID")?,
-            secret_key: var("AWS_SECRET_ACCESS_KEY")?,
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty()),
+            access_key: var("AWS_ACCESS_KEY_ID", &opts.access_key)?,
+            secret_key: var("AWS_SECRET_ACCESS_KEY", &opts.secret_key)?,
+            session_token: var("AWS_SESSION_TOKEN", &opts.session_token).ok(),
         })
     }
 
@@ -481,6 +501,9 @@ impl ObjectStore for S3Store {
         match r.status {
             200 | 206 => Ok(Some(r.body)),
             404 => Ok(None),
+            // A range on an object of no bytes: present, and empty, as the
+            // directory store answers it (0.98.0; it was an error).
+            416 => Ok(Some(Vec::new())),
             _ => Err(self.fail("GET", key, &r)),
         }
     }
@@ -1069,6 +1092,30 @@ pub(crate) fn amz_date(secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    /// The bucket's credentials come from the options when the binary
+    /// read them at start, so the environment can be scrubbed of them;
+    /// unset there, the environment is read as before.
+    #[test]
+    fn the_credentials_come_from_the_options_before_the_environment() {
+        let mut o = ArchiveOpts::default();
+        o.endpoint = Some("http://127.0.0.1:1".to_string());
+        o.bucket = "b".to_string();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        let e = S3Store::from_env(&o).unwrap_err().to_string();
+        assert!(e.contains("AWS_ACCESS_KEY_ID is not set"), "{e}");
+        o.access_key = Some("AKIA".to_string());
+        o.secret_key = Some("s3cr3t".to_string());
+        let s = S3Store::from_env(&o).unwrap();
+        assert_eq!(s.access_key, "AKIA");
+        assert!(s.session_token.is_none());
+    }
 }
 
 #[cfg(test)]

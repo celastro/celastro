@@ -966,8 +966,13 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         }
     } else {
         // Fetch payloads from the winning shards only, every shard at once.
+        // The offset is taken by rank, before the fetch: a candidate whose
+        // document is gone by the time it is fetched (deleted since, or on
+        // a shard reported missing) must not shift the page by one, so the
+        // skip counts ranked candidates and not fetched rows (0.98.0).
         fetch_t = Instant::now();
-        let page: Vec<&(String, f32, Option<f32>)> = ranked.iter().take(want).collect();
+        let page: Vec<&(String, f32, Option<f32>)> =
+            ranked.iter().skip(sel.offset).take(k).collect();
         let keys: Vec<&str> = page.iter().map(|(k, _, _)| k.as_str()).collect();
         let docs = fetch_many(input.shards, &keys, input.ts, partial, &mut missing)?;
         for ((key, score, dist), doc) in page.into_iter().zip(docs) {
@@ -982,10 +987,6 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
     }
     ex.fetch_micros = fetch_t.elapsed().as_micros();
     ex.fetched_payloads = rows.len();
-
-    if sel.offset > 0 {
-        rows = rows.into_iter().skip(sel.offset).collect();
-    }
     rows.truncate(k);
     // The cursor carries the last row's *sort* value, which is what
     // `search_after` compares against — not the distance the user sees.
@@ -1672,7 +1673,7 @@ pub(crate) fn aggregate_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> R
     let count_only =
         sel.group_by.is_none() && specs.iter().all(|(f, p)| *f == AggFunc::Count && p.is_none());
     let mut sx =
-        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+        ShardExplain { index: si, manifest_version: shard.layout_version(), ..Default::default() };
     let t0 = Instant::now();
     let snap = shard.snapshot_at(req.ts);
     let units = shard.sources(&snap);
@@ -2118,7 +2119,14 @@ fn eval_defined(
             )))
         }
         // A text match is two-valued: a document either matches or it does not.
-        Expr::TextMatch { .. } => Bitmap::all(n),
+        // Defined for a unit that holds the index's region: one sealed
+        // before the index knows nothing of the match, so a negation over
+        // it answers nothing rather than every row (through 0.97.0 `NOT
+        // text_match` returned a whole unindexed segment, matches included).
+        Expr::TextMatch { path, .. } => match unit.text_handle(path)? {
+            Some(h) if h.source(path).is_some() => Bitmap::all(n),
+            _ => Bitmap::new(n),
+        },
         // A distance is defined where the document has a vector; elsewhere the
         // predicate is NULL, so `NOT (d < t)` does not select a document that
         // has no distance to be outside the threshold with.
@@ -2425,7 +2433,7 @@ pub(crate) fn scan_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result
     }
     let needs_doc = !req.fields.is_empty() || sel.collapse.is_some();
     let mut sx =
-        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+        ShardExplain { index: si, manifest_version: shard.layout_version(), ..Default::default() };
     let t0 = Instant::now();
     let snap = shard.snapshot_at(req.ts);
     let units = shard.sources(&snap);
@@ -2528,7 +2536,7 @@ pub(crate) fn candidates_on(
     let sel = req.select;
     let t0 = Instant::now();
     let mut sx =
-        ShardExplain { index: si, manifest_version: shard.manifest_version, ..Default::default() };
+        ShardExplain { index: si, manifest_version: shard.layout_version(), ..Default::default() };
     let snap = shard.snapshot_at(req.ts);
     let units = shard.sources(&snap);
     // Per-source heaps, merged across every unit of this shard (step 3).
@@ -2613,10 +2621,12 @@ pub(crate) fn documents_on(
     ts: Timestamp,
     handles: &[(usize, u32)],
 ) -> Result<Vec<Value>> {
-    if shard.manifest_version != manifest_version {
+    // The layout, not the manifest alone: a freeze between the scan and
+    // the fetch reorders the units a handle names without a publication.
+    if shard.layout_version() != manifest_version {
         return Err(Error::SnapshotGone(format!(
-            "manifest v{manifest_version} moved to v{} between the scan and the fetch",
-            shard.manifest_version
+            "the shard's layout v{manifest_version} moved to v{} between the scan and the fetch",
+            shard.layout_version()
         )));
     }
     let snap = shard.snapshot_at(ts);

@@ -115,8 +115,13 @@ spec:
                   name: {{ include "celastro.wireSecretName" $r }}
                   key: CELASTRO_WIRE_TOKEN
             {{- if $r.Values.wire.tokenAlso }}
+            # The rotation's second token rides in the Secret like the
+            # first (0.98.0; it was a plain value in the pod spec).
             - name: CELASTRO_WIRE_TOKEN_ALSO
-              value: {{ $r.Values.wire.tokenAlso | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "celastro.wireSecretName" $r }}
+                  key: CELASTRO_WIRE_TOKEN_ALSO
             {{- end }}
             {{- end }}
             {{- if $r.Values.archive.endpoint }}
@@ -156,14 +161,17 @@ spec:
           # The probes ask the console itself, from inside the pod, and the
           # console answers only after it has read its catalog: a process
           # that is up with a database it cannot open is not ready.
-          # Ready means able to coordinate: with peers, the node has to have
-          # verified every one of them since it started, or a Service would
-          # route a statement to a pod that cannot yet reach the shards it
-          # does not hold. Liveness asks only whether it serves.
+          # Ready means able to coordinate: with peers, the node and the
+          # peers answering it now have to be a majority of the cluster, or
+          # a Service would route a statement to a pod that cannot reach the
+          # shards it does not hold. Liveness asks only whether it serves.
+          # Ready when this node and the peers answering it now are a
+          # majority of the cluster: one dead pod does not keep every
+          # restarted pod unready (0.98.0; before, every peer since start).
           readinessProbe:
             exec:
               {{- if gt $total 1 }}
-              command: ["/celastro", "--port", {{ $r.Values.port | quote }}, "health", "--attached", {{ sub $total 1 | toString | quote }}]
+              command: ["/celastro", "--port", {{ $r.Values.port | quote }}, "health", "--majority-of", {{ $total | toString | quote }}]
               {{- else }}
               command: ["/celastro", "--port", {{ $r.Values.port | quote }}, "health"]
               {{- end }}
@@ -173,6 +181,14 @@ spec:
             timeoutSeconds: {{ $r.Values.probes.timeoutSeconds }}
             periodSeconds: {{ $r.Values.probes.periodSeconds }}
             failureThreshold: {{ $r.Values.probes.failureThreshold }}
+          # An open that replays every log takes what it takes: the startup
+          # probe covers it, and liveness begins once it has passed.
+          startupProbe:
+            exec:
+              command: ["/celastro", "--port", {{ $r.Values.port | quote }}, "health"]
+            periodSeconds: {{ $r.Values.probes.periodSeconds }}
+            failureThreshold: {{ $r.Values.probes.startupFailureThreshold }}
+            timeoutSeconds: {{ $r.Values.probes.timeoutSeconds }}
           livenessProbe:
             exec:
               command: ["/celastro", "--port", {{ $r.Values.port | quote }}, "health"]

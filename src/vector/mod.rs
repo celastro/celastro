@@ -551,6 +551,24 @@ impl VectorStore {
             Codes::decode_bytes(codes)?
         };
         let graph = if graph.is_empty() { None } else { Some(Hnsw::decode(graph)?) };
+        // The three regions agree on how many vectors there are, or the
+        // file is damaged: a full-precision slice past its end, or a code
+        // for a vector the map does not name, was an index out of range
+        // at the first search rather than a refusal here (0.98.0).
+        if fullv.len() != map_v.len() * dims {
+            return Err(Error::Storage(format!(
+                "vector store: {} full-precision values for {} vectors of {dims} dimensions",
+                fullv.len(),
+                map_v.len()
+            )));
+        }
+        if codes.count != 0 && codes.count != map_v.len() {
+            return Err(Error::Storage(format!(
+                "vector store: {} codes for {} vectors",
+                codes.count,
+                map_v.len()
+            )));
+        }
         Ok(VectorStore { dims, metric, full: fullv, codes, vec_to_doc: map_v, graph })
     }
 }
@@ -570,6 +588,25 @@ fn cmp_dist(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
         // Ordinal tie-break keeps equal distances deterministic; the
         // coordinator re-breaks on primary key (§7.2).
         .then(a.0.cmp(&b.0))
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    /// Regions that disagree on the vector count are refused at open,
+    /// not an index out of range at the first search.
+    #[test]
+    fn a_vector_store_whose_regions_disagree_is_refused_at_open() {
+        let full: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let map2: Vec<u8> = [0u32, 1].iter().flat_map(|n| n.to_le_bytes()).collect();
+        let map3: Vec<u8> = [0u32, 1, 2].iter().flat_map(|n| n.to_le_bytes()).collect();
+        assert!(VectorStore::open(2, Metric::L2, &full, &[], &[], &map2).is_ok());
+        let e = VectorStore::open(2, Metric::L2, &full, &[], &[], &map3).err().expect("refused");
+        assert!(e.to_string().contains("full-precision values for 3 vectors"), "{e}");
+        let e = VectorStore::open(3, Metric::L2, &full, &[], &[], &map2).err().expect("refused");
+        assert!(e.to_string().contains("for 2 vectors of 3 dimensions"), "{e}");
+    }
 }
 
 #[cfg(test)]
