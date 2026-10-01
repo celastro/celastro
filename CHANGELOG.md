@@ -119,7 +119,9 @@ node's epoch, which the zombie fence compares, was its start instant; a
 clock corrected backwards (or the clockjump drill's offset lifted) made
 a restarted node older than the one its peers had seen, and they refused
 it for as long as the clock lagged -- an hour in the drill. The epoch is
-one past the directory's last (`EPOCH`) when the clock says less.
+one past the directory's last (`EPOCH`) when the clock says less; under
+`CELASTRO_SEAL_IDENTITY=3` or lower the file is not written, since a
+node before this release names it as damage.
 
 **The recovery point from the open on.** A node reopened reports how far
 the archive reaches for each shard it holds from its open, read from the

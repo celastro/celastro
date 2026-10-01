@@ -206,6 +206,11 @@ pub fn bound_select_with(sel: &Select, caps: (usize, usize)) -> Result<(Select, 
 /// it: an hour, in the clockjump drill. Its own directory's last word is
 /// what a restart counts from.
 fn next_epoch(dir: &Path, now: u64) -> Result<u64> {
+    // Under a pin to what a node before 0.97.0 reads, no `EPOCH` is
+    // written: that node's `check` would name it as a torn frame.
+    if crate::cipher::pool_by_id_pinned() {
+        return Ok(now);
+    }
     let path = dir.join("EPOCH");
     let last = match fs::read_to_string(&path) {
         Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
