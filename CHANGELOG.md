@@ -6,7 +6,7 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## Unreleased
+## 0.98.0 — 2026-10-01
 
 **The zombie fence, per connection and off the lock.** A node's pool to
 a peer kept one epoch, set by the newest dial, so an older pooled
