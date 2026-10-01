@@ -2892,9 +2892,7 @@ impl Db {
     /// log archive set. Until 0.97.0 the lag was the reach's age, which
     /// grew on an idle node and marked it STALE after an hour of quiet.
     pub fn archive_lag_micros(&self) -> Option<i64> {
-        if self.log_archive.is_none() {
-            return None;
-        }
+        self.log_archive.as_ref()?;
         Some(self.shards.values().flatten().map(|s| s.archive_lag_micros()).max().unwrap_or(0))
     }
 
@@ -10940,7 +10938,11 @@ mod tests {
         db.insert("notes", row("n1")).unwrap();
         assert!(db.archive_lag_micros().unwrap() > 0, "a write and nothing shipped: the lag is it");
         db.execute(&format!("BACKUP LOG TO '{}'", archive.display())).unwrap();
-        assert_eq!(db.archive_lag_micros(), Some(0), "shipped to the newest write: no lag, idle or not");
+        assert_eq!(
+            db.archive_lag_micros(),
+            Some(0),
+            "shipped to the newest write: no lag, idle or not"
+        );
         assert!(!db.show_health().contains("STALE"), "{}", db.show_health());
         db.insert("notes", row("n2")).unwrap();
         assert!(db.archive_lag_micros().unwrap() > 0, "a write past the reach");
