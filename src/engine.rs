@@ -6617,8 +6617,9 @@ impl Db {
 
     /// For the steward: the shards whose holder is not among `answered`,
     /// with the followers that are -- what an automatic failover promotes
-    /// from.
-    pub fn failover_plan(&self, answered: &[String]) -> Vec<(String, usize, u64, Vec<String>)> {
+    /// from -- and every follower the map names, so the sweep knows how
+    /// many it has not heard.
+    pub fn failover_plan(&self, answered: &[String]) -> Vec<FailoverPlan> {
         let mut out = Vec::new();
         for (name, tablets) in &self.catalog.placement {
             for (i, t) in tablets.iter().enumerate() {
@@ -6632,7 +6633,7 @@ impl Db {
                     .cloned()
                     .collect();
                 if !up.is_empty() {
-                    out.push((name.clone(), i, t.term, up));
+                    out.push((name.clone(), i, t.term, up, t.followers.clone()));
                 }
             }
         }
@@ -11075,6 +11076,10 @@ pub fn vote(lease: &Lease, from: &str, term: u64, candidate: &str, pre: bool) ->
     }
     (false, g.election.as_ref().map_or(0, |e| e.term()))
 }
+
+/// A shard the steward may fail over: the collection, the shard, its
+/// term, the followers heard this sweep and every follower the map names.
+pub type FailoverPlan = (String, usize, u64, Vec<String>, Vec<String>);
 
 /// A copy this node follows, and the term it follows at.
 pub struct FollowedShard {

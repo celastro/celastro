@@ -2826,10 +2826,33 @@ fn lease_renewer(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
     }
 }
 
+/// How many of a lost holder's `followers` the steward must hear from
+/// before it promotes one. Under quorum the last acknowledgement is on
+/// the holder and `needed` followers (`copies / 2`, as the shipper
+/// counts), so one of them is among any `followers - needed + 1` heard:
+/// every follower of three copies, three of four at five, the one of two.
+/// Under `all` every live follower has every acknowledged write, and
+/// under `none` no follower holds one: one heard is enough.
+fn must_hear(followers: usize, confirm: crate::replication::Confirm) -> usize {
+    let needed = match confirm {
+        crate::replication::Confirm::Quorum => {
+            let copies = followers + 1;
+            copies / 2
+        }
+        crate::replication::Confirm::All | crate::replication::Confirm::None => followers,
+    };
+    followers - needed + 1
+}
+
 /// The steward's part of a sweep, with automatic failover on: a
 /// promotion for every shard whose holder has missed two sweeps -- the
 /// follower that answered with the most recent copy is promoted, at the
-/// next term, and tells everyone.
+/// next term, and tells everyone. Under `confirm = quorum` only once
+/// enough followers have answered that the one that took part in the
+/// last acknowledgement is among them (`must_hear`): the most recent of
+/// whichever answered the sweep was promoted before, and with the
+/// confirming follower unheard for one call the older copy took the
+/// shard and the acknowledged write was on no holder.
 fn steward_sweep(
     db: &RwLock<Db>,
     peers: &[(String, Arc<crate::wire::Node>)],
@@ -2851,7 +2874,7 @@ fn steward_sweep(
     if !is_steward || !auto {
         return;
     }
-    for (collection, shard, term, followers) in plan {
+    for (collection, shard, term, followers, named) in plan {
         let holder = read(db).holder_of(&collection, shard).unwrap_or_default();
         if missed.get(&holder).copied().unwrap_or(0) < 2 {
             continue;
@@ -2877,10 +2900,11 @@ fn steward_sweep(
         // that wrote through the holder are there); under quorum only the
         // most recent copy is known to have taken part in the last
         // acknowledgement, and it is the one, wherever it is.
-        let (holder_region, quorum) = {
+        let (holder_region, confirm) = {
             let g = read(db);
-            (g.region_of(&holder), g.confirm_of(&collection) == crate::replication::Confirm::Quorum)
+            (g.region_of(&holder), g.confirm_of(&collection))
         };
+        let quorum = confirm == crate::replication::Confirm::Quorum;
         // The most recent copy first: a follower away from the holder
         // while another was live missed acknowledged writes, whatever its
         // region; the region only breaks a tie.
@@ -2889,6 +2913,9 @@ fn steward_sweep(
             (at, same)
         };
         let mut best: Option<(String, u64)> = None;
+        // The followers heard this sweep: an answer either way, since a
+        // copy behind is still a copy whose position is known.
+        let mut heard: Vec<String> = Vec::new();
         for f in &followers {
             let status = if f == &me {
                 let (followed, held) = {
@@ -2901,6 +2928,9 @@ fn steward_sweep(
                 let _deadline = crate::deadline::arm(Some(10_000));
                 node.ship_status(&collection, shard, term)
             };
+            if status.is_ok() {
+                heard.push(f.clone());
+            }
             match status {
                 Ok((caught_up, at)) if caught_up => {
                     if best.as_ref().map_or(true, |(b, bat)| rank(f, at) > rank(b, *bat)) {
@@ -2921,6 +2951,37 @@ fn steward_sweep(
                     &[("node", f.clone()), ("error", e.to_string())],
                 ),
             }
+        }
+        // Fewer heard than the rule needs is the promotion deferred to the
+        // next sweep, not made from the followers that happened to answer
+        // this one: under quorum the copy that confirmed the last write
+        // may be the one not heard, and promoting another loses it.
+        let need = must_hear(named.len(), confirm);
+        let unheard: Vec<String> = named.iter().filter(|f| !heard.contains(f)).cloned().collect();
+        if heard.len() < need {
+            crate::log::warn(
+                "failover_waits_for_followers",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("holder", holder.clone()),
+                    ("heard", heard.len().to_string()),
+                    ("must_hear", need.to_string()),
+                    ("unheard", unheard.join(", ")),
+                ],
+            );
+            continue;
+        }
+        if !unheard.is_empty() && confirm == crate::replication::Confirm::All {
+            crate::log::warn(
+                "failover_follower_unheard",
+                &[
+                    ("collection", collection.clone()),
+                    ("shard", shard.to_string()),
+                    ("holder", holder.clone()),
+                    ("unheard", unheard.join(", ")),
+                ],
+            );
         }
         let Some((f, at)) = best else {
             crate::log::warn(
@@ -4111,6 +4172,263 @@ mod tests {
         // process is a lease and a quarter old.
         assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(70)).is_some());
         assert!(g.promotion_wait("tcp://h:2", lease, t0 + Duration::from_secs(76)).is_none());
+    }
+
+    /// The quorum failover's candidate set: `followers - needed + 1` of a
+    /// lost holder's followers must be heard before one is promoted, so
+    /// that the one that confirmed the last write is among them.
+    #[test]
+    fn a_quorum_failover_must_hear_enough_followers_to_hold_the_confirming_one() {
+        use super::must_hear;
+        use crate::replication::Confirm;
+        assert_eq!(must_hear(2, Confirm::Quorum), 2, "three copies: every follower");
+        assert_eq!(must_hear(3, Confirm::Quorum), 2, "four copies: two of three");
+        assert_eq!(must_hear(4, Confirm::Quorum), 3, "five copies: three of four");
+        assert_eq!(must_hear(1, Confirm::Quorum), 1, "two copies: the one, as before");
+        assert_eq!(must_hear(2, Confirm::All), 1, "under all every live copy has everything");
+        assert_eq!(must_hear(2, Confirm::None), 1, "under none no copy holds an acknowledgement");
+    }
+
+    /// The wire token the steward tests serve under: the same value in
+    /// every test that sets it, since the variable is the process's.
+    const FAILOVER_TOKEN: &str = "lease-test-token";
+
+    /// A node for the steward's failover tests: served on the wire from
+    /// its own directory (or one it comes back to), the steward named.
+    /// Automatic failover is on at the steward alone: on a holder it
+    /// gates writes behind a lease nobody renews here.
+    fn failover_node(
+        tag: &str,
+        listener: std::net::TcpListener,
+        url: &str,
+        steward: &str,
+        dir: Option<std::path::PathBuf>,
+    ) -> (
+        std::sync::Arc<crate::lock::RwLock<crate::engine::Db>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::path::PathBuf,
+    ) {
+        use crate::engine::{Db, DbOpts};
+        let dir = dir.unwrap_or_else(|| {
+            let d =
+                std::env::temp_dir().join(format!("celastro-serve-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            d
+        });
+        let opts = DbOpts {
+            node: Some(url.to_string()),
+            steward: Some(steward.to_string()),
+            auto_failover: url == steward,
+            lease_secs: 0,
+            ..DbOpts::default()
+        };
+        let db = std::sync::Arc::new(crate::lock::RwLock::new(Db::open(&dir, opts).unwrap()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (d, st) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let _ = crate::wire::serve(listener, d, FAILOVER_TOKEN.to_string(), st, None);
+        });
+        (db, stop, dir)
+    }
+
+    fn failover_ack(
+        db: &std::sync::Arc<crate::lock::RwLock<crate::engine::Db>>,
+        sql: &str,
+    ) -> String {
+        let out = db.write().unwrap().execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match out.finished_with(db).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            crate::engine::Outcome::Ack(m) => m,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    fn failover_bind(port: u16) -> (std::net::TcpListener, String) {
+        let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let url = format!("tcp://127.0.0.1:{}", l.local_addr().unwrap().port());
+        (l, url)
+    }
+
+    /// Three copies under quorum and the holder lost: the sweep promotes
+    /// nothing until it has heard every follower -- the one it has not
+    /// may be the one that confirmed the last acknowledged writes -- and
+    /// then the most recent of them, which answers every acknowledged
+    /// key. Before, the most recent of whichever followers answered the
+    /// sweep was promoted: here the steward's own older copy, and the
+    /// keys the lost holder and the unheard follower had acknowledged
+    /// between them were on no holder.
+    #[test]
+    fn a_quorum_failover_waits_for_the_unheard_follower_rather_than_promote_the_older_copy() {
+        use super::{steward_sweep, Grants};
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        std::env::set_var(crate::wire::TOKEN_ENV, FAILOVER_TOKEN);
+        let (la, ua) = failover_bind(0);
+        let (lb, ub) = failover_bind(0);
+        let (lc, uc) = failover_bind(0);
+        let c_port: u16 = uc.rsplit(':').next().unwrap().parse().unwrap();
+        let (a, a_stop, a_dir) = failover_node("quorum-a", la, &ua, &uc, None);
+        let (b, b_stop, b_dir) = failover_node("quorum-b", lb, &ub, &uc, None);
+        let (c, c_stop, c_dir) = failover_node("quorum-c", lc, &uc, &uc, None);
+        // c's copy seals every few rows, so its ship mark is on disk and
+        // the copy reopens below as it stood: caught up, at its instant.
+        c.write().unwrap().opts.thresholds.max_bytes = 64;
+        for u in [&ub, &uc] {
+            failover_ack(&a, &format!("ATTACH NODE '{u}'"));
+        }
+        failover_ack(
+            &a,
+            &format!(
+                "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 3, \
+                 confirm = 'quorum', nodes = ['{ua}', '{ub}', '{uc}'])"
+            ),
+        );
+        let insert =
+            |i: usize| format!(r#"INSERT INTO items VALUES ('{{"id":"k{i:04}","n":{i}}}')"#);
+        for i in 0..20 {
+            failover_ack(&a, &insert(i));
+        }
+        let mark = c_dir.join("collections/items/followed/shard-0000/SHIPPED");
+        let live =
+            || failover_ack(&a, "SHOW HEALTH").contains("confirm = quorum, 3 of 3 copies live");
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until && !(mark.exists() && live()) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(mark.exists(), "c's copy wrote no ship mark; the reopen below proves nothing");
+        assert!(live(), "{}", failover_ack(&a, "SHOW HEALTH"));
+        // c away: ten more rows, acknowledged under quorum by a and b.
+        c_stop.store(true, Ordering::Relaxed);
+        drop(c);
+        std::thread::sleep(Duration::from_millis(700));
+        for i in 20..30 {
+            failover_ack(&a, &insert(i));
+        }
+        // a lost; c back as it was -- the older copy, and the steward.
+        a_stop.store(true, Ordering::Relaxed);
+        drop(a);
+        std::thread::sleep(Duration::from_millis(700));
+        let (lc, _) = failover_bind(c_port);
+        let (c, c_stop, c_dir) = failover_node("quorum-c", lc, &uc, &uc, Some(c_dir));
+        let (caught_up, at) = {
+            let g = c.read().unwrap();
+            let followed = g.followed();
+            let f = followed.lock().unwrap();
+            let copy = f.get(&("items".to_string(), 0)).expect("c follows shard 0");
+            let copy = copy.lock().unwrap();
+            (copy.shard.caught_up, copy.shard.ship_ts)
+        };
+        assert!(
+            caught_up && at > 0,
+            "c's copy reopened not caught up ({caught_up} at {at}); it would be passed over \
+             for the wrong reason"
+        );
+        // Back, c attaches b again, as a served node's peers reattach at
+        // their next sweep: the steward dials the peers it knows.
+        failover_ack(&c, &format!("ATTACH NODE '{ub}'"));
+        let peers = c.read().unwrap().peers();
+        assert!(peers.iter().any(|(u, _)| u == &ub), "c does not know b");
+        let grants = Grants::new();
+        let mut missed = std::collections::BTreeMap::new();
+        missed.insert(ua.clone(), 2u32);
+        missed.insert(ub.clone(), 1u32);
+        // Sweep one: a has missed two sweeps and b was not heard this
+        // one. The steward's own copy is the one candidate heard, and
+        // one of two is not enough under quorum: nothing is promoted.
+        steward_sweep(&c, &peers, &[], &missed, &grants, Duration::from_secs(1));
+        assert_eq!(
+            c.read().unwrap().holder_of("items", 0).as_deref(),
+            Some(ua.as_str()),
+            "the older copy was promoted with the confirming follower unheard"
+        );
+        // Sweep two: b heard. The more recent copy, it is promoted, and
+        // every key acknowledged while c was away answers on it.
+        steward_sweep(
+            &c,
+            &peers,
+            std::slice::from_ref(&ub),
+            &missed,
+            &grants,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            b.read().unwrap().holder_of("items", 0).as_deref(),
+            Some(ub.as_str()),
+            "b, heard and the more recent, was not promoted"
+        );
+        let r = b.write().unwrap().query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(30));
+        for i in 0..30 {
+            let r = b
+                .write()
+                .unwrap()
+                .query(&format!("SELECT id FROM items WHERE id = 'k{i:04}'"))
+                .unwrap();
+            assert_eq!(r.rows.len(), 1, "k{i:04} was acknowledged and is not on the new holder");
+        }
+        b_stop.store(true, Ordering::Relaxed);
+        c_stop.store(true, Ordering::Relaxed);
+        drop(b);
+        drop(c);
+        std::thread::sleep(Duration::from_millis(700));
+        for d in [a_dir, b_dir, c_dir] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// Two copies under `all` and the holder lost: the one follower,
+    /// heard, is promoted at the first sweep as before -- here the
+    /// steward's own copy, promoted where it is.
+    #[test]
+    fn a_failover_under_all_promotes_the_one_follower_heard_as_before() {
+        use super::{steward_sweep, Grants};
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        std::env::set_var(crate::wire::TOKEN_ENV, FAILOVER_TOKEN);
+        let (la, ua) = failover_bind(0);
+        let (lb, ub) = failover_bind(0);
+        let (a, a_stop, a_dir) = failover_node("all-a", la, &ua, &ub, None);
+        let (b, b_stop, b_dir) = failover_node("all-b", lb, &ub, &ub, None);
+        failover_ack(&a, &format!("ATTACH NODE '{ub}'"));
+        failover_ack(
+            &a,
+            &format!(
+                "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 2, \
+                 nodes = ['{ua}', '{ub}'])"
+            ),
+        );
+        for i in 0..10 {
+            failover_ack(
+                &a,
+                &format!(r#"INSERT INTO items VALUES ('{{"id":"k{i:04}","n":{i}}}')"#),
+            );
+        }
+        let live = || failover_ack(&a, "SHOW HEALTH").contains(&format!("follower {ub} live"));
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until && !live() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(live(), "{}", failover_ack(&a, "SHOW HEALTH"));
+        a_stop.store(true, Ordering::Relaxed);
+        drop(a);
+        std::thread::sleep(Duration::from_millis(700));
+        let peers = b.read().unwrap().peers();
+        let grants = Grants::new();
+        let mut missed = std::collections::BTreeMap::new();
+        missed.insert(ua.clone(), 2u32);
+        steward_sweep(&b, &peers, &[], &missed, &grants, Duration::from_secs(1));
+        assert_eq!(
+            b.read().unwrap().holder_of("items", 0).as_deref(),
+            Some(ub.as_str()),
+            "the one follower, heard, was not promoted"
+        );
+        let r = b.write().unwrap().query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(10));
+        b_stop.store(true, Ordering::Relaxed);
+        drop(b);
+        std::thread::sleep(Duration::from_millis(700));
+        for d in [a_dir, b_dir] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     /// The metrics page names every counter once, typed, and counts what

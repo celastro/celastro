@@ -1049,7 +1049,13 @@ length on a thread of its own (inside the sweep the renewals stretched
 with it, and five nodes under an ingest refused writes for a lease the
 steward was late to renew) and, on each reconcile sweep with
 `CELASTRO_AUTO_FAILOVER=on`, promotes the follower with the
-most recent copy once a holder has missed two sweeps. A holder whose
+most recent copy once a holder has missed two sweeps -- under
+`confirm = quorum` only once enough followers have answered that the
+one that confirmed the last write is among them, `followers - needed +
+1` of them (every follower of three copies), the sweep logging
+`failover_waits_for_followers` and trying again until then; a lasting
+split between the steward and that follower is a shard without
+automatic failover until an operator promotes by hand. A holder whose
 lease ran out refuses writes until it is renewed, so a holder the
 steward cannot reach is not taking writes while its follower is
 promoted; a steward that is down is no failover and no worse than
@@ -2056,9 +2062,18 @@ with the holder, and refuses the write when the budget runs out with
 fewer -- the error says the write is on this disk alone and may not
 survive a failover, which is the truth; `None` acknowledges at once.
 Under quorum the promotion takes the most recent caught-up copy, the
-one that took part in the last acknowledgement, wherever it is; under
-`All` every live copy has everything, so the holder's region is
-preferred. The shipper's backoff became the follower's on the way:
+one that took part in the last acknowledgement, wherever it is -- and
+only once enough followers have answered the steward that this copy is
+among them, `followers - needed + 1` of them (every follower of three
+copies, three of four at five), the sweep logging
+`failover_waits_for_followers` and leaving the shard to the next until
+then (before, the most recent of whichever followers answered the sweep
+was promoted, and the confirming follower unheard for one ten-second
+call lost the acknowledged write: the older copy took the shard, the
+confirming copy was reset under the new term and the lost holder
+demoted from nothing); under `All` every live copy has everything, so
+the holder's region is preferred. The shipper's backoff became the
+follower's on the way:
 one follower down slept the whole round, and under quorum the live
 follower is the acknowledgement.
 
