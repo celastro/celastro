@@ -115,9 +115,12 @@ in [docs/sql.md](sql.md#backups).
 ## Encryption at rest
 
 Off until a master key is given. **`key master <FILE>`** writes one
-(64 hex digits, readable by you only); `CELASTRO_MASTER_KEY_FILE` on
-every start then encrypts every file under `--dir`, and every backup and
-export it writes. A database made with the key is refused without it.
+(64 hex digits, readable by you only) and syncs it to disk before it
+answers; keep it on durable storage and copy it somewhere safe before
+the first open, since every file the database writes from then on is
+under it and a lost master opens none of them. `CELASTRO_MASTER_KEY_FILE`
+on every start then encrypts every file under `--dir`, and every backup
+and export it writes. A database made with the key is refused without it.
 When the master rotates, `CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or
 `CELASTRO_MASTER_KEY_PREVIOUS`, the hex, removed from the environment
 once read as `CELASTRO_MASTER_KEY` is) names the one it replaced: a node

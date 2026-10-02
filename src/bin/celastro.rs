@@ -2320,7 +2320,22 @@ fn write_with_mode(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<
         o.mode(if private { 0o600 } else { 0o644 });
     }
     let mut f = o.open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    // Durable before the command answers: the first open wraps the data
+    // key under the master in this file and writes `KEY` with an fsync,
+    // so a master that was still in the page cache at a power loss left
+    // a `KEY` no master opens, with acknowledged rows under it. The
+    // file's bytes, then its name (0.98.0 synced neither).
+    f.sync_all()?;
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn serve_json(server: &Server) -> Value {
