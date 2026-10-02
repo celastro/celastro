@@ -3672,3 +3672,86 @@ fn a_cluster_backup_names_a_silent_peer_and_answers() {
     let _ = std::fs::remove_dir_all(&c_dir);
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// A write whose group sync is in flight when its shard is pinned for a
+/// move is carried by the move: the pin waits for the syncs in flight to
+/// settle, then reads its instant. It read the instant at once -- the
+/// horizon, below the write -- so the export left the write out while
+/// its own thread went on to sync and acknowledge it, and the switch
+/// removed the source's directory, its only copy. Both pins: the
+/// source's own, and the one a coordinator asks a source for over the
+/// wire.
+#[test]
+fn a_write_in_flight_at_the_pin_is_carried_by_the_move() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("inflight-a");
+    let b = Node::start("inflight-b");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (nodes = ['{}'], replicas = 1)",
+        a.url
+    ));
+    for i in 0..20usize {
+        let doc = Value::obj(vec![
+            ("id".into(), Value::Str(format!("k{i:04}"))),
+            ("n".into(), Value::Int(i as i64)),
+        ]);
+        a.db.write().unwrap().insert("items", doc).unwrap();
+    }
+    for n in [&a, &b] {
+        n.db.write().unwrap().set_group_commit(true);
+    }
+    // The write appended and applied under the holder's lock, its sync
+    // left for after it as a served statement's is; the statement is
+    // finished -- synced, acknowledged -- on a thread of its own a second
+    // after the move is asked for: where a console thread is, in its
+    // fdatasync, when the pin reads the clock.
+    let held_move = |holder: &Node, issuer: &Node, target: &Node, key: &str| {
+        let sql = format!(r#"INSERT INTO items VALUES ('{{"id":"{key}","n":1}}')"#);
+        let pending = match holder.exec(&sql).unwrap() {
+            Outcome::Deferred(d) => d,
+            other => panic!("the sync was not left for after the lock: {other:?}"),
+        };
+        let finisher = {
+            let db = holder.db.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                pending.finish_with(&db)
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let m = issuer.ack(&format!("MOVE SHARD 0 OF items TO '{}'", target.url));
+        let took = t0.elapsed();
+        assert!(m.contains("map switched"), "{m}");
+        let acked = finisher.join().unwrap().unwrap_or_else(|e| panic!("the write in flight: {e}"));
+        assert!(
+            matches!(&acked, Outcome::Ack(m) if m.contains("1 document(s) written")),
+            "{acked:?}"
+        );
+        assert_eq!(target.local_shards("items"), vec![0]);
+        for n in [holder, target] {
+            let r = n.query(&format!("SELECT id FROM items WHERE id = '{key}' LIMIT 2")).unwrap();
+            assert_eq!(r.rows.len(), 1, "{}: `{key}`, acknowledged under the pin, is gone", n.url);
+        }
+        // The row is the point; this is how it got there: the pin waited.
+        assert!(
+            took >= std::time::Duration::from_millis(900),
+            "the pin did not wait for the write in flight: the move took {took:?}"
+        );
+    };
+    // The source's own pin: the move issued where the shard is.
+    held_move(&a, &a, &b, "held-at-source");
+    // The pin over the wire: issued at a, the shard on b.
+    held_move(&b, &a, &a, "held-over-wire");
+    for n in [&a, &b] {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(22), "{}", n.url);
+    }
+    for n in [a, b] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

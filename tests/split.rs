@@ -235,3 +235,61 @@ fn a_median_split_and_a_merge_are_each_other_s_inverse() {
     assert_eq!(count(&mut db, "SELECT count(*) AS n FROM items"), 420);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A write whose group sync is in flight when the shard is split is on
+/// one of the halves afterwards: the split waits for the syncs in flight
+/// to settle, then pins the files the new shard is made from. It pinned
+/// at once -- at the horizon, below the write -- so the new shard lacked
+/// the write and the old shard's range no longer covered its key:
+/// acknowledged, and read from neither half.
+#[test]
+fn a_write_in_flight_at_the_pin_is_on_one_of_the_halves() {
+    let d = dir("inflight");
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    ack(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    for i in 0..40 {
+        db.insert("items", doc(i)).unwrap();
+    }
+    db.set_group_commit(true);
+    // One statement, a row for each side of the split key, its sync left
+    // for after the lock as a served statement's is; finished -- synced,
+    // acknowledged -- on a thread of its own a second after the split is
+    // asked for: where a console thread is, in its fdatasync, when the
+    // pin reads the clock.
+    let sql = r#"INSERT INTO items VALUES ('{"id":"a-held","n":1}'), ('{"id":"z-held","n":2}')"#;
+    let pending = match db.execute(sql).unwrap() {
+        Outcome::Deferred(p) => p,
+        other => panic!("the sync was not left for after the lock: {other:?}"),
+    };
+    let finisher = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        pending.finish()
+    });
+    let t0 = std::time::Instant::now();
+    let m = ack(&mut db, "SPLIT SHARD 0 OF items AT 'm'");
+    let took = t0.elapsed();
+    assert!(m.contains("shard 1 is [m, )"), "{m}");
+    let acked = finisher.join().unwrap().unwrap_or_else(|e| panic!("the write in flight: {e}"));
+    assert!(matches!(&acked, Outcome::Ack(m) if m.contains("2 document(s) written")), "{acked:?}");
+    let both_answer = |db: &mut Db, when: &str| {
+        for key in ["a-held", "z-held"] {
+            let r = db.query(&format!("SELECT id FROM items WHERE id = '{key}' LIMIT 5")).unwrap();
+            assert_eq!(
+                r.rows.len(),
+                1,
+                "{when}: `{key}`, acknowledged under the pin, answers from neither half"
+            );
+        }
+        assert_eq!(count(db, "SELECT count(*) AS n FROM items"), 42, "{when}");
+    };
+    both_answer(&mut db, "after the split");
+    // The rows are the point; this is how they got there: the pin waited.
+    assert!(
+        took >= std::time::Duration::from_millis(900),
+        "the pin did not wait for the write in flight: the split took {took:?}"
+    );
+    drop(db);
+    let mut db = Db::open(&d, DbOpts::default()).unwrap();
+    both_answer(&mut db, "after a reopen");
+    let _ = std::fs::remove_dir_all(&d);
+}

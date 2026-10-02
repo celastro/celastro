@@ -4276,6 +4276,35 @@ impl Db {
 
     // ------------------------------------------------------------- moves
 
+    /// Every write in flight here settled, before a pin. Under group
+    /// commit a write is appended and applied under the lock and its log
+    /// synced after the lock is let go, and until the sync it is above
+    /// `read_ts()`: a snapshot pinned meanwhile -- a move's export, a
+    /// split's -- left it out while its own thread went on to sync and
+    /// acknowledge it, and the switch then removed the source's
+    /// directory, the only copy, or ranged its key out of the shard it
+    /// stayed in. No write begins while this lock is held, so the wait is
+    /// the syncs in flight and no longer; a sync that failed never
+    /// settles, and the statement's deadline bounds the rest: either
+    /// refuses the pin, and nothing is pinned below a write.
+    fn settle_writes_in_flight(&self, collection: &str, shard: usize, what: &str) -> Result<()> {
+        let ms = crate::deadline::remaining_ms().unwrap_or(DEFAULT_STATEMENT_DEADLINE_MS);
+        let until = Instant::now() + Duration::from_millis(ms);
+        if self.clock.wait_visible(self.clock.peek(), until) {
+            return Ok(());
+        }
+        if self.clock.failed() {
+            return Err(Error::Storage(format!(
+                "shard {shard} of `{collection}` was not pinned for the {what}: a write in flight \
+                 will not settle, its log failed to sync; restart the node to replay it"
+            )));
+        }
+        Err(Error::Deadline(format!(
+            "shard {shard} of `{collection}` was not pinned for the {what}: a write in flight did \
+             not settle within {ms} ms"
+        )))
+    }
+
     /// Pin a shard this node holds for a move to `to`: from this call until
     /// the map switches, writes to it are refused naming the move, and the
     /// files as they are at this instant are what the target pulls. Returns
@@ -4324,6 +4353,7 @@ impl Db {
         }
         let coll = self.catalog.get(collection)?.clone();
         self.absorb_shard_catalogs(collection)?;
+        self.settle_writes_in_flight(collection, shard, "move")?;
         let ts = self.read_ts();
         let s = self
             .shards
@@ -4877,6 +4907,7 @@ impl Db {
             )));
         }
         self.absorb_shard_catalogs(collection)?;
+        self.settle_writes_in_flight(collection, shard, "split")?;
         let ts = self.read_ts();
         let cdir = dir.join("collections").join(collection);
         let incoming = cdir.join(format!("shard-{next:04}.incoming"));
@@ -7991,8 +8022,9 @@ impl Db {
         let dialer = self.dialer();
         let chunk = self.opts.insert_batch.max(1);
         Ok(Outcome::Deferred(Deferred::new(move || {
-            let n = n + carry_deletes(&collection, away, remaining, &dialer, chunk)?;
+            // This node's syncs before the carry, as an insert's: see there.
             confirm.wait()?;
+            let n = n + carry_deletes(&collection, away, remaining, &dialer, chunk)?;
             Ok(Outcome::Ack(format!("{n} document(s) deleted")))
         })))
     }
@@ -8369,9 +8401,17 @@ impl Db {
                 let chunk = self.opts.insert_batch.max(1);
                 let here_n = n - away.values().map(|(_, d)| d.len()).sum::<usize>();
                 Ok(Outcome::Deferred(Deferred::new(move || {
+                    // This node's syncs settled before the carry, not
+                    // after it. A pin here waits for the writes in flight
+                    // here, and a carry waits for the holder's lock; a
+                    // statement carrying while its own sync was unsettled
+                    // kept a pin here waiting on a peer -- one that may be
+                    // pinning in turn and waiting on a carry back, two
+                    // pins refused at their deadlines. The client pays the
+                    // same two waits, the other way round.
+                    confirm.wait()?;
                     let last =
                         carry_writes(&collection, away, last, here_n, remaining, &dialer, chunk)?;
-                    confirm.wait()?;
                     Ok(Outcome::Ack(format!("{n} document(s) written at ts {last}")))
                 })))
             }
