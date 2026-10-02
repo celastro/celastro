@@ -2718,10 +2718,39 @@ fn handle(
                     "the move's budget ran out before the switch ({e})"
                 ))));
             }
-            let switch = db
+            // Bound first: a `match` on the call would hold the write guard
+            // through its arms, and the refused arm reads the map.
+            let finished = db
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
-                .finish_move_here(&coll, &tablets, shard, &incoming, &from)?;
+                .finish_move_here(&coll, &tablets, shard, &incoming, &from);
+            let switch = match finished {
+                Ok(s) => s,
+                Err(e) => {
+                    // Refused before the map was taken here -- the adopt
+                    // (a key this node lacks, a range that does not open)
+                    // -- is a move this node does not finish either, and the
+                    // fenced source has to be told so, or it refuses its
+                    // shard's reads until a restart: an abort by order does
+                    // not release a fenced pin. Once the map names this node
+                    // the error goes back as it is; the switch or the next
+                    // reconcile finishes the move.
+                    let taken = db
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .catalog
+                        .placement
+                        .get(&collection)
+                        .and_then(|t| t.get(shard))
+                        .is_some_and(|t| t.node == me);
+                    if taken {
+                        return Err(e);
+                    }
+                    return Err(Error::Plan(let_go(format!(
+                        "the shard was not adopted here ({e})"
+                    ))));
+                }
+            };
             // The switch is carried holding nothing, for the same reason the
             // copy is.
             let switched = Db::carry_switch(&switch);

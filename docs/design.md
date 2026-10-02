@@ -712,8 +712,11 @@ seconds, so a target that comes back late cannot pin it again; all
 takes the map next, so the source refuses the abort; the target itself
 fails its pull -- the files pulled removed, the pin released by force,
 since it takes nothing -- when the fence is refused (an abort landed
-first) or the move's budget ran out before the switch; and the node
-that issued the abort asks the target's catalog with no lock held,
+first), when the move's budget ran out before the switch, or when the
+adopt is refused after the fence (a key the node lacks, a range that
+does not open), since an abort by order no longer frees a fenced source;
+and the node that issued the abort asks the target's catalog with no
+lock held,
 carrying the switch to the source when the target has taken the map
 (the move complete) and leaving the pin otherwise. (0.98.0 discarded
 the fence's answer and adopted under a fresh budget, so an abort during
