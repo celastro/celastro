@@ -9,7 +9,7 @@ use celastro::value::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn dir(tag: &str) -> PathBuf {
@@ -484,6 +484,18 @@ fn post(addr: &str, token: &str, sql: &str) -> String {
     reply
 }
 
+/// A `celastro serve` the test started. Dropping it stops the process with
+/// no grace and reaps it, on every exit path: a test that fails an
+/// assertion on the way leaves no server running behind it.
+struct Served(Child);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The cadence under `serve`: `CELASTRO_LOG_SHIP_EVERY=1` ships the live
 /// log every second, the process is lost with no grace, its volume with
 /// it, and a restore `AS OF` an instant after the last acknowledged write
@@ -496,16 +508,18 @@ fn a_served_node_ships_its_live_log_on_a_cadence_and_a_restore_holds_every_row_a
     let dest = dir("cadence-dest");
     std::fs::create_dir_all(&dest).unwrap();
     let data = dir("cadence-data");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_celastro"))
-        .args(["--json", "--dir", data.to_str().unwrap(), "serve", "--port", "0"])
-        .env("CELASTRO_LOG_ARCHIVE", dest.to_str().unwrap())
-        .env("CELASTRO_LOG_SHIP_EVERY", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn celastro");
+    let mut served = Served(
+        Command::new(env!("CARGO_BIN_EXE_celastro"))
+            .args(["--json", "--dir", data.to_str().unwrap(), "serve", "--port", "0"])
+            .env("CELASTRO_LOG_ARCHIVE", dest.to_str().unwrap())
+            .env("CELASTRO_LOG_SHIP_EVERY", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn celastro"),
+    );
     let mut first = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    BufReader::new(served.0.stdout.take().unwrap()).read_line(&mut first).unwrap();
     let hello = celastro::json::parse(&first).expect("the first line is the JSON url object");
     let addr = hello.get("addr").and_then(|v| v.as_str()).unwrap().to_string();
     let token = hello.get("token").and_then(|v| v.as_str()).unwrap().to_string();
@@ -541,8 +555,7 @@ fn a_served_node_ships_its_live_log_on_a_cadence_and_a_restore_holds_every_row_a
     }
     assert_eq!(held, expected(0..20), "the cadence never shipped every row");
     // The power loss: no grace, and the volume gone with it.
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(served);
     let _ = std::fs::remove_dir_all(&data);
     let now = celastro::time::from_micros(celastro::time::now_micros());
     let (m, held) = restore_at(&fresh, &dest, now);
