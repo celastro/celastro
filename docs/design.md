@@ -1966,6 +1966,25 @@ for at the next term, and only a majority of yeses makes it stand, so
 a node cut off alone never raises its term and, back, follows the
 steward's next heartbeat instead of forcing an election.
 
+**A holder outside the steward group is leased too (0.98.0).** The
+heartbeats went to the group alone, so a data node not in
+`CELASTRO_STEWARDS` -- the documented group of three among more nodes
+-- was never leased: `Db::steward` stayed none, `lease_check` had
+nothing to run out, and cut off from the steward such a holder
+acknowledged writes for as long as the partition lasted while the
+steward, its hold-off over, promoted the holder's follower; the heal
+demoted it and lost every write it had taken. The steward's heartbeat
+round now goes to every attached peer (`serve::lease_everyone`), at its
+term; a node outside the group runs the machine as a lease-taker alone
+-- it takes the heartbeat, stands for nothing, and its answers are not
+votes (`Election` takes an answer from outside the group for nothing,
+so a leased outsider neither freshens a cut-off steward's majority nor
+steps it down). And with stewards configured, no steward heard for a
+lease since the election began on a node counts as a lease run out:
+nobody is renewing it, and a steward it cannot see may be promoting its
+follower. The lease of grace is a fresh node's, whose first heartbeat
+is an election and a quarter lease away.
+
 **The steward waits out the lease before it promotes (0.61.1).** The
 lease is what stops a holder that is cut off rather than dead: it
 refuses writes once the lease runs out. The steward promoted a

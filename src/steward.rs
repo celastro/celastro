@@ -58,7 +58,9 @@ pub enum Msg {
         term: u64,
         granted: bool,
     },
-    /// A steward's heartbeat (the lease renewal carries it).
+    /// A steward's heartbeat (the lease renewal carries it). It goes to
+    /// every attached node, in the group or not; only a member's answer
+    /// counts.
     Heartbeat {
         term: u64,
     },
@@ -114,14 +116,20 @@ pub struct Election {
     round: BTreeSet<String>,
     majority_at: Instant,
     became_steward: Option<Instant>,
+    /// When this election began here: a node that has heard no steward
+    /// for a lease since then is refused writes under automatic failover.
+    started: Instant,
     lease: Duration,
     timeout: Duration,
 }
 
 impl Election {
-    /// `group` includes `me`. `term` and `voted_for` as persisted, or
-    /// zero and none. `timeout` is the election timeout, at least half
-    /// the lease; a caller adds its own random slice.
+    /// `group` is the configured group, which may leave `me` out: a node
+    /// outside it runs the machine as a lease-taker alone -- it accepts
+    /// the elected steward's heartbeats and stands for nothing. `term`
+    /// and `voted_for` as persisted, or zero and none. `timeout` is the
+    /// election timeout, at least half the lease; a caller adds its own
+    /// random slice.
     pub fn new(
         me: &str,
         group: &[String],
@@ -132,9 +140,6 @@ impl Election {
         now: Instant,
     ) -> Election {
         let mut group = group.to_vec();
-        if !group.iter().any(|g| g == me) {
-            group.push(me.to_string());
-        }
         group.sort();
         group.dedup();
         Election {
@@ -151,6 +156,7 @@ impl Election {
             round: BTreeSet::new(),
             majority_at: now,
             became_steward: None,
+            started: now,
             lease,
             timeout: timeout.max(lease / 2),
         }
@@ -190,6 +196,17 @@ impl Election {
     /// Since when this node has been steward, if it is.
     pub fn steward_since(&self) -> Option<Instant> {
         self.became_steward
+    }
+
+    /// When this election began here.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// Whether `who` is one of the group: the only ones that stand, and
+    /// the only ones whose answers count.
+    fn voter(&self, who: &str) -> bool {
+        self.group.iter().any(|g| g == who)
     }
 
     fn step_down(&mut self, term: u64, out: &mut Vec<Action>) {
@@ -262,7 +279,9 @@ impl Election {
                 }
             }
             Role::Follower | Role::Candidate => {
-                if !self.quiet(now) {
+                // A node outside the group takes the steward's lease and
+                // stands for nothing: the group elects among itself.
+                if !self.voter(&self.me) || !self.quiet(now) {
                     return out;
                 }
                 // Ask first whether the group would vote: a node alone
@@ -306,6 +325,18 @@ impl Election {
     /// come back as actions.
     pub fn on_message(&mut self, now: Instant, from: &str, msg: Msg) -> Vec<Action> {
         let mut out = Vec::new();
+        // The heartbeat goes to every attached node, the group's and the
+        // rest, but only the group votes: an answer from outside it neither
+        // freshens the majority nor steps a steward down. (A higher term
+        // out there is one a member stood at, and comes back through the
+        // members.)
+        let answer = matches!(
+            msg,
+            Msg::PreVoteAnswer { .. } | Msg::VoteAnswer { .. } | Msg::HeartbeatAnswer { .. }
+        );
+        if answer && !self.voter(from) {
+            return out;
+        }
         match msg {
             Msg::PreVote { term, candidate: _ } => {
                 // Would be granted: a term at least this node's, and no
@@ -631,5 +662,66 @@ mod tests {
             to: "c".into(),
             msg: Msg::VoteAnswer { term: 2, granted: true }
         }));
+    }
+
+    /// The heartbeat reaches every attached node, but only the group
+    /// votes: an answer from a node outside it is no majority and no
+    /// reason to step down, so a steward cut off from its group steps
+    /// down on time however many leased outsiders still answer it, and an
+    /// outsider's term moves nobody.
+    #[test]
+    fn an_answer_from_outside_the_group_counts_for_nothing() {
+        let mut g = Group::new(3, Duration::from_secs(10));
+        g.tick(6, "n1");
+        assert_eq!(g.stewards(), vec!["n1".to_string()]);
+        g.cut.insert(("n1".into(), "n0".into()));
+        g.cut.insert(("n1".into(), "n2".into()));
+        // Its rounds reach no member; a leased outsider answers every one.
+        for t in [8, 10] {
+            g.tick(t, "n1");
+            let now = g.at(t);
+            let n1 = g.nodes.get_mut("n1").unwrap();
+            let out = n1.on_message(now, "x", Msg::HeartbeatAnswer { term: 1, accepted: true });
+            assert!(out.is_empty(), "{out:?}");
+        }
+        let n = g.tick(12, "n1");
+        assert!(
+            n.contains(&Action::SteppedDown { term: 1 }),
+            "an outsider's answers kept the steward up: {n:?}"
+        );
+        // An outsider's higher term moves nobody: it is a member's to carry.
+        let mut g = Group::new(3, Duration::from_secs(10));
+        g.tick(6, "n1");
+        let now = g.at(7);
+        let n1 = g.nodes.get_mut("n1").unwrap();
+        let out = n1.on_message(now, "x", Msg::HeartbeatAnswer { term: 5, accepted: false });
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!((n1.role(), n1.term()), (Role::Steward, 1));
+        let out = n1.on_message(now, "x", Msg::VoteAnswer { term: 5, granted: false });
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(n1.term(), 1);
+    }
+
+    /// A node outside the group takes the steward's heartbeat as a member
+    /// does and stands for nothing: quiet for ever, it asks no pre-vote
+    /// and raises no term.
+    #[test]
+    fn a_node_outside_the_group_follows_the_steward_and_never_stands() {
+        let t0 = Instant::now();
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let lease = Duration::from_secs(10);
+        let mut x = Election::new("x", &names, 0, None, lease, lease / 2, t0);
+        assert_eq!(x.group(), &names[..], "the outsider is not added to the group");
+        for secs in [6, 12, 60, 600] {
+            assert!(x.tick(t0 + Duration::from_secs(secs)).is_empty(), "the outsider stood");
+        }
+        assert_eq!((x.role(), x.term(), x.steward()), (Role::Follower, 0, None));
+        let out = x.on_message(t0 + Duration::from_secs(601), "b", Msg::Heartbeat { term: 2 });
+        assert!(out.contains(&Action::Send {
+            to: "b".into(),
+            msg: Msg::HeartbeatAnswer { term: 2, accepted: true }
+        }));
+        assert_eq!((x.term(), x.steward()), (2, Some("b")));
+        assert_eq!(x.started(), t0);
     }
 }

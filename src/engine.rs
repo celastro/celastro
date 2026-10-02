@@ -477,7 +477,9 @@ pub struct DbOpts {
     /// The group that elects the steward among themselves, addresses:
     /// `CELASTRO_STEWARDS`. Set, `steward` is ignored and the steward is
     /// whichever of the group holds the current term; a node not in the
-    /// group follows the elected one's leases.
+    /// group stands for nothing and takes its lease from the elected one,
+    /// which renews every attached peer, and under `auto_failover` it
+    /// refuses writes once a lease has passed with none, as a member does.
     pub stewards: Option<Vec<String>>,
     /// Where this node runs: `CELASTRO_REGION` (or `CELASTRO_REGIONS`, a
     /// list picked by the node's ordinal). Placement spreads a shard's
@@ -2770,7 +2772,17 @@ impl Db {
             ));
         }
         if self.opts.stewards.is_some() && self.steward().is_none() {
-            out.push_str("steward: none elected yet; automatic failover waits for one\n");
+            let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+            out.push_str(&format!(
+                "steward: none heard yet; automatic failover waits for one{}\n",
+                if self.opts.auto_failover && Self::no_steward_for_a_lease(&g, self.opts.lease_secs)
+                {
+                    "; no lease for a lease's length: writes are refused until a steward \
+                     reaches this node"
+                } else {
+                    ""
+                }
+            ));
         }
         if let Some(s) = self.steward() {
             let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
@@ -6090,16 +6102,10 @@ impl Db {
         self.steward().is_some_and(|s| self.is_self(&s))
     }
 
-    /// The group that elects the steward, this node included, or none
-    /// when the steward is configured.
+    /// The group that elects the steward, as configured -- this node may
+    /// be outside it -- or none when the steward is configured.
     pub fn steward_group(&self) -> Option<Vec<String>> {
-        let mut g = self.opts.stewards.clone()?;
-        if let Some(me) = &self.opts.node {
-            if !g.contains(me) {
-                g.push(me.clone());
-            }
-        }
-        Some(g)
+        self.opts.stewards.clone()
     }
 
     /// The lease, shared with the wire.
@@ -6109,13 +6115,33 @@ impl Db {
 
     /// A write is refused under automatic failover once the steward's
     /// lease on this node ran out: a holder the steward cannot reach may
-    /// be replaced, and must not take writes meanwhile.
+    /// be replaced, and must not take writes meanwhile. With an elected
+    /// steward, no steward heard at all counts the same once a lease has
+    /// passed since the election began here (`no_steward_for_a_lease`):
+    /// such a node is cut off from the group, or the group has no steward
+    /// -- nobody is renewing it either way, and a steward it cannot see
+    /// may be promoting its follower. (Before, it took writes with no
+    /// lease to run out, for as long as a partition lasted.)
     fn lease_check(&self) -> Result<()> {
         if !self.opts.auto_failover || self.is_steward() {
             return Ok(());
         }
-        let Some(steward) = self.steward() else { return Ok(()) };
+        let steward = self.steward();
         let g = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(steward) = steward else {
+            if self.opts.stewards.is_none()
+                || !Self::no_steward_for_a_lease(&g, self.opts.lease_secs)
+            {
+                return Ok(());
+            }
+            return Err(Error::Plan(format!(
+                "this node's lease from the steward was never granted: no steward has reached \
+                 this node in the {} s since its election began; writes are refused until one \
+                 does (automatic failover is on; a steward this node cannot see may be \
+                 promoting a follower)",
+                g.election.as_ref().map_or(0, |e| e.started().elapsed().as_secs())
+            )));
+        };
         let fresh = g
             .at
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(self.opts.lease_secs));
@@ -6133,6 +6159,20 @@ impl Db {
                 None => "was never granted".to_string(),
             }
         )))
+    }
+
+    /// With an elected steward, whether a lease has passed since the
+    /// election began on this node and no steward has been heard: the
+    /// point at which having no lease is a lease run out. The lease of
+    /// grace is a fresh node's: its first heartbeat is an election and up
+    /// to a quarter lease away, and a node refused before one could have
+    /// arrived would be refused for nothing. A directory opened by a tool
+    /// rather than served runs no election, and is not gated here.
+    fn no_steward_for_a_lease(g: &LeaseState, lease_secs: u64) -> bool {
+        g.steward.is_none()
+            && g.election.as_ref().is_some_and(|e| {
+                e.started().elapsed() >= std::time::Duration::from_secs(lease_secs)
+            })
     }
 
     /// The steward's word about who it is, kept beside the lease so a
@@ -15305,6 +15345,126 @@ mod tests {
         assert_eq!(apply_election_actions(&mut g, actions()).len(), 1, "persisted, the vote goes");
         assert!(root.join(STEWARD_FILE).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lease cell as the elector leaves it on a served node: an
+    /// election over `group` that began `ago` ago.
+    fn election_here(db: &Db, group: &[&str], ago: Duration) {
+        let lease = Duration::from_secs(db.lease_secs());
+        let group: Vec<String> = group.iter().map(|g| g.to_string()).collect();
+        let began = Instant::now().checked_sub(ago).expect("an instant that long ago");
+        db.lease().lock().unwrap().election = Some(crate::steward::Election::new(
+            db.node().unwrap(),
+            &group,
+            0,
+            None,
+            lease,
+            lease / 2,
+            began,
+        ));
+    }
+
+    fn outside_the_group(dir: &Path, node: &str, group: &[&str]) -> Db {
+        let opts = DbOpts {
+            node: Some(node.into()),
+            stewards: Some(group.iter().map(|g| g.to_string()).collect()),
+            auto_failover: true,
+            lease_secs: 30,
+            ..DbOpts::default()
+        };
+        let mut db = Db::open(dir, opts).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+        db
+    }
+
+    fn id_doc(id: &str) -> Value {
+        Value::obj(vec![("id".into(), Value::Str(id.into()))])
+    }
+
+    fn has_row(db: &mut Db, id: &str) -> bool {
+        !db.query(&format!("SELECT * FROM items WHERE id = '{id}'")).unwrap().rows.is_empty()
+    }
+
+    /// A node outside the steward group takes the elected steward's lease
+    /// as a member does -- at any term no lower than it has seen, the
+    /// health naming the steward and the renewal -- and is fenced by it:
+    /// once the lease has run out, its writes are refused.
+    #[test]
+    fn a_node_outside_the_steward_group_takes_the_elected_stewards_lease_and_is_fenced_by_it() {
+        let dir = tmp("outside-lease");
+        let group = ["tcp://n0:1", "tcp://n1:1", "tcp://n2:1"];
+        let mut db = outside_the_group(&dir, "tcp://n9:1", &group);
+        election_here(&db, &group, Duration::ZERO);
+        // The elected steward's heartbeat at term 1: taken, the steward known.
+        assert_eq!(renew_lease(&db.lease(), "tcp://n1:1", 1).unwrap(), 1);
+        assert_eq!(db.steward().as_deref(), Some("tcp://n1:1"));
+        assert!(!db.is_steward());
+        db.insert("items", id_doc("a")).unwrap();
+        let h = db.show_health();
+        assert!(
+            h.contains(
+                "steward: tcp://n1:1 (elected, term 1); automatic failover on; lease renewed 0 s ago"
+            ),
+            "{h}"
+        );
+        // A lower term is no lease; a higher one is the next steward's.
+        assert!(renew_lease(&db.lease(), "tcp://n0:1", 0).is_err());
+        assert_eq!(renew_lease(&db.lease(), "tcp://n2:1", 2).unwrap(), 2);
+        assert_eq!(db.steward().as_deref(), Some("tcp://n2:1"));
+        // Cut off: the lease ran out, and the write is refused as a member's is.
+        db.lease().lock().unwrap().at =
+            Some(Instant::now().checked_sub(Duration::from_secs(31)).unwrap());
+        let e = db.insert("items", id_doc("b")).unwrap_err().to_string();
+        assert!(e.contains("lease from the steward tcp://n2:1 ran out"), "{e}");
+        assert!(has_row(&mut db, "a") && !has_row(&mut db, "b"));
+        // Renewed, it writes again.
+        assert_eq!(renew_lease(&db.lease(), "tcp://n2:1", 2).unwrap(), 2);
+        db.insert("items", id_doc("b")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A node with an elected steward configured that has heard none for a
+    /// lease since its election began refuses writes as a node whose lease
+    /// ran out does: cut off from the group, or the group without a
+    /// steward, nobody renews it, and a steward it cannot see may be
+    /// promoting its follower. (Before, no steward meant no lease to run
+    /// out: such a node took writes for as long as a partition lasted.) A
+    /// fresh node has a lease to hear its first heartbeat in; a member of
+    /// the group is held to the same rule.
+    #[test]
+    fn a_node_that_has_heard_no_steward_for_a_lease_refuses_writes() {
+        let dir = tmp("no-steward-lease");
+        let group = ["tcp://n0:1", "tcp://n1:1", "tcp://n2:1"];
+        let mut db = outside_the_group(&dir, "tcp://n9:1", &group);
+        // Opened, not served: no election runs here and nothing gates a write.
+        db.insert("items", id_doc("a")).unwrap();
+        // Served just now: the first heartbeat has a lease to arrive in.
+        election_here(&db, &group, Duration::ZERO);
+        db.insert("items", id_doc("b")).unwrap();
+        let h = db.show_health();
+        assert!(h.contains("steward: none heard yet; automatic failover waits for one\n"), "{h}");
+        // A lease has passed and no steward reached this node: refused.
+        election_here(&db, &group, Duration::from_secs(31));
+        let e = db.insert("items", id_doc("c")).unwrap_err().to_string();
+        assert!(
+            e.contains("lease from the steward was never granted")
+                && e.contains("no steward has reached this node in the 31 s"),
+            "{e}"
+        );
+        assert!(has_row(&mut db, "b") && !has_row(&mut db, "c"));
+        let h = db.show_health();
+        assert!(h.contains("writes are refused until a steward reaches this node"), "{h}");
+        // The steward's heartbeat ends it.
+        assert_eq!(renew_lease(&db.lease(), "tcp://n0:1", 1).unwrap(), 1);
+        db.insert("items", id_doc("c")).unwrap();
+        // A member that has heard no steward for a lease is refused too.
+        let member_dir = tmp("no-steward-lease-member");
+        let mut member = outside_the_group(&member_dir, "tcp://n2:1", &group);
+        election_here(&member, &group, Duration::from_secs(31));
+        let e = member.insert("items", id_doc("a")).unwrap_err().to_string();
+        assert!(e.contains("lease from the steward was never granted"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&member_dir);
     }
 
     /// A holder's documents go in runs bounded by count and by bytes, one

@@ -2592,7 +2592,9 @@ fn reconciler(db: &RwLock<Db>, stop: &AtomicBool, every: Duration, grants: &Gran
 /// The election's clock and its wire: the machine ticks here, its
 /// sends go out as vote and lease calls with the lock let go, and the
 /// answers come back to it. With an election the heartbeats are the
-/// lease renewals, so `lease_renewer` stands aside.
+/// lease renewals, so `lease_renewer` stands aside -- and they go to
+/// every attached peer, not the group alone (`lease_everyone`): a holder
+/// outside the group has a lease to run out like a member's.
 fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
     use crate::steward::{Election, Msg, Role};
     let (me, group, secs, lease, dir) = {
@@ -2623,7 +2625,7 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
-        let mut sends = {
+        let (mut sends, mut beat) = {
             let mut g = lease.lock().unwrap_or_else(|p| p.into_inner());
             let Some(e) = g.election.as_mut() else { return };
             let steward = e.role() == Role::Steward;
@@ -2640,16 +2642,23 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
             if steward || became {
                 last_beat = Instant::now();
             }
-            sends
+            // A steward's tick is a heartbeat round: the lease goes to the
+            // group with the sends the election made, and to every other
+            // attached peer at the same term (`lease_everyone`).
+            let beat = g.election.as_ref().filter(|e| e.role() == Role::Steward).map(|e| e.term());
+            (sends, beat)
         };
         // The answers make more sends -- the votes after the pre-votes,
         // the first heartbeats after the votes -- carried in turn, a few
         // rounds at most. (Dropped, the pre-votes were granted and the
         // votes never asked: no steward, ever, on the first cluster.)
         let mut rounds = 0;
-        while !sends.is_empty() && rounds < 4 {
+        while (!sends.is_empty() || beat.is_some()) && rounds < 4 {
             rounds += 1;
             let peers = read(db).peers();
+            if let Some(term) = beat.take() {
+                lease_everyone(&mut sends, &group, peers.iter().map(|(u, _)| u.as_str()), term);
+            }
             // Every peer at once: one that does not answer must not hold the
             // heartbeat to the others past their timeout -- sent in turn, a
             // peer whose name did not resolve yet cost the rest three seconds
@@ -2730,7 +2739,34 @@ fn elector(db: &RwLock<Db>, stop: &AtomicBool, grants: &Grants) {
             if became {
                 grants.restart();
                 last_beat = Instant::now();
+                // Elected on the votes just counted: its first heartbeats
+                // are among the sends, and the peers outside the group get
+                // theirs in the next round.
+                beat = g.election.as_ref().map(|e| e.term());
             }
+        }
+    }
+}
+
+/// A steward's heartbeat round widened to every attached peer, at the
+/// steward's `term`. The heartbeat is the lease renewal, and a holder
+/// outside the group has a lease to run out like a member's: leased by
+/// nobody, it acknowledged writes for as long as a partition lasted while
+/// the steward, its hold-off over, promoted the holder's follower -- two
+/// holders until the heal, which demoted it and lost every write it had
+/// taken. The group's sends stay as the election made them; every
+/// attached peer outside the group gets the same heartbeat, and the
+/// election counts none of their answers (`steward::Election` takes an
+/// answer from outside the group for nothing).
+fn lease_everyone<'a>(
+    sends: &mut Vec<(String, crate::steward::Msg)>,
+    group: &[String],
+    peers: impl Iterator<Item = &'a str>,
+    term: u64,
+) {
+    for p in peers {
+        if !group.iter().any(|g| g == p) && !sends.iter().any(|(to, _)| to == p) {
+            sends.push((p.to_string(), crate::steward::Msg::Heartbeat { term }));
         }
     }
 }
@@ -6566,6 +6602,155 @@ mod tests {
             assert!(error.contains("NOTHING was deleted"), "{error}");
             assert!(error.contains(leaf), "the leaf that was cut, as written: {error}");
             assert_eq!(live_documents(&mut db), before, "refused means nothing was written");
+        }
+    }
+
+    /// A steward's heartbeat round reaches every attached peer: the
+    /// group's as the election made it, the rest with the same term, and
+    /// nobody twice.
+    #[test]
+    fn a_heartbeat_round_reaches_every_attached_peer_outside_the_group_once() {
+        use super::lease_everyone;
+        use crate::steward::Msg;
+        let group: Vec<String> =
+            ["tcp://n0:1", "tcp://n1:1", "tcp://n2:1"].iter().map(|s| s.to_string()).collect();
+        let peers = ["tcp://n1:1", "tcp://n2:1", "tcp://n7:1", "tcp://n9:1"];
+        let beat = |to: &str| (to.to_string(), Msg::Heartbeat { term: 3 });
+        let mut sends = vec![beat("tcp://n1:1"), beat("tcp://n2:1")];
+        lease_everyone(&mut sends, &group, peers.iter().copied(), 3);
+        assert_eq!(
+            sends,
+            vec![beat("tcp://n1:1"), beat("tcp://n2:1"), beat("tcp://n7:1"), beat("tcp://n9:1")]
+        );
+        // Asked again in the same round, nobody twice.
+        lease_everyone(&mut sends, &group, peers.iter().copied(), 3);
+        assert_eq!(sends.len(), 4);
+        // A group of one has no member to send to; the peers are leased all the same.
+        let mut alone = Vec::new();
+        lease_everyone(&mut alone, &group[..1], peers.iter().copied(), 1);
+        assert_eq!(alone.len(), 4, "{alone:?}");
+    }
+
+    /// A holder outside the steward group is leased by the elected
+    /// steward as a member is, and fenced as one: its health names the
+    /// steward and the renewal, its writes go, and cut off from the
+    /// steward it refuses them once the lease has run out. (Before, the
+    /// heartbeats went to the group alone: such a holder had no lease to
+    /// run out, and acknowledged writes through a partition while the
+    /// steward promoted its follower; every one of them was lost at the
+    /// heal.) Two members, the second answering but never standing, so
+    /// the first is elected at its first timeout; the holder is neither.
+    #[test]
+    fn a_holder_outside_the_steward_group_is_leased_and_fenced_like_a_member() {
+        use super::{elector, Grants};
+        use crate::engine::{Db, DbOpts, Role};
+        use crate::lock::RwLock;
+        use crate::steward::Election;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const TOKEN: &str = "lease-test-token";
+        std::env::set_var(crate::wire::TOKEN_ENV, TOKEN);
+        let lease = Duration::from_secs(2);
+        let bind = || {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let url = format!("tcp://127.0.0.1:{}", l.local_addr().unwrap().port());
+            (l, url)
+        };
+        let (l1, s1) = bind();
+        let (l2, s2) = bind();
+        let (lh, hu) = bind();
+        let group = vec![s1.clone(), s2.clone()];
+        let open = |tag: &str, listener: TcpListener, url: &str, role: Role| {
+            let dir =
+                std::env::temp_dir().join(format!("celastro-serve-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let opts = DbOpts {
+                node: Some(url.to_string()),
+                stewards: Some(group.clone()),
+                auto_failover: true,
+                lease_secs: lease.as_secs(),
+                role,
+                ..DbOpts::default()
+            };
+            let db = Arc::new(RwLock::new(Db::open(&dir, opts).unwrap()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (d, st) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let _ = crate::wire::serve(listener, d, TOKEN.to_string(), st, None);
+            });
+            (db, stop, dir)
+        };
+        let (a, a_stop, a_dir) = open("steward", l1, &s1, Role::Coordinator);
+        let (b, b_stop, b_dir) = open("member", l2, &s2, Role::Coordinator);
+        let (h, h_stop, h_dir) = open("holder", lh, &hu, Role::Data);
+        // The second member answers votes and heartbeats over the wire
+        // from an election that began long ago -- quiet, so it grants the
+        // first member's pre-vote at once -- and ticks no clock of its own.
+        b.read().unwrap().lease().lock().unwrap().election = Some(Election::new(
+            &s2,
+            &group,
+            0,
+            None,
+            lease,
+            lease / 2,
+            Instant::now() - Duration::from_secs(60),
+        ));
+        let doc = |id: &str| crate::json::parse(&format!(r#"{{"id":"{id}"}}"#)).unwrap();
+        h.write()
+            .unwrap()
+            .execute("CREATE COLLECTION items (id TEXT PRIMARY KEY) WITH (replicas = 1)")
+            .unwrap();
+        // Opened, not yet served: nothing gates a write.
+        h.write().unwrap().insert("items", doc("a")).unwrap();
+        for (x, y) in [(&a, &s2), (&a, &hu), (&b, &s1), (&b, &hu), (&h, &s1), (&h, &s2)] {
+            x.write().unwrap().attach_node(y).unwrap();
+        }
+        let run = |db: &Arc<RwLock<Db>>, stop: &Arc<AtomicBool>| {
+            let (d, st) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let grants = Grants::new();
+                elector(&d, &st, &grants)
+            })
+        };
+        run(&a, &a_stop);
+        run(&h, &h_stop);
+        // Elected at the first member's timeout; the holder leased by its
+        // first heartbeat round, which goes to every attached peer.
+        let until = Instant::now() + Duration::from_secs(15);
+        while h.read().unwrap().steward().is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            h.read().unwrap().steward().as_deref(),
+            Some(s1.as_str()),
+            "the holder outside the group was never leased"
+        );
+        assert!(a.read().unwrap().is_steward() && !h.read().unwrap().is_steward());
+        let health = h.read().unwrap().show_health();
+        assert!(
+            health.contains(&format!(
+                "steward: {s1} (elected, term 1); automatic failover on; lease renewed "
+            )),
+            "{health}"
+        );
+        h.write().unwrap().insert("items", doc("b")).unwrap();
+        // Cut off from the steward: nothing renews the lease, and once it
+        // has run out the write is refused, as a member's would be.
+        a_stop.store(true, Ordering::Release);
+        std::thread::sleep(lease + Duration::from_secs(2));
+        let e = h.write().unwrap().insert("items", doc("c")).unwrap_err().to_string();
+        assert!(e.contains(&format!("lease from the steward {s1} ran out")), "{e}");
+        let rows = h.write().unwrap().query("SELECT * FROM items WHERE id = 'c'").unwrap().rows;
+        assert!(rows.is_empty(), "the refused write landed");
+        for stop in [&b_stop, &h_stop] {
+            stop.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(700));
+        for d in [&a_dir, &b_dir, &h_dir] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }

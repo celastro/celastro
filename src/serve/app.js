@@ -351,7 +351,7 @@ function remember(sql) {
 // still shows; it is just not coloured, which is the safe direction.
 var MON_DOWN = ['DOWN', 'UNREACHABLE', 'GONE', 'EXPIRED', 'NOT ADOPTED'];
 var MON_ACT = ['EXPIRES SOON', 'CLOCK OFF', 'AN OLDER PROCESS', 'previous key(s) kept',
-  'seal failure', 'restarted since last seen', 'none elected yet'];
+  'seal failure', 'restarted since last seen', 'none heard yet'];
 var MON_EVERY_MS = 10000;
 var MON_SAMPLES = 60; // ten minutes at ten seconds, and the sparkline's width
 
