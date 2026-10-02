@@ -93,9 +93,19 @@ impl MemtableBudget {
         // that read the same total each subtract all of it: `used` wraps past
         // zero, `under_pressure` is then permanently true, and the node flushes
         // a segment per document for the rest of its life.
-        let _ = self.used.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |u| {
-            Some(u.saturating_sub(n))
-        });
+        let mut cur = self.used.load(AtomicOrdering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(n);
+            match self.used.compare_exchange_weak(
+                cur,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
     }
     pub fn used(&self) -> usize {
         self.used.load(AtomicOrdering::Relaxed)

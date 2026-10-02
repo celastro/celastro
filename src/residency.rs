@@ -479,9 +479,19 @@ impl ResidencyManager {
             self.peak.fetch_max(r, Ordering::Relaxed);
         } else {
             let d = before - after;
-            let _ = self
-                .resident
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(d)));
+            let mut cur = self.resident.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_sub(d);
+                match self.resident.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => cur = seen,
+                }
+            }
         }
     }
 
