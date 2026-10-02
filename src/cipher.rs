@@ -240,15 +240,27 @@ impl Cipher {
     }
 
     /// Sixteen hex digits naming the current data key without revealing
-    /// it: what a backup's pool key carries, so an object sealed under one
-    /// key is never taken for the same object under another (a segment
-    /// resealed by a rotation keeps its id and its length, and a pool that
-    /// trusted the size restored old-key bytes against a new-key record,
-    /// 0.97.0).
+    /// it: [`Cipher::fingerprint_of`] the ring's first key.
     pub fn fingerprint(&self) -> String {
+        self.fingerprint_of(0)
+    }
+
+    /// Sixteen hex digits naming the `n`th key of the ring as
+    /// [`Cipher::opening_key`] counts them -- 0 the current data key, `n`
+    /// the nth previous one -- without revealing it: what a backup's pool
+    /// object carries in its name, so an object sealed under one key is
+    /// never taken for the same object under another (a segment re-sealed
+    /// by a rotation, or by `key reseal` at the archived tier, keeps its
+    /// id and its length, and a pool that trusted the size restored
+    /// old-key bytes against a new-key record, 0.97.0). The name carries
+    /// the key the bytes are under, which is not always the node's current
+    /// one: a segment at the archived tier stays under the old key until
+    /// it is re-sealed (0.97.0 and 0.98.0 named it by the current key).
+    pub fn fingerprint_of(&self, n: usize) -> String {
+        let key = if n == 0 { &self.data_key } else { &self.previous[n - 1] };
         let mut labelled = Vec::with_capacity(64);
         labelled.extend_from_slice(b"celastro pool key fingerprint v1");
-        labelled.extend_from_slice(&self.data_key);
+        labelled.extend_from_slice(key);
         let h = crate::crypto::sha2::sha256(&labelled);
         crate::cipher::wipe(&mut labelled);
         crate::crypto::hex(&h[..8])

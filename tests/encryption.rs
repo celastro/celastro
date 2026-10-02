@@ -390,6 +390,170 @@ fn backups_across_a_key_rotation_each_restore_whole() {
     let _ = std::fs::remove_dir_all(&dest);
 }
 
+/// A backup names a pool object by the key its bytes are under. A segment
+/// at the archived tier stays under the old key after `key rotate` until
+/// `key reseal`, and the reseal rewrites the tier's object in place at its
+/// length: named by the current key (0.97.0, 0.98.0), the pool held the
+/// old-key bytes under the new key's name, every backup after the reseal
+/// found it present at its size and recorded the new bytes' hash, and
+/// `VERIFY BACKUP` and `RESTORE` refused them with "does not match its
+/// recorded checksum" for as long as the segment lived.
+#[test]
+fn backups_across_a_reseal_of_the_archived_tier_each_restore_whole() {
+    let d = dir("reseal");
+    let store = dir("reseal-store");
+    let dest = dir("reseal-dest");
+    let scratch = dir("reseal-scratch");
+    std::fs::create_dir_all(&dest).unwrap();
+    let m = master(14);
+    let with_store = || {
+        let mut o = opts(Some(m));
+        o.archive.dir = Some(store.clone());
+        o.archive.prefix = "celastro/".into();
+        o
+    };
+    let backup = |db: &mut Db| -> u64 {
+        let m = ack(db, &format!("BACKUP TO '{}'", dest.display()));
+        m.split_whitespace().nth(1).unwrap().parse().unwrap()
+    };
+    let mut db = Db::open(&d, with_store()).unwrap();
+    setup(&mut db, 30);
+    for i in ["items_body", "items_emb", "items_tenant"] {
+        ack(&mut db, &format!("ALTER INDEX {i} ON items SET TIER 'archived'"));
+    }
+    assert!(files(&store) > 0, "the segments went to the store");
+    let want = ids(&mut db, "SELECT id FROM items LIMIT 100");
+    let text = ids(&mut db, QUERY);
+    let b1 = backup(&mut db);
+    drop(db);
+    // The rotation recodes the directory and keeps the old key in the
+    // ring; the tier's objects stay under it.
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w.files > 0, "{w:?}");
+    let mut db = Db::open(&d, with_store()).unwrap();
+    assert_eq!(db.data_key_ring_size(), 1);
+    let b2 = backup(&mut db);
+    drop(db);
+    // `key reseal`, then `key retire`: the tier's objects under the new key
+    // at the same length, and the ring gone.
+    let c = celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap();
+    let tier = celastro::objstore::DirStore::new(&store).unwrap();
+    let resealed =
+        celastro::cipher::reseal_archive(&c, &tier, "celastro/", &["items".into()], &scratch)
+            .unwrap();
+    assert!(resealed > 0, "the tier's objects were under the old key");
+    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1);
+    let mut db = Db::open(&d, with_store()).unwrap();
+    let b3 = backup(&mut db);
+    drop(db);
+    // The backup after the reseal first: today's refusal. Then the two
+    // before it, still whole.
+    for ts in [b3, b1, b2] {
+        let fresh = dir(&format!("reseal-fresh-{ts}"));
+        let mut r = Db::open(&fresh, with_store()).unwrap();
+        let v = ack(&mut r, &format!("VERIFY BACKUP '{}' AS OF {ts}", dest.display()));
+        assert!(v.contains("every one as recorded"), "{v}");
+        let m = ack(&mut r, &format!("RESTORE FROM '{}' AS OF {ts}", dest.display()));
+        assert!(m.contains("restored"), "{m}");
+        assert_eq!(ids(&mut r, "SELECT id FROM items LIMIT 100"), want, "backup {ts}: {m}");
+        assert_eq!(ids(&mut r, QUERY), text, "backup {ts}");
+        drop(r);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+    // The pool holds an archived segment twice over: under the old key's
+    // fingerprint for the backups before the reseal, under the new key's
+    // for the one after.
+    let mut copies: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in std::fs::read_dir(dest.join("pool/items/shard-0000")).unwrap() {
+        let name = e.unwrap().file_name().to_string_lossy().to_string();
+        *copies.entry(name.split('.').next().unwrap().to_string()).or_default() += 1;
+    }
+    assert!(copies.values().any(|n| *n >= 2), "{copies:?}");
+    for p in [&d, &store, &dest, &scratch] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+/// The process-global pin of the pool's names to the id alone
+/// (`CELASTRO_SEAL_IDENTITY=3`), set for a test and lifted when it ends,
+/// however it ends.
+struct PoolPin;
+
+impl PoolPin {
+    fn set() -> PoolPin {
+        celastro::cipher::pin_pool_by_id(true);
+        PoolPin
+    }
+}
+
+impl Drop for PoolPin {
+    fn drop(&mut self) {
+        celastro::cipher::pin_pool_by_id(false);
+    }
+}
+
+/// Under `CELASTRO_SEAL_IDENTITY=3` the pool names an object by its id
+/// alone, as a node before 0.97.0 reads it. A rotation re-seals every
+/// segment at its length, so after one the object is present at the
+/// segment's size and was trusted: the backup with the ring still held
+/// recalled the old-key hash from the last record, the one after `key
+/// retire` did the same under a KEY holding the new key alone, `VERIFY
+/// BACKUP` passed it, and its restore failed at the attach ("frame 0 does
+/// not authenticate") -- the backup held nothing of the segment, and
+/// nothing said so. A present object's first frame is read now, and one
+/// under another key than the segment's puts the segment under its
+/// fingerprint name, which the reply says a node before 0.97.0 cannot
+/// restore.
+#[test]
+fn a_backup_under_the_id_pin_puts_a_segment_a_rotation_resealed_under_its_fingerprint() {
+    let _pin = PoolPin::set();
+    let d = dir("pin-rotate");
+    let dest = dir("pin-rotate-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let m = master(15);
+    let backup = |db: &mut Db| -> (u64, String) {
+        let m = ack(db, &format!("BACKUP TO '{}'", dest.display()));
+        (m.split_whitespace().nth(1).unwrap().parse().unwrap(), m)
+    };
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    setup(&mut db, 30);
+    let want1 = ids(&mut db, "SELECT id FROM items LIMIT 100");
+    let (b1, m1) = backup(&mut db);
+    assert!(!m1.contains("named by the key's fingerprint"), "{m1}");
+    drop(db);
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w.files > 0, "{w:?}");
+    // The ring still held: the segments present at their size under the
+    // old key.
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    db.insert("items", doc(200)).unwrap();
+    ack(&mut db, "FLUSH items");
+    let want2 = ids(&mut db, "SELECT id FROM items LIMIT 100");
+    let (b2, m2) = backup(&mut db);
+    drop(db);
+    // The ring retired: the KEY holds the new key alone.
+    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1);
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    let (b3, m3) = backup(&mut db);
+    drop(db);
+    for (ts, want) in [(b3, &want2), (b2, &want2), (b1, &want1)] {
+        let fresh = dir(&format!("pin-rotate-fresh-{ts}"));
+        let mut r = Db::open(&fresh, opts(Some(m))).unwrap();
+        let v = ack(&mut r, &format!("VERIFY BACKUP '{}' AS OF {ts}", dest.display()));
+        assert!(v.contains("every one as recorded"), "{v}");
+        let msg = ack(&mut r, &format!("RESTORE FROM '{}' AS OF {ts}", dest.display()));
+        assert!(msg.contains("restored"), "{msg}");
+        assert_eq!(&ids(&mut r, "SELECT id FROM items LIMIT 100"), want, "backup {ts}: {msg}");
+        drop(r);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+    for m in [&m2, &m3] {
+        assert!(m.contains("named by the key's fingerprint") && m.contains("before 0.97.0"), "{m}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
 /// A write-ahead log that opens to no frame under the directory's key --
 /// another database's log put in its place, under the same master, which
 /// is what a copy by hand from another node's directory is -- refuses the

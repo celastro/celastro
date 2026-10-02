@@ -672,6 +672,7 @@ fn run(
     // in the pool at its size is not read again to fill in its hash.
     let known = previous_hashes(&target, &mine, &cipher);
     let mut recalled = 0usize;
+    let mut renamed = 0usize;
     let put = |key: String, data: &[u8], files: &mut Vec<(String, u64, String)>| -> Result<()> {
         target.store.put(&target.key(&key), data)?;
         files.push((key, data.len() as u64, hex(&sha256(data))));
@@ -682,25 +683,32 @@ fn run(
             shards += 1;
             let sdir = format!("{name}/shard-{index:04}");
             for h in &ex.sealed {
-                // Under a key the pool object is named by the key's
-                // fingerprint too: the same segment under another key is
-                // another object, never trusted for its size alone --
-                // unless the writes are pinned to what a node before
-                // 0.97.0 reads, which names an object by its id alone.
-                let key = match cipher.as_deref() {
-                    Some(c) if !crate::cipher::pool_by_id_pinned() => {
-                        format!("pool/{sdir}/{:016x}.{}.seg", h.id(), c.fingerprint())
-                    }
-                    _ => format!("pool/{sdir}/{:016x}.seg", h.id()),
-                };
                 // A segment on disk streams from its file, hashed on the
                 // way: the copy holds no segment whole, so a node's memory
                 // during a backup does not follow its largest segment. One
                 // held as bytes (a memtable's, a remote tier's) goes as
-                // bytes.
-                let (len, hash) = match h.segment.source().path().map(|p| p.to_path_buf()) {
-                    Some(path) => {
-                        let len = std::fs::metadata(&path)?.len();
+                // bytes. Under a key its first frame is read first: it says
+                // which key of the ring the bytes are under, and that names
+                // the pool object (`pool_name`).
+                let held = match h.segment.source().path() {
+                    Some(p) => Held::File(p.to_path_buf(), std::fs::metadata(p)?.len()),
+                    None => Held::Bytes(handle_bytes(h)?),
+                };
+                let head = match (&held, cipher.as_deref()) {
+                    (_, None) => Vec::new(),
+                    (Held::File(p, _), Some(_)) => head_of(p)?,
+                    (Held::Bytes(d), Some(_)) => {
+                        d[..d.len().min(crate::cipher::HEAD_BYTES)].to_vec()
+                    }
+                };
+                let (key, by_fingerprint_under_pin) =
+                    pool_name(&target, cipher.as_deref(), name, *index, h.id(), &head, held.len())?;
+                if by_fingerprint_under_pin {
+                    renamed += 1;
+                }
+                let (len, hash) = match &held {
+                    Held::File(path, len) => {
+                        let len = *len;
                         match target.store.size(&target.key(&key))? {
                             Some(n) if n == len => {
                                 present += 1;
@@ -713,7 +721,7 @@ fn run(
                                         (len, h.clone())
                                     }
                                     _ => {
-                                        let (l, h) = crate::objstore::file_sha256(&path)?;
+                                        let (l, h) = crate::objstore::file_sha256(path)?;
                                         (l, hex(&h))
                                     }
                                 }
@@ -727,15 +735,14 @@ fn run(
                                 )))
                             }
                             None => {
-                                let out = target.store.put_file(&target.key(&key), &path)?;
+                                let out = target.store.put_file(&target.key(&key), path)?;
                                 copied += 1;
                                 bytes += out.0;
                                 (out.0, hex(&out.1))
                             }
                         }
                     }
-                    None => {
-                        let data = handle_bytes(h)?;
+                    Held::Bytes(data) => {
                         match target.store.size(&target.key(&key))? {
                             Some(n) if n == data.len() as u64 => present += 1,
                             Some(n) => {
@@ -748,12 +755,12 @@ fn run(
                                 )))
                             }
                             None => {
-                                target.store.put(&target.key(&key), &data)?;
+                                target.store.put(&target.key(&key), data)?;
                                 copied += 1;
                                 bytes += data.len() as u64;
                             }
                         }
-                        (data.len() as u64, hex(&sha256(&data)))
+                        (data.len() as u64, hex(&sha256(data)))
                     }
                 };
                 files.push((key, len, hash));
@@ -815,6 +822,13 @@ fn run(
             String::new()
         }
     );
+    if renamed > 0 {
+        ack.push_str(&format!(
+            "; {renamed} object(s) named by the key's fingerprint rather than the id alone: a \
+             rotation re-sealed them while the pool is pinned to the id (CELASTRO_SEAL_IDENTITY), \
+             and a node before 0.97.0 cannot restore this backup"
+        ));
+    }
     if let Some(keep) = keep {
         let held: Vec<String> = colls
             .iter()
@@ -833,6 +847,102 @@ fn run(
         }
     }
     Ok(Outcome::Ack(ack))
+}
+
+/// A sealed segment as a backup holds it to copy: its file and the file's
+/// length, or its bytes.
+enum Held {
+    File(PathBuf, u64),
+    Bytes(Vec<u8>),
+}
+
+impl Held {
+    fn len(&self) -> u64 {
+        match self {
+            Held::File(_, len) => *len,
+            Held::Bytes(d) => d.len() as u64,
+        }
+    }
+}
+
+/// The first [`crate::cipher::HEAD_BYTES`] of the file at `path`, or the
+/// whole of it when it is shorter: a frame authenticates on its own, so
+/// that much says which key of a ring seals the file.
+fn head_of(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(crate::cipher::HEAD_BYTES);
+    std::fs::File::open(path)?.take(crate::cipher::HEAD_BYTES as u64).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+/// The pool object a sealed segment of shard `index` of `coll` goes to,
+/// and whether the pin below was overridden for it.
+///
+/// In the clear, `pool/<coll>/shard-NNNN/<id>.seg`: a segment id never
+/// recurs within a shard, so the object there at the file's size is the
+/// file. Under a key, `<id>.<fingerprint>.seg`, the fingerprint of the
+/// key of the ring that opens the segment's first frame -- the key the
+/// bytes are under, which is the node's current key for every local file
+/// (a rotation recodes them) and, for a segment at the archived tier, the
+/// key it was archived under until `key reseal`. 0.97.0 and 0.98.0 named
+/// it by the current key: the tier's old-key bytes went under a new-key
+/// name, the reseal rewrote the tier's object at its length, and every
+/// later backup found the pool object present at that size and recorded
+/// the new bytes' hash against the old bytes, so `VERIFY BACKUP` and
+/// `RESTORE` refused it for as long as the segment lived. A segment no
+/// key of the ring opens refuses the backup: no copy of it could ever be
+/// restored.
+///
+/// Under the pin (`CELASTRO_SEAL_IDENTITY` 3 or lower) the name is
+/// `<id>.seg`, as a node before 0.97.0 reads it -- unless an object of
+/// that name is there under another key than the segment's, which is a
+/// rotation while pinned: the segment then goes under its fingerprint
+/// name, which a node before 0.97.0 cannot restore, and the reply says so.
+/// Until now the present object was trusted for its size, its old-key
+/// bytes recorded under a KEY that, once the ring was retired, did not
+/// open them: the backup held nothing of the segment, and `VERIFY` passed
+/// it.
+fn pool_name(
+    target: &Target,
+    cipher: Option<&crate::cipher::Cipher>,
+    coll: &str,
+    index: usize,
+    id: u64,
+    head: &[u8],
+    len: u64,
+) -> Result<(String, bool)> {
+    let sdir = format!("{coll}/shard-{index:04}");
+    let by_id = format!("pool/{sdir}/{id:016x}.seg");
+    let Some(c) = cipher else { return Ok((by_id, false)) };
+    // The identities the shard seals the file under (`Shard::file_ids`).
+    let ids = crate::cipher::Ids::new(
+        format!("{sdir}/{id:016x}.seg"),
+        format!("shard-{index:04}/{id:016x}.seg"),
+    );
+    let whole = len <= crate::cipher::HEAD_BYTES as u64;
+    let Some(under) = c.opening_key(&ids, head, whole) else {
+        return Err(Error::Storage(format!(
+            "backup: segment {id:016x} of {sdir} opens under no key this node's KEY holds, so no \
+             copy of it could be restored: refused (the segment is damaged, or under a key that \
+             was retired)"
+        )));
+    };
+    let by_fingerprint = format!("pool/{sdir}/{id:016x}.{}.seg", c.fingerprint_of(under.0));
+    if !crate::cipher::pool_by_id_pinned() {
+        return Ok((by_fingerprint, false));
+    }
+    // One ranged read: an object there under the segment's own key and
+    // identity holds the segment's bytes, since a file is sealed once
+    // under a key; under any other it holds the segment as it was before
+    // a rotation re-sealed it.
+    match target.store.head(&target.key(&by_id), crate::cipher::HEAD_BYTES as u64)? {
+        None => Ok((by_id, false)),
+        Some(there) => {
+            let same =
+                c.opening_key(&ids, &there, there.len() < crate::cipher::HEAD_BYTES) == Some(under);
+            Ok(if same { (by_id, false) } else { (by_fingerprint, true) })
+        }
+    }
 }
 
 /// Retention: remove this node's backups at the destination beyond the
