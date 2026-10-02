@@ -1270,7 +1270,29 @@ fn a_peer_whose_clock_is_off_is_refused_or_named() {
     let h = a.ack("SHOW HEALTH");
     assert!(h.contains("clock -0.8 s CLOCK OFF"), "{h}");
     assert_eq!(a.db.read().unwrap().peer_seen(&b.url).unwrap().skew_micros / 100_000, -8);
+    // A peer refused for its clock answers hellos still. Through 0.99.0 the
+    // reconciler's hello then counted it as answering, so a node that could
+    // attach nobody for its clock was ready; the refused attach marks the
+    // peer, readiness leaves it out, and an attach that passes clears it.
+    b.db.write().unwrap().pretend(None, 6_000_000);
+    let e = a.exec(&format!("ATTACH NODE '{}'", b.url)).unwrap_err().to_string();
+    assert!(e.contains("fix the clocks"), "{e}");
+    let hello = celastro::wire::Node::new(&b.url, Some(TOKEN), None).unwrap().hello().unwrap();
+    a.db.read().unwrap().observe_peer(&b.url, &hello);
+    let seen = a.db.read().unwrap().peer_seen(&b.url).unwrap();
+    assert!(seen.attach_refused && seen.last_answered.is_some(), "{seen:?}");
+    let within = std::time::Duration::from_secs(90);
+    assert_eq!(
+        a.db.read().unwrap().answering_count(within),
+        0,
+        "a peer this node refused for its clock counted as answering"
+    );
+    let h = a.ack("SHOW HEALTH");
+    assert!(h.contains("clock +6.0 s CLOCK OFF ATTACH REFUSED"), "{h}");
     b.db.write().unwrap().pretend(None, 0);
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    assert!(!a.db.read().unwrap().peer_seen(&b.url).unwrap().attach_refused);
+    assert_eq!(a.db.read().unwrap().answering_count(within), 1);
     let h = a.ack("SHOW HEALTH");
     assert!(h.contains("clock +0.0 s") || h.contains("clock -0.0 s"), "{h}");
     assert!(!h.contains("CLOCK OFF"), "{h}");

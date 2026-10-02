@@ -388,9 +388,13 @@ where a fleet and last week are drawn instead.
 console is serving on loopback -- and, with `--attached N`, has verified
 `N` other nodes since it started; with `--majority-of T`, this node and
 the peers answering it now (within three reconciler sweeps) are a
-majority of a cluster of `T`. A container's liveness, startup and
-readiness probes run it; the chart's readiness asks for the majority,
-so one dead pod does not keep every restarted pod unready.
+majority of a cluster of `T`. A peer this node refused to attach for its
+clock does not count, though it answers, until an attach of it passes:
+a node restarted with its clock off stays unready, with `fix the clocks`
+in its log and `ATTACH REFUSED` on `SHOW HEALTH`'s line for the peer. A
+container's liveness, startup and readiness probes run it; the chart's
+readiness asks for the majority, so one dead pod does not keep every
+restarted pod unready.
 
 ```sh
 celastro health --port 18787

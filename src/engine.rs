@@ -367,6 +367,12 @@ pub struct PeerSeen {
     /// When the peer last answered a hello, for readiness: a peer that
     /// answered within the sweep's interval or so counts as answering.
     pub last_answered: Option<Instant>,
+    /// This node's last ATTACH of the address was refused for the peer's
+    /// clock. The peer answers hellos still, and this node cannot work
+    /// with it, so readiness leaves it out until an attach passes: through
+    /// 0.99.0 the sweep's hello counted it, and a node that could attach
+    /// nobody for its clock was ready.
+    pub attach_refused: bool,
 }
 
 /// What a message says about a node a definition did not reach.
@@ -2993,9 +2999,14 @@ impl Db {
                     let clock = if h.now_micros > 0 {
                         let skew = h.now_micros as i64 - self.received_at(&h) as i64;
                         format!(
-                            ", clock {:+.1} s{}",
+                            ", clock {:+.1} s{}{}",
                             skew as f64 / 1e6,
-                            if skew.abs() > CLOCK_WARN_MICROS { " CLOCK OFF" } else { "" }
+                            if skew.abs() > CLOCK_WARN_MICROS { " CLOCK OFF" } else { "" },
+                            if self.peer_seen(url).is_some_and(|p| p.attach_refused) {
+                                " ATTACH REFUSED"
+                            } else {
+                                ""
+                            }
                         )
                     } else {
                         String::new()
@@ -3918,7 +3929,9 @@ impl Db {
             .iter()
             .filter(|n| !self.is_self(n))
             .filter(|n| {
-                seen.get(*n).and_then(|p| p.last_answered).is_some_and(|t| t.elapsed() <= within)
+                seen.get(*n).is_some_and(|p| {
+                    !p.attach_refused && p.last_answered.is_some_and(|t| t.elapsed() <= within)
+                })
             })
             .count()
     }
@@ -4505,6 +4518,10 @@ impl Db {
         if hello.now_micros > 0 {
             let skew = hello.now_micros as i64 - self.received_at(hello) as i64;
             if skew.abs() > CLOCK_REFUSE_MICROS {
+                // The peer answers and this node cannot work with it: the
+                // readiness probe counting the peers that answer leaves it
+                // out until an attach passes (`answering_count`).
+                guard(&self.peers_seen).entry(url.to_string()).or_default().attach_refused = true;
                 return Err(Error::Plan(format!(
                     "the clock at {url} is {:+.1} s from this node's, more than {} s: every \
                      timestamp and every tombstone compares by the clock, so the two would \
@@ -4515,6 +4532,7 @@ impl Db {
                 )));
             }
         }
+        guard(&self.peers_seen).entry(url.to_string()).or_default().attach_refused = false;
         for note in self.observe_peer(url, hello) {
             crate::log::warn("peer", &[("node", url.to_string()), ("note", note)]);
         }
