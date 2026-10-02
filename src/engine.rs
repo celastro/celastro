@@ -8073,16 +8073,25 @@ impl Db {
             }
             Statement::BackupStatus { ts } => Ok(Outcome::Ack(self.backup_status(ts))),
             Statement::Local(inner) => self.run_read(*inner, sql, params),
-            Statement::Explain { analyze, inner } => match *inner {
-                Statement::Select(sel) => {
-                    Ok(Outcome::Explain(self.explain_select(&sel, sql, params, analyze)?))
+            // The select behind any `LOCAL`, explained; everything else
+            // under EXPLAIN is refused, as the write path refuses it. It
+            // was handed back to this match as it came, and `EXPLAIN SHOW
+            // HEALTH` from the console recursed until the stack overflowed
+            // and the node aborted.
+            Statement::Explain { analyze, inner } => {
+                let mut inner = *inner;
+                loop {
+                    inner = match inner {
+                        Statement::Local(i) => *i,
+                        Statement::Select(sel) => {
+                            return Ok(Outcome::Explain(
+                                self.explain_select(&sel, sql, params, analyze)?,
+                            ))
+                        }
+                        _ => return Err(Error::Plan("EXPLAIN takes a SELECT".into())),
+                    };
                 }
-                other => self.run_read(
-                    Statement::Explain { analyze, inner: Box::new(other) },
-                    sql,
-                    params,
-                ),
-            },
+            }
             other => Err(Error::Plan(format!(
                 "`{}` is not a read; it runs under the write lock",
                 statement_kind(&other)
@@ -17977,5 +17986,44 @@ mod tests {
             2
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `EXPLAIN` on the read path -- the console's, a scoped token's --
+    /// takes a `SELECT`, behind `LOCAL` or not, and refuses everything
+    /// else as the write path does. It handed every other statement back
+    /// to itself as it came: `EXPLAIN SHOW HEALTH`, `EXPLAIN BACKUP
+    /// STATUS`, `EXPLAIN LOCAL SELECT` and `EXPLAIN EXPLAIN SELECT`, all
+    /// of which `is_read` routes here, recursed until the stack overflowed
+    /// and the node aborted.
+    #[test]
+    fn explain_on_the_read_path_takes_a_select_behind_local_and_refuses_the_rest() {
+        let mut db = Db::in_memory();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":1}')"#)
+            .unwrap()
+            .finished()
+            .unwrap();
+        for sql in [
+            "EXPLAIN SHOW HEALTH",
+            "EXPLAIN BACKUP STATUS 1",
+            "EXPLAIN EXPLAIN SELECT id FROM items LIMIT 1",
+            "EXPLAIN LOCAL SHOW HEALTH",
+            "EXPLAIN ANALYZE EXPLAIN SELECT id FROM items LIMIT 1",
+        ] {
+            let stmt = crate::sql::parse(sql, &[]).unwrap();
+            assert!(Db::is_read(&stmt), "{sql} takes the read path");
+            let e = db.read(sql).unwrap_err().to_string();
+            assert!(e.contains("EXPLAIN takes a SELECT"), "{sql}: {e}");
+        }
+        for sql in [
+            "EXPLAIN LOCAL SELECT id FROM items LIMIT 1",
+            "EXPLAIN ANALYZE LOCAL SELECT id FROM items LIMIT 1",
+            "LOCAL EXPLAIN SELECT id FROM items LIMIT 1",
+        ] {
+            match db.read(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+                Outcome::Explain(plan) => assert!(plan.contains("shard"), "{sql}: {plan}"),
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
     }
 }

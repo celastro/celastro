@@ -6132,6 +6132,43 @@ mod tests {
         assert!(body_of(&r).starts_with(r#"{"ok":true"#), "{r}");
     }
 
+    /// `EXPLAIN` of what is not a `SELECT` reaches the read path from the
+    /// console -- a read-only scoped token's `/api/query` included, since
+    /// it is a read -- and is refused there as the write path refuses it;
+    /// it recursed until the stack overflowed and took the node down.
+    /// `EXPLAIN LOCAL SELECT` is the select's plan.
+    #[test]
+    fn explain_of_a_non_select_from_the_console_is_refused_and_not_a_crash() {
+        let mut db = Db::in_memory();
+        let create = "CREATE COLLECTION notes (id TEXT PRIMARY KEY, n INT)";
+        let (r, _) = serve_request(&mut db, &post_as("tok", "/api/query", &sql_body(create)));
+        assert!(body_of(&r).starts_with(r#"{"ok":true"#), "{r}");
+        let scoped = parse_scoped_tokens("reader-notes-token-01234567=notes:ro").unwrap();
+        let ro = "reader-notes-token-01234567";
+        let run = |db: &mut Db, token: &str, sql: &str| -> String {
+            let (r, _) = serve_scoped(db, &scoped, &post_as(token, "/api/query", &sql_body(sql)));
+            body_of(&r).to_string()
+        };
+        for sql in [
+            "EXPLAIN EXPLAIN SELECT id FROM notes LIMIT 1",
+            "EXPLAIN LOCAL EXPLAIN SELECT id FROM notes LIMIT 1",
+        ] {
+            let body = run(&mut db, ro, sql);
+            assert!(body.starts_with(r#"{"ok":false"#), "{sql}: {body}");
+            assert!(body.contains("EXPLAIN takes a SELECT"), "{sql}: {body}");
+        }
+        let body = run(&mut db, ro, "EXPLAIN LOCAL SELECT id FROM notes LIMIT 1");
+        assert!(
+            body.starts_with(r#"{"ok":true"#) && body.contains(r#""kind":"explain""#),
+            "{body}"
+        );
+        for sql in ["EXPLAIN SHOW HEALTH", "EXPLAIN BACKUP STATUS 1"] {
+            let body = run(&mut db, "tok", sql);
+            assert!(body.starts_with(r#"{"ok":false"#), "{sql}: {body}");
+            assert!(body.contains("EXPLAIN takes a SELECT"), "{sql}: {body}");
+        }
+    }
+
     fn post_as(token: &str, path: &str, body: &str) -> String {
         format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Celastro-Token: {token}\r\nContent-Type: \
