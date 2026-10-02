@@ -6,7 +6,117 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
-## 0.98.0 — 2026-10-01
+## 0.98.0 — 2026-10-02
+
+**A write in flight at a seal, a compaction or a `FLUSH` keeps its
+delete.** Under group commit a delete or update is applied under the lock
+and synced after it. 0.98.0 as committed -- never published -- kept the
+marks of writes whose sync was still pending off the disk, and in doing
+so lost them three ways. The seal that installed the frozen memtable
+holding the row, and the compaction that retired the segment holding it,
+dropped the pending mark with the structure that held it, so a sync that
+then succeeded acknowledged a delete already undone: the row read live
+again, an update's old version beside its new one, for good once the next
+seal took the log. An inline seal (`FLUSH`, or the write path's
+backpressure) published every delete log without the pending marks and
+then emptied the live log, which declared the pending records synced
+with their marks on no disk, so a crash before the next publication
+brought the row back after an `ok`. And a refused delete of a row in the
+newer of two frozen memtables was not taken back, because its mark named
+the memtable by a position the older one's install had shifted, so a
+delete the client was told failed took effect. A pending mark now moves
+with its row onto the segment an install writes, where a failed sync
+still takes it back; `FLUSH` syncs the live log before it publishes
+anything; a frozen memtable is named by its freeze, not its place; and a
+compaction's install carries the inputs' marks as they stand under the
+lock, so a mark the recovery took back during the build is not carried
+from the build's copy (that path dates from 0.96.0). A sync completing
+after an inline sync of the same log no longer lowers the length a later
+failed sync cuts the log to. Nothing on disk or on the wire changes; a
+0.97.0 node reads everything as before.
+
+**A seal or a compaction built while a shard left the node lands on its
+own shard.** The sealer's and the compactor's jobs named their shard by
+its position in the node's list, taken under the lock and looked up again
+after a build that ran for seconds to minutes holding nothing. A
+failover's demotion or promotion, a move or a `MERGE SHARDS` in between
+shifted the positions: the install landed on the shard that had moved
+into the position -- its manifest naming a segment that lies in another
+shard's directory, so that shard did not open again, and the reserving
+shard's rotated log unlinked with the acknowledged rows still in it -- or
+on no shard, the ticket dropped and logged as sealed; a failed build went
+to the front of the wrong shard's queue, ahead of that shard's own seals;
+a compaction whose input ids a neighbour happened to share (every shard
+counts from 1) retired the neighbour's own segments for another shard's
+rows. The 0.98.0 note that a seal whose install fails puts its ticket
+back held only while the node's list stood still. Jobs name the shard by
+its index now; a shard refuses a ticket frozen on an earlier incarnation
+of its index (`seal_refused`; the sealer logs `seal_dropped`) rather than
+install it, queue it or remove its log; a compaction installs only onto
+the very segments it pinned, and a refused install leaves its files to
+the open's reclamation, since a new incarnation of the shard may have
+written its own under the same names.
+
+**A merge over a seal in flight is refused.** `MERGE SHARDS a AND b`
+flushed what b had queued and read b's segments, but not a frozen
+memtable whose ticket the sealer had already taken: its rows --
+acknowledged, readable until the merge -- were in no segment the merge
+read, and went with b's directory and the rotated log that held them,
+the acknowledgement short by their count. The merge is refused while a
+seal of any shard of the collection on the node is building ("a seal of
+shard N of `c` is building; try again in a moment"); it does not wait,
+since the install needs the lock the merge holds. A sealer that dropped
+its job keeps the refusal true until a restart, whose open replays the
+rotated log.
+
+**A holder outside the steward group is leased, and fenced.** With
+`CELASTRO_STEWARDS` set the steward's heartbeats -- the lease renewals --
+went to the group alone, so a data node outside it was never leased: its
+`SHOW HEALTH` said "none elected yet" beside an elected steward, and with
+no lease to run out a holder cut off from the steward acknowledged writes
+for as long as the partition lasted while the steward, its hold-off over,
+promoted the holder's follower; the heal demoted it and every write it
+had acknowledged was lost. The documented group of three among more nodes
+was exactly this deployment, and the docs' claim since 0.62.0 that such a
+node "follows the elected one's leases" was false. The elected steward
+now renews every attached node at its term, in the group or not; a node
+outside the group takes the lease as a member does, stands for nothing
+and casts no vote (before, it ran an election over the group plus itself
+and could win it); and with stewards configured, no steward heard for a
+lease since the node began its election counts as a lease run out -- a
+fresh node has a lease to hear its first heartbeat in, after which writes
+are refused with the lease wording until a steward reaches it, and `SHOW
+HEALTH` says "steward: none heard yet" and names the refusal. During a
+rolling upgrade from 0.97.0, upgrade the steward group first: a 0.97.0
+steward sends a node outside the group nothing, and an upgraded outsider
+refuses writes from a lease after its restart until the steward runs this
+version.
+
+**A move or split carries the write in flight.** `MOVE SHARD`,
+`REBALANCE` and `SPLIT SHARD` pinned the shard at the read instant, which
+under group commit sits below a write whose log sync is still in the air:
+the export left that write out while its own thread synced and
+acknowledged it, the switch then removed the source's directory -- the
+write's only copy -- and a split ranged its key out of the shard it
+stayed in. An acknowledged write, lost by an ordinary operator statement
+under `serve`'s default configuration with no fault anywhere; the
+`hotshard` drill's one missing row was this. The pin now waits, under the
+lock, for every write in flight to settle before it reads its instant --
+one sync's latency, bounded by the statement's budget; a sync that
+failed, or a budget that passed, refuses the move or split by name, and
+nothing is pinned below a write. A statement's deferred work settles this
+node's syncs before it carries rows to other holders, where it did so
+after, so a pin never waits on a peer's lock through a carry.
+
+**`EXPLAIN` of what is not a `SELECT` is refused, not a crash.** 0.97.0
+said "`EXPLAIN` of anything but a `SELECT` is refused"; that held on the
+write path alone. On the read path -- the console's `/api/query`, under
+any token, a read-only scoped one included -- `EXPLAIN SHOW HEALTH`,
+`EXPLAIN BACKUP STATUS`, `EXPLAIN LOCAL SELECT` and `EXPLAIN EXPLAIN
+SELECT` were handed back to the same match unchanged and recursed until
+the stack overflowed: one statement from anyone holding a token ended the
+process. The select behind `LOCAL` is explained; everything else under
+`EXPLAIN` is refused with the same words on both paths.
 
 **The zombie fence, per connection and off the lock.** A node's pool to
 a peer kept one epoch, set by the newest dial, so an older pooled
