@@ -798,7 +798,7 @@ pub(crate) fn manifest_checked(b: &[u8]) -> Result<Manifest> {
 /// whole.
 pub fn check_plain_dir(dir: &Path) -> Result<crate::cipher::Walked> {
     let mut w = crate::cipher::Walked::default();
-    crate::cipher::walk_framed(dir, &mut |path, _ids, log| {
+    let leftovers = crate::cipher::walk_framed(dir, &mut |path, _ids, log| {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let bytes = fs::read(path)?;
         let checked: Result<usize> = if log {
@@ -836,6 +836,7 @@ pub fn check_plain_dir(dir: &Path) -> Result<crate::cipher::Walked> {
         }
         Ok(())
     })?;
+    w.leftovers = leftovers;
     Ok(w)
 }
 

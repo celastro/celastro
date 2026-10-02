@@ -2206,7 +2206,12 @@ impl Db {
                 );
                 for l in &replay.logs {
                     let p = sdir.join(format!("wal.{:06}.log", taken + 1));
-                    fs::write(&p, log_archive.get(&l.key)?)?;
+                    // Published as every other file of the directory is:
+                    // written, fsynced, renamed, the directory fsynced. The
+                    // open rewrites no log when it cuts nothing, so until
+                    // the next seal these copies are the rows' only one
+                    // (0.98.0 wrote them with no sync at all).
+                    crate::shard::atomic_write(&p, &log_archive.get(&l.key)?)?;
                     // An archived copy under the current scheme ends with
                     // a trailer; one without it was cut at a record
                     // boundary, and is refused rather than replayed short.
@@ -4786,24 +4791,80 @@ impl Db {
         if self.shards.get(&name).is_some_and(|v| v.iter().any(|s| s.index == shard)) {
             return Err(Error::Plan(format!("shard {shard} of `{name}` is already on this node")));
         }
+        // The pulled files open under this node's key, or the move ends
+        // here with nothing changed. A move copies the source's files as
+        // they lie, sealed under its data key; a target whose ring does
+        // not hold that key cannot open them, and until 0.98.0 found out
+        // after the rename and the catalog's entry naming this node, which
+        // its next open then failed on. RANGE's identity is the shard's
+        // index, not the directory's name, so the pulled directory is read
+        // where it stands.
+        let had_collection = self.catalog.get(&name).is_ok();
+        if let Err(e) = read_range(&self.cipher, incoming, shard, &name) {
+            let _ = fs::remove_dir_all(incoming);
+            if !had_collection {
+                let _ = fs::remove_dir(&cdir);
+            }
+            let why = match &self.cipher {
+                Some(_) => format!(
+                    "{e}; a whole file that does not open here is sealed under a data key this \
+                     node's KEY does not hold -- the nodes' keys differ, and `celastro key rotate \
+                     <DIR> --to <KEY>` rotates each of them to one key"
+                ),
+                None => e.to_string(),
+            };
+            return Err(Error::Storage(format!(
+                "shard {shard} of `{name}` was not adopted, and nothing here changed: {why}"
+            )));
+        }
         if sdir.exists() {
             fs::remove_dir_all(&sdir)?;
         }
         fs::rename(incoming, &sdir)?;
         crate::shard::sync_dir(&cdir)?;
         crate::shard::sync_dir(&dir.join("collections"))?;
-        if self.catalog.get(&name).is_err() {
-            let mut def = coll.clone();
-            def.doc_count = 0;
-            def.paths.clear();
-            self.catalog.create(def)?;
-        }
-        self.catalog.placement.insert(name.clone(), tablets.to_vec());
-        let def = self.catalog.get(&name)?.clone();
-        let (lo, hi) = read_range(&self.cipher, &sdir, shard, &name)?;
-        let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
-        sh.set_key_range(lo, hi);
-        sh.index = shard;
+        // The catalog's word once the shard has opened, or put back as it
+        // was: a placement naming this node for a directory it could not
+        // open failed the next open outright, and nothing repaired it.
+        let placement_before = self.catalog.placement.get(&name).cloned();
+        let opened = (|| -> Result<Shard> {
+            if !had_collection {
+                let mut def = coll.clone();
+                def.doc_count = 0;
+                def.paths.clear();
+                self.catalog.create(def)?;
+            }
+            self.catalog.placement.insert(name.clone(), tablets.to_vec());
+            let def = self.catalog.get(&name)?.clone();
+            let (lo, hi) = read_range(&self.cipher, &sdir, shard, &name)?;
+            let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
+            sh.set_key_range(lo, hi);
+            sh.index = shard;
+            Ok(sh)
+        })();
+        let sh = match opened {
+            Ok(sh) => sh,
+            Err(e) => {
+                match placement_before {
+                    Some(p) => {
+                        self.catalog.placement.insert(name.clone(), p);
+                    }
+                    None => {
+                        self.catalog.placement.remove(&name);
+                    }
+                }
+                if !had_collection {
+                    self.forget_collection(&name);
+                }
+                let _ = fs::remove_dir_all(&sdir);
+                if !had_collection {
+                    let _ = fs::remove_dir(&cdir);
+                }
+                return Err(Error::Storage(format!(
+                    "shard {shard} of `{name}` was not adopted, and nothing here changed: {e}"
+                )));
+            }
+        };
         let v = self.shards.entry(name.clone()).or_default();
         v.push(sh);
         v.sort_by_key(|s| s.index);
@@ -11548,6 +11609,75 @@ mod tests {
         assert_eq!(db.recovery_point().1, Some(shipped), "the reach from the open on");
         assert!(db.show_health().contains("archived logs reach "), "{}", db.show_health());
         drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `RESTORE ... AS OF` publishes each archived log it places as every
+    /// other file of the shard is published -- bytes fsynced, renamed,
+    /// the directory fsynced -- on the path where the open rewrites no
+    /// log: a backup taken with the live log empty, every archived log
+    /// after it, an instant at the archive's end. Nothing is cut at the
+    /// open, so the placed copies are the rows' only copy until the next
+    /// seal; 0.98.0 wrote them with no sync, and a power loss after the
+    /// `ok` replayed them as empty.
+    #[test]
+    fn a_restore_makes_the_archived_logs_it_places_durable_before_it_answers() {
+        let root = tmp("restore-placed-logs");
+        let (dir, archive, fresh) = (root.join("data"), root.join("archive"), root.join("fresh"));
+        std::fs::create_dir_all(&archive).unwrap();
+        let opts =
+            || DbOpts { log_archive: Some(archive.display().to_string()), ..DbOpts::default() };
+        let mut db = Db::open(&dir, opts()).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+        // Before any row: the live log is empty at the backup's instant, so
+        // every archived log begins after it.
+        db.execute(&format!("BACKUP TO '{}'", archive.display())).unwrap().finished().unwrap();
+        let row = |i: u32| Value::obj(vec![("id".into(), Value::Str(format!("n{i:03}")))]);
+        for i in 0..5 {
+            db.insert("items", row(i)).unwrap();
+        }
+        // The seal rotates the log into the archive; the copy of the live
+        // log is the second.
+        db.execute("FLUSH items").unwrap();
+        for i in 5..8 {
+            db.insert("items", row(i)).unwrap();
+        }
+        db.execute(&format!("BACKUP LOG TO '{}'", archive.display())).unwrap();
+        let now = db.now_ts();
+        drop(db);
+
+        let mut r = Db::open(&fresh, DbOpts::default()).unwrap();
+        durability_probe::start();
+        let m = match r
+            .execute(&format!("RESTORE FROM '{}' AS OF {now}", archive.display()))
+            .unwrap()
+            .finished()
+            .unwrap()
+        {
+            Outcome::Ack(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let ev = durability_probe::take();
+        assert!(m.contains("2 archived log(s) replayed"), "{m}");
+        let staged = fresh.join("collections").join("items.restore.tmp").join("shard-0000");
+        for n in 1..=2 {
+            let p = staged.join(format!("wal.{n:06}.log"));
+            let renamed = ev
+                .at(Op::Rename, &p)
+                .unwrap_or_else(|| panic!("{} was not published by a rename: {ev:?}", p.display()));
+            let synced = ev
+                .at(Op::TempSync, &p.with_extension("tmp"))
+                .unwrap_or_else(|| panic!("{}'s bytes were not fsynced: {ev:?}", p.display()));
+            assert!(synced < renamed, "{ev:?}");
+            assert!(ev.at_after(Op::DirSync, &staged, renamed).is_some(), "{ev:?}");
+        }
+        // The path that matters: nothing was cut at the open, so the live
+        // log was not rewritten and the placed logs are the rows' only
+        // copy.
+        let live = fresh.join("collections").join("items").join("shard-0000").join("wal.log");
+        assert!(ev.at(Op::WalTruncate, &live).is_none(), "{ev:?}");
+        assert_eq!(r.query("SELECT id FROM items LIMIT 100").unwrap().rows.len(), 8);
+        drop(r);
         let _ = std::fs::remove_dir_all(&root);
     }
 

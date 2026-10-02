@@ -1614,6 +1614,10 @@ pub struct Walked {
     /// Previous data keys the rotation kept in a ring, for an archived
     /// tier whose objects are still under them.
     pub kept_keys: usize,
+    /// Directories under `collections/` the walk passed over: a restore's
+    /// or an import's staging directory, and a drop's directory aside,
+    /// which the next restore, import or open replaces or removes.
+    pub leftovers: usize,
 }
 
 /// The files a database directory holds that are not framed under the
@@ -1640,16 +1644,24 @@ fn is_log(name: &str) -> bool {
 }
 
 /// Every framed file under `dir`, in the order the walk finds them:
-/// `f(path, ids, is_log)`. The identities are what the shard gives a file
-/// -- the collection, the shard directory's name and the file's own,
-/// whichever of `segments/`, `archive/` or `deletes/` holds it, and the
-/// legacy pair without the collection -- and a root file's is its name. A
-/// move in flight (an `incoming/` directory) is refused: its files are the
-/// source's until the move ends.
+/// `f(path, ids, is_log)`; the answer is how many directories under
+/// `collections/` were passed over. The identities are what the shard
+/// gives a file -- the collection, the shard directory's name and the
+/// file's own, whichever of `segments/`, `archive/` or `deletes/` holds
+/// it, and the legacy pair without the collection -- and a root file's is
+/// its name. A move in flight (a `shard-NNNN.incoming/` directory) is
+/// refused: its files are the source's until the move ends, sealed under
+/// the source's name. A restore's or an import's staging directory
+/// (`<name>.restore.tmp/`, `<name>.import.tmp/`) and a drop's directory
+/// aside (`<name>.dropping/`) are passed over and counted: their files
+/// are sealed under the final name, not the directory's, the next
+/// restore, import or open replaces or removes them, and a walk that took
+/// them for collections called every file in them damaged and stopped a
+/// rotation on them (0.98.0).
 pub(crate) fn walk_framed(
     dir: &std::path::Path,
     f: &mut dyn FnMut(&std::path::Path, &Ids, bool) -> Result<()>,
-) -> Result<()> {
+) -> Result<usize> {
     fn shard_dir(
         dir: &std::path::Path,
         coll: &str,
@@ -1661,12 +1673,6 @@ pub(crate) fn walk_framed(
         for entry in entries {
             let name = entry.file_name().to_string_lossy().to_string();
             if entry.file_type()?.is_dir() {
-                if name == "incoming" {
-                    return Err(Error::Storage(format!(
-                        "{}: a move is in flight (incoming/); finish or abort it first",
-                        dir.display()
-                    )));
-                }
                 shard_dir(&entry.path(), coll, shard, f)?;
             } else if !is_plain_file(&name) {
                 // A rotated log (`wal.NNNNNN.log`) was sealed as `wal.log`
@@ -1692,19 +1698,22 @@ pub(crate) fn walk_framed(
             if !entry.file_type()?.is_dir() {
                 continue;
             }
+            if name.ends_with(".incoming") {
+                return Err(Error::Storage(format!(
+                    "{}: a move is in flight (`{name}`): its files are the source's until the \
+                     move ends; finish or abort it, or remove the directory if no move is running",
+                    dir.display()
+                )));
+            }
             if name.starts_with("shard-") {
                 shard_dir(&entry.path(), coll, &name, f)?;
             } else if name == "followed" {
                 shards_in(&entry.path(), coll, f)?;
-            } else if name == "incoming" {
-                return Err(Error::Storage(format!(
-                    "{}: a move is in flight (incoming/); finish or abort it first",
-                    dir.display()
-                )));
             }
         }
         Ok(())
     }
+    let mut leftovers = 0usize;
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
@@ -1717,6 +1726,10 @@ pub(crate) fn walk_framed(
                 for c in colls {
                     if c.file_type()?.is_dir() {
                         let coll = c.file_name().to_string_lossy().to_string();
+                        if is_leftover_dir(&coll) {
+                            leftovers += 1;
+                            continue;
+                        }
                         shards_in(&c.path(), &coll, f)?;
                     }
                 }
@@ -1725,7 +1738,13 @@ pub(crate) fn walk_framed(
             f(&entry.path(), &Ids::same(&name), is_log(&name))?;
         }
     }
-    Ok(())
+    Ok(leftovers)
+}
+
+/// A directory under `collections/` that is not a collection's: a
+/// restore's or an import's staging directory, or a drop's aside.
+fn is_leftover_dir(name: &str) -> bool {
+    name.ends_with(".restore.tmp") || name.ends_with(".import.tmp") || name.ends_with(".dropping")
 }
 
 /// Every framed file and every log record under `dir` opened under
@@ -1734,7 +1753,7 @@ pub(crate) fn walk_framed(
 /// run reports every damaged file.
 pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
     let mut w = Walked::default();
-    walk_framed(dir, &mut |path, ids, log| {
+    let leftovers = walk_framed(dir, &mut |path, ids, log| {
         let bytes = std::fs::read(path)?;
         if log {
             let opened = cipher.open_log(ids, &bytes);
@@ -1755,6 +1774,7 @@ pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
         }
         Ok(())
     })?;
+    w.leftovers = leftovers;
     Ok(w)
 }
 
@@ -1764,8 +1784,22 @@ pub fn check_dir(dir: &std::path::Path, cipher: &Cipher) -> Result<Walked> {
 /// under neither stops the walk with the file named, nothing else
 /// touched. The plain files stay as they are.
 pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<Walked> {
+    recode(dir, from, to, true)
+}
+
+/// [`recode_dir`]'s decisions with nothing written: every file a rotation
+/// from `from` to `to` would refuse, named in `failures` with what to do
+/// about it, and the counts of what it would re-seal or pass over. What
+/// `rotate_data_key` asks before it writes `KEY.next`. Not `check_dir`'s
+/// rules: a log with records and then a torn tail is readable to a check
+/// and a refusal to a rotation.
+pub fn recode_dry_run(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<Walked> {
+    recode(dir, from, to, false)
+}
+
+fn recode(dir: &std::path::Path, from: &Cipher, to: &Cipher, write: bool) -> Result<Walked> {
     let mut w = Walked::default();
-    walk_framed(dir, &mut |path, ids, log| {
+    let leftovers = walk_framed(dir, &mut |path, ids, log| {
         let bytes = std::fs::read(path)?;
         if log {
             if bytes.is_empty() {
@@ -1784,12 +1818,33 @@ pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<W
                     w.already += 1;
                     return Ok(());
                 }
-                return Err(Error::Storage(format!(
-                    "{}: {} record(s) open under the current key, then the log does not; \
-                     nothing was changed",
-                    path.display(),
-                    opened.records.len()
-                )));
+                // Records and then nothing that opens is a tail a crash
+                // left, which the open cuts and a rotation does not: a
+                // rotated log's end is a trailer a restore checks, and the
+                // cut's rule lives in one place.
+                let why = if opened.opened > 0 {
+                    format!(
+                        "{}: {} record(s) open under the current key, then the log does not: a \
+                         tail a crash left; open the database once to cut it, then rotate",
+                        path.display(),
+                        opened.records.len()
+                    )
+                } else {
+                    format!(
+                        "{}: the log opens under neither the current key nor the new one",
+                        path.display()
+                    )
+                };
+                if !write {
+                    w.failures.push(why);
+                    return Ok(());
+                }
+                return Err(Error::Storage(format!("{why}; this file was not changed")));
+            }
+            if !write {
+                w.records += opened.records.len();
+                w.files += 1;
+                return Ok(());
             }
             // Written afresh under the new key, as a log of the scheme the
             // new cipher writes: its own header, its records, and the
@@ -1825,17 +1880,24 @@ pub fn recode_dir(dir: &std::path::Path, from: &Cipher, to: &Cipher) -> Result<W
                         w.already += 1;
                         return Ok(());
                     }
-                    return Err(Error::Storage(format!(
-                        "{}: {e}; nothing was changed",
-                        path.display()
-                    )));
+                    let why = format!("{}: {e}", path.display());
+                    if !write {
+                        w.failures.push(why);
+                        return Ok(());
+                    }
+                    return Err(Error::Storage(format!("{why}; this file was not changed")));
                 }
             };
+            if !write {
+                w.files += 1;
+                return Ok(());
+            }
             crate::shard::atomic_write(path, &to.seal_file(ids, &plain)?)?;
             w.files += 1;
         }
         Ok(())
     })?;
+    w.leftovers = leftovers;
     Ok(w)
 }
 
@@ -1860,6 +1922,23 @@ pub fn rotate_data_key(
     master: &[u8; 32],
     previous: &[&[u8; 32]],
 ) -> Result<Walked> {
+    rotate_data_key_to(dir, master, previous, None)
+}
+
+/// [`rotate_data_key`] to a given key: `to` is a wrapped data key in
+/// `KEY`'s form, as `key init` writes one, unwrapped under the same
+/// master; its current key becomes this directory's, with the previous
+/// kept behind it as any rotation keeps it. What rotates a cluster to one
+/// key: a rotation without it draws a fresh key, and a cluster whose
+/// nodes each drew their own can no longer move a shard between them,
+/// restore one node's backup onto another or prune a shared backup
+/// destination, since a copy path moves the sealed bytes as they lie.
+pub fn rotate_data_key_to(
+    dir: &std::path::Path,
+    master: &[u8; 32],
+    previous: &[&[u8; 32]],
+    to: Option<&[u8]>,
+) -> Result<Walked> {
     // The directory's lock, held to the end: a node serving it meanwhile
     // would write under the old key past the walk, and those files would
     // never open again (0.97.0).
@@ -1871,6 +1950,15 @@ pub fn rotate_data_key(
     // `KEY` under a previous master is left as it is: `KEY.next`, under
     // the current one, is renamed over it at the end.
     let (old, _) = Cipher::unwrap_any(&wrapped, master, previous)?;
+    let given = match to {
+        Some(bytes) => Some(
+            Cipher::unwrap_any(bytes, master, previous)
+                .map_err(|e| Error::Storage(format!("the key to rotate to: {e}")))?
+                .0
+                .without_previous(),
+        ),
+        None => None,
+    };
     let next_path = dir.join(KEY_NEXT);
     let mut new = match crate::shard::read_optional(&next_path)? {
         Some(next) => {
@@ -1880,6 +1968,14 @@ pub fn rotate_data_key(
                     next_path.display()
                 ))
             })?;
+            // An interrupted rotation finishes to the key it began with.
+            if given.as_ref().is_some_and(|g| !crate::crypto::ct_eq(&g.data_key, &c.data_key)) {
+                return Err(Error::Storage(format!(
+                    "{}: a rotation to another key was interrupted; `key rotate` without `--to` \
+                     finishes it first",
+                    next_path.display()
+                )));
+            }
             // The interrupted rotation's key, wrapped under a master since
             // replaced: under the current one before it becomes `KEY`.
             if under_previous {
@@ -1887,7 +1983,19 @@ pub fn rotate_data_key(
             }
             c
         }
-        None => Cipher::generate()?,
+        None => match given {
+            Some(g) => {
+                if crate::crypto::ct_eq(&g.data_key, &old.data_key) {
+                    return Err(Error::Storage(format!(
+                        "{}: KEY already holds the key given as its current one; nothing to \
+                         rotate to",
+                        dir.display()
+                    )));
+                }
+                g
+            }
+            None => Cipher::generate()?,
+        },
     };
     // The catalog first: an index at the archived tier has objects the
     // walk does not reach, so the old key stays behind the new one in a
@@ -1910,6 +2018,20 @@ pub fn rotate_data_key(
         if new.previous.is_empty() {
             new.keep_previous(&old);
         }
+    }
+    // Every file looked at before anything is written: one that would
+    // stop the walk part way -- a log a crash left torn, a file under
+    // neither key -- is named now, with nothing changed, rather than after
+    // CATALOG and the shards sorted before it are under a key that exists
+    // in KEY.next alone (0.98.0 stopped there, and its "nothing was
+    // changed" read as if removing KEY.next undid the run; it did not).
+    let dry = recode(dir, &old, &new, false)?;
+    if !dry.failures.is_empty() {
+        return Err(Error::Storage(format!(
+            "{} file(s) would not rotate, so nothing was written: {}",
+            dry.failures.len(),
+            dry.failures.join("; ")
+        )));
     }
     if !next_path.exists() {
         crate::shard::atomic_write(&next_path, &new.wrap(master)?)?;

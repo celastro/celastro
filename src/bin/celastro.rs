@@ -82,7 +82,9 @@ COMMANDS:
                              rewrap every backup's KEY at DEST (named as BACKUP TO names it)
                              under the master key in MASTER, and each record's hash of it
   key rotate <DIR>           a new data key for the database at DIR: every file sealed again,
-                             KEY rewrapped; with no process serving DIR; resumable if interrupted
+        [--to <KEY>]             KEY rewrapped; with no process serving DIR; resumable if
+                                 interrupted; --to adopts the wrapped data key in the file KEY
+                                 (as `key init` writes one), so a cluster rotates to one key
   key retire <DIR>           drop the previous data keys a rotation kept for the archived tier;
         [--check]                refuses while an archived object still needs them (--check only
         [--force]                reports, --force drops without looking)
@@ -272,10 +274,13 @@ enum Cmd {
         dest: String,
         master: PathBuf,
     },
-    /// `key rotate <DIR>`: a new data key for the database at DIR, every
-    /// file sealed again; `check <DIR>`: every frame of it opened.
+    /// `key rotate <DIR> [--to <KEY>]`: a new data key for the database at
+    /// DIR -- or the one the file KEY holds, so a cluster's nodes rotate
+    /// to one key -- every file sealed again; `check <DIR>`: every frame
+    /// of it opened.
     KeyRotate {
         dir: PathBuf,
+        to: Option<PathBuf>,
     },
     /// `key retire <DIR> [--check] [--force]`: the previous data keys a
     /// rotation kept, dropped once nothing at the archived tier still
@@ -327,6 +332,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
     let mut open = false;
     let mut check = false;
     let mut force = false;
+    let mut to: Option<PathBuf> = None;
     let mut shard_bind: Option<String> = None;
     let mut bind: Option<IpAddr> = None;
     let mut attached: Option<u64> = None;
@@ -401,6 +407,10 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                 }
                 force = true;
             }
+            "--to" => match value_for(inline.as_deref(), &args, &mut i) {
+                Some(v) => to = Some(PathBuf::from(v)),
+                None => return Cli::Usage(missing_value(&name)),
+            },
             "--shard-bind" => match value_for(inline.as_deref(), &args, &mut i) {
                 Some(v) => shard_bind = Some(v),
                 None => return Cli::Usage(missing_value(&name)),
@@ -538,7 +548,7 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
         "key" => match (rest.first().map(String::as_str), rest.len()) {
             (Some("master"), 2) => Cmd::KeyMaster { file: PathBuf::from(&rest[1]) },
             (Some("init"), 2) => Cmd::KeyInit { file: PathBuf::from(&rest[1]) },
-            (Some("rotate"), 2) => Cmd::KeyRotate { dir: PathBuf::from(&rest[1]) },
+            (Some("rotate"), 2) => Cmd::KeyRotate { dir: PathBuf::from(&rest[1]), to: to.clone() },
             (Some("retire"), 2) => {
                 Cmd::KeyRetire { dir: PathBuf::from(&rest[1]), check, force }
             }
@@ -556,7 +566,8 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
                      or CELASTRO_MASTER_KEY. `key rekey <KEY> <MASTER>`: rewrap the data key in KEY \
                      under the master key in the file MASTER. `key rekey-backups <DEST> <MASTER>`: \
                      rewrap every backup's KEY at DEST under the master key in the file MASTER. \
-                     `key rotate <DIR>`: a new data key for the database at DIR. `key retire <DIR> \
+                     `key rotate <DIR> [--to <KEY>]`: a new data key for the database at DIR, or the \
+                     one in the file KEY, so a cluster's nodes rotate to one. `key retire <DIR> \
                      [--check] [--force]`: drop the ring a rotation kept. `key reseal <DIR>`: seal \
                      the archived objects under the current key and retire the ring"
                         .to_string(),
@@ -627,6 +638,9 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
              not both"
                 .to_string(),
         );
+    }
+    if to.is_some() && !matches!(cmd, Cmd::KeyRotate { .. }) {
+        return Cli::Usage("`--to` only means something to `key rotate`".to_string());
     }
     // The demo builds its own database, with build options no persistent
     // database should inherit. Accepting `--dir` alongside it would run the
@@ -787,8 +801,8 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::KeyRekeyBackups { dest, master } = cmd {
         return key_rekey_backups(&dest, &master, json);
     }
-    if let Cmd::KeyRotate { dir } = cmd {
-        return key_rotate(&dir, json);
+    if let Cmd::KeyRotate { dir, to } = cmd {
+        return key_rotate(&dir, to.as_deref(), json);
     }
     if let Cmd::KeyRetire { dir, check, force } = cmd {
         return key_retire(&dir, check, force, json);
@@ -1807,24 +1821,44 @@ fn master_or_fail(json: bool, what: &str) -> std::result::Result<Masters, i32> {
     Ok(Masters { current, previous })
 }
 
-/// `key rotate <DIR>`: every file under DIR sealed again under a fresh data
-/// key, then KEY rewrapped; with no process serving DIR.
-fn key_rotate(dir: &Path, json: bool) -> i32 {
+/// `key rotate <DIR> [--to <KEY>]`: every file under DIR sealed again under
+/// a fresh data key -- or the one the file KEY holds, so a cluster's nodes
+/// rotate to one key -- then KEY rewrapped; with no process serving DIR.
+fn key_rotate(dir: &Path, to: Option<&Path>, json: bool) -> i32 {
     let master = match master_or_fail(json, "key rotate") {
         Ok(m) => m,
         Err(code) => return code,
     };
-    match celastro::cipher::rotate_data_key(dir, &master.current, &master.previous()) {
+    let given = match to {
+        Some(p) => match std::fs::read(p) {
+            Ok(b) => Some(b),
+            Err(e) => return fail(json, &format!("{}: {e}", p.display())),
+        },
+        None => None,
+    };
+    let under = match to {
+        Some(p) => format!("the data key in {}", p.display()),
+        None => "a new data key".to_string(),
+    };
+    match celastro::cipher::rotate_data_key_to(
+        dir,
+        &master.current,
+        &master.previous(),
+        given.as_deref(),
+    ) {
         Ok(w) => {
             ack(
                 json,
                 &format!(
-                    "{}: {} file(s) and {} log record(s) sealed under a new data key{}; KEY rewrapped{}",
+                    "{}: {} file(s) and {} log record(s) sealed under {under}{}; KEY rewrapped{}{}",
                     dir.display(),
                     w.files,
                     w.records,
                     if w.already > 0 {
-                        format!(" ({} file(s) were under it already: a rotation resumed)", w.already)
+                        format!(
+                            " ({} file(s) were under it already: a rotation resumed)",
+                            w.already
+                        )
                     } else {
                         String::new()
                     },
@@ -1836,18 +1870,34 @@ fn key_rotate(dir: &Path, json: bool) -> i32 {
                         )
                     } else {
                         String::new()
+                    },
+                    if w.leftovers > 0 {
+                        format!(
+                            "; {} director{} under collections/ passed over (a restore's or an \
+                             import's staging, or a drop's aside)",
+                            w.leftovers,
+                            if w.leftovers == 1 { "y" } else { "ies" }
+                        )
+                    } else {
+                        String::new()
                     }
                 ),
             );
             EXIT_OK
         }
-        Err(e) => fail(
-            json,
-            &format!(
-                "could not rotate {}: {e} (run `key rotate` again to finish a rotation this interrupted)",
-                dir.display()
-            ),
-        ),
+        // A refusal before anything is written says so itself. One after
+        // KEY.next is written is a rotation to finish: KEY.next holds the
+        // new key and the previous one, so it is never the file to remove.
+        Err(e) => {
+            let hint = if dir.join(celastro::cipher::KEY_NEXT).exists() {
+                "; KEY.next holds the new key and the previous one: keep it. Running `key rotate` \
+                 again finishes the rotation; if it cannot, renaming KEY.next to KEY opens the \
+                 database under both keys, and a later `key rotate` finishes under a fresh one"
+            } else {
+                ""
+            };
+            fail(json, &format!("could not rotate {}: {e}{hint}", dir.display()))
+        }
     }
 }
 
@@ -2183,6 +2233,21 @@ fn check_dir(dir: &Path, json: bool) -> i32 {
     if !dir.join("KEY").exists() {
         return check_plain_dir(dir, json);
     }
+    // As the open refuses: the files a rotation re-sealed before it
+    // stopped are under the key in KEY.next, and a check against KEY alone
+    // called every one of them damaged (0.98.0).
+    if dir.join(celastro::cipher::KEY_NEXT).exists() {
+        return fail(
+            json,
+            &format!(
+                "{}: a data-key rotation was interrupted (KEY.next is there); run `celastro key \
+                 rotate {}` to finish it before checking: until then the files it re-sealed are \
+                 under the key in KEY.next, not the one in KEY",
+                dir.display(),
+                dir.display()
+            ),
+        );
+    }
     let master = match master_or_fail(json, "check") {
         Ok(m) => m,
         Err(code) => return code,
@@ -2206,10 +2271,21 @@ fn check_dir(dir: &Path, json: bool) -> i32 {
             ack(
                 json,
                 &format!(
-                    "{}: {} file(s) and {} log record(s) open under the data key; nothing is damaged",
+                    "{}: {} file(s) and {} log record(s) open under the data key; nothing is \
+                     damaged{}",
                     dir.display(),
                     w.files,
-                    w.records
+                    w.records,
+                    if w.leftovers > 0 {
+                        format!(
+                            "; {} director{} under collections/ passed over (a restore's or an \
+                             import's staging, or a drop's aside)",
+                            w.leftovers,
+                            if w.leftovers == 1 { "y" } else { "ies" }
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
             );
             EXIT_OK
@@ -4054,6 +4130,24 @@ mod tests {
              TRUNCATED — text_match(body, '-a*') was cut: documents it excludes are here\n"
         );
     }
+    /// `key rotate` takes `--to <KEY>`, and nothing else does.
+    #[test]
+    fn key_rotate_takes_a_key_to_rotate_to() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match parse_args(args(&["key", "rotate", "d", "--to", "k"])) {
+            Cli::Run { cmd: Cmd::KeyRotate { dir, to }, .. } => {
+                assert_eq!((dir, to), (PathBuf::from("d"), Some(PathBuf::from("k"))));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_args(args(&["key", "rotate", "d"])) {
+            Cli::Run { cmd: Cmd::KeyRotate { to, .. }, .. } => assert!(to.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse_args(args(&["check", "d", "--to", "k"])), Cli::Usage(_)));
+        assert!(matches!(parse_args(args(&["key", "rotate", "d", "--to"])), Cli::Usage(_)));
+    }
+
     /// `health` takes `--port` like `serve` does, takes no arguments, and
     /// needs no directory: it asks a running console rather than opening one.
     #[test]

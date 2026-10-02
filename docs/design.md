@@ -2512,8 +2512,8 @@ atomically. The new key is written to `KEY.next` before anything else
 and renamed over `KEY` after everything, so a rotation cut short is
 finished by running it again -- a file that opens under the new key is
 counted and left -- and `open_key` refuses a directory with a
-`KEY.next` until then. A move in flight (`incoming/`) refuses the
-rotation; so does an index at the archived tier, whose objects are in a
+`KEY.next` until then. A move in flight (`shard-NNNN.incoming/`) refuses
+the rotation; so did an index at the archived tier, whose objects are in a
 store the walk does not reach (the choice was that, or a key ring the
 frames cannot name a key into). `celastro check <DIR>` is the same walk
 opening everything and writing nothing -- and on a directory in the clear

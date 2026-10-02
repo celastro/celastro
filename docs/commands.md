@@ -179,13 +179,32 @@ needed until all of them are rewrapped, and destroyed only then.
 
 The data key itself rotates with **`key rotate <DIR>`**: every file and
 every log record under the directory is sealed again under a fresh data
-key and `KEY` rewrapped, with no process serving the directory (a
-cluster rotates node by node, each stopped for its turn -- the nodes
-no longer need to share one data key once they hold their own copies).
-The new key goes to `KEY.next` first, so a rotation cut short is
-finished by running it again, and a node refuses to open a directory
-with a `KEY.next` until then. Backups and exports made before carry
-their own `KEY` and open as they did.
+key and `KEY` rewrapped, with no process serving the directory. A
+cluster's nodes keep sharing one data key: a move, a restore onto
+another node and a shared backup destination's `KEEP` copy sealed files
+as they lie, so two nodes that each drew their own key can no longer
+move a shard between them (the move is refused, naming the key, and
+the target is left as it was). A cluster therefore rotates node by
+node, each stopped for its turn, **to the same key**: `key init`
+writes the new wrapped key once, and **`key rotate <DIR> --to <KEY>`**
+adopts it on each node, keeping the previous key behind it as any
+rotation does. (Through 0.98.0 this paragraph said the nodes no longer
+needed to share one; they do.) Before it writes anything the rotation
+reads every file it would re-seal and refuses, naming them, if one
+would stop it part way: a log a crash left torn (open the database
+once, which cuts it, then rotate) or a move's half-pulled
+`shard-NNNN.incoming` (finish or abort the move, or remove the
+directory if none is running); a restore's or an import's staging
+directory and a drop's `<name>.dropping` are passed over and counted.
+Then the new key goes to `KEY.next`, the files follow, and `KEY.next`
+is renamed over `KEY` last, so a rotation cut short between is
+finished by running it again; a node refuses to open a directory with
+a `KEY.next` until then, and so does `check`. `KEY.next` holds the new
+key and the previous one, so it is never the file to remove: if the
+rotation cannot be finished, renaming it to `KEY` opens the database
+under both keys, and a later rotation finishes under a fresh one.
+Backups and exports made before carry their own `KEY` and open as they
+did.
 
 An index at the archived tier has objects in a store the rotation does
 not reach, so the old key stays in a ring behind the new one in `KEY`
@@ -239,7 +258,10 @@ in the directory) it opens every frame; in the clear it reads every
 segment's regions, the manifests, the delete logs and the catalog against
 their checksums and every log record against its CRC, and names a log
 that ends mid-record as torn, with where. One run reports every damaged
-file; the exit status is the verdict.
+file; the exit status is the verdict. A directory with a `KEY.next` is
+refused, as the open refuses it: the files a rotation re-sealed before
+it stopped are under the key in `KEY.next`, and a check against `KEY`
+alone would call every one of them damaged.
 
 ```sh
 CELASTRO_MASTER_KEY_FILE=./master.key celastro key rotate ./data

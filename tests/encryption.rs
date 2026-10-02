@@ -1267,3 +1267,327 @@ fn a_reseal_on_a_shared_archive_prefix_walks_this_nodes_shards_alone() {
         let _ = std::fs::remove_dir_all(p);
     }
 }
+
+/// A move copies the source's files as they lie, sealed under its data
+/// key. Onto a node whose ring does not hold that key the move is refused
+/// naming the key, and the target is as it was: no `shard-NNNN`, no
+/// `shard-NNNN.incoming`, no placement naming it, and it opens again.
+/// Through 0.98.0 the target renamed the directory in and recorded the
+/// placement before it tried to open a byte, and its next open failed on
+/// the shard it could not read. `key rotate --to` rotates both nodes to
+/// one key, and the same move then lands.
+#[test]
+fn a_move_onto_a_node_whose_ring_lacks_the_sources_key_is_refused_and_leaves_nothing_behind() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let m = master(17);
+    let keys = dir("move-keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let key_file = keys.join("KEY");
+    std::fs::write(&key_file, celastro::cipher::Cipher::generate().unwrap().wrap(&m).unwrap())
+        .unwrap();
+    let node_opts = |url: &str| {
+        let mut o = opts(Some(m));
+        o.key_file = Some(key_file.clone());
+        o.node = Some(url.to_string());
+        o
+    };
+    let holder = |db: &Db| db.catalog.placement.get("items").map(|t| t[0].node.clone());
+    // A alone first: a collection, rows, sealed segments; then A's own
+    // rotation, which draws a key B's KEY -- the shared one -- lacks.
+    let a = Served::start(dir("move-a"), 0, &node_opts);
+    a.exec(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT) \
+         PARTITION BY (tenant) WITH (splits = ['t1', 't2'])",
+    )
+    .unwrap();
+    a.exec(INDEXES[0]).unwrap();
+    for i in 0..60usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.exec("FLUSH items").unwrap();
+    let want = a.query("SELECT id FROM items LIMIT 200");
+    assert_eq!(want.len(), 60);
+    let (a_dir, a_port) = a.stop();
+    let w = celastro::cipher::rotate_data_key(&a_dir, &m).unwrap();
+    assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
+    let a = Served::start(a_dir, a_port, &node_opts);
+    let b = Served::start(dir("move-b"), 0, &node_opts);
+    a.exec(&format!("ATTACH NODE '{}'", b.url)).unwrap();
+    let e = a.exec(&format!("MOVE SHARD 0 OF items TO '{}'", b.url)).unwrap_err();
+    assert!(e.contains("not adopted") && e.contains("data key"), "{e}");
+    // The target as it was: nothing renamed in, nothing left, no placement
+    // naming it; the source still holds and answers.
+    let b_items = b.dir.join("collections").join("items");
+    assert!(!b_items.join("shard-0000").exists(), "the pulled directory was renamed in");
+    assert!(!b_items.join("shard-0000.incoming").exists(), "the pulled directory was left");
+    assert!(
+        !b_items.exists() || std::fs::read_dir(&b_items).unwrap().next().is_none(),
+        "{} holds something",
+        b_items.display()
+    );
+    let on_b = holder(&b.db.read().unwrap());
+    assert!(on_b.is_none() || on_b.as_deref() == Some(a.url.as_str()), "{on_b:?}");
+    assert_eq!(holder(&a.db.read().unwrap()).as_deref(), Some(a.url.as_str()));
+    assert_eq!(a.query("SELECT id FROM items LIMIT 200"), want);
+    let (a_dir, a_port) = a.stop();
+    let (b_dir, b_port) = b.stop();
+    let (a_url, b_url) = (format!("tcp://127.0.0.1:{a_port}"), format!("tcp://127.0.0.1:{b_port}"));
+    {
+        let b = Db::open(&b_dir, node_opts(&b_url)).unwrap();
+        let on_b = holder(&b);
+        assert!(on_b.is_none() || on_b.as_deref() == Some(a_url.as_str()), "{on_b:?}");
+    }
+    // Rotated to one key -- the same wrapped key given to both -- the
+    // move lands, and the key given again is nothing to rotate to.
+    let shared = celastro::cipher::Cipher::generate().unwrap().wrap(&m).unwrap();
+    for d in [&a_dir, &b_dir] {
+        let w = celastro::cipher::rotate_data_key_to(d, &m, Some(&shared)).unwrap();
+        assert!(w.failures.is_empty(), "{w:?}");
+    }
+    let fingerprint = |d: &Path| {
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m)
+            .unwrap()
+            .fingerprint()
+    };
+    assert_eq!(fingerprint(&a_dir), fingerprint(&b_dir), "one current key on both");
+    let e =
+        celastro::cipher::rotate_data_key_to(&a_dir, &m, Some(&shared)).unwrap_err().to_string();
+    assert!(e.contains("already holds"), "{e}");
+    let a = Served::start(a_dir, a_port, &node_opts);
+    let b = Served::start(b_dir, b_port, &node_opts);
+    let moved = a.exec(&format!("MOVE SHARD 0 OF items TO '{}'", b.url)).unwrap();
+    assert!(moved.contains("moved"), "{moved}");
+    assert_eq!(holder(&a.db.read().unwrap()).as_deref(), Some(b.url.as_str()));
+    assert_eq!(b.query("SELECT id FROM items WHERE tenant = 't0' LIMIT 100"), tenant_ids(0, 60));
+    assert_eq!(a.query("SELECT id FROM items LIMIT 200"), want);
+    assert_eq!(b.query("SELECT id FROM items LIMIT 200"), want);
+    let (a_dir, _) = a.stop();
+    let (b_dir, _) = b.stop();
+    for (d, url) in [(&a_dir, &a_url), (&b_dir, &b_url)] {
+        drop(Db::open(d, node_opts(url)).unwrap());
+    }
+    for p in [&a_dir, &b_dir, &keys] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+/// A database with sealed segments, a delete and a log with records in
+/// it, closed: what a rotation walks, and the rows it holds.
+fn closed_db(tag: &str, m: [u8; 32]) -> (PathBuf, Vec<String>) {
+    let d = dir(tag);
+    let all = {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        setup(&mut db, 20);
+        ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100")
+    };
+    (d, all)
+}
+
+/// Whether `CATALOG` opens under the key in `KEY`: what a rotation that
+/// wrote nothing leaves true.
+fn catalog_opens_under_key(d: &Path, m: &[u8; 32]) -> bool {
+    let c = celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), m).unwrap();
+    let bytes = std::fs::read(d.join("CATALOG")).unwrap();
+    c.open_file(&celastro::cipher::Ids::same("CATALOG"), &bytes).is_ok()
+}
+
+/// `from` copied under `to`, as a restore's or a move's staging leaves it.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), dest).unwrap();
+        }
+    }
+}
+
+/// A log a crash left torn -- bytes after the last whole record, or a
+/// zero-filled extension -- stops a rotation before it writes anything:
+/// no `KEY.next`, `CATALOG` still under `KEY`, the refusal naming the log
+/// and saying to open the database once, which cuts the tail; the
+/// rotation then goes through. Through 0.98.0 `KEY.next` was written and
+/// `CATALOG` re-sealed under its key before the walk stopped on the log,
+/// with a message that read as if nothing had changed.
+#[test]
+fn a_rotation_refuses_a_torn_log_tail_before_writing_anything_and_the_open_cuts_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let m = master(21);
+    for (tag, tail) in [("rotate-torn", vec![0xA5u8; 40]), ("rotate-zeroed", vec![0u8; 4096])] {
+        let (d, all) = closed_db(tag, m);
+        let log = d.join("collections").join("items").join("shard-0000").join("wal.log");
+        let whole = std::fs::read(&log).unwrap();
+        assert!(whole.len() > 64, "the log holds records");
+        let mut torn = whole.clone();
+        torn.extend_from_slice(&tail);
+        std::fs::write(&log, &torn).unwrap();
+        let e = celastro::cipher::rotate_data_key(&d, &m).unwrap_err().to_string();
+        assert!(
+            e.contains("nothing was written")
+                && e.contains("wal.log")
+                && e.contains("open the database once"),
+            "{e}"
+        );
+        assert!(!d.join("KEY.next").exists(), "{tag}: KEY.next was written before the refusal");
+        assert!(catalog_opens_under_key(&d, &m), "{tag}: CATALOG was re-sealed before the refusal");
+        {
+            let mut db = Db::open(&d, opts(Some(m))).unwrap();
+            assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+        }
+        assert_eq!(std::fs::read(&log).unwrap().len(), whole.len(), "{tag}: the open cut the tail");
+        let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+        assert!(w.files > 0 && w.records > 0 && w.failures.is_empty(), "{w:?}");
+        assert!(!d.join("KEY.next").exists());
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A move cut short leaves `shard-NNNN.incoming` beside the shards, its
+/// files sealed under the source's name: a rotation refuses it before it
+/// writes anything, naming the directory as a move in flight. Through
+/// 0.98.0 the guard looked for a directory named `incoming`, which nothing
+/// writes, and the walk took the directory for a shard of that name after
+/// `KEY.next` was written.
+#[test]
+fn a_rotation_refuses_a_half_pulled_shard_before_writing_anything() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let m = master(22);
+    let (d, all) = closed_db("rotate-incoming", m);
+    let shard = d.join("collections").join("items").join("shard-0000");
+    let incoming = d.join("collections").join("items").join("shard-0001.incoming");
+    copy_tree(&shard, &incoming);
+    let e = celastro::cipher::rotate_data_key(&d, &m).unwrap_err().to_string();
+    assert!(e.contains("shard-0001.incoming") && e.contains("move is in flight"), "{e}");
+    assert!(!d.join("KEY.next").exists(), "KEY.next was written before the refusal");
+    assert!(catalog_opens_under_key(&d, &m), "CATALOG was re-sealed before the refusal");
+    std::fs::remove_dir_all(&incoming).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A restore's or an import's staging directory left beside the
+/// collections -- its files sealed under the final name, not the
+/// directory's -- is passed over by a rotation and counted, the shard
+/// beside it re-sealed under the new key alone, and the staging files
+/// left as they were. Through 0.98.0 the walk took the directory for a
+/// collection of that name, no file in it opened, and the rotation
+/// stopped there after writing `KEY.next`.
+#[test]
+fn a_rotation_passes_over_a_staging_directory_and_reseals_the_shard_beside_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let m = master(23);
+    let (d, all) = closed_db("rotate-staging", m);
+    let shard = d.join("collections").join("items").join("shard-0000");
+    copy_tree(&shard, &d.join("collections").join("items.restore.tmp").join("shard-0000"));
+    copy_tree(&shard, &d.join("collections").join("items.import.tmp").join("shard-0000"));
+    let before =
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap();
+    let staged =
+        d.join("collections").join("items.restore.tmp").join("shard-0000").join("MANIFEST");
+    let staged_bytes = std::fs::read(&staged).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert_eq!(w.leftovers, 2, "{w:?}");
+    assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
+    // The shard beside them is under the new key alone; the staging files
+    // are as they were, under the old.
+    let after =
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap();
+    let c = celastro::cipher::check_dir(&d, &after.without_previous()).unwrap();
+    assert!(c.failures.is_empty() && c.leftovers == 2 && c.files == w.files, "{c:?}");
+    assert_eq!(std::fs::read(&staged).unwrap(), staged_bytes, "a staging file was rewritten");
+    let ids_of = celastro::cipher::Ids::new("items/shard-0000/MANIFEST", "shard-0000/MANIFEST");
+    assert!(before.open_file(&ids_of, &staged_bytes).is_ok());
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A drop cut short leaves `<name>.dropping` beside the collections: a
+/// rotation passes over it, and the next open completes the drop as it
+/// would have. Through 0.98.0 the rotation took the directory for a
+/// collection of that name and stopped on it after writing `KEY.next`,
+/// and the open never ran to complete the drop.
+#[test]
+fn a_rotation_passes_over_a_drop_left_aside_and_the_next_open_completes_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let m = master(24);
+    let d = dir("rotate-dropping");
+    let all = {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        setup(&mut db, 20);
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO notes VALUES ('{\"id\":\"a\",\"n\":1}')").unwrap();
+        ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100")
+    };
+    let aside = d.join("collections").join("notes.dropping");
+    std::fs::rename(d.join("collections").join("notes"), &aside).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert_eq!(w.leftovers, 1, "{w:?}");
+    assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert!(db.execute("SHOW CATALOG notes").is_err(), "the interrupted drop was not completed");
+    assert!(!aside.exists(), "the directory aside was not removed");
+    assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `KEY.next` holds the new key and the previous one, so a rotation that
+/// stopped after writing it is never undone by removing it: renaming it
+/// over `KEY` opens the database under both keys -- the files re-sealed
+/// before the stop and the rest -- and a later rotation finishes under a
+/// fresh key with nothing already under it.
+#[test]
+fn a_rotation_cut_short_is_recovered_by_renaming_key_next_over_key() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let m = master(25);
+    let (d, all) = closed_db("rotate-recover", m);
+    let old = celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap();
+    let mut fresh = celastro::cipher::Cipher::generate().unwrap();
+    fresh.keep_previous(&old);
+    std::fs::write(d.join("KEY.next"), fresh.wrap(&m).unwrap()).unwrap();
+    // The stop as 0.98.0 left it: CATALOG and one segment under the new
+    // key, everything else under the old.
+    let reseal = |rel: PathBuf, ids: celastro::cipher::Ids| {
+        let p = d.join(rel);
+        let plain = old.open_file(&ids, &std::fs::read(&p).unwrap()).unwrap();
+        std::fs::write(&p, fresh.seal_file(&ids, &plain).unwrap()).unwrap();
+    };
+    reseal(PathBuf::from("CATALOG"), celastro::cipher::Ids::same("CATALOG"));
+    let segments = d.join("collections").join("items").join("shard-0000").join("segments");
+    let seg = std::fs::read_dir(&segments)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .find(|n| n.ends_with(".seg"))
+        .expect("a sealed segment");
+    reseal(
+        segments.join(&seg).strip_prefix(&d).unwrap().to_path_buf(),
+        celastro::cipher::Ids::new(format!("items/shard-0000/{seg}"), format!("shard-0000/{seg}")),
+    );
+    let e = Db::open(&d, opts(Some(m))).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("rotation was interrupted"), "{e}");
+    std::fs::rename(d.join("KEY.next"), d.join("KEY")).unwrap();
+    {
+        let mut db = Db::open(&d, opts(Some(m))).unwrap();
+        assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+    }
+    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    assert!(w.files > 0 && w.already == 0 && w.failures.is_empty(), "{w:?}");
+    assert_eq!(w.kept_keys, 2, "both keys kept behind the fresh one");
+    let mut db = Db::open(&d, opts(Some(m))).unwrap();
+    assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
