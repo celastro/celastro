@@ -428,7 +428,7 @@ fn backups_across_a_reseal_of_the_archived_tier_each_restore_whole() {
     drop(db);
     // The rotation recodes the directory and keeps the old key in the
     // ring; the tier's objects stay under it.
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w.files > 0, "{w:?}");
     let mut db = Db::open(&d, with_store()).unwrap();
     assert_eq!(db.data_key_ring_size(), 1);
@@ -438,11 +438,16 @@ fn backups_across_a_reseal_of_the_archived_tier_each_restore_whole() {
     // at the same length, and the ring gone.
     let c = celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap();
     let tier = celastro::objstore::DirStore::new(&store).unwrap();
-    let resealed =
-        celastro::cipher::reseal_archive(&c, &tier, "celastro/", &["items".into()], &scratch)
-            .unwrap();
+    let resealed = celastro::cipher::reseal_archive(
+        &c,
+        &tier,
+        "celastro/",
+        &[("items".into(), "shard-0000".into())],
+        &scratch,
+    )
+    .unwrap();
     assert!(resealed > 0, "the tier's objects were under the old key");
-    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1);
+    assert_eq!(celastro::cipher::retire_keys(&d, &m, &[]).unwrap(), 1);
     let mut db = Db::open(&d, with_store()).unwrap();
     let b3 = backup(&mut db);
     drop(db);
@@ -521,7 +526,7 @@ fn a_backup_under_the_id_pin_puts_a_segment_a_rotation_resealed_under_its_finger
     let (b1, m1) = backup(&mut db);
     assert!(!m1.contains("named by the key's fingerprint"), "{m1}");
     drop(db);
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w.files > 0, "{w:?}");
     // The ring still held: the segments present at their size under the
     // old key.
@@ -532,7 +537,7 @@ fn a_backup_under_the_id_pin_puts_a_segment_a_rotation_resealed_under_its_finger
     let (b2, m2) = backup(&mut db);
     drop(db);
     // The ring retired: the KEY holds the new key alone.
-    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1);
+    assert_eq!(celastro::cipher::retire_keys(&d, &m, &[]).unwrap(), 1);
     let mut db = Db::open(&d, opts(Some(m))).unwrap();
     let (b3, m3) = backup(&mut db);
     drop(db);
@@ -1214,6 +1219,9 @@ fn a_backup_under_the_old_master_restores_under_the_new_one_once_rekeyed() {
     let r = celastro::backup::rekey_backups(&archive, None, &dest, &m1, &m2).unwrap();
     assert_eq!((r.rewrapped, r.already), (0, 1), "{r:?}");
     for p in [&src, &backups] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
 
 /// A node of a test cluster: a `Db` on its directory, served on the wire
 /// from a thread, with the address its peers call it by.
@@ -1366,7 +1374,7 @@ fn a_reseal_on_a_shared_archive_prefix_walks_this_nodes_shards_alone() {
     let current = |v: &[Option<(usize, bool)>]| v.iter().all(|o| *o == Some((0, true)));
 
     // A rotates: its ring is {K_A, K0}; B's KEY is K0 alone.
-    let w = celastro::cipher::rotate_data_key(&a_dir, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&a_dir, &m, &[]).unwrap();
     assert_eq!(w.kept_keys, 1, "{w:?}");
     let (ca, cb) = (unwrap_key(&a_dir), unwrap_key(&b_dir));
     // A move of one of B's shards onto A, cut short: not a shard of A's.
@@ -1409,7 +1417,7 @@ fn a_reseal_on_a_shared_archive_prefix_walks_this_nodes_shards_alone() {
     }
     let walk = celastro::cipher::walk_archive(&ca, &dir_store, PREFIX, &here).unwrap();
     assert_eq!(walk.under_previous, 0, "{walk:?}");
-    assert_eq!(celastro::cipher::retire_keys(&a_dir, &m).unwrap(), 1);
+    assert_eq!(celastro::cipher::retire_keys(&a_dir, &m, &[]).unwrap(), 1);
     std::fs::remove_dir_all(&incoming).unwrap();
 
     // Both back on their addresses. Every row reads from the store: A's
@@ -1473,7 +1481,7 @@ fn a_move_onto_a_node_whose_ring_lacks_the_sources_key_is_refused_and_leaves_not
     let want = a.query("SELECT id FROM items LIMIT 200");
     assert_eq!(want.len(), 60);
     let (a_dir, a_port) = a.stop();
-    let w = celastro::cipher::rotate_data_key(&a_dir, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&a_dir, &m, &[]).unwrap();
     assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
     let a = Served::start(a_dir, a_port, &node_opts);
     let b = Served::start(dir("move-b"), 0, &node_opts);
@@ -1506,7 +1514,7 @@ fn a_move_onto_a_node_whose_ring_lacks_the_sources_key_is_refused_and_leaves_not
     // move lands, and the key given again is nothing to rotate to.
     let shared = celastro::cipher::Cipher::generate().unwrap().wrap(&m).unwrap();
     for d in [&a_dir, &b_dir] {
-        let w = celastro::cipher::rotate_data_key_to(d, &m, Some(&shared)).unwrap();
+        let w = celastro::cipher::rotate_data_key_to(d, &m, &[], Some(&shared)).unwrap();
         assert!(w.failures.is_empty(), "{w:?}");
     }
     let fingerprint = |d: &Path| {
@@ -1515,8 +1523,9 @@ fn a_move_onto_a_node_whose_ring_lacks_the_sources_key_is_refused_and_leaves_not
             .fingerprint()
     };
     assert_eq!(fingerprint(&a_dir), fingerprint(&b_dir), "one current key on both");
-    let e =
-        celastro::cipher::rotate_data_key_to(&a_dir, &m, Some(&shared)).unwrap_err().to_string();
+    let e = celastro::cipher::rotate_data_key_to(&a_dir, &m, &[], Some(&shared))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("already holds"), "{e}");
     let a = Served::start(a_dir, a_port, &node_opts);
     let b = Served::start(b_dir, b_port, &node_opts);
@@ -1589,7 +1598,7 @@ fn a_rotation_refuses_a_torn_log_tail_before_writing_anything_and_the_open_cuts_
         let mut torn = whole.clone();
         torn.extend_from_slice(&tail);
         std::fs::write(&log, &torn).unwrap();
-        let e = celastro::cipher::rotate_data_key(&d, &m).unwrap_err().to_string();
+        let e = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap_err().to_string();
         assert!(
             e.contains("nothing was written")
                 && e.contains("wal.log")
@@ -1603,7 +1612,7 @@ fn a_rotation_refuses_a_torn_log_tail_before_writing_anything_and_the_open_cuts_
             assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
         }
         assert_eq!(std::fs::read(&log).unwrap().len(), whole.len(), "{tag}: the open cut the tail");
-        let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+        let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
         assert!(w.files > 0 && w.records > 0 && w.failures.is_empty(), "{w:?}");
         assert!(!d.join("KEY.next").exists());
         let mut db = Db::open(&d, opts(Some(m))).unwrap();
@@ -1627,12 +1636,12 @@ fn a_rotation_refuses_a_half_pulled_shard_before_writing_anything() {
     let shard = d.join("collections").join("items").join("shard-0000");
     let incoming = d.join("collections").join("items").join("shard-0001.incoming");
     copy_tree(&shard, &incoming);
-    let e = celastro::cipher::rotate_data_key(&d, &m).unwrap_err().to_string();
+    let e = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap_err().to_string();
     assert!(e.contains("shard-0001.incoming") && e.contains("move is in flight"), "{e}");
     assert!(!d.join("KEY.next").exists(), "KEY.next was written before the refusal");
     assert!(catalog_opens_under_key(&d, &m), "CATALOG was re-sealed before the refusal");
     std::fs::remove_dir_all(&incoming).unwrap();
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
     let mut db = Db::open(&d, opts(Some(m))).unwrap();
     assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
@@ -1660,7 +1669,7 @@ fn a_rotation_passes_over_a_staging_directory_and_reseals_the_shard_beside_it() 
     let staged =
         d.join("collections").join("items.restore.tmp").join("shard-0000").join("MANIFEST");
     let staged_bytes = std::fs::read(&staged).unwrap();
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert_eq!(w.leftovers, 2, "{w:?}");
     assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
     // The shard beside them is under the new key alone; the staging files
@@ -1697,7 +1706,7 @@ fn a_rotation_passes_over_a_drop_left_aside_and_the_next_open_completes_it() {
     };
     let aside = d.join("collections").join("notes.dropping");
     std::fs::rename(d.join("collections").join("notes"), &aside).unwrap();
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert_eq!(w.leftovers, 1, "{w:?}");
     assert!(w.files > 0 && w.failures.is_empty(), "{w:?}");
     let mut db = Db::open(&d, opts(Some(m))).unwrap();
@@ -1747,7 +1756,7 @@ fn a_rotation_cut_short_is_recovered_by_renaming_key_next_over_key() {
         let mut db = Db::open(&d, opts(Some(m))).unwrap();
         assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all);
     }
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w.files > 0 && w.already == 0 && w.failures.is_empty(), "{w:?}");
     assert_eq!(w.kept_keys, 2, "both keys kept behind the fresh one");
     let mut db = Db::open(&d, opts(Some(m))).unwrap();

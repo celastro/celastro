@@ -439,7 +439,7 @@ fn a_restore_crosses_a_data_key_rotation_under_the_keys_the_archive_holds() {
     // The live log shipped under the first key.
     ack(&mut db, &format!("BACKUP LOG TO '{}'", dest.display()));
     drop(db);
-    let w = celastro::cipher::rotate_data_key(&data, &master).unwrap();
+    let w = celastro::cipher::rotate_data_key(&data, &master, &[]).unwrap();
     assert!(w.files > 0 && w.records >= 20, "{w:?}");
     // Reopened under the new key, more rows, and the same log shipped
     // again: the copy under the new key replaces the one under the old.
