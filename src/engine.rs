@@ -1367,6 +1367,10 @@ pub struct Db {
     /// directory: the data is not here. Said once in the notes and on
     /// every `SHOW HEALTH` until a restore or a drop settles it.
     not_adopted: BTreeSet<String>,
+    /// Shards whose `RANGE` the open rewrote to the map's with rows left
+    /// outside the range: said on every `SHOW HEALTH` while the shard
+    /// still holds any, until a compaction drops them.
+    range_repaired: BTreeSet<(String, usize)>,
     /// When this process opened the database, microseconds: what `hello`
     /// carries as the epoch, so a peer can tell a restart from the same
     /// process, and an older process answering at the address from
@@ -1463,6 +1467,7 @@ impl Db {
             nodes: Mutex::new(BTreeMap::new()),
             attached: BTreeSet::new(),
             not_adopted: BTreeSet::new(),
+            range_repaired: BTreeSet::new(),
             epoch: crate::time::now_micros().max(0) as u64,
             epoch_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peers_seen: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1651,8 +1656,8 @@ impl Db {
                     let (lo, hi) = read_range(&db.cipher, &fdir, i, name)?;
                     let mut sh =
                         Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &fdir)?;
-                    sh.set_key_range(lo, hi);
                     sh.index = i;
+                    db.take_tablet_range(name, &mut sh, &fdir, t, (lo, hi))?;
                     followed.push(sh);
                 }
                 continue;
@@ -1678,8 +1683,13 @@ impl Db {
                 )?,
                 None => Shard::open(coll.clone(), db.clock.clone(), db.shard_opts(), &sdir)?,
             };
-            sh.set_key_range(lo, hi);
             sh.index = i;
+            // The map's range, when RANGE says another (a crash inside a
+            // split or a merge); a map derived above was read from RANGE and
+            // agrees with it by construction.
+            if db.take_tablet_range(name, &mut sh, &sdir, t, (lo, hi))? > 0 {
+                db.range_repaired.insert((name.to_string(), i));
+            }
             shards.push(sh);
         }
         if !shards.is_empty() {
@@ -1696,6 +1706,57 @@ impl Db {
             }
         }
         Ok(derived)
+    }
+
+    /// The range a shard opens with: the map's, and `RANGE` rewritten to
+    /// it when the two disagree. A merge writes `RANGE` and then the map,
+    /// a split the map and then `RANGE`, and a crash between the two -- or
+    /// the second write failing -- left them apart. The open took `RANGE`,
+    /// so two shards owned the same keys: a scan answered their rows
+    /// twice, a delete landed on one copy and the key came back from the
+    /// other, and a retried merge absorbed the rows a second time, for
+    /// good (through 0.99.0). The map is what every other node routes by,
+    /// so it wins, as `ensure_followed` has kept a followed copy's range
+    /// at every persist. Returns the live rows the shard holds outside the
+    /// range it got -- masked out of its segments and its memtable, and
+    /// dropped by the next compaction. Nothing, in a crash between the two
+    /// writes; but a node that ran on in the diverged state wrote rows to
+    /// the wrong shard, and those are what the count, the log line and
+    /// `SHOW HEALTH` tell the operator about.
+    fn take_tablet_range(
+        &self,
+        collection: &str,
+        sh: &mut Shard,
+        dir: &Path,
+        t: &Tablet,
+        on_disk: (Option<String>, Option<String>),
+    ) -> Result<usize> {
+        let (lo, hi) = (t.lo.clone(), t.hi.clone());
+        if on_disk == (lo.clone(), hi.clone()) {
+            sh.set_key_range(lo, hi);
+            return Ok(0);
+        }
+        sh.set_key_range(lo.clone(), hi.clone());
+        let i = sh.index;
+        crate::shard::write_content(
+            &self.cipher,
+            &shard_file_ids(collection, &format!("shard-{i:04}"), "RANGE"),
+            &dir.join("RANGE"),
+            format!("{}\n{}", lo.clone().unwrap_or_default(), hi.clone().unwrap_or_default())
+                .as_bytes(),
+        )?;
+        let outside = rows_outside_range(sh);
+        crate::log::warn(
+            "range_repaired",
+            &[
+                ("collection", collection.to_string()),
+                ("shard", i.to_string()),
+                ("range_file", range_text(&on_disk.0, &on_disk.1)),
+                ("map", range_text(&lo, &hi)),
+                ("rows_outside", outside.to_string()),
+            ],
+        );
+        Ok(outside)
     }
 
     fn shard_opts(&self) -> ShardOpts {
@@ -2878,6 +2939,22 @@ impl Db {
             out.push_str(&format!(
                 "collection `{name}`: NOT ADOPTED, a peer's map names this node as a holder \
                  and the data is not in this directory; restore it or drop it\n"
+            ));
+        }
+        for (name, i) in &self.range_repaired {
+            let Some(sh) = self.shards.get(name).and_then(|v| v.iter().find(|s| s.index == *i))
+            else {
+                continue;
+            };
+            let outside = rows_outside_range(sh);
+            if outside == 0 {
+                continue;
+            }
+            let (lo, hi) = sh.key_range();
+            out.push_str(&format!(
+                "shard {i} of `{name}`: RANGE repaired at the open to the map's {}; {outside} \
+                 row(s) outside it are invisible and dropped at the next compaction\n",
+                range_text(&lo, &hi)
             ));
         }
         if self.opts.stewards.is_some() && self.steward().is_none() {
@@ -4915,8 +4992,16 @@ impl Db {
             let def = self.catalog.get(&name)?.clone();
             let (lo, hi) = read_range(&self.cipher, &sdir, shard, &name)?;
             let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &sdir)?;
-            sh.set_key_range(lo, hi);
             sh.index = shard;
+            // The map's range over the directory's, as the open prefers it.
+            match tablets.get(shard) {
+                Some(t) => {
+                    if self.take_tablet_range(&name, &mut sh, &sdir, t, (lo, hi))? > 0 {
+                        self.range_repaired.insert((name.clone(), shard));
+                    }
+                }
+                None => sh.set_key_range(lo, hi),
+            }
             Ok(sh)
         })();
         let sh = match opened {
@@ -6013,7 +6098,11 @@ impl Db {
         let def = self.catalog.get(collection)?.clone();
         let opened = read_range(&self.cipher, &to, shard, collection).and_then(|(lo, hi)| {
             let mut sh = Shard::open(def, self.clock.clone(), self.shard_opts(), &to)?;
-            sh.set_key_range(lo, hi);
+            sh.index = shard;
+            // The map's range over the copy's, as the open prefers it.
+            if self.take_tablet_range(collection, &mut sh, &to, t, (lo, hi))? > 0 {
+                self.range_repaired.insert((collection.to_string(), shard));
+            }
             Ok(sh)
         });
         let mut sh = match opened {
@@ -10546,6 +10635,38 @@ fn read_range_at(
     let lo = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
     let hi = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
     Ok((lo, hi))
+}
+
+/// `[lo, hi)` as the map says it, an empty bound for an open end.
+fn range_text(lo: &Option<String>, hi: &Option<String>) -> String {
+    format!("[{}, {})", lo.as_deref().unwrap_or(""), hi.as_deref().unwrap_or(""))
+}
+
+/// The live rows a shard holds outside its range: the ordinals its
+/// segments' masks leave out and the keys its memtables hold outside it,
+/// deleted ones not counted -- what a read never sees and the next
+/// compaction drops.
+fn rows_outside_range(sh: &Shard) -> usize {
+    let mut n = 0usize;
+    for h in &sh.segments {
+        let Some((a, b)) = h.mask() else { continue };
+        let total = h.segment.num_docs() as u32;
+        n += (0..a.min(total))
+            .chain(b.min(total)..total)
+            .filter(|&o| !h.is_deleted_at(o, crate::time::MAX_TS))
+            .count();
+    }
+    for m in std::iter::once(&sh.memtable).chain(sh.frozen.iter().map(|f| f.as_ref())) {
+        n += m
+            .by_key
+            .iter()
+            .filter(|(k, chain)| {
+                !m.in_range(k)
+                    && chain.last().is_some_and(|&o| !m.is_deleted_at(o, crate::time::MAX_TS))
+            })
+            .count();
+    }
+    n
 }
 
 /// A collection's shards as the coordinator calls them: `Local` by direct
@@ -16683,6 +16804,155 @@ mod tests {
             "a missing tablet map was read as a shard that owns every key"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A merge writes `RANGE`, then the map; a crash between the two left
+    /// shard 0's `RANGE` widened over the rows it absorbed while the map
+    /// still named shard 1 live. The open trusted `RANGE`, so every row of
+    /// shard 1 answered twice, a delete of one landed on shard 0's copy and
+    /// the key came back from shard 1, and a second merge absorbed the rows
+    /// again for good (through 0.99.0). The open takes the map's range,
+    /// rewrites `RANGE`, and counts the rows outside it for `SHOW HEALTH`
+    /// until a compaction drops them.
+    #[test]
+    fn a_merge_cut_between_range_and_the_map_is_reconciled_at_the_open() {
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for e in fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                let (src, dst) = (e.path(), to.join(e.file_name()));
+                if e.file_type().unwrap().is_dir() {
+                    copy_tree(&src, &dst);
+                } else {
+                    fs::copy(&src, &dst).unwrap();
+                }
+            }
+        }
+        let count = |db: &mut Db| -> i64 {
+            let r = db.query("SELECT count(*) AS n FROM notes").unwrap();
+            r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+        };
+        let ranges = |db: &Db| -> Vec<Option<(Option<String>, Option<String>)>> {
+            db.shards("notes").unwrap().iter().map(|s| s.key_range.clone()).collect()
+        };
+        let dir = tmp("range-merge-cut");
+        let aside = tmp("range-merge-cut-aside");
+        let cdir = dir.join("collections").join("notes");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        for i in 0..20 {
+            db.insert("notes", note(&format!("a{i:02}"))).unwrap();
+            db.insert("notes", note(&format!("z{i:02}"))).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        drop(db);
+        fs::create_dir_all(&aside).unwrap();
+        fs::copy(dir.join("CATALOG"), aside.join("CATALOG")).unwrap();
+        copy_tree(&cdir.join("shard-0001"), &aside.join("shard-0001"));
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        run_ack(&mut db, "MERGE SHARDS 0 AND 1 OF notes");
+        drop(db);
+        // The crash, between the two writes: shard 0's RANGE and segments
+        // as the merge left them, the map and shard 1 as they were before.
+        fs::copy(aside.join("CATALOG"), dir.join("CATALOG")).unwrap();
+        let _ = fs::remove_dir_all(cdir.join("shard-0001"));
+        copy_tree(&aside.join("shard-0001"), &cdir.join("shard-0001"));
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let halves = vec![Some((None, Some("m".to_string()))), Some((Some("m".to_string()), None))];
+        assert_eq!(ranges(&db), halves, "the map's ranges, not RANGE's");
+        assert_eq!(count(&mut db), 40, "every row once");
+        let h = db.show_health();
+        assert!(
+            h.contains(
+                "shard 0 of `notes`: RANGE repaired at the open to the map's [, m); 20 row(s) \
+                 outside it"
+            ),
+            "{h}"
+        );
+        let (lo, hi) = read_range(&db.cipher, &cdir.join("shard-0000"), 0, "notes").unwrap();
+        assert_eq!((lo, hi), (None, Some("m".to_string())), "RANGE rewritten to the map's");
+        // A delete lands on the one shard that owns the key, and holds.
+        db.execute("DELETE FROM notes WHERE id = 'z05'").unwrap();
+        let r = db.query("SELECT id FROM notes WHERE id = 'z05' LIMIT 5").unwrap();
+        assert!(r.rows.is_empty(), "a deleted key came back from a second shard");
+        assert_eq!(count(&mut db), 39);
+        // The merge again: what shard 0 absorbed the first time is dropped
+        // with its mask before the range widens, and shard 1's rows taken
+        // once.
+        run_ack(&mut db, "MERGE SHARDS 0 AND 1 OF notes");
+        assert_eq!(count(&mut db), 39, "the retried merge made the duplicates permanent");
+        assert_eq!(db.shards("notes").unwrap()[0].key_range, Some((None, None)));
+        let h = db.show_health();
+        assert!(!h.contains("RANGE repaired"), "nothing is outside the range now: {h}");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(count(&mut db), 39);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&aside);
+    }
+
+    /// A split writes the map at the new shard's adoption and the source's
+    /// `RANGE` after; a crash between the two left the source's `RANGE`
+    /// over the whole range while the map gave the upper half to the new
+    /// shard. The open trusted `RANGE`, so the upper half answered twice
+    /// and an insert above the split landed in the source, a shard the map
+    /// routes no node to for that key (through 0.99.0). The open takes the
+    /// map's range and rewrites `RANGE`.
+    #[test]
+    fn a_split_cut_between_the_map_and_range_is_reconciled_at_the_open() {
+        let count = |db: &mut Db| -> i64 {
+            let r = db.query("SELECT count(*) AS n FROM notes").unwrap();
+            r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+        };
+        let dir = tmp("range-split-cut");
+        let cdir = dir.join("collections").join("notes");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        for i in 0..20 {
+            db.insert("notes", note(&format!("a{i:02}"))).unwrap();
+            db.insert("notes", note(&format!("z{i:02}"))).unwrap();
+        }
+        db.execute("FLUSH notes").unwrap();
+        let range = cdir.join("shard-0000").join("RANGE");
+        let whole = fs::read(&range).unwrap();
+        run_ack(&mut db, "SPLIT SHARD 0 OF notes AT 'm'");
+        drop(db);
+        // The crash, between the two writes: the map says two shards, the
+        // source's RANGE still the whole range.
+        fs::write(&range, &whole).unwrap();
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let ranges: Vec<_> =
+            db.shards("notes").unwrap().iter().map(|s| s.key_range.clone()).collect();
+        assert_eq!(
+            ranges,
+            vec![Some((None, Some("m".to_string()))), Some((Some("m".to_string()), None))],
+            "the map's ranges, not RANGE's"
+        );
+        assert_eq!(count(&mut db), 40, "every row once");
+        let h = db.show_health();
+        assert!(
+            h.contains(
+                "shard 0 of `notes`: RANGE repaired at the open to the map's [, m); 20 row(s) \
+                 outside it"
+            ),
+            "{h}"
+        );
+        // An insert above the split lands in the shard the map names.
+        db.insert("notes", note("zz")).unwrap();
+        let shards = db.shards("notes").unwrap();
+        assert_eq!(
+            (shards[0].memtable.len(), shards[1].memtable.len()),
+            (0, 1),
+            "the row went to the shard the map routes to"
+        );
+        let (lo, hi) = read_range(&db.cipher, &cdir.join("shard-0000"), 0, "notes").unwrap();
+        assert_eq!((lo, hi), (None, Some("m".to_string())), "RANGE rewritten to the map's");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(count(&mut db), 41);
+        drop(db);
         let _ = fs::remove_dir_all(&dir);
     }
 
