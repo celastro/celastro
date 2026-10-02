@@ -14670,15 +14670,26 @@ mod tests {
                 return None;
             }
             let r = db.query("SELECT id, n FROM items LIMIT 1000").unwrap();
-            Some(
-                r.rows
-                    .iter()
-                    .map(|row| {
-                        let id = row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string();
-                        (id, row.doc.path("n").and_then(|v| v.as_i64()).unwrap())
-                    })
-                    .collect(),
-            )
+            let map: BTreeMap<String, i64> = r
+                .rows
+                .iter()
+                .map(|row| {
+                    let id = row.doc.path("id").and_then(|v| v.as_str()).unwrap().to_string();
+                    (id, row.doc.path("n").and_then(|v| v.as_i64()).unwrap())
+                })
+                .collect();
+            // A key live twice -- a replaced version beside its replacement,
+            // the mark that killed it lost -- folds to one entry here, and
+            // whichever version the map keeps passes the per-key check
+            // below. The scan answers one row per key, so the row count
+            // cannot show it either; the shard's count of live versions can.
+            assert_eq!(r.rows.len(), map.len(), "{d:?}: a key is live twice");
+            assert_eq!(
+                db.shards("items").unwrap()[0].num_docs(crate::time::MAX_TS),
+                map.len(),
+                "{d:?}: a key is live twice"
+            );
+            Some(map)
         };
         let mut partial = 0;
         for c in copies.iter() {
@@ -14822,8 +14833,44 @@ mod tests {
         assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
         drop(db);
         let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        // Once, and the new version: the seal kept the version the write
+        // replaced for the reader held below the write, and the mark that
+        // supersedes it was pending at the seal. The seal left the pending
+        // mark out of the published delete log and then emptied the log
+        // holding the write's record, so both versions were live after a
+        // reopen (0.98.0 as committed). The scan answers one row per key,
+        // so the shard's count of live versions is what shows the second.
+        assert_eq!(ids(&mut db), ["k0"]);
+        assert_eq!(
+            db.shards("items").unwrap()[0].num_docs(crate::time::MAX_TS),
+            1,
+            "the version the write replaced came back beside it"
+        );
         let r = db.query("SELECT n FROM items WHERE id = 'k0'").unwrap();
         assert_eq!(r.rows[0].doc.path("n").and_then(|v| v.as_i64()), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seal that runs while a delete of a sealed row is in flight keeps
+    /// the delete: the seal syncs the log before it publishes, so the mark
+    /// is in the published delete log before the truncation declares the
+    /// record synced and the statement is acknowledged. The seal left the
+    /// pending mark out and emptied the log, so the acknowledgement stood
+    /// on nothing and the row came back at the reopen (0.98.0 as
+    /// committed).
+    #[test]
+    fn a_seal_with_a_delete_in_flight_keeps_the_delete() {
+        let (dir, mut db) = group_commit_db("gc-seal-delete");
+        db.execute("FLUSH items").unwrap();
+        let pending = db.execute("DELETE FROM items WHERE id = 'k0'").unwrap();
+        let pending1 = db.execute(r#"INSERT INTO items VALUES ('{"id":"k1","n":1}')"#).unwrap();
+        db.execute("FLUSH items").unwrap();
+        pending.finished().unwrap();
+        pending1.finished().unwrap();
+        assert_eq!(ids(&mut db), ["k1"]);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(ids(&mut db), ["k1"], "the acknowledged delete came back on the reopen");
         let _ = fs::remove_dir_all(&dir);
     }
 

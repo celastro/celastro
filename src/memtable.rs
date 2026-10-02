@@ -153,6 +153,12 @@ pub struct Memtable {
     /// horizon would emit. Kept as a running maximum on the write path, so
     /// `should_flush` is a comparison and not a walk of every chain.
     depth: usize,
+    /// Which of its shard's freezes made this memtable a frozen one, from
+    /// 1; 0 while it is the live one. A frozen memtable's identity for a
+    /// location kept across installs (`Loc::Frozen`): its position among
+    /// the frozen shifts when an older one is installed, and two freezes
+    /// can reserve the same first segment id.
+    pub gen: u64,
 }
 
 impl Memtable {
@@ -184,6 +190,7 @@ impl Memtable {
             bytes: 0,
             depth: 0,
             budget,
+            gen: 0,
         }
     }
 

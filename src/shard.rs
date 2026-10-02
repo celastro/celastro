@@ -1757,7 +1757,12 @@ impl LogSync {
                     st.synced = st.synced.max(target);
                     st.syncs += 1;
                     if st.generation == generation {
-                        st.synced_len = len.min(st.low_water);
+                        // Never lowered: an inline sync of the same log
+                        // (`Wal::sync`, under the lock) can have covered
+                        // records appended after this one measured the
+                        // file, and a later cut to the shorter length
+                        // would take records that sync acknowledged.
+                        st.synced_len = st.synced_len.max(len.min(st.low_water));
                     }
                     LogSync::ship_synced(&mut st);
                 }
@@ -2171,9 +2176,13 @@ impl Wal {
         self.file = truncate_file(&self.path)?;
         self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
         self.begin()?;
-        // The records it held are in segments a published manifest names,
-        // which is the only way a caller may get here, so every writer still
-        // waiting on them is durable.
+        // Every record it held is on the disk twice over: the caller
+        // synced this log before it published the segments holding the
+        // records' rows, and nothing was appended since (`Shard::flush`,
+        // under the lock), so the publication wrote every supersede mark
+        // those records placed. A publication that left a pending mark
+        // out and then emptied the log here declared the mark's record
+        // synced with the mark on no disk (0.98.0 as committed).
         self.group.replace(self.file.try_clone()?);
         Ok(())
     }
@@ -2183,8 +2192,12 @@ impl Wal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Loc {
     Mem(u32),
-    /// A memtable that has been frozen but whose segment is not committed yet.
-    Frozen(usize, u32),
+    /// A memtable that has been frozen but whose segment is not committed
+    /// yet, by the freeze that made it (`Memtable::gen`) rather than by its
+    /// position: an older memtable's install shifts the positions, and a
+    /// location kept until a sync lands (`unsynced_marks`) must still find
+    /// its row.
+    Frozen(u64, u32),
     Seg(u64, u32),
 }
 
@@ -2361,8 +2374,13 @@ pub struct Shard {
     wal: Option<Wal>,
     /// The supersede marks of records whose sync is deferred and not yet
     /// covered by one: `(sequence, where, instant)`, taken back if the sync
-    /// fails (`recover_log`).
+    /// fails (`recover_log`). A mark moves with its row: an install that
+    /// seals the frozen memtable or retires the segment holding it points
+    /// the entry at the row's new segment (`repoint_unsynced_marks`).
     unsynced_marks: Vec<(u64, Loc, Timestamp)>,
+    /// How many memtables this shard has frozen since it was opened: the
+    /// identity the next frozen one carries (`Memtable::gen`).
+    freezes: u64,
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
     pub(crate) flushes: u64,
@@ -2470,6 +2488,7 @@ impl Shard {
             frozen: Vec::new(),
             pending_seals: Vec::new(),
             unsynced_marks: Vec::new(),
+            freezes: 0,
             unsealed_wals: Vec::new(),
             wal_seq: 1,
             timeline: 0,
@@ -2898,9 +2917,9 @@ impl Shard {
         if let Some(ord) = self.memtable.find_at(key, t) {
             return Some(Loc::Mem(ord));
         }
-        for (i, f) in self.frozen.iter().enumerate().rev() {
+        for f in self.frozen.iter().rev() {
             if let Some(ord) = f.find_at(key, t) {
-                return Some(Loc::Frozen(i, ord));
+                return Some(Loc::Frozen(f.gen, ord));
             }
         }
         // Segments are searched newest first; the first visible hit wins, and
@@ -2935,10 +2954,10 @@ impl Shard {
                 consider(Loc::Mem(ord), *ts);
             }
         }
-        for (i, f) in self.frozen.iter().enumerate() {
+        for f in &self.frozen {
             if let Some(ord) = f.find(key) {
                 if let Some(ts) = f.ordinals.commit_ts.get(ord as usize) {
-                    consider(Loc::Frozen(i, ord), *ts);
+                    consider(Loc::Frozen(f.gen, ord), *ts);
                 }
             }
         }
@@ -2987,8 +3006,8 @@ impl Shard {
     fn unmark_superseded(&mut self, target: Loc, ts: Timestamp) {
         match target {
             Loc::Mem(ord) => self.memtable.unmark_deleted(ord, ts),
-            Loc::Frozen(i, ord) => {
-                if let Some(f) = self.frozen.get(i) {
+            Loc::Frozen(gen, ord) => {
+                if let Some(f) = self.frozen.iter().find(|f| f.gen == gen) {
                     f.unmark_deleted(ord, ts);
                 }
             }
@@ -3003,8 +3022,8 @@ impl Shard {
     fn mark_superseded(&mut self, target: Loc, ts: Timestamp) {
         match target {
             Loc::Mem(ord) => self.memtable.mark_deleted(ord, ts),
-            Loc::Frozen(i, ord) => {
-                if let Some(f) = self.frozen.get(i) {
+            Loc::Frozen(gen, ord) => {
+                if let Some(f) = self.frozen.iter().find(|f| f.gen == gen) {
                     f.mark_deleted(ord, ts);
                 }
             }
@@ -3424,9 +3443,12 @@ impl Shard {
         match self.locate(key, t) {
             None => Ok(None),
             Some(Loc::Mem(ord)) => Ok(self.memtable.docs.get(ord as usize).map(|d| d.doc.clone())),
-            Some(Loc::Frozen(i, ord)) => {
-                Ok(self.frozen[i].docs.get(ord as usize).map(|d| d.doc.clone()))
-            }
+            Some(Loc::Frozen(gen, ord)) => Ok(self
+                .frozen
+                .iter()
+                .find(|f| f.gen == gen)
+                .and_then(|f| f.docs.get(ord as usize))
+                .map(|d| d.doc.clone())),
             Some(Loc::Seg(sid, ord)) => {
                 let h = self
                     .segments
@@ -3889,7 +3911,10 @@ impl Shard {
             }
         }
         let fresh = self.fresh_memtable();
-        let frozen = Arc::new(std::mem::replace(&mut self.memtable, fresh));
+        let mut frozen = std::mem::replace(&mut self.memtable, fresh);
+        self.freezes += 1;
+        frozen.gen = self.freezes;
+        let frozen = Arc::new(frozen);
         self.frozen.push(frozen.clone());
         self.pending_seals.push(SealTicket {
             frozen,
@@ -4007,11 +4032,14 @@ impl Shard {
         if let Some(reach) = built.archived_reach {
             self.archived_reach = self.archived_reach.max(Some(reach));
         }
-        let mut deletes = Shard::deletes_of(&t.frozen);
-        // Not the marks of writes whose sync is pending: taken back if the
-        // sync fails, and a seal must not carry them into a segment.
-        let pending = self.unsynced_instants();
-        deletes.retain(|(_, _, dts)| !pending.contains(dts));
+        // Every mark the frozen memtable holds, the ones whose sync is
+        // pending included. A pending mark is kept off the disk by the
+        // publication and taken back by `recover_log` if its sync fails;
+        // in memory it has to move onto the new segment with its row, or a
+        // sync that then succeeds -- the usual outcome -- acknowledges a
+        // delete whose only copy left with the frozen memtable, and the
+        // row read live again (0.98.0 as committed left them out).
+        let deletes = Shard::deletes_of(&t.frozen);
         let committed = self
             .handles_for(built.segments, &deletes, &built.written)
             .and_then(|h| self.commit_handles(h));
@@ -4022,6 +4050,18 @@ impl Shard {
                 return Err(e);
             }
         };
+        // The pending marks that named the frozen memtable name their rows'
+        // segments from here, so a sync that fails still takes them back.
+        // After the commit: a ticket put back by a failed one keeps its
+        // memtable, and segments named before a failed publication were
+        // never published.
+        let frozen = &t.frozen;
+        self.repoint_unsynced_marks(&sealed.segment_ids, |loc| match loc {
+            Loc::Frozen(gen, ord) if gen == frozen.gen => {
+                frozen.docs.get(ord as usize).map(|d| (d.sort_key.clone(), d.commit_ts))
+            }
+            _ => None,
+        });
         self.sealed.merge(&t.tally);
         self.frozen.retain(|f| !Arc::ptr_eq(f, &t.frozen));
         t.frozen.release_budget();
@@ -4065,6 +4105,37 @@ impl Shard {
     /// counted; the next start seals it.
     pub(crate) fn seal_put_back(&mut self, t: SealTicket) {
         self.pending_seals.insert(0, t);
+    }
+
+    /// The pending marks on rows an install moves -- the frozen memtable a
+    /// seal commits, the inputs a compaction retires -- pointed at the
+    /// rows' places in the segments `ids` name, so a sync that fails still
+    /// takes them back (`recover_log`) from where the rows are now. `row`
+    /// names a mark's row as `(key, version)` when the mark is on what the
+    /// install retires, and the row is found in the outputs as
+    /// `handles_for` finds it. A mark whose row no output holds keeps its
+    /// location, which names nothing from here and takes nothing back.
+    fn repoint_unsynced_marks(
+        &mut self,
+        ids: &[u64],
+        row: impl Fn(Loc) -> Option<(String, Timestamp)>,
+    ) {
+        if self.unsynced_marks.is_empty() {
+            return;
+        }
+        let outputs: Vec<&Arc<SegmentHandle>> =
+            self.segments.iter().filter(|h| ids.contains(&h.id())).collect();
+        for (_, loc, _) in self.unsynced_marks.iter_mut() {
+            let Some((key, version)) = row(*loc) else { continue };
+            for h in &outputs {
+                if let Some(ord) = h.segment.ordinals.find(&key) {
+                    if h.segment.ordinals.commit_ts.get(ord as usize) == Some(&version) {
+                        *loc = Loc::Seg(h.id(), ord);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// The deletes a memtable holds, as `(key, version, delete instant)`.
@@ -4154,6 +4225,28 @@ impl Shard {
     ///
     /// [`compaction::run`]: crate::compaction::run
     pub(crate) fn flush(&mut self) -> Result<Option<Sealed>> {
+        // The live log to the disk first, as a freeze's rotation does. This
+        // seal publishes every segment's delete log and then empties the
+        // live log, and `truncate` declares every record the log held
+        // synced. With a sync pending here the publication would leave the
+        // pending marks out -- a sync that fails takes them back, so they
+        // are never put on the disk -- and the truncation would then
+        // acknowledge their records with the marks on no disk: an
+        // acknowledged delete came back at the next reopen, an update's
+        // superseded version beside the new one (0.98.0 as committed).
+        // Synced under the lock, with nothing appended until the
+        // truncation, nothing is pending for the installs or the
+        // publication below. A sync that fails fails the seal with the
+        // shard as it was, and tells the clock as `seal_freeze` does, so
+        // the next write probes and recovers the log in place.
+        if let Some(w) = self.wal.as_mut() {
+            if let Err(e) = w.sync() {
+                if w.group.failure().is_some() {
+                    self.clock.fail();
+                }
+                return Err(e);
+            }
+        }
         // Seals frozen for the background first, inline: `FLUSH` means
         // everything sealed, and a shard with no sealer running has none.
         let mut drained = Vec::new();
@@ -5042,22 +5135,26 @@ impl Shard {
             }
         }
         self.catchup_floor = self.catchup_floor.max(forgotten);
-        // The marks placed on the inputs since the build read them: a
-        // delete, or an update, that landed while the build ran off the
-        // lock went into an input's log alone, and the install retired
-        // that log with its input -- the row came back live (through
-        // 0.96.0). Collected again here, under the lock; a mark the build
-        // carried is carried twice, to the same instant.
-        let pending = self.unsynced_instants();
-        let mut carried: Vec<CarriedDelete> = carried_deletes.to_vec();
-        carried.retain(|(_, _, dts)| !pending.contains(dts));
+        // The marks on the inputs as they stand now, under the lock, not as
+        // the build read them off it. A delete, or an update, that landed
+        // while the build ran went into an input's log alone, and the
+        // install retired that log with its input -- the row came back
+        // live (through 0.96.0). And a mark the build read can have been
+        // taken back since, by the recovery of a log whose sync failed, so
+        // the build's list put a delete the client was told failed onto
+        // the output (0.98.0 as committed). The marks whose sync is pending
+        // are carried too: the publication keeps them off the disk, and
+        // `recover_log` takes them back from where the row is, which is
+        // the output from here (`repoint_unsynced_marks` below); left out,
+        // a sync that then succeeded acknowledged a delete the install had
+        // retired with its input. An absorb has no inputs and carries the
+        // list of the shard the rows came from.
+        let mut carried: Vec<CarriedDelete> =
+            if input_ids.is_empty() { carried_deletes.to_vec() } else { Vec::new() };
         for h in self.segments.iter().filter(|h| input_ids.contains(&h.id())) {
             let log = h.deletes.read().unwrap();
             for (ord, dts) in log.iter() {
                 if dts == crate::time::MAX_TS {
-                    continue;
-                }
-                if pending.contains(&dts) {
                     continue;
                 }
                 let key = h.segment.ordinals.key(ord).unwrap_or("").to_string();
@@ -5091,6 +5188,7 @@ impl Shard {
         }
         // The set this compaction is proposing, in a local: the survivors of
         // the input list, plus the outputs, in id order.
+        let output_ids: Vec<u64> = handles.iter().map(|h| h.id()).collect();
         let mut next: Vec<Arc<SegmentHandle>> =
             self.segments.iter().filter(|h| !input_ids.contains(&h.id())).cloned().collect();
         next.extend(handles);
@@ -5117,6 +5215,18 @@ impl Shard {
         let removed: Vec<Arc<SegmentHandle>> =
             self.segments.iter().filter(|h| input_ids.contains(&h.id())).cloned().collect();
         self.segments = next;
+        // The pending marks that named the inputs name their rows' outputs
+        // from here, so a sync that fails still takes them back.
+        self.repoint_unsynced_marks(&output_ids, |loc| match loc {
+            Loc::Seg(sid, ord) if input_ids.contains(&sid) => {
+                removed.iter().find(|h| h.id() == sid).and_then(|h| {
+                    let key = h.segment.ordinals.key(ord)?;
+                    let version = *h.segment.ordinals.commit_ts.get(ord as usize)?;
+                    Some((key.to_string(), version))
+                })
+            }
+            _ => None,
+        });
         self.retain_floor = self.retain_floor.max(retain_from);
         self.manifest_version = version;
         self.compactions += 1;
@@ -7630,6 +7740,167 @@ mod tests {
         );
         s.insert(third).unwrap();
         assert_ne!(s.get(&key, MAX_TS).unwrap().unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delete whose sync is pending when the seal installs the frozen
+    /// memtable holding its row keeps its mark: on the new segment in
+    /// memory at once, and on the disk once the sync lands and the next
+    /// publication writes it. The install left the pending marks out of
+    /// the segment and released the frozen memtable that held them, so a
+    /// sync that then succeeded -- the usual outcome -- acknowledged a
+    /// delete with no mark anywhere and the row read live again; the next
+    /// seal took the log holding the record and made it permanent (0.98.0
+    /// as committed).
+    #[test]
+    fn a_deferred_delete_of_a_frozen_row_survives_the_seal_that_installs_it() {
+        let dir = test_dir("frozen-pending");
+        fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let key = sort_key(&s.coll, &doc(1)).unwrap();
+        s.insert(doc(1)).unwrap();
+        s.insert(doc(2)).unwrap();
+        assert!(s.seal_freeze().unwrap());
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        // The delete, its sync left to the caller, lands on the frozen row
+        // while the build is out.
+        s.defer_sync = true;
+        s.delete(&key).unwrap();
+        let pending = s.take_pending();
+        s.defer_sync = false;
+        assert!(s.get(&key, MAX_TS).unwrap().is_none());
+        s.seal_install(t, built).unwrap();
+        assert!(s.frozen.is_empty());
+        assert!(
+            s.get(&key, MAX_TS).unwrap().is_none(),
+            "the install brought back a row whose delete is in flight"
+        );
+        // The sync lands: the delete is acknowledged.
+        for p in pending {
+            p.log.settle(p.seq).unwrap();
+        }
+        assert!(s.get(&key, MAX_TS).unwrap().is_none(), "the acknowledged delete was undone");
+        // The next seal publishes the mark and takes the log that held the
+        // record; a reopen has only the disk.
+        s.insert(doc(3)).unwrap();
+        assert!(s.seal_freeze().unwrap());
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        drop(s);
+        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            s2.get(&key, MAX_TS).unwrap().is_none(),
+            "the acknowledged delete came back on the reopen"
+        );
+        assert_eq!(s2.num_docs(MAX_TS), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A refused delete of a row in the newer of two frozen memtables is
+    /// taken back after the older one's install. The take-back went by the
+    /// memtable's position among the frozen, which the install shifted, so
+    /// the refused delete's mark stayed, the row read as absent, and the
+    /// newer memtable's install then sealed the mark for good (0.98.0 as
+    /// committed).
+    #[test]
+    fn a_refused_delete_of_a_row_in_the_newer_of_two_frozen_memtables_is_taken_back() {
+        let dir = test_dir("two-frozen");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        assert!(s.seal_freeze().unwrap());
+        s.insert(doc(2)).unwrap();
+        assert!(s.seal_freeze().unwrap());
+        assert_eq!(s.frozen.len(), 2);
+        let key = sort_key(&s.coll, &doc(2)).unwrap();
+        s.defer_sync = true;
+        s.delete(&key).unwrap();
+        let p = s.take_pending().pop().unwrap();
+        s.defer_sync = false;
+        assert!(s.get(&key, MAX_TS).unwrap().is_none());
+        // The older memtable's install, while the delete's sync is out.
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        assert_eq!(s.frozen.len(), 1);
+        // The sync fails: the delete is refused, and the recovery that the
+        // next write runs takes its mark back.
+        durability_probe::fail_next(Op::WalSync, &log);
+        assert!(p.log.settle(p.seq).is_err(), "the injected failure was swallowed");
+        assert!(s.recover_log().unwrap());
+        assert!(
+            s.get(&key, MAX_TS).unwrap().is_some(),
+            "the refused delete's mark stayed on the frozen row: a delete the client was told \
+             failed took effect"
+        );
+        // The newer memtable's install, and a reopen: the row is there.
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        assert!(s.get(&key, MAX_TS).unwrap().is_some());
+        drop(s);
+        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            s2.get(&key, MAX_TS).unwrap().is_some(),
+            "a delete the client was told failed took effect on the reopen"
+        );
+        assert_eq!(s2.num_docs(MAX_TS), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An inline seal syncs the live log before it publishes anything and
+    /// empties it: a delete whose sync is pending when the seal runs is on
+    /// the disk -- its record first, then its mark in the delete log the
+    /// seal publishes -- by the time the truncation declares it synced and
+    /// its statement is acknowledged. The seal published the delete logs
+    /// without the pending marks (a sync that fails takes them back) and
+    /// then emptied the log that held the records, so the acknowledgement
+    /// stood on nothing and the row came back at the next reopen (0.98.0
+    /// as committed).
+    #[test]
+    fn an_inline_seal_syncs_the_log_before_it_publishes_and_empties_it() {
+        let dir = test_dir("sealsync");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let dlog = dir.join("deletes").join(format!("{:016x}.dlog", 1));
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        let key = sort_key(&s.coll, &doc(1)).unwrap();
+        s.insert(doc(1)).unwrap();
+        s.flush().unwrap();
+        assert!(!dlog.exists(), "segment 1 has no deletes yet");
+        // A delete of the sealed row and a row for the memtable, their
+        // syncs left to the caller, who holds them across the seal: no
+        // settle, no sync, no persist.
+        s.defer_sync = true;
+        s.delete(&key).unwrap();
+        s.insert(doc(2)).unwrap();
+        let pending = s.take_pending();
+        s.defer_sync = false;
+        durability_probe::start();
+        s.flush().unwrap();
+        let ev = durability_probe::take();
+        // The caller's acknowledgement.
+        for p in pending {
+            p.log.settle(p.seq).unwrap();
+        }
+        drop(s);
+        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            s2.get(&key, MAX_TS).unwrap().is_none(),
+            "the acknowledged delete came back on the reopen"
+        );
+        assert_eq!(s2.num_docs(MAX_TS), 1, "doc 2, once");
+        assert!(dlog.exists(), "the mark of a delete in flight was left out of the delete log");
+        assert!(
+            ev.ordered((Op::WalSync, &log), (Op::Rename, &dir.join("MANIFEST"))),
+            "the seal published before it synced the log: {ev:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

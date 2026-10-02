@@ -562,6 +562,108 @@ mod tests {
         assert_eq!(s.num_docs(s.clock.peek()), 99);
     }
 
+    /// [`shard_with`], on a directory of its own: with a log, so a write
+    /// can leave its sync to the caller and a reopen reads the disk.
+    fn shard_with_dir(label: &str, n_segments: usize, per: usize) -> (std::path::PathBuf, Shard) {
+        let dir = std::env::temp_dir()
+            .join(format!("celastro-compaction-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+        s.attach_dir(&dir).unwrap();
+        for seg in 0..n_segments {
+            for i in 0..per {
+                s.insert(doc(seg * per + i)).unwrap();
+            }
+            s.flush().unwrap();
+        }
+        (dir, s)
+    }
+
+    /// A delete whose sync is pending when the compaction installs keeps
+    /// its mark on the output: in memory at once, and on the disk once the
+    /// sync lands and the next publication writes it. The install left the
+    /// pending marks out and retired the input that held them, so a sync
+    /// that then succeeded -- the usual outcome -- acknowledged a delete
+    /// with no mark anywhere, and the row read live again (0.98.0 as
+    /// committed).
+    #[test]
+    fn a_deferred_delete_of_an_input_row_survives_the_compaction_that_installs() {
+        let (dir, mut s) = shard_with_dir("pending-install", 4, 25);
+        let opts = CompactionOpts::default();
+        let r = reserve(&mut s, &opts).expect("four segments merge");
+        let built = build(&r).unwrap().expect("a build");
+        let key = format!("t0{KEY_SEP}d00007");
+        // The delete, its sync left to the caller, lands on an input after
+        // the build read it.
+        s.defer_sync = true;
+        s.delete(&key).unwrap();
+        let p = s.take_pending().pop().unwrap();
+        s.defer_sync = false;
+        assert!(s.get(&key, MAX_TS).unwrap().is_none());
+        assert!(install(&mut s, built).unwrap());
+        assert_eq!(s.segments.len(), 1);
+        assert!(
+            s.get(&key, MAX_TS).unwrap().is_none(),
+            "the install brought back a row whose delete is in flight"
+        );
+        // The sync lands: the delete is acknowledged.
+        p.log.settle(p.seq).unwrap();
+        assert!(s.get(&key, MAX_TS).unwrap().is_none(), "the acknowledged delete was undone");
+        // The next seal publishes the mark and empties the log that held the
+        // record; a reopen has only the disk.
+        s.insert(doc(100)).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            s2.get(&key, MAX_TS).unwrap().is_none(),
+            "the acknowledged delete came back on the reopen"
+        );
+        assert_eq!(s2.num_docs(MAX_TS), 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delete the build read whose sync then fails is not carried at the
+    /// install: the recovery took its mark back from the input, and the
+    /// install carries the inputs' marks as they stand under the lock, not
+    /// the build's copy of them. The install started from the build's list,
+    /// so a delete the client was told failed marked the output's row dead,
+    /// for good (0.98.0 as committed).
+    #[test]
+    fn a_delete_refused_during_the_build_is_not_carried_at_the_install() {
+        use crate::shard::durability_probe::{self, Op};
+        let (dir, mut s) = shard_with_dir("refused-install", 4, 25);
+        let opts = CompactionOpts::default();
+        let r = reserve(&mut s, &opts).expect("four segments merge");
+        let key = format!("t0{KEY_SEP}d00007");
+        s.defer_sync = true;
+        s.delete(&key).unwrap();
+        let p = s.take_pending().pop().unwrap();
+        s.defer_sync = false;
+        // The build reads the mark; then its sync fails, the delete is
+        // refused, and the next write's recovery takes the mark back.
+        let built = build(&r).unwrap().expect("a build");
+        durability_probe::fail_next(Op::WalSync, &dir.join("wal.log"));
+        assert!(p.log.settle(p.seq).is_err(), "the injected failure was swallowed");
+        assert!(s.recover_log().unwrap());
+        assert!(s.get(&key, MAX_TS).unwrap().is_some(), "the recovery left the refused mark");
+        assert!(install(&mut s, built).unwrap());
+        assert_eq!(s.segments.len(), 1);
+        assert!(
+            s.get(&key, MAX_TS).unwrap().is_some(),
+            "a delete the client was told failed took effect at the install"
+        );
+        drop(s);
+        let s2 = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert!(
+            s2.get(&key, MAX_TS).unwrap().is_some(),
+            "a delete the client was told failed took effect on the reopen"
+        );
+        assert_eq!(s2.num_docs(MAX_TS), 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn size_tiers_merge_at_the_fanout() {
         let mut s = shard_with(4, 25);
