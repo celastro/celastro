@@ -147,6 +147,10 @@ pub struct Log {
     pub records: Vec<Vec<u8>>,
     pub log_id: Option<LogId>,
     pub complete: bool,
+    /// Which key of the ring opened it: 0 the current data key, `n` the
+    /// nth previous one. A restore rewrites a placed log that is under a
+    /// previous key under the current one.
+    pub key: usize,
     /// The trailer's plaintext, when the log ends with one: empty from a
     /// copy archived before 0.88.0, and since then the log's place --
     /// `timeline | seq | first | last`, 32 bytes -- which a restore holds
@@ -257,6 +261,19 @@ impl Cipher {
         ring.extend(old.previous.iter().copied());
         ring.retain(|k| !crate::crypto::ct_eq(k, &self.data_key));
         self.previous = ring;
+    }
+
+    /// Keep `other`'s current key and ring behind this one's as well, each
+    /// key once: what a restore does with the keys the log archive holds
+    /// for the node, so an archived log shipped under any of them opens.
+    pub fn keep_also(&mut self, other: &Cipher) {
+        for k in other.data_keys() {
+            let held = crate::crypto::ct_eq(k, &self.data_key)
+                || self.previous.iter().any(|p| crate::crypto::ct_eq(p, k));
+            if !held {
+                self.previous.push(*k);
+            }
+        }
     }
 
     /// The same data key with no ring behind it: what a retirement leaves.
@@ -782,14 +799,16 @@ impl Cipher {
         // The current scheme: a header first, under the file's key of each
         // data key in turn; the data key that opens the header is the one
         // the records' key derives from.
-        for data_key in self.data_keys() {
-            if let Some(out) = self.open_log_current(data_key, &ids.current, log) {
+        for (n, data_key) in self.data_keys().into_iter().enumerate() {
+            if let Some(mut out) = self.open_log_current(data_key, &ids.current, log) {
+                out.key = n;
                 return out;
             }
         }
-        for key in &self.file_keys(&ids.legacy) {
-            let out = self.open_log_legacy(key, &ids.legacy, log);
+        for (n, key) in self.file_keys(&ids.legacy).iter().enumerate() {
+            let mut out = self.open_log_legacy(key, &ids.legacy, log);
             if !out.records.is_empty() {
+                out.key = n;
                 return out;
             }
         }
@@ -823,6 +842,7 @@ impl Cipher {
             complete: false,
             trailer: Vec::new(),
             opened: 4 + len,
+            key: 0,
         };
         let mut i = 4 + len;
         let mut index = 1u64;

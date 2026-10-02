@@ -1331,9 +1331,22 @@ pub(crate) mod durable {
     }
 }
 
+/// What a restore finds an archived copy of a log to be.
+pub(crate) enum ArchivedCopy {
+    /// Whole, under the given key of the ring (0 the current data key):
+    /// its trailer closes it, or it is under the legacy scheme, which
+    /// cannot say.
+    Whole(usize),
+    /// Cut at a record boundary: its trailer is gone.
+    Cut,
+    /// Under a key the cipher does not hold: it opens to nothing.
+    Foreign,
+}
+
 /// A placed log cut at `ceiling`: the records past it dropped and the
 /// file rewritten, as a restore does to a log that runs past the end of
-/// its timeline's part of the history.
+/// its timeline's part of the history -- and a placed log rewritten under
+/// the current key, when the archive's copy was under another of the ring.
 pub(crate) fn trim_log(
     path: &Path,
     cipher: &crate::cipher::Shared,
@@ -1880,24 +1893,31 @@ impl Wal {
         Ok(())
     }
 
-    /// Whether the log at `path` is whole: a log under the current scheme
-    /// that an archive wrote ends with a trailer that says so, and one cut
-    /// at a record boundary has lost it; a log under the legacy scheme
-    /// cannot say. What a restore asks of each archived log it fetched.
-    pub(crate) fn complete(
+    /// What the archived copy of a log at `path` is: whole -- a log under
+    /// the current scheme that an archive wrote ends with a trailer that
+    /// says so; one under the legacy scheme cannot say -- and under which
+    /// key of the ring; cut at a record boundary, its trailer lost; or
+    /// under a key the cipher does not hold. What a restore asks of each
+    /// archived log it fetched.
+    pub(crate) fn archived_copy(
         path: &Path,
         cipher: &crate::cipher::Shared,
         ids: &crate::cipher::Ids,
-    ) -> Result<bool> {
-        let Some(c) = cipher else { return Ok(true) };
-        let Some(b) = read_optional(path)? else { return Ok(true) };
+    ) -> Result<ArchivedCopy> {
+        let Some(c) = cipher else { return Ok(ArchivedCopy::Whole(0)) };
+        let Some(b) = read_optional(path)? else { return Ok(ArchivedCopy::Whole(0)) };
         let log = c.open_log(ids, &b);
         // A non-empty log that opens to nothing is under another key, not a
-        // whole copy: a restore must not count it and replay nothing.
+        // whole copy: a restore must not count it and replay nothing, and
+        // says which key it lacks rather than calling the copy cut.
         if !b.is_empty() && log.opened == 0 {
-            return Ok(false);
+            return Ok(ArchivedCopy::Foreign);
         }
-        Ok(log.log_id.is_none() || log.complete)
+        if log.log_id.is_none() || log.complete {
+            Ok(ArchivedCopy::Whole(log.key))
+        } else {
+            Ok(ArchivedCopy::Cut)
+        }
     }
 
     /// The bytes of the log as an archive keeps them: the file as it is,

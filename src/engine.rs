@@ -1516,6 +1516,26 @@ impl Db {
             // this node is data this directory never had.
             db.catalog.born_micros = lifecycle::now_micros(&db.clock);
         }
+        // The node's wrapped KEY to the log archive, under the fingerprint
+        // of the data key it runs under: put before any log is shipped
+        // under that key, and here at the open as well, so a rotation's
+        // new key is in the archive from the first open under it. An
+        // archive that does not answer leaves it to the first ship, which
+        // puts it first or fails; so does a directory with nothing in it
+        // yet, since a restore into one replaces the key made at its open.
+        if let (Some(a), Some(c)) = (db.log_archive.clone(), db.cipher.as_ref()) {
+            if let Some(wrapped) = crate::shard::read_optional(&dir.join("KEY"))? {
+                a.set_key(c.fingerprint(), wrapped);
+                if !db.catalog.collections.is_empty() {
+                    if let Err(e) = a.ensure_key() {
+                        crate::log::warn(
+                            "log_archive_key",
+                            &[("archive", a.display().to_string()), ("error", e.to_string())],
+                        );
+                    }
+                }
+            }
+        }
         // A ring is retired by `key retire`, whose walk sees the store and
         // the local segments alike: an open that dropped the ring on the
         // catalog's word -- no index archived -- locked out segments that
@@ -1871,6 +1891,9 @@ impl Db {
             dest,
             &node,
         )?;
+        if let (Some(c), Some(wrapped)) = (&self.cipher, self.key_bytes()?) {
+            a.set_key(c.fingerprint(), wrapped);
+        }
         let (mut shards, mut empty, mut reach) = (0usize, 0usize, 0u64);
         for s in self.shards.values_mut().flat_map(|v| v.iter_mut()) {
             match s.archive_live_log(&a)? {
@@ -2110,6 +2133,12 @@ impl Db {
             self.opts.master_key.as_deref(),
             &previous_masters(&self.opts),
         )?;
+        // The archive's view of the node: the logs after the backup, and
+        // the keys they are under.
+        let log_archive = crate::backup::LogArchive::new(
+            target.clone(),
+            crate::backup::node_slug(node.unwrap_or(&here)),
+        );
         // The backup's key regime has to be this database's: its files are
         // copied as they are, so an encrypted backup needs the master that
         // wraps its data key, and a plain one cannot land in an encrypted
@@ -2117,21 +2146,47 @@ impl Db {
         // database is empty, nothing was written under that one -- so the
         // files that follow open under it. A backup made under the previous
         // master lands under the current one.
+        //
+        // An archived log is under the key the node ran under when it
+        // shipped it, which a data-key rotation between the backup and the
+        // instant made another key than the backup's: the keys the archive
+        // holds for the node (`nodes/<node>/keys/`, put by every open and
+        // ship under a key) join the backup's in a ring the archived copies
+        // are read under, and a copy under one of them is rewritten under
+        // the backup's key as it is placed, so the directory stays under
+        // the KEY written here. A key there wrapped under another master
+        // is passed over and counted, for the refusal below to name.
+        let mut archive_keys = (0usize, 0usize);
+        let mut under: crate::cipher::Shared = None;
         self.cipher =
             match (&fetched.key, &self.opts.master_key) {
                 (Some(wrapped), Some(master)) => {
-                    let (cipher, under_previous) = crate::cipher::Cipher::unwrap_any(
-                        wrapped,
-                        master,
-                        &previous_masters(&self.opts),
-                    )
-                    .map_err(|e| {
-                        Error::Storage(format!(
-                            "RESTORE: the backup's KEY does not open under this master key: {e}"
-                        ))
-                    })?;
+                    let open = || {
+                        crate::cipher::Cipher::unwrap_any(
+                            wrapped,
+                            master,
+                            &previous_masters(&self.opts),
+                        )
+                        .map_err(|e| {
+                            Error::Storage(format!(
+                                "RESTORE: the backup's KEY does not open under this master \
+                                 key: {e}"
+                            ))
+                        })
+                    };
+                    let (cipher, under_previous) = open()?;
+                    let (mut ring, _) = open()?;
+                    let (keys, foreign) = log_archive.keys(master)?;
+                    for k in &keys {
+                        ring.keep_also(k);
+                    }
+                    archive_keys = (keys.len(), foreign);
+                    under = Some(Arc::new(ring));
                     let bytes = if under_previous { cipher.wrap(master)? } else { wrapped.clone() };
                     crate::shard::atomic_write(&dir.join("KEY"), &bytes)?;
+                    if let Some(a) = &self.log_archive {
+                        a.set_key(cipher.fingerprint(), bytes.clone());
+                    }
                     Some(Arc::new(cipher))
                 }
                 (Some(_), None) => {
@@ -2164,10 +2219,6 @@ impl Db {
         let mut shards_restored = 0usize;
         let mut bytes = 0u64;
         let mut elsewhere: Vec<String> = Vec::new();
-        let log_archive = crate::backup::LogArchive {
-            target: target.clone(),
-            slug: crate::backup::node_slug(node.unwrap_or(&here)),
-        };
         let past = as_of.filter(|t| *t > fetched.ts);
         let mut replayed = 0usize;
         // The least instant a shard's archived logs reach, over the shards
@@ -2214,19 +2265,40 @@ impl Db {
                     crate::shard::atomic_write(&p, &log_archive.get(&l.key)?)?;
                     // An archived copy under the current scheme ends with
                     // a trailer; one without it was cut at a record
-                    // boundary, and is refused rather than replayed short.
-                    if !crate::shard::Wal::complete(&p, &self.cipher, &ids)? {
-                        return Err(Error::Storage(format!(
-                            "the archived log {} is cut: its trailer is missing, so its end is not \
-                             what was archived",
-                            l.key
-                        )));
-                    }
+                    // boundary, and is refused rather than replayed short;
+                    // one under no key held here is refused naming that.
+                    let copy = match crate::shard::Wal::archived_copy(&p, &under, &ids)? {
+                        crate::shard::ArchivedCopy::Whole(key) => key,
+                        crate::shard::ArchivedCopy::Cut => {
+                            return Err(Error::Storage(format!(
+                                "the archived log {} is cut: its trailer is missing, so its end is \
+                                 not what was archived",
+                                l.key
+                            )))
+                        }
+                        crate::shard::ArchivedCopy::Foreign => {
+                            let (held, foreign) = archive_keys;
+                            return Err(Error::Storage(format!(
+                                "the archived log {} is under a key this restore does not hold: \
+                                 neither the backup's KEY nor the {held} key(s) the archive holds \
+                                 for the node (nodes/{}/keys/) opens it{}",
+                                l.key,
+                                log_archive.slug,
+                                if foreign > 0 {
+                                    format!(
+                                        "; {foreign} key(s) there did not open under this master key"
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            )));
+                        }
+                    };
                     // A copy archived since 0.88.0 says where it belongs;
                     // one standing under another name -- another number,
                     // another timeline, other instants -- is not the log
                     // its name says it is, and is refused.
-                    if let Some(place) = crate::shard::Wal::trailer_place(&p, &self.cipher, &ids)? {
+                    if let Some(place) = crate::shard::Wal::trailer_place(&p, &under, &ids)? {
                         if place != [l.timeline, l.seq, l.first, l.last] {
                             return Err(Error::Storage(format!(
                                 "the archived log {} was archived as timeline {}, log {}, instants \
@@ -2235,8 +2307,13 @@ impl Db {
                             )));
                         }
                     }
-                    if l.cut {
-                        crate::shard::trim_log(&p, &self.cipher, &ids, l.last)?;
+                    // A copy under a key of the ring other than the backup's
+                    // -- shipped after a rotation -- is rewritten under the
+                    // backup's key as it is placed, so the directory stays
+                    // under the KEY written above: a seal archives the logs
+                    // it empties with a trailer under the key it runs under.
+                    if l.cut || copy > 0 {
+                        crate::shard::trim_log(&p, &under, &ids, l.last)?;
                     }
                     taken += 1;
                     here = l.last.min(upto);

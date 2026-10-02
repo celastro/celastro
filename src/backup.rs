@@ -28,7 +28,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::crypto::hex;
 use crate::crypto::sha2::sha256;
@@ -195,9 +196,20 @@ fn open_record(bytes: &[u8], cipher: Option<&crate::cipher::Cipher>, key: &str) 
 /// A restore `AS OF t` takes the newest backup at or before `t` and then
 /// the logs after it, in sequence, and stops at a gap in the sequence: a
 /// log that was never archived is a stretch the restore cannot claim.
+/// Under a key the node's wrapped `KEY` is there too, as
+/// `nodes/<node>/keys/<fingerprint>` for each data key it has shipped
+/// under, so a restore opens the logs shipped under a key the backup's
+/// `KEY` does not hold -- the one live at a data-key rotation, re-shipped
+/// under the new key.
 pub struct LogArchive {
     pub(crate) target: Target,
     pub(crate) slug: String,
+    /// The node's wrapped `KEY` and the fingerprint of the data key it
+    /// runs under, for `nodes/<node>/keys/<fingerprint>`; none for a
+    /// database in the clear, or for a restore's view of an archive.
+    key: Mutex<Option<(String, Vec<u8>)>>,
+    /// Whether that key is known to be in the archive.
+    key_published: AtomicBool,
 }
 
 /// An archived log's name read: `<seq>-<first>-<last>.log` (timeline 0,
@@ -249,7 +261,60 @@ impl LogArchive {
         dest: &str,
         node: &str,
     ) -> Result<LogArchive> {
-        Ok(LogArchive { target: target(archive, backup_dir, dest)?, slug: node_slug(node) })
+        Ok(LogArchive::new(target(archive, backup_dir, dest)?, node_slug(node)))
+    }
+
+    pub(crate) fn new(target: Target, slug: String) -> LogArchive {
+        LogArchive { target, slug, key: Mutex::new(None), key_published: AtomicBool::new(false) }
+    }
+
+    /// The node's wrapped `KEY` and its current data key's fingerprint, to
+    /// go under `nodes/<node>/keys/` before anything is shipped under that
+    /// key: set at the open, and again by a restore, which changes the key
+    /// the node runs under.
+    pub(crate) fn set_key(&self, fingerprint: String, wrapped: Vec<u8>) {
+        *self.key.lock().unwrap_or_else(|p| p.into_inner()) = Some((fingerprint, wrapped));
+        self.key_published.store(false, Ordering::Relaxed);
+    }
+
+    /// The node's wrapped `KEY` in the archive as
+    /// `nodes/<node>/keys/<fingerprint>`, put once when it is not there,
+    /// before any log goes there under that key. A restore to an instant
+    /// unwraps every key there under the master it holds and reads the
+    /// archived copies under the backup's key and those: until now it held
+    /// the backup's `KEY` alone, and the log live at a data-key rotation
+    /// -- re-shipped under the new key, the copy replacing the old key's
+    /// -- was refused as cut, every instant from its first record to the
+    /// next backup unreachable, and with the volume lost the new key
+    /// existed in `<dir>/KEY` and nowhere else. Nothing for a database in
+    /// the clear.
+    pub(crate) fn ensure_key(&self) -> Result<()> {
+        if self.key_published.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let held = self.key.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some((fingerprint, wrapped)) = held else { return Ok(()) };
+        let key = self.target.key(&format!("nodes/{}/keys/{fingerprint}", self.slug));
+        if self.target.store.size(&key)?.is_none() {
+            self.target.store.put(&key, &wrapped)?;
+        }
+        self.key_published.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The keys the archive holds for the node, each unwrapped under
+    /// `master`, and how many did not open under it (wrapped under another
+    /// master).
+    pub(crate) fn keys(&self, master: &[u8; 32]) -> Result<(Vec<crate::cipher::Cipher>, usize)> {
+        let prefix = self.target.key(&format!("nodes/{}/keys/", self.slug));
+        let (mut out, mut foreign) = (Vec::new(), 0usize);
+        for key in self.target.store.list(&prefix)? {
+            match crate::cipher::Cipher::unwrap(&self.target.store.get(&key)?, master) {
+                Ok(c) => out.push(c),
+                Err(_) => foreign += 1,
+            }
+        }
+        Ok((out, foreign))
     }
 
     pub(crate) fn display(&self) -> &str {
@@ -366,6 +431,8 @@ impl LogArchive {
         else {
             return Ok(None);
         };
+        // The key the copy is under is in the archive before the copy.
+        self.ensure_key()?;
         let key = self.key(collection, shard, timeline, seq, first, last);
         // The bytes as they lie, and under the cipher's current scheme a
         // trailer that says the copy is whole: put from a file beside the

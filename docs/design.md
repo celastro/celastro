@@ -453,7 +453,13 @@ new object, and the older copies of a number go once it is there); with
 `CELASTRO_LOG_SHIP_EVERY` set, `serve` does that on a cadence (0.93.0):
 the synced prefix of each live log copied beside it under the lock and
 put with the lock let go, so a store's seconds hold no statement up, a
-failed tick tried again at the next. A
+failed tick tried again at the next. Under a key, the node's wrapped
+`KEY` goes to the archive as `nodes/<node>/keys/<fingerprint>` before
+anything is shipped under that key, and a restore reads the archived
+copies under the backup's key and every key there, rewriting a copy under
+another key as it places it: the log live at a data-key rotation is
+re-shipped under the new key, and the backup before the rotation holds
+only the old. A
 restore `AS OF t` takes the newest backup at or before `t`, lists the
 shard's archived logs, claims them in sequence from the one that
 straddles the backup's instant (or the first, or the one after a log the

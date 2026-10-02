@@ -476,7 +476,10 @@ same>' AS OF <any instant>` then takes the newest backup at or before it,
 replays the archived logs up to it, and says how far it reached: the
 instant asked, or where the archive ends, or a gap where a log was never
 archived. The logs are under `nodes/<node>/logs/<collection>/shard-NNNN/`,
-named by their rotation number and the instants they span. A restore
+named by their rotation number and the instants they span; an encrypted
+node's wrapped `KEY` is there too, under `nodes/<node>/keys/<fingerprint>`,
+one per data key it has shipped under, so a restore to an instant across
+a `key rotate` opens the logs shipped under the new key. A restore
 forks a timeline of its own for every shard it opens: what the restored
 node writes is archived under it (`0001-<number>-...`) beside the run's
 it left, the fork's instant is recorded (`timeline-0001`), and a later

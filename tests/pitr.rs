@@ -405,6 +405,90 @@ fn a_restore_refuses_an_archived_log_that_was_cut() {
     }
 }
 
+/// A restore to an instant across a data-key rotation. The log live at
+/// the rotation is shipped under the old key, recoded with the directory
+/// by `key rotate`, and shipped again under the new one -- the longer copy
+/// replacing the shorter -- so the archive holds its instants under the
+/// new key alone, while a restore from the backup before the rotation held
+/// that backup's KEY alone: every instant from that log's first record to
+/// the next backup was refused as "cut" (0.98.0), and with the volume lost
+/// the new key existed in `<dir>/KEY` and nowhere else. A node puts its
+/// wrapped KEY in the archive under `nodes/<node>/keys/<fingerprint>`
+/// before it ships under a key, and a restore reads the archived logs
+/// under the backup's key and every key the archive holds for the node,
+/// placing them under the backup's.
+#[test]
+fn a_restore_crosses_a_data_key_rotation_under_the_keys_the_archive_holds() {
+    let dest = dir("rotate-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let data = dir("rotate-data");
+    let master: [u8; 32] = [0x3c; 32];
+    let with = |d: &Path| {
+        let mut o = DbOpts::default();
+        o.log_archive = Some(d.display().to_string());
+        o.master_key = Some(master.into());
+        o
+    };
+    let mut db = Db::open(&data, with(&dest)).unwrap();
+    ack(&mut db, "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)");
+    insert(&mut db, 0, 10);
+    let backup = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
+    let base: u64 = backup.split_whitespace().nth(1).unwrap().parse().unwrap();
+    insert(&mut db, 10, 20);
+    let t20 = db.now_ts();
+    // The live log shipped under the first key.
+    ack(&mut db, &format!("BACKUP LOG TO '{}'", dest.display()));
+    drop(db);
+    let w = celastro::cipher::rotate_data_key(&data, &master).unwrap();
+    assert!(w.files > 0 && w.records >= 20, "{w:?}");
+    // Reopened under the new key, more rows, and the same log shipped
+    // again: the copy under the new key replaces the one under the old.
+    let mut db = Db::open(&data, with(&dest)).unwrap();
+    insert(&mut db, 20, 30);
+    let t30 = db.now_ts();
+    ack(&mut db, &format!("BACKUP LOG TO '{}'", dest.display()));
+    drop(db);
+    let names = archived(&dest);
+    assert_eq!(names.len(), 1, "one copy of the log: {names:?}");
+    let restore = |tag: &str, as_of: u64| -> (String, Vec<String>, PathBuf) {
+        let fresh = dir(tag);
+        let mut r = Db::open(&fresh, with(&dest)).unwrap();
+        let m = ack(&mut r, &format!("RESTORE FROM '{}' AS OF {as_of}", dest.display()));
+        let held = ids(&mut r);
+        (m, held, fresh)
+    };
+    // Before the rotation, from the backup whose KEY does not hold the
+    // key the log is under now.
+    let (m, held, before) = restore("rotate-before", t20);
+    assert_eq!(held, expected(0..20), "{m}");
+    assert!(m.contains("1 archived log(s) replayed") && !m.contains("archive ends"), "{m}");
+    // After it.
+    let (m, held, after) = restore("rotate-after", t30);
+    assert_eq!(held, expected(0..30), "{m}");
+    // The volume lost: the latest instant, whole.
+    let _ = std::fs::remove_dir_all(&data);
+    let now = celastro::time::from_micros(celastro::time::now_micros());
+    let (m, held, lost) = restore("rotate-lost", now);
+    assert_eq!(held, expected(0..30), "{m}");
+    assert!(m.contains("replayed"), "{m}");
+    // The restored directory is under the backup's KEY, the placed log
+    // rewritten under it, and opens again with every row.
+    let backup_key = dest.join(format!("nodes/local/backups/{base:020}/KEY"));
+    assert_eq!(std::fs::read(lost.join("KEY")).unwrap(), std::fs::read(&backup_key).unwrap());
+    // The archive holds the node's KEY under each key's fingerprint.
+    let keys: Vec<String> = std::fs::read_dir(dest.join("nodes/local/keys"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(keys.len(), 2, "the node's KEY under each key's fingerprint: {keys:?}");
+    let mut r = Db::open(&lost, with(&dest)).unwrap();
+    assert_eq!(ids(&mut r), expected(0..30));
+    drop(r);
+    for p in [&dest, &data, &before, &after, &lost] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 #[test]
 fn a_restore_forks_a_timeline_and_a_later_restore_follows_it() {
     let dest = dir("tl-dest");
