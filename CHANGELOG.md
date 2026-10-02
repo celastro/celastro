@@ -6,6 +6,259 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.100.0 — 2026-10-02
+
+**A `DELETE ... WHERE` deletes the versions its select read.** Before, a
+delete by predicate evaluated its predicate once, at the select's instant, and
+deleted the keys on this node under the lock the select ran under -- but the
+keys on another node were carried there afterwards by key alone, and the
+holder deleted whatever version was live. A row a second client rewrote and
+was acknowledged between the select and the carry was gone and counted in the
+acknowledgement, though it matched the predicate at no instant; the
+single-node run of the same two statements kept it. Now the select returns
+each row's version instant (wire version 8 carries it with every scan hit),
+the carry sends each key with it (`delete_many_at`), and the holder deletes a
+key only while that is still its live version: a row rewritten since is left
+alone, and the acknowledgement counts it -- `2 document(s) deleted, 1 skipped:
+rewritten since the select` -- for a second statement to take if it still
+matches. The check is equality on the instant, not order, since the holders'
+clocks are not one clock. A holder on the previous release answers a scan
+without the instants, or the new call with "unknown call": its keys are
+deleted as before and the acknowledgement says how many were `deleted
+unchecked on an older node`, so a mixed cluster across the upgrade keeps
+deleting, and a 0.99.0 coordinator's deletes on a 0.100.0 holder are
+unchanged. Nothing on disk changes.
+
+**`CREATE INDEX ... USING vector` over a row not yet sealed no longer leaves a
+node that cannot reopen.** What could be observed before: the statement's
+width check walked the sealed rows only. A row still in a shard's memtable
+with a vector of another width, or a non-finite component, passed it; the
+catalog took the index, the shard's seal under the new definition refused the
+row and the shard rolled back, the catalog did not, and the next persist of
+the catalog -- any seal anywhere on the node -- wrote the index to `CATALOG`
+although the statement had reported a failure; a retry said "already exists".
+At the next restart, clean or not, the open built that shard's memtable for
+the index and the replay of the row failed `Db::open` with "vector has 3
+dimensions but the index declares 2": the node did not start, `DROP INDEX` was
+not there to run, and the remedies were a restore or the loss of the log's
+acknowledged writes. Before a restart, `ALTER INDEX ... TIER` on the
+collection pushed the catalog's definition into the shards with no seal, and
+every seal of that shard failed from then on while its memtable grew with each
+acknowledged write. The 0.98.0 note that a vector index checks the rows it is
+created over held for the sealed rows alone; a memtable row the seal refused
+was taken as handled by the shard's own rollback, and the catalog's half of it
+was not. Now the statement checks the unsealed rows too -- the newest version
+of every key in each shard's memtable and frozen memtables, and the followed
+copies' shards -- and refuses naming the row; a deleted unsealed row is
+refused as well, since a seal writes the tombstoned version for the compaction
+to collect, and the message says to flush the collection first. A shard that
+cannot take the index for any other reason (a disk that refuses the segment)
+undoes it everywhere: the catalog's definition, version and activity clock go
+back, every shard and followed copy that adopted takes the previous definition
+again with its memtable rebuilt for it, and `CATALOG` is written only after
+every shard has adopted, so it never carries an index a shard refused -- which
+is also what keeps `ALTER INDEX ... TIER` from pushing one. A refused `CREATE
+INDEX` leaves the node exactly as it was. A directory already in the old state
+-- an index in `CATALOG` that a row in a shard's log does not fit -- does not
+open under this version either. Nothing on disk or on the wire changes.
+
+**`RANGE` and the map agree at the open.** A split or a merge writes two
+records of what a shard owns: the shard directory's `RANGE` and the catalog's
+map; a merge writes `RANGE` first, a split the map. The open trusted `RANGE`,
+so a crash between the two writes -- or the second write failing with the node
+running on -- left two shards owning the same keys: a scan answered the rows
+of the merged shard twice, a `DELETE` of one of them landed on one copy and
+the key came back from the other, an `INSERT` above a fresh split landed in
+the source shard, where the map routes no node to look for it, and a retried
+`MERGE SHARDS` absorbed the rows a second time, for good; `SHOW HEALTH`
+compared nothing. (The 0.98.0 merge order, the catalog before the directory's
+removal, covers a different pair of writes and stands.) Now the open gives
+every placed shard, and every followed copy, the map's range: when `RANGE`
+disagrees it is rewritten to the map's and `range_repaired` is logged with
+both ranges and the number of live rows the shard holds outside the new one.
+Those rows are invisible from then on and dropped by the next compaction --
+none in a crash between the two writes, but a node that ran on in the diverged
+state wrote rows to the wrong shard, and `SHOW HEALTH` says the count on every
+report while the shard still holds any. A shard adopted by a move or a split
+and a promoted copy take the map's range the same way; a map from before
+placement existed is read from `RANGE` and agrees with it. `RANGE` keeps its
+form, a repaired directory opens under 0.97.0, and nothing on the wire
+changes.
+
+**The write path's recovery in place keeps every acknowledged row, reaches a
+followed copy, and a rotation cannot leave the log in two files.** Four things
+could be observed before. After a restart that found a rotated log -- a seal
+frozen and not installed when the process last ended, which a stop during a
+background build leaves on purpose -- one failed `fdatasync` on that shard,
+and the disk answering, made the recovery in place rebuild the memtable from
+`wal.log` alone: the rotated log's rows read as absent at once (a key updated
+over a sealed version read as absent entirely), and the next seal's install
+removed their log, so acknowledged rows were gone for good with nothing
+logged. 0.98.0's "the rotated logs' list survives a failed rotation" kept the
+paths and not the rows, and the kept list is what that install unlinked. A
+followed copy whose sync failed was never recovered -- the recovery pass
+probes the shards a node holds, not the copies it follows -- so every ship
+after it was refused with "restart the node to replay it" until that restart;
+under `confirm = 'quorum'` with two copies every write on the holder missed
+its deadline meanwhile, and `SHOW HEALTH` said nothing of it: 0.98.0's claim
+that a copy's failed sync is recovered at the next write held for held shards
+only. A rotation whose header write failed after the rename (a full disk,
+under encryption) left the appends going to a fresh, empty `wal.log` while the
+group fdatasync'd the renamed file, so a deferred `DELETE` could be
+acknowledged with its record in the page cache alone, and the renamed log sat
+in no list -- a hole in the archive's chain a restore stopped at -- until a
+restart; and every failed rotation consumed a log number for no log, the same
+hole for good. And the rotation fsynced the shard directory before it created
+the new `wal.log`, so the new name was dirty metadata until the seal's
+install, minutes under a background build. Now the recovery replays the
+rotated logs it knows of before the live one, as the open does, and a scan
+handle taken before a recovery reports its snapshot gone rather than another
+row; a followed copy recovers its log under its own lock at the next ship, and
+`SHOW HEALTH` names a copy whose sync failed while it is one; the rotation is
+all or nothing -- undone when anything after the rename fails, the log left
+exactly as it was, or, if the undo itself fails, the group poisoned and the
+rotated log listed for the recovery to replay and the next seal to remove --
+and a log number is consumed only once a log exists under it; and one
+directory fsync publishes the rename aside and the new log together, before
+the first record is acknowledged into it. No file or wire form changed; a
+0.97.0 node reads the same directories.
+
+**Under `confirm = quorum` the steward promotes only once it has heard enough
+followers to hold the one that confirmed the last write.** Before, with
+automatic failover on, the steward promoted the most recent copy among
+whichever followers answered the sweep: with three copies, the holder lost and
+the follower that had confirmed the last acknowledged writes missing the
+steward's one ten-second call (its hello, or its `ship_status`), the other,
+older follower was promoted, the confirming copy was then reset under the new
+term and the lost holder demoted from nothing, and the acknowledged writes
+were on no copy -- one node lost and one transient on a live one. The 0.63.0
+note's "the promotion takes the most recent caught-up copy, the one that took
+part in the last acknowledgement" held only among the followers heard. Now the
+sweep counts the followers heard (an answer either way) and promotes once
+`followers - needed + 1` of the map's followers have answered -- every
+follower of three copies, three of four at five, the one of two as before --
+logging `failover_waits_for_followers` with the counts and the names not heard
+and leaving the shard to the next sweep otherwise. Under `all` and `none` one
+heard is enough as before, and a follower not heard under `all` is logged
+`failover_follower_unheard`. What an operator sees differently: a lasting
+split between the steward and the confirming follower is a shard without
+automatic failover while it lasts (losing the holder and that follower's reach
+is a majority of the copies); `PROMOTE SHARD i OF c ON 'node'` by hand
+promotes a caught-up copy the operator can reach, and `docs/tuning.md` and
+`docs/design.md` say so. In the library `Db::failover_plan` returns
+`Vec<FailoverPlan>`, the map's follower list beside the live ones. Nothing on
+the wire or on disk changes.
+
+**A followed copy starts over on a change of holder, not on every change of
+term.** 0.98.0's reset of a kept copy keyed on the term, and the term moves
+without the holder: every `REPLACE COPY` -- the steward's own after
+`CELASTRO_REPLACE_SECS` -- and every `ALTER ... SET (replicas | regions)`
+dropped every surviving follower's copy of the shard and shipped it again from
+nothing, so for the whole re-ship (hours for a large shard) the holder's disk
+was the shard's only copy: under `all` it acknowledged alone with `SHOW
+HEALTH` saying the followers were catching up, under `quorum` every write to
+the shard was refused, and losing the holder in that window was acknowledged
+data lost with no automatic failover, the copies not being caught up. The
+0.98.0 note said the copy resets "when the holder changes"; the code reset it
+on any term, so that claim was false for a replace and a re-plan. Now a copy
+carries the holder it follows and resets only when the holder differs, or when
+the term is more than one past the copy's with the same holder (two switches
+missed in one, the holder away and back); a kept copy adopts the new term as
+before 0.98.0 and the new shipper picks it up where it stood, so a replace or
+a re-plan ships the new copy alone. A promotion still starts the third copy
+over. Nothing on disk or on the wire changes; in the library `FollowedShard`
+gains `holder`.
+
+**A move's target checks its fence and its budget before it takes the map, and
+a fenced pin is past aborting.** Two things could be observed before. The
+target discarded the fence's answer -- meant for a source too old to know the
+call, the discard also swallowed "not pinned for a move here" -- and adopted
+under a fresh budget of its own, so a target whose move the coordinator had
+given up at `CELASTRO_MOVE_TIMEOUT` and aborted, or whose source an `ABORT
+MOVE` had already released, took the map anyway: two holders, the source's
+writes gone with its directory at the switch or at the next reconcile. And
+`ABORT MOVE` during the switch's carry -- the remedy 0.98.0 documented for the
+very symptom the fence shows, reads refused "its map is switching" -- released
+the fenced pin, so the source acknowledged writes at the old term until the
+carry reached it and removed its directory with them; the target never had
+them, and both statements said ok. Now the target fails the pull on any fence
+answer but "unknown call", on its budget run out before the switch, and on an
+adopt refused after the fence (a key this node lacks, a range that does not
+open), removing the files pulled and releasing the source's pin itself, by
+force, since it takes nothing -- an abort by order no longer releases a fenced
+pin, so a target that gives up has to; the move statement reports the failure
+and the shard stays whole on the source. A source refuses to release a fenced
+pin by order, naming the target, and `ABORT MOVE` then asks the target's
+catalog with no lock held: the target has taken the map -- the switch is
+carried to the source and the abort is refused saying the move is complete;
+the pin went meanwhile (the target gave up) -- aborted; the target has not
+taken the map yet -- asked again within the statement's ten seconds, then
+refused with the pin left and the ways out named (retry; a source restarted
+while fenced comes back unpinned, for a target gone for good). A coordinator's
+own abort at its deadline ignores the refusal as before, the switch or the
+next reconcile finishing the move. On the wire AbortMove's body carries a
+trailing force byte a 0.99.0 source ignores and a 0.99.0 caller never sends; a
+0.99.0 target still adopts as it did, and its carry finishes the move. In the
+library `Db::abort_move_by_order(collection, shard, force) -> Result<()>` and
+`wire::Node::abort_move(collection, shard, force)`. `docs/sql.md`,
+`docs/design.md` and `docs/tuning.md` say what an abort of a fenced move does.
+
+**A moved shard's `segments/` and `deletes/`, and a followed copy's entry, are
+fsynced where they are; the open sets aside a collection directory the catalog
+does not hold.** Three things could be observed before, the first two under a
+strict reading of the filesystem contract and not on the journaled filesystems
+the docs ship to. A move's pull and a split fsynced the new shard's
+`incoming/` but not the `segments/` and `deletes/` its files were renamed or
+linked into -- the one path that differed from a backup's `write_shard` and
+the tier move -- so a crash after the adopt could take back a segment the
+manifest names and fail the open, with the source's copy already gone.
+`ensure_followed` and a demotion published a followed copy's `shard-NNNN`
+entry one level too high, fsyncing the collection's directory and not
+`followed/`, so a crash could lose the copy and it came back from nothing. And
+a collection directory the catalog did not name -- a restore's or an import's
+rename made durable with the process gone before the catalog was published --
+was invisible to the open: the rerun import failed on the populated directory,
+and `CREATE COLLECTION` of that name built its shards over it, the first seal
+publishing an empty manifest over the orphan's and the next open reclaiming
+its segments. Now both subdirectories are fsynced before `incoming/` in the
+pull and the split (the split's plain copy fallback has its bytes fsynced
+too), `followed/` is fsynced in both places, and the open reconciles
+`collections/` with the catalog: an import's or a restore's staging directory
+is removed, a collection directory holding only a dead pull's
+`shard-NNNN.incoming` is removed, and any other is set aside as
+`<name>.orphan-<n>` and logged (`collection_dir_orphaned`, with what to do:
+`RESTORE` or `IMPORT` again under the name, or remove it) -- never refused, so
+a pull that died cannot stop a node starting and a restore's data is kept
+where an operator finds it; `CREATE COLLECTION` refuses a `shard-NNNN` that
+already holds a `MANIFEST` or a log with records in it, naming the way out.
+
+**A node that can attach nobody for its clock is not ready.** `ATTACH` refuses
+a peer whose clock is more than five seconds from this node's, and the chart's
+readiness probe (`health --majority-of`) counts the peers answering this node
+-- but the reconciler's sweep marked every peer whose hello came back as
+answering, clock or no clock, so a pod restarted with its clock an hour off
+refused every attach, logged "fix the clocks", and turned ready at its first
+sweep thirty seconds in, taking traffic it could forward to no one. Now a
+refused attach marks the peer, readiness leaves a marked peer out until an
+attach of it passes, and `SHOW HEALTH`'s line for the peer says `ATTACH
+REFUSED` beside `CLOCK OFF`. The peers of such a node are not affected: their
+attach of it, made while its clock was right, stands, and the sweep only warns
+of the skew. Nothing on the wire or on disk changes.
+
+**Raising `replicas` adds a copy and leaves the ones there.** `CREATE
+COLLECTION` placed a shard's followers over the node ring as it was attached,
+and `ALTER ... SET (replicas = n)` re-planned every shard's followers over the
+ring sorted -- the same order on every node, which the carried re-plan needs,
+and another order than the CREATE's on most clusters. So raising two copies to
+three moved the live follower to the sorted ring's next node and shipped two
+copies from nothing, the holder's disk the shard's only copy for the whole
+re-ship: the exposure the kept-copy fix above closes for a replace, open
+through the planner. Now the re-plan keeps the followers the map names, in the
+map's order, and fills the count from the sorted ring -- one list on every
+node, since the map and the ring are the same on each; a count lowered drops
+the map's last. `SET (regions = n)` still plans every follower afresh, which
+is what it is for. Nothing on disk or on the wire changes.
+
 ## 0.99.0 — 2026-10-02
 
 **A master-key rotation reaches every `KEY`, and the chart's documented
