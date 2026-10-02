@@ -1699,10 +1699,11 @@ impl Db {
         if !followed.is_empty() {
             let mut g = db.followed.lock().unwrap_or_else(|p| p.into_inner());
             for sh in followed {
-                let term = tablets.get(sh.index).map(|t| t.term).unwrap_or(0);
+                let (term, holder) =
+                    tablets.get(sh.index).map(|t| (t.term, t.node.clone())).unwrap_or_default();
                 g.insert(
                     (name.to_string(), sh.index),
-                    Arc::new(Mutex::new(FollowedShard { shard: sh, term })),
+                    Arc::new(Mutex::new(FollowedShard { shard: sh, term, holder })),
                 );
             }
         }
@@ -3488,7 +3489,14 @@ impl Db {
         // from the old holder past the new one's position at the
         // promotion is on no other node, and kept it would come back if
         // this copy were promoted in turn (0.98.0; before, a third copy
-        // kept its position and the new holder shipped from there).
+        // kept its position and the new holder shipped from there). A
+        // change of holder, not any change of term: a `REPLACE COPY` and
+        // an `ALTER ... SET (replicas | regions)` raise the term with the
+        // holder unchanged, and a copy reset there left the holder's disk
+        // the only one for the whole re-ship -- acknowledging alone under
+        // `all`, refusing every write under quorum. A term more than one
+        // past this copy's with the same holder is two switches missed in
+        // one (the holder away and back, A to B to A), and resets.
         let reset: Vec<usize> = {
             let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
             wanted
@@ -3498,7 +3506,8 @@ impl Db {
                 .filter(|i| {
                     g.get(&(collection.to_string(), *i)).is_some_and(|c| {
                         let f = c.lock().unwrap_or_else(|p| p.into_inner());
-                        f.term != tablets[*i].term && f.shard.ship_ts > 0
+                        let t = &tablets[*i];
+                        (f.holder != t.node || t.term > f.term + 1) && f.shard.ship_ts > 0
                     })
                 })
                 .collect()
@@ -3516,8 +3525,8 @@ impl Db {
         }
         have.retain(|i| !reset.contains(i));
         {
-            // The terms and the ranges as the map says them now, for the
-            // copies kept. The range moves at a split or a merge, and a
+            // The terms, the holders and the ranges as the map says them
+            // now, for the copies kept. The range moves at a split or a merge, and a
             // copy left with the old one masked out the rows a merge
             // absorbed: they arrived, counted for nothing, and a copy
             // promoted after the merge answered two rows of three.
@@ -3527,6 +3536,7 @@ impl Db {
                     let mut f = c.lock().unwrap_or_else(|p| p.into_inner());
                     let t = &tablets[*i];
                     f.term = t.term;
+                    f.holder = t.node.clone();
                     if f.shard.key_range() != (t.lo.clone(), t.hi.clone()) {
                         f.shard.set_key_range(t.lo.clone(), t.hi.clone());
                         if let Some(d) = f.shard.dir().map(|d| d.to_path_buf()) {
@@ -3584,7 +3594,11 @@ impl Db {
             }
             self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 (collection.to_string(), *i),
-                Arc::new(Mutex::new(FollowedShard { shard: sh, term: t.term })),
+                Arc::new(Mutex::new(FollowedShard {
+                    shard: sh,
+                    term: t.term,
+                    holder: t.node.clone(),
+                })),
             );
         }
         Ok(())
@@ -6268,6 +6282,7 @@ impl Db {
                                 Arc::new(Mutex::new(FollowedShard {
                                     shard: back,
                                     term: copy_term,
+                                    holder: t.node.clone(),
                                 })),
                             );
                         }
@@ -6428,7 +6443,7 @@ impl Db {
             sh.index = shard;
             self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 (collection.to_string(), shard),
-                Arc::new(Mutex::new(FollowedShard { shard: sh, term })),
+                Arc::new(Mutex::new(FollowedShard { shard: sh, term, holder: new_holder.clone() })),
             );
         }
         crate::log::info(
@@ -11081,10 +11096,12 @@ pub fn vote(lease: &Lease, from: &str, term: u64, candidate: &str, pre: bool) ->
 /// term, the followers heard this sweep and every follower the map names.
 pub type FailoverPlan = (String, usize, u64, Vec<String>, Vec<String>);
 
-/// A copy this node follows, and the term it follows at.
+/// A copy this node follows, the term it follows at, and the holder it
+/// follows -- in memory alone, the map saying it again at every open.
 pub struct FollowedShard {
     pub shard: Shard,
     pub term: u64,
+    pub holder: String,
 }
 
 /// The followed copies by `(collection, shard)`, behind a lock of their

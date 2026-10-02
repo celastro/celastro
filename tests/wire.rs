@@ -3682,10 +3682,104 @@ fn b_url(port: u16) -> String {
     format!("tcp://127.0.0.1:{port}")
 }
 
+/// A node's followed copy of `shard` of `items`: the handle (a copy
+/// dropped and made again is another), and the term and the holder it
+/// follows.
+fn followed_copy(n: &Node, shard: usize) -> (usize, u64, String) {
+    let g = n.db.read().unwrap();
+    let followed = g.followed();
+    let f = followed.lock().unwrap();
+    let c = f.get(&("items".to_string(), shard)).expect("follows the shard");
+    let s = c.lock().unwrap();
+    (Arc::as_ptr(c) as usize, s.term, s.holder.clone())
+}
+
+/// A `REPLACE COPY` raises the term with the holder unchanged, and the
+/// surviving follower keeps its copy under the new term: the same copy,
+/// at the instant it stood, live again at once, the holder shipping the
+/// replacement alone. From 0.98.0 the survivor's copy was reset on any
+/// change of term, and the holder's disk was the shard's only copy for
+/// the whole re-ship.
+#[test]
+fn a_surviving_copy_keeps_its_position_through_a_replace_copy() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("keep-a");
+    let b = Node::start("keep-b");
+    let c = Node::start("keep-c");
+    let d = Node::start("keep-d");
+    for n in [&b, &c, &d] {
+        a.ack(&format!("ATTACH NODE '{}'", n.url));
+    }
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 3, nodes = ['{a}', \
+         '{b}', '{c}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .replace("{c}", &c.url)
+            .as_str(),
+    );
+    for i in 0..20usize {
+        a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"k{i:04}","n":{i}}}')"#));
+    }
+    let health_says = |n: &Node, what: &str| {
+        for _ in 0..100 {
+            if n.ack("SHOW HEALTH").contains(what) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+    for n in [&b, &c] {
+        assert!(health_says(&a, &format!("follower {} live", n.url)), "{}", a.ack("SHOW HEALTH"));
+    }
+    // b's copy is live: it stands at an instant, the one a reset drops.
+    let before = followed_copy(&b, 0);
+    // c lost; its copy replaced by one on d.
+    let (c_url, c_dir) = (c.url.clone(), c.dir.clone());
+    drop(c);
+    settle();
+    let m = a.ack(&format!("REPLACE COPY OF SHARD 0 OF items ON '{c_url}' WITH '{}'", d.url));
+    assert!(m.contains("at term 1"), "{m}");
+    // b's copy is the copy it was, at the new term, where it stood.
+    let after = followed_copy(&b, 0);
+    assert_eq!(after.0, before.0, "b's copy was dropped and made again from nothing");
+    assert_eq!((after.1, after.2.as_str()), (1, a.url.as_str()), "{after:?}");
+    assert_eq!(b.db.read().unwrap().followed_count("items", 0), Some(20));
+    // Live again, never copied from nothing; d is the one copied.
+    let from_nothing = format!("follower {} copying from nothing", b.url);
+    let mut live = (false, false);
+    for _ in 0..150 {
+        let h = a.ack("SHOW HEALTH");
+        assert!(!h.contains(&from_nothing), "{h}");
+        live = (
+            h.contains(&format!("follower {} live", b.url)),
+            h.contains(&format!("follower {} live", d.url)),
+        );
+        if live == (true, true) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(live, (true, true), "{}", a.ack("SHOW HEALTH"));
+    assert_eq!(d.db.read().unwrap().followed_count("items", 0), Some(20));
+    let _ = std::fs::remove_dir_all(&c_dir);
+    for n in [a, b, d] {
+        let dir = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `ALTER ... SET (replicas = n)` names a follower that never had the
 /// collection: it is handed the definition and the map whole, makes its
 /// copy and is caught up, where before the carried `LOCAL ALTER` was
-/// refused there and no copy was ever made.
+/// refused there and no copy was ever made. The follower the collection
+/// had all along keeps its copy under the new term (the re-plan raises
+/// the term with the holder unchanged, and from 0.98.0 reset the copies
+/// it kept).
 #[test]
 fn a_replica_count_raised_hands_the_collection_to_a_follower_that_never_had_it() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -3706,8 +3800,26 @@ fn a_replica_count_raised_hands_the_collection_to_a_follower_that_never_had_it()
         a.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
     }
     assert!(c.exec("SHOW CATALOG items").is_err(), "c never had the collection");
+    let mut live = false;
+    for _ in 0..100 {
+        if a.ack("SHOW HEALTH").contains(&format!("follower {} live", b.url)) {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(live, "{}", a.ack("SHOW HEALTH"));
+    let kept = followed_copy(&b, 0);
     let m = a.ack("ALTER COLLECTION items SET (replicas = 3)");
     assert!(m.contains(&format!("{} (adopted the collection)", c.url)), "{m}");
+    // b, knowing no peer but a, planned nothing from the carried ALTER
+    // and takes the new map when it hears from a: the same copy, under
+    // the new term, its rows in place.
+    b.ack(&format!("ATTACH NODE '{}'", a.url));
+    let after = followed_copy(&b, 0);
+    assert_eq!(after.0, kept.0, "b's copy was dropped and made again from nothing");
+    assert_eq!((after.1, after.2.as_str()), (1, a.url.as_str()), "{after:?}");
+    assert_eq!(b.db.read().unwrap().followed_count("items", 0), Some(8));
     let cat = c.ack("SHOW CATALOG items");
     let followers = cat.split("followed by ").nth(1).unwrap_or("").lines().next().unwrap_or("");
     assert!(followers.contains(&b.url) && followers.contains(&c.url), "{cat}");

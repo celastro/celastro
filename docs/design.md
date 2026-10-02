@@ -999,7 +999,14 @@ and a catch-up cut short skipped the rows the chunks after it held). A
 copy kept across a change of holder starts over under the new one
 (0.98.0): what it took from the old holder past the new one's position
 is on no other node, and would come back were that copy promoted in
-turn. A ship batch is cut by count and by bytes, 500 items or 32 MiB,
+turn. A change of term with the holder unchanged -- a `REPLACE COPY`,
+an `ALTER ... SET (replicas | regions)` -- keeps the copy where it
+stands and the new shipper picks it up there (0.98.0 reset it on any
+change of term, and the holder's disk was the shard's only copy for the
+whole re-ship); the copy carries the holder it follows for the
+distinction, and a term more than one past its own with the same holder
+is two switches missed in one, and starts over. A ship batch is cut by
+count and by bytes, 500 items or 32 MiB,
 as a holder's share of a statement is. Since 0.94.0 the operator can refuse instead:
 `CELASTRO_MIN_HOLDERS=n` refuses, before it is logged, a write that
 fewer than `n` nodes would hold -- the holder and the followers fed live
