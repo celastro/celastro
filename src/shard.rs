@@ -4021,6 +4021,15 @@ impl Shard {
     /// log, but nothing queued them again before a restart, so a node whose
     /// disk filled during a seal and then emptied never sealed them.
     pub(crate) fn seal_install(&mut self, t: SealTicket, built: SealBuilt) -> Result<Sealed> {
+        // Before anything of the ticket is taken, and before the requeues
+        // below: a ticket of another incarnation of this index is dropped,
+        // never queued here.
+        if self.refuses_seal(&t, "install") {
+            return Err(Error::Storage(format!(
+                "the seal of shard {} was frozen on another incarnation of the shard",
+                t.index
+            )));
+        }
         if let Some(tl) = built.timeline {
             // As an install that fails below: the ticket goes back, or the
             // frozen rows were never sealed before a restart (0.98.0).
@@ -4095,6 +4104,9 @@ impl Shard {
     /// queue, the rows stay readable in the frozen memtable and durable in
     /// its rotated log, and the failure is counted.
     pub(crate) fn seal_requeue(&mut self, t: SealTicket, err: &Error) {
+        if self.refuses_seal(&t, "requeue") {
+            return;
+        }
         self.seal_failures += 1;
         self.last_seal_error = Some(err.to_string());
         self.pending_seals.insert(0, t);
@@ -4104,6 +4116,9 @@ impl Shard {
     /// the queue as a failed one does, but nothing failed and nothing is
     /// counted; the next start seals it.
     pub(crate) fn seal_put_back(&mut self, t: SealTicket) {
+        if self.refuses_seal(&t, "put back") {
+            return;
+        }
         self.pending_seals.insert(0, t);
     }
 
@@ -4136,6 +4151,39 @@ impl Shard {
                 }
             }
         }
+    }
+
+    /// Whether `t` was frozen on this shard: its memtable is one of
+    /// `frozen` from the freeze to the install, and on no other shard.
+    /// The shard at an index can be another incarnation by the time a
+    /// build off the lock comes back -- demoted and promoted again,
+    /// dropped and created again -- and it owns none of the first one's
+    /// tickets.
+    pub(crate) fn owns_seal(&self, t: &SealTicket) -> bool {
+        self.frozen.iter().any(|f| Arc::ptr_eq(f, &t.frozen))
+    }
+
+    /// A ticket that is not this shard's, met at `at`: logged, for the
+    /// caller to drop. Not queued here, where every build of it would fail
+    /// or install another shard's rows under this manifest; its rotated
+    /// logs and the build's files are not touched -- the logs are replayed
+    /// wherever that shard's directory went, and a segment file no
+    /// manifest names is reclaimed by the open.
+    pub(crate) fn refuses_seal(&self, t: &SealTicket, at: &str) -> bool {
+        if self.owns_seal(t) {
+            return false;
+        }
+        crate::log::warn(
+            "seal_refused",
+            &[
+                ("collection", self.coll.name.clone()),
+                ("shard", self.index.to_string()),
+                ("ticket_shard", t.index.to_string()),
+                ("rows", t.frozen.len().to_string()),
+                ("at", at.to_string()),
+            ],
+        );
+        true
     }
 
     /// The deletes a memtable holds, as `(key, version, delete instant)`.

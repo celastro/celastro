@@ -3021,7 +3021,10 @@ fn seal_step(db: &RwLock<Db>) -> bool {
         let started = Instant::now();
         match Db::seal_build(&job) {
             Ok(built) => match locked(db, |g| g.seal_install(job, built)) {
-                (Ok(_), held) => crate::log::info(
+                // The shard is gone, or another incarnation of it stands
+                // at its index: the ticket was dropped, and logged there.
+                (Ok(false), _) => crate::log::info("seal_dropped", &[("what", what)]),
+                (Ok(true), held) => crate::log::info(
                     "sealed",
                     &[
                         ("what", what),

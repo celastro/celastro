@@ -332,11 +332,15 @@ pub struct Built {
     pub retain_from: Timestamp,
     /// The outputs already on the disk, by id: the build wrote them.
     written: BTreeMap<u64, PathBuf>,
+    /// The input handles the reservation pinned: the install compares them
+    /// to the shard's by identity, since ids are a per-shard counter and
+    /// collide across shards, and across incarnations of one.
+    handles: Vec<Arc<SegmentHandle>>,
 }
 
 /// Take back files a build wrote that no manifest can name: a build that
-/// failed partway, or an install that declined before publishing. A reopen
-/// would reclaim them too; this does it before the disk has to wait.
+/// failed partway. A reopen would reclaim them too; this does it before
+/// the disk has to wait.
 fn discard(written: &BTreeMap<u64, PathBuf>) {
     for p in written.values() {
         let _ = std::fs::remove_file(p);
@@ -438,16 +442,24 @@ pub fn build(r: &Reserved) -> Result<Option<Built>> {
         carried,
         retain_from: r.retain_from,
         written,
+        handles: r.handles.clone(),
     }))
 }
 
-/// Install what `build` made, if the shard still holds every input: a
-/// shard that moved on meanwhile -- another compaction took the inputs, a
-/// drop -- gets nothing, and `false` says so.
+/// Install what `build` made, if the shard still holds every input -- the
+/// handles the reservation pinned, not segments of the same ids: a shard
+/// that moved on meanwhile (another compaction took the inputs, a drop)
+/// gets nothing, and so does another incarnation of the shard at this
+/// index whose segments carry the ids; `false` says so. The build's files
+/// are left for the open to reclaim, not unlinked: their names were
+/// reserved on the incarnation that built them, and another one, counting
+/// again from its manifest, may since have written its own segments under
+/// them.
 pub fn install(shard: &mut Shard, built: Built) -> Result<bool> {
-    let Built { inputs, outputs, carried, retain_from, written } = built;
-    if !inputs.iter().all(|id| shard.segments.iter().any(|h| h.id() == *id)) {
-        discard(&written);
+    let Built { inputs, outputs, carried, retain_from, written, handles } = built;
+    if handles.len() != inputs.len()
+        || !handles.iter().all(|r| shard.segments.iter().any(|h| Arc::ptr_eq(h, r)))
+    {
         return Ok(false);
     }
     // A failed install keeps its files: a publication that reports failure

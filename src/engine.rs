@@ -5088,6 +5088,25 @@ impl Db {
                 )));
             }
         }
+        // A seal the sealer has taken is in `frozen` and no longer in
+        // `pending_seals`: the flush below cannot drain it, its rows are in
+        // no segment the merge reads, and `b`'s went with `b`'s directory
+        // -- acknowledged, visible, and gone. Refused, for every shard of
+        // the collection here (the positions after `b` shift), rather than
+        // waited for: the install needs the lock this holds. A sealer that
+        // dropped its job keeps the refusal true until a restart, whose
+        // open replays the rotated log.
+        if let Some(s) = self
+            .shards
+            .get(collection)
+            .and_then(|v| v.iter().find(|s| s.frozen.len() > s.pending_seals.len()))
+        {
+            return Err(Error::Plan(format!(
+                "a seal of shard {} of `{collection}` is building; try again in a moment (a \
+                 sealer that dropped the job keeps this true until a restart)",
+                s.index
+            )));
+        }
         self.absorb_shard_catalogs(collection)?;
         let now = self.read_ts();
         let copts = self.opts.compaction;
@@ -7000,9 +7019,13 @@ impl Db {
     pub fn compaction_reserve(&mut self) -> Option<CompactionTicket> {
         let opts = self.opts.compaction;
         for (name, shards) in self.shards.iter_mut() {
-            for (i, s) in shards.iter_mut().enumerate() {
+            for s in shards.iter_mut() {
                 if let Some(reserved) = compaction::reserve(s, &opts) {
-                    return Some(CompactionTicket { collection: name.clone(), shard: i, reserved });
+                    return Some(CompactionTicket {
+                        collection: name.clone(),
+                        shard: s.index,
+                        reserved,
+                    });
                 }
             }
         }
@@ -7017,8 +7040,10 @@ impl Db {
         if !ticket.reserved.backfill {
             return;
         }
-        if let Some(s) =
-            self.shards.get_mut(&ticket.collection).and_then(|v| v.get_mut(ticket.shard))
+        if let Some(s) = self
+            .shards
+            .get_mut(&ticket.collection)
+            .and_then(|v| v.iter_mut().find(|s| s.index == ticket.shard))
         {
             for id in &ticket.reserved.inputs {
                 s.backfill_set_aside.insert(*id);
@@ -7101,11 +7126,11 @@ impl Db {
     /// triple, for the seal.
     pub fn seal_reserve(&mut self) -> Option<SealJob> {
         for (name, shards) in self.shards.iter_mut() {
-            for (i, s) in shards.iter_mut().enumerate() {
+            for s in shards.iter_mut() {
                 if let Some(ticket) = s.seal_take() {
                     return Some(SealJob {
                         collection: name.clone(),
-                        shard: i,
+                        shard: s.index,
                         followed: false,
                         ticket,
                     });
@@ -7138,15 +7163,28 @@ impl Db {
         Shard::seal_build(&job.ticket)
     }
 
-    /// Commit a built seal. `false` when the shard is gone.
+    /// Commit a built seal. `false` when the shard is gone, or when the
+    /// shard at its index is another incarnation -- demoted and promoted
+    /// again, dropped and created again, while the build ran -- which owns
+    /// none of the first one's tickets: the ticket is dropped and logged,
+    /// its rows durable in its rotated log wherever that directory went.
     pub fn seal_install(&mut self, job: SealJob, built: crate::shard::SealBuilt) -> Result<bool> {
         if job.followed {
             let Some(c) = self.followed_copy(&job.collection, job.shard) else { return Ok(false) };
-            c.lock().unwrap_or_else(|p| p.into_inner()).shard.seal_install(job.ticket, built)?;
+            let mut g = c.lock().unwrap_or_else(|p| p.into_inner());
+            if g.shard.refuses_seal(&job.ticket, "install") {
+                return Ok(false);
+            }
+            g.shard.seal_install(job.ticket, built)?;
             return Ok(true);
         }
         let Some(shards) = self.shards.get_mut(&job.collection) else { return Ok(false) };
-        let Some(shard) = shards.get_mut(job.shard) else { return Ok(false) };
+        let Some(shard) = shards.iter_mut().find(|s| s.index == job.shard) else {
+            return Ok(false);
+        };
+        if shard.refuses_seal(&job.ticket, "install") {
+            return Ok(false);
+        }
         shard.seal_install(job.ticket, built)?;
         let name = job.collection.clone();
         self.absorb_shard_catalogs(&name)?;
@@ -7180,7 +7218,10 @@ impl Db {
             }
             return;
         }
-        if let Some(shard) = self.shards.get_mut(&job.collection).and_then(|s| s.get_mut(job.shard))
+        if let Some(shard) = self
+            .shards
+            .get_mut(&job.collection)
+            .and_then(|v| v.iter_mut().find(|s| s.index == job.shard))
         {
             shard.seal_requeue(job.ticket, err);
         }
@@ -7194,7 +7235,10 @@ impl Db {
             }
             return;
         }
-        if let Some(shard) = self.shards.get_mut(&job.collection).and_then(|s| s.get_mut(job.shard))
+        if let Some(shard) = self
+            .shards
+            .get_mut(&job.collection)
+            .and_then(|v| v.iter_mut().find(|s| s.index == job.shard))
         {
             shard.seal_put_back(job.ticket);
         }
@@ -7208,7 +7252,9 @@ impl Db {
         built: compaction::Built,
     ) -> Result<bool> {
         let Some(shards) = self.shards.get_mut(&ticket.collection) else { return Ok(false) };
-        let Some(shard) = shards.get_mut(ticket.shard) else { return Ok(false) };
+        let Some(shard) = shards.iter_mut().find(|s| s.index == ticket.shard) else {
+            return Ok(false);
+        };
         let installed = compaction::install(shard, built)?;
         if installed {
             self.persist()?;
@@ -10153,6 +10199,10 @@ fn sum_term_stats(
 /// install, with the build in between holding nothing.
 pub struct SealJob {
     collection: String,
+    /// The shard's index in the placement map, never its position in the
+    /// node's list: a demotion, a promotion, a move or a merge during the
+    /// build shifts the positions, and a ticket installed by position
+    /// landed on a neighbour.
     shard: usize,
     /// A followed copy's seal, under the followed lock, rather than a
     /// held shard's.
@@ -10959,6 +11009,7 @@ pub struct MovePlan {
 /// to install.
 pub struct CompactionTicket {
     collection: String,
+    /// The shard's index, as a [`SealJob`]'s.
     shard: usize,
     reserved: compaction::Reserved,
 }
@@ -11760,6 +11811,286 @@ mod tests {
         let d = std::env::temp_dir().join(format!("celastro-engine-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    // The sealer's and the compactor's triple -- reserve under the lock,
+    // build holding nothing, install under it again -- against a node whose
+    // list of shards changed while the build ran.
+
+    fn run_ack(db: &mut Db, sql: &str) -> String {
+        match db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).finished().unwrap() {
+            Outcome::Ack(m) => m,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    /// `items` on this node in `splits.len() + 1` shards, the sealer on,
+    /// as the served default has it.
+    fn sharded_items(dir: &Path, splits: &[&str]) -> Db {
+        let mut db = Db::open(dir, DbOpts::default()).unwrap();
+        db.set_background_seal(true);
+        let with = if splits.is_empty() {
+            String::new()
+        } else {
+            let keys: Vec<String> = splits.iter().map(|k| format!("'{k}'")).collect();
+            format!(" WITH (splits = [{}])", keys.join(", "))
+        };
+        run_ack(&mut db, &format!("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT){with}"));
+        db
+    }
+
+    /// `n` rows from `k{from:04}` on.
+    fn insert_rows(db: &mut Db, from: usize, n: usize) {
+        let rows: Vec<String> =
+            (from..from + n).map(|i| format!(r#"('{{"id":"k{i:04}","n":{i}}}')"#)).collect();
+        run_ack(db, &format!("INSERT INTO items VALUES {}", rows.join(", ")));
+    }
+
+    fn rows_of(db: &mut Db) -> usize {
+        db.query("SELECT id FROM items LIMIT 100000").unwrap().rows.len()
+    }
+
+    /// The manifest version and the segment ids of shard `index`.
+    fn manifest_ids(db: &Db, index: usize) -> (u64, Vec<u64>) {
+        let s = db.shards("items").unwrap().iter().find(|s| s.index == index).unwrap();
+        (s.manifest_version, s.segments.iter().map(|h| h.id()).collect())
+    }
+
+    fn pending_seals_of(db: &Db, index: usize) -> usize {
+        db.shards("items").unwrap().iter().find(|s| s.index == index).unwrap().pending_seals.len()
+    }
+
+    /// The rotated logs of shard `index`: `wal.NNNNNN.log`, not the live one.
+    fn rotated_logs(dir: &Path, index: usize) -> Vec<PathBuf> {
+        let d = dir.join("collections").join("items").join(format!("shard-{index:04}"));
+        let mut logs: Vec<PathBuf> = fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|f| f.starts_with("wal.") && f.ends_with(".log") && f != "wal.log")
+            })
+            .collect();
+        logs.sort();
+        logs
+    }
+
+    /// Shard 0 leaves the node while a build runs, as a demotion or a move
+    /// away drains it from the list: shard 1 is at position 0 now, shard 2
+    /// at position 1.
+    fn shard_0_leaves(db: &mut Db) {
+        let gone = db.shards.get_mut("items").unwrap().remove(0);
+        assert_eq!(gone.index, 0);
+        drop(gone);
+    }
+
+    /// The sealer took shard 1's ticket at position 1 of the node's list
+    /// and built it off the lock; shard 0 left the node meanwhile, so
+    /// position 1 is shard 2. The install finds shard 1 by its index:
+    /// shard 2's manifest is untouched and every row reads across a
+    /// reopen. By position, shard 2's manifest named a segment that lies
+    /// in shard 1's directory -- shard 2 did not open again -- and shard
+    /// 1's rotated log was unlinked with the frozen rows in it.
+    #[test]
+    fn a_seal_reserved_before_an_earlier_shard_left_the_node_installs_on_its_own_shard() {
+        let dir = tmp("seal-by-index");
+        let mut db = sharded_items(&dir, &["k0100", "k0200"]);
+        insert_rows(&mut db, 100, 20);
+        insert_rows(&mut db, 200, 20);
+        run_ack(&mut db, "FLUSH items");
+        insert_rows(&mut db, 120, 30);
+        assert_eq!(db.freeze("items").unwrap(), 1, "shard 1's memtable frozen");
+        let job = db.seal_reserve().expect("shard 1's ticket");
+        assert!(job.describe().contains("shard 1 of"), "{}", job.describe());
+        let built = Db::seal_build(&job).unwrap();
+        shard_0_leaves(&mut db);
+        let two_before = manifest_ids(&db, 2);
+        assert!(db.seal_install(job, built).unwrap(), "installed on shard 1");
+        assert_eq!(manifest_ids(&db, 2), two_before, "shard 2's manifest is untouched");
+        assert_eq!(manifest_ids(&db, 1).1.len(), 2, "shard 1 sealed its frozen rows");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 70, "every acknowledged row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same shift between the reserve and a build that the stop
+    /// interrupted, or that failed: the ticket goes back to shard 1's
+    /// queue, not to the shard at its old position, and FLUSH seals it
+    /// there. By position, shard 2's queue took it at the front; every
+    /// build of it there installed shard 1's rows under shard 2's manifest
+    /// or failed, ahead of every seal of shard 2's own.
+    #[test]
+    fn a_seal_put_back_or_requeued_after_an_earlier_shard_left_the_node_goes_to_its_own_shard() {
+        let dir = tmp("seal-requeue-by-index");
+        let mut db = sharded_items(&dir, &["k0100", "k0200"]);
+        insert_rows(&mut db, 100, 20);
+        insert_rows(&mut db, 200, 20);
+        run_ack(&mut db, "FLUSH items");
+        insert_rows(&mut db, 120, 30);
+        assert_eq!(db.freeze("items").unwrap(), 1);
+        let job = db.seal_reserve().expect("shard 1's ticket");
+        shard_0_leaves(&mut db);
+        db.seal_put_back(job);
+        assert_eq!((pending_seals_of(&db, 1), pending_seals_of(&db, 2)), (1, 0), "put back");
+        let job = db.seal_reserve().expect("the ticket again");
+        db.seal_requeue(job, &Error::Storage("the disk is full".into()));
+        assert_eq!((pending_seals_of(&db, 1), pending_seals_of(&db, 2)), (1, 0), "requeued");
+        run_ack(&mut db, "FLUSH items");
+        assert_eq!(pending_seals_of(&db, 1), 0, "FLUSH sealed it");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 70, "every acknowledged row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A build that comes back to a shard that is another incarnation of
+    /// its index -- the database reopened under it here; in a cluster, the
+    /// shard demoted and promoted again -- is dropped: not installed over
+    /// rows the new incarnation replayed from the same rotated log, not
+    /// queued where every build of it would fail, the log left to the
+    /// shard that owns it now.
+    #[test]
+    fn a_seal_of_an_earlier_incarnation_of_the_shard_is_dropped_and_its_log_kept() {
+        let dir = tmp("seal-other-incarnation");
+        let mut db = sharded_items(&dir, &[]);
+        let mut jobs = Vec::new();
+        for round in 0..3 {
+            insert_rows(&mut db, round * 10, 10);
+            assert_eq!(db.freeze("items").unwrap(), 1);
+            jobs.push(db.seal_reserve().expect("the ticket"));
+        }
+        let built = Db::seal_build(&jobs[0]).unwrap();
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 30, "the rotated logs replayed");
+        let logs = rotated_logs(&dir, 0);
+        assert_eq!(logs.len(), 3, "{logs:?}");
+        let before = manifest_ids(&db, 0);
+        let mut jobs = jobs.into_iter();
+        assert!(!db.seal_install(jobs.next().unwrap(), built).unwrap(), "dropped, not installed");
+        db.seal_requeue(jobs.next().unwrap(), &Error::Storage("the disk is full".into()));
+        db.seal_put_back(jobs.next().unwrap());
+        assert_eq!(pending_seals_of(&db, 0), 0, "nothing of the earlier incarnation is queued");
+        assert_eq!(manifest_ids(&db, 0), before, "the manifest is untouched");
+        assert_eq!(rotated_logs(&dir, 0), logs, "the rotated logs are untouched");
+        assert_eq!(rows_of(&mut db), 30);
+        run_ack(&mut db, "FLUSH items");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 30, "every row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compactor reserved shard 1's four flat segments at position 1
+    /// and built them off the lock; shard 0 left the node meanwhile, so
+    /// position 1 is shard 2, whose segments carry the same four ids --
+    /// every shard counts from 1. The install finds shard 1 by its index.
+    /// By position, shard 2 retired its own four segments for shard 1's
+    /// merged rows, masked out of its range: its rows gone, its manifest
+    /// naming a file in shard 1's directory.
+    #[test]
+    fn a_compaction_reserved_before_an_earlier_shard_left_the_node_installs_on_its_own_shard() {
+        let dir = tmp("compaction-by-index");
+        let mut db = sharded_items(&dir, &["k0100", "k0200"]);
+        for round in 0..4 {
+            insert_rows(&mut db, 100 + round * 10, 10);
+            insert_rows(&mut db, 200 + round * 10, 10);
+            run_ack(&mut db, "FLUSH items");
+        }
+        assert_eq!(manifest_ids(&db, 1).1, vec![1, 2, 3, 4]);
+        assert_eq!(manifest_ids(&db, 2).1, vec![1, 2, 3, 4]);
+        let ticket = db.compaction_reserve().expect("shard 1's four flat segments");
+        assert!(ticket.describe().starts_with("`items` shard 1:"), "{}", ticket.describe());
+        let built = Db::compaction_build(&ticket).unwrap().expect("a build");
+        shard_0_leaves(&mut db);
+        let two_before = manifest_ids(&db, 2);
+        assert!(db.compaction_install(ticket, built).unwrap(), "installed on shard 1");
+        assert_eq!(manifest_ids(&db, 2), two_before, "shard 2's manifest is untouched");
+        assert_eq!(manifest_ids(&db, 1).1.len(), 1, "shard 1's four segments merged into one");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 80, "every row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction reserved on an earlier incarnation of the shard, whose
+    /// build outlived it, comes back to one whose segments carry the same
+    /// ids but are not the ones it pinned, and whose id counter started
+    /// again from the manifest: the build wrote its output under id 5 after
+    /// the new incarnation opened, and the seal since then wrote its own
+    /// segment under the same name. The install is dropped and leaves that
+    /// file alone. Installed, the manifest named id 5 twice and retired the
+    /// four inputs, and a reopen was short their rows; unlinked as a stale
+    /// build's files were, the new segment was gone with them.
+    #[test]
+    fn a_compaction_of_an_earlier_incarnation_of_the_shard_is_dropped_and_its_files_left_alone() {
+        let dir = tmp("compaction-other-incarnation");
+        let mut db = sharded_items(&dir, &[]);
+        for round in 0..4 {
+            insert_rows(&mut db, round * 10, 10);
+            run_ack(&mut db, "FLUSH items");
+        }
+        assert_eq!(manifest_ids(&db, 0).1, vec![1, 2, 3, 4]);
+        let ticket = db.compaction_reserve().expect("four flat segments");
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        let built = Db::compaction_build(&ticket).unwrap().expect("a build");
+        insert_rows(&mut db, 40, 10);
+        run_ack(&mut db, "FLUSH items");
+        assert_eq!(manifest_ids(&db, 0).1, vec![1, 2, 3, 4, 5], "the seal took the reserved name");
+        let before = manifest_ids(&db, 0);
+        assert!(!db.compaction_install(ticket, built).unwrap(), "dropped, not installed");
+        assert_eq!(manifest_ids(&db, 0), before, "the manifest is untouched");
+        assert_eq!(rows_of(&mut db), 50);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 50, "every row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `MERGE SHARDS 0 AND 1` while the sealer holds a ticket of shard 1:
+    /// the frozen rows are in no segment the merge reads, and shard 1's
+    /// directory, with their rotated log, goes with shard 1. The merge is
+    /// refused until the seal lands, changing nothing; then it rebuilds
+    /// every row into shard 0, across a reopen. Unrefused, the merge was
+    /// acknowledged short of the frozen rows, and the install that followed
+    /// found no shard to land on.
+    #[test]
+    fn a_merge_during_the_build_of_a_seal_is_refused_and_lands_every_row_after_it() {
+        let dir = tmp("merge-seal-in-flight");
+        let mut db = sharded_items(&dir, &["k0100"]);
+        insert_rows(&mut db, 0, 50);
+        insert_rows(&mut db, 100, 50);
+        run_ack(&mut db, "FLUSH items");
+        insert_rows(&mut db, 150, 20);
+        assert_eq!(db.freeze("items").unwrap(), 1, "shard 1's memtable frozen");
+        let job = db.seal_reserve().expect("shard 1's ticket");
+        let built = Db::seal_build(&job).unwrap();
+        let merged = db.execute("MERGE SHARDS 0 AND 1 OF items").and_then(|o| o.finished());
+        // Whatever the merge did, the seal lands, and every acknowledged
+        // row must read.
+        let installed = db.seal_install(job, built).unwrap();
+        assert_eq!(rows_of(&mut db), 120, "every row reads once the seal landed");
+        assert!(installed, "the seal installed on shard 1");
+        let e = merged.expect_err("the merge during the build is refused").to_string();
+        assert!(e.contains("a seal of shard 1 of `items` is building"), "{e}");
+        assert!(dir.join("collections/items/shard-0001").exists(), "the refusal changed nothing");
+        assert_eq!(manifest_ids(&db, 0).1.len(), 1, "the refusal changed nothing");
+        let m = run_ack(&mut db, "MERGE SHARDS 0 AND 1 OF items");
+        assert!(m.contains("70 row(s) of shard 1 rebuilt"), "{m}");
+        assert_eq!(rows_of(&mut db), 120);
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert_eq!(rows_of(&mut db), 120, "every row reads after a reopen");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
