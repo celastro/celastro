@@ -1020,7 +1020,14 @@ stands and the new shipper picks it up there (0.98.0 reset it on any
 change of term, and the holder's disk was the shard's only copy for the
 whole re-ship); the copy carries the holder it follows for the
 distinction, and a term more than one past its own with the same holder
-is two switches missed in one, and starts over. A ship batch is cut by
+is two switches missed in one, and starts over. For the copy to be kept
+the re-plan has to name it: `SET (replicas = n)` keeps the followers the
+map names, in the map's order, and fills the count from the sorted ring
+(through 0.99.0 it planned every follower afresh over the sorted ring,
+while the CREATE had placed them over the ring as attached, so a count
+raised by one moved the live follower and shipped two from nothing);
+`SET (regions = n)` plans them afresh, moving copies being its point. A
+ship batch is cut by
 count and by bytes, 500 items or 32 MiB,
 as a holder's share of a statement is. Since 0.94.0 the operator can refuse instead:
 `CELASTRO_MIN_HOLDERS=n` refuses, before it is logged, a write that

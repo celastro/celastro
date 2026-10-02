@@ -3957,6 +3957,85 @@ fn a_surviving_copy_keeps_its_position_through_a_replace_copy() {
     }
 }
 
+/// `CREATE COLLECTION` places followers over the ring as it was attached;
+/// `ALTER ... SET (replicas)` re-plans over the ring sorted, which is
+/// another order on most clusters. Through 0.99.0 the re-plan then moved
+/// the live follower to the sorted ring's next node and shipped two copies
+/// from nothing, the holder's disk the shard's only copy meanwhile; now the
+/// followers the map names are kept and the ring fills the count.
+#[test]
+fn a_replica_count_raised_keeps_the_follower_the_map_names_wherever_the_ring_would_put_one() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let started = [
+        Node::start("keep-a"),
+        Node::start("keep-b"),
+        Node::start("keep-c"),
+        Node::start("keep-d"),
+    ];
+    // Roles by the sorted ring: the holder first, the follower the CREATE
+    // names last, so a fresh plan of three copies would pick the two
+    // between and drop it.
+    let mut order: Vec<usize> = (0..4).collect();
+    order.sort_by(|x, y| started[*x].url.cmp(&started[*y].url));
+    let h = &started[order[0]];
+    let ring_next = &started[order[1]];
+    let kept_node = &started[order[3]];
+    for i in 1..4 {
+        h.ack(&format!("ATTACH NODE '{}'", started[order[i]].url));
+    }
+    h.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT) WITH (replicas = 2, nodes = ['{h}', \
+         '{k}'])"
+            .replace("{h}", &h.url)
+            .replace("{k}", &kept_node.url)
+            .as_str(),
+    );
+    for i in 0..8usize {
+        h.ack(&format!(r#"INSERT INTO items VALUES ('{{"id":"d{i:04}","n":{i}}}')"#));
+    }
+    let mut live = false;
+    for _ in 0..100 {
+        if h.ack("SHOW HEALTH").contains(&format!("follower {} live", kept_node.url)) {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(live, "{}", h.ack("SHOW HEALTH"));
+    let kept = followed_copy(kept_node, 0);
+    h.ack("ALTER COLLECTION items SET (replicas = 3)");
+    let cat = h.ack("SHOW CATALOG items");
+    let followers = cat.split("followed by ").nth(1).unwrap_or("").lines().next().unwrap_or("");
+    assert!(
+        followers.contains(&kept_node.url) && followers.contains(&ring_next.url),
+        "the raised count moved the follower the map named: {cat}"
+    );
+    assert!(!followers.contains(&started[order[2]].url), "{cat}");
+    // The kept follower, knowing no peer but the holder, takes the new map
+    // when it hears from it: the same copy, under the new term.
+    kept_node.ack(&format!("ATTACH NODE '{}'", h.url));
+    let after = followed_copy(kept_node, 0);
+    assert_eq!(after.0, kept.0, "the kept follower's copy was dropped and made again from nothing");
+    assert_eq!((after.1, after.2.as_str()), (1, h.url.as_str()), "{after:?}");
+    assert_eq!(kept_node.db.read().unwrap().followed_count("items", 0), Some(8));
+    let mut ok = false;
+    for _ in 0..100 {
+        if ring_next.ack("SHOW HEALTH").contains("follows shard 0 of `items` at term 1: caught up")
+        {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ok, "{}", ring_next.ack("SHOW HEALTH"));
+    for n in started {
+        let d = n.dir.clone();
+        drop(n);
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// `ALTER ... SET (replicas = n)` names a follower that never had the
 /// collection: it is handed the definition and the map whole, makes its
 /// copy and is caught up, where before the carried `LOCAL ALTER` was

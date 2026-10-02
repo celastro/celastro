@@ -5721,7 +5721,7 @@ impl Db {
     fn set_replicas(&mut self, collection: &str, n: usize) -> Result<usize> {
         let coll = self.catalog.get(collection)?.clone();
         let was = if coll.replicas == 0 { DEFAULT_REPLICAS } else { coll.replicas as usize };
-        self.replan_followers(collection, n, coll.regions as usize);
+        self.replan_followers(collection, n, coll.regions as usize, true);
         if let Some(c) = self.catalog.collections.get_mut(collection) {
             c.replicas = n as u8;
         }
@@ -5736,7 +5736,7 @@ impl Db {
         let coll = self.catalog.get(collection)?.clone();
         let was = coll.regions as usize;
         let replicas = if coll.replicas == 0 { DEFAULT_REPLICAS } else { coll.replicas as usize };
-        self.replan_followers(collection, replicas, n);
+        self.replan_followers(collection, replicas, n, false);
         if let Some(c) = self.catalog.collections.get_mut(collection) {
             c.regions = n as u8;
         }
@@ -5756,7 +5756,11 @@ impl Db {
         Ok(was)
     }
 
-    fn replan_followers(&mut self, collection: &str, replicas: usize, regions: usize) {
+    /// With `keep`, the followers the map names stay and the ring fills
+    /// the count (`SET (replicas)`); without, every shard's followers are
+    /// planned afresh over the ring (`SET (regions)`, whose point is to
+    /// move them).
+    fn replan_followers(&mut self, collection: &str, replicas: usize, regions: usize, keep: bool) {
         // The ring in one order everywhere: `data_nodes` puts this node
         // first, and the carried `LOCAL ALTER` re-plans on every node, so
         // each node walked a different ring and named different followers
@@ -5792,7 +5796,33 @@ impl Db {
             // wins here at the next sweep. (Planned from a node list short
             // of the holder, the list came out empty, at the same term.)
             let Some(h) = holder_at else { continue };
-            let followers = self.followers_over_regions(&nodes, h, replicas, regions);
+            let planned = self.followers_over_regions(&nodes, h, replicas, regions);
+            // The ring here is sorted, the same on every node; a CREATE
+            // placed its followers over the ring as it was attached, which
+            // is another order on most clusters. Planned afresh, a count
+            // raised by one moved the live follower to the ring's next node
+            // and shipped two copies from nothing, the holder's disk the
+            // shard's only copy meanwhile. The followers the map names are
+            // kept, in the map's order, and the ring fills what the count
+            // still wants -- one list on every node, the map and the sorted
+            // ring being the same on each.
+            let followers = if keep {
+                let want = replicas.saturating_sub(1);
+                let mut kept: Vec<String> =
+                    t.followers.iter().filter(|f| **f != t.node && known(f)).cloned().collect();
+                kept.truncate(want);
+                for f in planned {
+                    if kept.len() >= want {
+                        break;
+                    }
+                    if f != t.node && !kept.contains(&f) {
+                        kept.push(f);
+                    }
+                }
+                kept
+            } else {
+                planned
+            };
             // A changed follower list is a new term: the higher term wins
             // wherever two maps disagree, so a node that missed the carry
             // takes the new list at its next sweep rather than keeping the
@@ -12210,11 +12240,11 @@ mod tests {
                 "items".into(),
                 (0..5).map(|i| Tablet { node: nodes[i].clone(), ..Default::default() }).collect(),
             );
-            db.replan_followers("items", 3, 2);
+            db.replan_followers("items", 3, 2, false);
             // A changed list is a new term; a plan that changes nothing
             // keeps it.
             assert!(db.catalog.placement["items"].iter().all(|t| t.term == 1), "no new term");
-            db.replan_followers("items", 3, 2);
+            db.replan_followers("items", 3, 2, false);
             assert!(
                 db.catalog.placement["items"].iter().all(|t| t.term == 1),
                 "a term for nothing"

@@ -32,7 +32,8 @@ on it prunes shards; `splits = [...]` fixes the key ranges of the shards
 (two splits, three shards) and cannot be changed later; `nodes = [...]`
 names the nodes the shards go to (below); `replicas = n` is how many
 copies each shard has, the holder and `n - 1` followers (two by
-default; `ALTER COLLECTION ... SET (replicas = n)` re-plans them);
+default; `ALTER COLLECTION ... SET (replicas = n)` keeps the followers
+each shard has and adds or drops to the count);
 `regions = n` spreads those copies over at least `n` regions when the
 nodes carry one (`CELASTRO_REGION`); `confirm = 'all' | 'quorum' |
 'none'` is what acknowledges a write -- every live follower, a majority
