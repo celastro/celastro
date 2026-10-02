@@ -6591,63 +6591,172 @@ impl Db {
         // DDL is a control-plane transaction; data-plane nodes observe catalog
         // versions and never block on it (§10). Here that means the shards get
         // the new definition and the next flush picks it up.
+        /// Every live vector at `idx.path` of `s` fits `dims` finite
+        /// components, or the row that does not, by key: the sealed rows
+        /// as the backfill rewrites them (a deleted row is dropped there),
+        /// and the newest version of every key in the memtable and the
+        /// frozen ones as a seal under the new definition writes them --
+        /// a deleted row included, since a seal keeps the tombstoned
+        /// version for the compaction to collect, and refuses it all the
+        /// same.
+        fn vectors_fit(s: &Shard, idx: &IndexDef, dims: usize) -> Result<()> {
+            let misfit = |key: &str, f: &[f32], unsealed: bool| -> Result<()> {
+                let advice = if unsealed {
+                    "fix the row first, or delete it and flush the collection"
+                } else {
+                    "fix or delete the row first"
+                };
+                if f.len() != dims {
+                    return Err(Error::Schema(format!(
+                        "`{}` of `{key}` has {} dimensions but the index declares {dims}: {advice}",
+                        idx.path,
+                        f.len()
+                    )));
+                }
+                if let Some(bad) = f.iter().find(|x| !x.is_finite()) {
+                    return Err(Error::Schema(format!(
+                        "`{}` of `{key}` has a non-finite component ({bad}): {advice}",
+                        idx.path
+                    )));
+                }
+                Ok(())
+            };
+            for h in &s.segments {
+                let n = h.segment.num_docs() as u32;
+                for ord in 0..n {
+                    if h.is_deleted_at(ord, crate::time::MAX_TS) {
+                        continue;
+                    }
+                    let d = h.segment.document(ord)?;
+                    let Some(v) = d.path(&idx.path) else { continue };
+                    let Some(f) = crate::segment::extract_vector(v) else { continue };
+                    misfit(h.segment.ordinals.key(ord).unwrap_or(""), &f, false)?;
+                }
+            }
+            for m in std::iter::once(&s.memtable).chain(s.frozen.iter().map(|f| f.as_ref())) {
+                for (key, chain) in &m.by_key {
+                    let Some(&ord) = chain.last() else { continue };
+                    let Some(d) = m.docs.get(ord as usize) else { continue };
+                    let Some(v) = d.doc.path(&idx.path) else { continue };
+                    let Some(f) = crate::segment::extract_vector(v) else { continue };
+                    misfit(key, &f, true)?;
+                }
+            }
+            Ok(())
+        }
         let name = idx.name.clone();
-        // A vector index over rows already sealed: every sealed vector has
-        // to fit it, or the backfill fails on every pass; checked here,
-        // naming the row (0.98.0).
+        // A vector index over rows already written: every vector has to
+        // fit it, sealed or not, or the backfill fails on every pass and
+        // the seal below refuses the memtable; checked here, naming the
+        // row (0.98.0 the sealed rows; the unsealed ones and the followed
+        // copies' since -- a memtable row the seal refused failed the
+        // shard's adopt after the catalog had taken the index, and the
+        // next open replayed that row into a memtable built for the index
+        // and did not open).
         if let IndexKind::Vector { dims, .. } = &idx.kind {
             if let Some(shards) = self.shards.get(collection) {
                 for s in shards {
-                    for h in &s.segments {
-                        let n = h.segment.num_docs() as u32;
-                        for ord in 0..n {
-                            if h.is_deleted_at(ord, crate::time::MAX_TS) {
-                                continue;
-                            }
-                            let d = h.segment.document(ord)?;
-                            let Some(v) = d.path(&idx.path) else { continue };
-                            let Some(f) = crate::segment::extract_vector(v) else { continue };
-                            let key = h.segment.ordinals.key(ord).unwrap_or("").to_string();
-                            if f.len() != *dims {
-                                return Err(Error::Schema(format!(
-                                    "`{}` of `{key}` has {} dimensions but the index declares \
-                                     {dims}: fix or delete the row first",
-                                    idx.path,
-                                    f.len()
-                                )));
-                            }
-                            if let Some(bad) = f.iter().find(|x| !x.is_finite()) {
-                                return Err(Error::Schema(format!(
-                                    "`{}` of `{key}` has a non-finite component ({bad}): fix or \
-                                     delete the row first",
-                                    idx.path
-                                )));
-                            }
-                        }
+                    vectors_fit(s, &idx, *dims)?;
+                }
+            }
+            for c in followed_of(&self.followed, collection) {
+                vectors_fit(&c.lock().unwrap_or_else(|p| p.into_inner()).shard, &idx, *dims)?;
+            }
+        }
+        // What the catalog said before, for the undo below. The shards
+        // take the definition one at a time and a seal under it can fail
+        // -- a row the check above could not see, a disk that refuses the
+        // segment -- and the catalog must not keep an index a shard did
+        // not take: kept, the next persist wrote it, and the next open
+        // replayed the shard's rows into a memtable built for the index
+        // and did not open (0.99.0). Nothing reaches the disk before every
+        // shard has adopted; `persist_catalog` is last. The same keeps
+        // `apply_tiers` honest, which pushes the catalog's definition into
+        // every shard with no seal: the catalog never holds what a shard
+        // refused.
+        let before = self.catalog.get(collection)?.clone();
+        let version_before = self.catalog.version;
+        self.catalog.add_index(collection, idx)?;
+        // Creation time is what a `SINCE CREATION` rule measures, and an index
+        // starts its idle clock now rather than at epoch — otherwise every
+        // index is instantly overdue the moment a policy is written.
+        let now = lifecycle::now_micros(&self.clock);
+        let key = (collection.to_string(), name);
+        let activity_before = self.catalog.activity.insert(key.clone(), IndexActivity::new(now));
+        let coll = self.catalog.get(collection)?.clone();
+        let followed = followed_of(&self.followed, collection);
+        let mut adopted = (0usize, 0usize);
+        let mut failed: Option<Error> = None;
+        if let Some(shards) = self.shards.get_mut(collection) {
+            for s in shards.iter_mut() {
+                if let Err(e) = s.adopt_catalog(coll.clone()) {
+                    failed = Some(e);
+                    break;
+                }
+                adopted.0 += 1;
+            }
+        }
+        if failed.is_none() {
+            for c in &followed {
+                let r =
+                    c.lock().unwrap_or_else(|p| p.into_inner()).shard.adopt_catalog(coll.clone());
+                if let Err(e) = r {
+                    failed = Some(e);
+                    break;
+                }
+                adopted.1 += 1;
+            }
+        }
+        if let Some(e) = failed {
+            // Undone where it happened, in memory: the definition, the
+            // version, the activity clock, and the shards that adopted.
+            // Those go through `adopt_catalog`, not `adopt_definition`:
+            // their memtable was rebuilt for the new index and would
+            // refuse, after the log append, a row the restored definition
+            // accepts; empty -- they sealed, or were -- it is rebuilt from
+            // `before` with nothing to fail.
+            *self.catalog.get_mut(collection)? = before.clone();
+            self.catalog.version = version_before;
+            match activity_before {
+                Some(a) => {
+                    self.catalog.activity.insert(key.clone(), a);
+                }
+                None => {
+                    self.catalog.activity.remove(&key);
+                }
+            }
+            let mut undone: Result<()> = Ok(());
+            if let Some(shards) = self.shards.get_mut(collection) {
+                for s in shards.iter_mut().take(adopted.0) {
+                    if let Err(u) = s.adopt_catalog(before.clone()) {
+                        undone = Err(u);
                     }
                 }
             }
+            for c in followed.iter().take(adopted.1) {
+                let r =
+                    c.lock().unwrap_or_else(|p| p.into_inner()).shard.adopt_catalog(before.clone());
+                if let Err(u) = r {
+                    undone = Err(u);
+                }
+            }
+            if let Err(u) = undone {
+                crate::log::warn(
+                    "index_undo_failed",
+                    &[
+                        ("collection", collection.to_string()),
+                        ("index", key.1.clone()),
+                        ("error", u.to_string()),
+                    ],
+                );
+            }
+            return Err(e);
         }
-        self.catalog.add_index(collection, idx)?;
         // A new definition: what a backfill set aside is tried again.
         if let Some(shards) = self.shards.get_mut(collection) {
             for s in shards.iter_mut() {
                 s.backfill_set_aside.clear();
             }
-        }
-        // Creation time is what a `SINCE CREATION` rule measures, and an index
-        // starts its idle clock now rather than at epoch — otherwise every
-        // index is instantly overdue the moment a policy is written.
-        let now = lifecycle::now_micros(&self.clock);
-        self.catalog.activity.insert((collection.to_string(), name), IndexActivity::new(now));
-        let coll = self.catalog.get(collection)?.clone();
-        if let Some(shards) = self.shards.get_mut(collection) {
-            for s in shards.iter_mut() {
-                s.adopt_catalog(coll.clone())?;
-            }
-        }
-        for c in followed_of(&self.followed, collection) {
-            c.lock().unwrap_or_else(|p| p.into_inner()).shard.adopt_catalog(coll.clone())?;
         }
         // A new index changes where this collection's segments belong: the
         // resolved tier of a segment is the coldest tier over the indexes it
@@ -17968,6 +18077,110 @@ mod tests {
             "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')",
         )
         .unwrap();
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same refusal for a row still in the memtable, naming it, and a
+    /// node that reopens after it. Through 0.99.0 the check walked the
+    /// sealed rows only: the catalog took the index, the shard's seal under
+    /// it refused the row and the shard rolled back, the catalog did not,
+    /// the next persist wrote it, and the next open replayed the row into
+    /// a memtable built for the index and did not open. A deleted row is
+    /// refused too -- a seal writes the tombstoned version for the
+    /// compaction to collect -- until a flush seals it.
+    #[test]
+    fn a_vector_index_refused_by_an_unsealed_row_leaves_a_node_that_reopens() {
+        let dir = tmp("index-badrow-unsealed");
+        let create =
+            "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')";
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY)").unwrap();
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"wide","emb":[1.0, 2.0, 3.0]}')"#).unwrap();
+        let e = db.execute(create).unwrap_err().to_string();
+        assert!(e.contains("`wide`") && e.contains("3 dimensions"), "{e}");
+        assert!(
+            db.catalog.get("notes").unwrap().indexes.is_empty(),
+            "the catalog kept an index the statement said was not created"
+        );
+        // A persist of the catalog, as every seal anywhere on the node makes.
+        db.execute("CREATE COLLECTION other (id TEXT PRIMARY KEY)").unwrap();
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap_or_else(|e| {
+            panic!("the node did not reopen after a refused CREATE INDEX: {e}")
+        });
+        let e = db.execute(create).unwrap_err().to_string();
+        assert!(e.contains("`wide`") && !e.contains("already exists"), "{e}");
+        db.execute("DELETE FROM notes WHERE id = 'wide'").unwrap();
+        let e = db.execute(create).unwrap_err().to_string();
+        assert!(e.contains("`wide`") && e.contains("flush"), "a tombstoned row is sealed too: {e}");
+        db.execute("FLUSH notes").unwrap();
+        db.execute(create).unwrap();
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A shard that cannot take the index undoes it everywhere: with two
+    /// shards, the first adopts (its memtable empty, rebuilt for the
+    /// index), the second's seal fails -- here on a directory with no
+    /// write bit, a full disk's behaviour -- and the catalog and the first
+    /// shard are put back as they were. Through 0.99.0 the first shard
+    /// kept the index and the catalog with it: a row the collection
+    /// accepts was refused by that shard, and the next persist wrote an
+    /// index the statement said was not created.
+    #[cfg(unix)]
+    #[test]
+    fn a_vector_index_one_shard_cannot_take_is_undone_on_the_catalog_and_the_shards_that_took_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("index-undo");
+        let create =
+            "CREATE INDEX notes_emb ON notes USING vector (emb) WITH (dims = 2, metric = 'l2')";
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION notes (id TEXT PRIMARY KEY) WITH (splits = ['m'])").unwrap();
+        // A row that fits, unsealed, in shard 1 alone: the check passes and
+        // the seal is what fails.
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"n1","emb":[1.0, 2.0]}')"#).unwrap();
+        let shard = dir.join("collections").join("notes").join("shard-0001");
+        let mut perms = fs::metadata(&shard).unwrap().permissions();
+        let was = perms.mode();
+        perms.set_mode(0o555);
+        fs::set_permissions(&shard, perms).unwrap();
+        let writable = || {
+            let mut back = fs::metadata(&shard).unwrap().permissions();
+            back.set_mode(was);
+            fs::set_permissions(&shard, back).unwrap();
+        };
+        // Running as root, an unwritable directory is not unwritable: say so
+        // rather than pass on an injection that did not happen.
+        if fs::File::create(shard.join(".probe")).is_ok() {
+            let _ = fs::remove_file(shard.join(".probe"));
+            writable();
+            eprintln!("skipped: this process can write a directory it has no write bit for");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let e = db.execute(create).unwrap_err().to_string();
+        writable();
+        assert!(
+            db.catalog.get("notes").unwrap().indexes.is_empty(),
+            "the catalog kept an index a shard refused ({e})"
+        );
+        for s in db.shards("notes").unwrap() {
+            assert!(s.coll.indexes.is_empty(), "shard {} kept the index ({e})", s.index);
+        }
+        // A row the collection's definition accepts, into the shard that
+        // adopted first: taken, and sealed under the definition put back.
+        db.execute(r#"INSERT INTO notes VALUES ('{"id":"a1","emb":[1.0, 2.0, 3.0]}')"#).unwrap();
+        db.execute("FLUSH notes").unwrap();
+        drop(db);
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert!(
+            db.catalog.get("notes").unwrap().indexes.is_empty(),
+            "the persisted catalog carried the refused index"
+        );
+        // The disk back and the wide row gone, the statement again: made.
+        db.execute("DELETE FROM notes WHERE id = 'a1'").unwrap();
+        db.execute(create).unwrap();
         drop(db);
         let _ = fs::remove_dir_all(&dir);
     }
