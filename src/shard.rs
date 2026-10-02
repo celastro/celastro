@@ -1099,6 +1099,9 @@ pub(crate) mod durable {
             /// A WAL file was opened, creating it if it was not there. The
             /// event the directory fsync that publishes its name comes after.
             WalCreate,
+            /// A fresh log's header reached `write_all`: the first write to
+            /// the file a rotation or a truncation starts the log over in.
+            WalHeader,
             /// A WAL record reached `write_all`.
             WalAppend,
             /// A WAL record was fdatasync'd.
@@ -1587,6 +1590,11 @@ pub(crate) struct Wal {
     /// truncated.
     log_id: Option<crate::cipher::LogId>,
     records: u64,
+    /// A rotation that failed after the rename and could not undo it: the
+    /// log is under its rotated name, the group poisoned over it, and the
+    /// caller lists the path with the rotated logs (`take_stranded`), for
+    /// the recovery in place to replay and the next seal to remove.
+    stranded: Option<PathBuf>,
 }
 
 /// Empty `path`, and record that it happened, in one statement.
@@ -1880,7 +1888,16 @@ impl Wal {
             None => (0, None),
         };
         let group = Arc::new(LogSync::new(path, file.try_clone()?, file.metadata()?.len()));
-        Ok(Wal { file, path: path.to_path_buf(), group, cipher, ids, log_id, records })
+        Ok(Wal {
+            file,
+            path: path.to_path_buf(),
+            group,
+            cipher,
+            ids,
+            log_id,
+            records,
+            stranded: None,
+        })
     }
 
     /// The ordinal the next record is sealed with: the records so far, and
@@ -1889,17 +1906,32 @@ impl Wal {
         self.records + self.log_id.is_some() as u64
     }
 
+    /// A fresh log's header under the current scheme, unless writes are
+    /// pinned, written into `file` at its start; the log's id when one
+    /// was written. Nothing of the `Wal` is touched: `rotate` writes the
+    /// header into a file it has not adopted yet, so a header that fails
+    /// to write leaves the log, its count and its id as they were.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn write_header(
+        file: &mut fs::File,
+        path: &Path,
+        cipher: &crate::cipher::Shared,
+        ids: &crate::cipher::Ids,
+    ) -> Result<Option<crate::cipher::LogId>> {
+        let Some(c) = cipher else { return Ok(None) };
+        let Some((h, log_id)) = c.log_header(ids)? else { return Ok(None) };
+        #[cfg(test)]
+        durability_probe::check(durability_probe::Op::WalHeader, path)?;
+        file.write_all(&h)?;
+        Ok(Some(log_id))
+    }
+
     /// Start the file afresh: a header under the current scheme, unless
     /// writes are pinned, and a new id for the log.
     fn begin(&mut self) -> Result<()> {
         self.records = 0;
         self.log_id = None;
-        if let Some(c) = &self.cipher {
-            if let Some((h, log_id)) = c.log_header(&self.ids)? {
-                self.file.write_all(&h)?;
-                self.log_id = Some(log_id);
-            }
-        }
+        self.log_id = Wal::write_header(&mut self.file, &self.path, &self.cipher, &self.ids)?;
         Ok(())
     }
 
@@ -2206,15 +2238,75 @@ impl Wal {
     /// rows written meanwhile keep their log. The rotated file is the
     /// frozen memtable's, deleted when its segments are installed, and
     /// replayed with the live log if the process ends before then.
+    ///
+    /// All or nothing for the `Wal` and its group. Everything after the
+    /// rename that can fail -- the fresh file, the directory fsync, the
+    /// header, the group's handle -- is made into locals and adopted only
+    /// once all of it succeeded; a failure before that undoes the rename,
+    /// so the log is as it was and the group fsyncs the file the appends
+    /// go to. Until 0.99.0 a header that failed to write left `Wal::file`
+    /// on the new, empty file and the group's on the renamed one: every
+    /// deferred settle fdatasync'd a file nothing was appended to and
+    /// acknowledged records that were in the page cache alone, and the
+    /// renamed log was in no list. A rename back that fails too poisons
+    /// the group, so the recovery in place takes over, and keeps the
+    /// rotated path for the caller (`take_stranded`).
     pub(crate) fn rotate(&mut self, seq: u64) -> Result<PathBuf> {
         self.sync()?;
         let rotated = self.path.with_file_name(format!("wal.{seq:06}.log"));
         fs::rename(&self.path, &rotated)?;
+        #[cfg(test)]
+        durability_probe::note_rename(&rotated);
+        match self.fresh_file() {
+            Ok((file, handle, log_id)) => {
+                self.file = file;
+                self.records = 0;
+                self.log_id = log_id;
+                self.group.replace(handle);
+                Ok(rotated)
+            }
+            Err(e) => {
+                // The half-made file first, so the rename back lands on
+                // nothing; neither needs space on a disk that has none.
+                let _ = fs::remove_file(&self.path);
+                if let Err(back) = fs::rename(&rotated, &self.path) {
+                    let mut st = self.group.lock();
+                    st.failed = Some(format!(
+                        "{e}; the log is under {} and could not be renamed back ({back})",
+                        rotated.display()
+                    ));
+                    drop(st);
+                    self.stranded = Some(rotated);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// A fresh file under the log's name, for a rotation: created, its
+    /// name made durable with the rename aside in one directory fsync, its
+    /// header written, and the handle the group takes over it -- all into
+    /// locals, the `Wal` untouched until the caller adopts them.
+    fn fresh_file(&self) -> Result<(fs::File, fs::File, Option<crate::cipher::LogId>)> {
+        let mut file =
+            fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        #[cfg(test)]
+        durability_probe::note_create(&self.path);
+        // After the create, not before it: one fsync of the directory
+        // covers the rename aside and the new entry. Before it (0.99.0)
+        // the new log's name was dirty metadata until the seal's install
+        // fsynced the directory -- minutes, under a background build --
+        // and every record acknowledged into the new log meanwhile was
+        // fdatasync'd into a file a power loss could leave unnamed.
         sync_dir_of(&self.path)?;
-        self.file = fs::OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
-        self.begin()?;
-        self.group.replace(self.file.try_clone()?);
-        Ok(rotated)
+        let log_id = Wal::write_header(&mut file, &self.path, &self.cipher, &self.ids)?;
+        let handle = file.try_clone()?;
+        Ok((file, handle, log_id))
+    }
+
+    /// The rotated log a failed rotation could not put back, once.
+    pub(crate) fn take_stranded(&mut self) -> Option<PathBuf> {
+        self.stranded.take()
     }
 
     pub(crate) fn truncate(&mut self) -> Result<()> {
@@ -2429,6 +2521,9 @@ pub struct Shard {
     /// How many memtables this shard has frozen since it was opened: the
     /// identity the next frozen one carries (`Memtable::gen`).
     freezes: u64,
+    /// How many times the log was recovered in place since the open, each
+    /// a memtable rebuilt with ordinals of its own (`layout_version`).
+    recoveries: u64,
     /// Counters for `EXPLAIN` and for the operator-visible flush/compaction
     /// metrics of §12.1.
     pub(crate) flushes: u64,
@@ -2537,6 +2632,7 @@ impl Shard {
             pending_seals: Vec::new(),
             unsynced_marks: Vec::new(),
             freezes: 0,
+            recoveries: 0,
             unsealed_wals: Vec::new(),
             wal_seq: 1,
             timeline: 0,
@@ -2728,11 +2824,16 @@ impl Shard {
     /// The version of the unit layout a scan's handles name: the manifest's
     /// version and how many memtables stand frozen, so a freeze moves it
     /// too (0.98.0; the manifest alone let a freeze between a scan and its
-    /// fetch hand a handle another unit's document). From the structure
-    /// rather than a counter, so a shard reopened to the same layout -- a
-    /// restart with nothing frozen -- answers the same version.
+    /// fetch hand a handle another unit's document), and how many times
+    /// the log was recovered in place, each a memtable rebuilt whose
+    /// ordinals are not the old one's. From the structure rather than a
+    /// counter, so a shard reopened to the same layout -- a restart with
+    /// nothing frozen -- answers the same version.
     pub fn layout_version(&self) -> u64 {
-        self.manifest_version.wrapping_mul(1 << 24).wrapping_add(self.frozen.len() as u64)
+        self.manifest_version
+            .wrapping_mul(1 << 24)
+            .wrapping_add(self.recoveries.wrapping_mul(1 << 12))
+            .wrapping_add(self.frozen.len() as u64)
     }
 
     /// A log whose sync failed takes no writes and holds reads at the
@@ -2768,13 +2869,29 @@ impl Shard {
             }
         }
         let ids = self.file_ids("wal.log");
-        let records = Wal::replay(&path, &self.opts.cipher, &ids)?;
+        // The rotated logs the open replayed into the live memtable first,
+        // oldest first, then the live log: as the open built it. From the
+        // live log alone (0.97.0 to 0.99.0) the rebuilt memtable lacked
+        // every row of a seal frozen and not installed when the process
+        // last ended -- acknowledged rows, read as absent from here, and
+        // gone for good at the next seal, whose install removed their log.
+        // Not the logs of the tickets: their rows are in `frozen`, which
+        // the recovery leaves alone.
+        let mut records = Vec::new();
+        for p in &self.unsealed_wals {
+            records.extend(Wal::replay(p, &self.opts.cipher, &ids)?);
+        }
+        records.extend(Wal::replay(&path, &self.opts.cipher, &ids)?);
         self.wal = Some(Wal::open(&path, self.opts.cipher.clone(), ids)?);
         // The memtable's bytes given back to the node's budget before it
         // goes, as a seal gives them back: nothing else does.
         self.memtable.release_budget();
-        self.memtable = Memtable::new(&self.coll, self.opts.budget.clone());
+        self.memtable = self.fresh_memtable();
         self.unsealed = PathTally::default();
+        // A layout of its own from here: the rebuilt memtable's ordinals
+        // are not the old one's, and a handle taken before the recovery
+        // must find its snapshot gone rather than another row.
+        self.recoveries += 1;
         // The records were observed by the writes that made them: the
         // catalog's counts are not to see them twice.
         self.apply_replayed(records, false)?;
@@ -3984,11 +4101,26 @@ impl Shard {
         self.next_segment_id += layers.len() as u64;
         let mut wals = std::mem::take(&mut self.unsealed_wals);
         if let Some(w) = self.wal.as_mut() {
+            // The number is consumed once a log exists under it: by the
+            // rotation, or by a failed one that left the log under its
+            // rotated name. Consumed before the attempt (0.98.0, 0.99.0),
+            // a rotation whose sync failed left a number with no log --
+            // a hole the archive's chain of logs stops at, for good.
             let seq = self.wal_seq;
-            self.wal_seq += 1;
             match w.rotate(seq) {
-                Ok(p) => wals.push(p),
+                Ok(p) => {
+                    self.wal_seq += 1;
+                    wals.push(p);
+                }
                 Err(e) => {
+                    // A rotation that failed after the rename and could
+                    // not undo it: the log is under its rotated name, and
+                    // goes in the list with the others, which the recovery
+                    // in place replays and the next seal removes.
+                    if let Some(p) = w.take_stranded() {
+                        self.wal_seq += 1;
+                        wals.push(p);
+                    }
                     // The list taken above goes back: a rotation that
                     // fails must not lose the rotated logs of the seals
                     // before it (0.98.0), which a reopen replays. And the
@@ -5048,6 +5180,16 @@ impl Shard {
         let mut mark_ts = 0;
         let mut caught_up_at = None;
         let mut catching_up = false;
+        // A copy whose sync failed is recovered here, under the copy's own
+        // lock, before the batch: the probe is the recovery's fdatasync,
+        // and the holder's next ship is the copy's next write. The node's
+        // recovery pass probes the shards it holds and not the copies it
+        // follows, so a copy's failed sync refused every later ship until
+        // a restart (0.98.0, 0.99.0) -- under `quorum` with two copies,
+        // every write on the holder missed its deadline until then.
+        if self.wal.as_ref().is_some_and(|w| w.group.failure().is_some()) {
+            self.recover_log()?;
+        }
         let Some(w) = self.wal.as_mut() else {
             return Err(Error::Storage("a followed copy needs a directory".into()));
         };
@@ -8065,28 +8207,247 @@ mod tests {
     }
 
     /// A seal's rotation that fails keeps the list of the logs rotated
-    /// before it: a reopen replays them with the live log, and the next
-    /// seal rotates again.
+    /// before it and the rows they hold: a reopen replays them with the
+    /// live log, the recovery in place replays them too, and the next
+    /// seal rotates again and takes them along. The 0.98.0 form of this
+    /// test pushed a path with no file behind it and asserted the list's
+    /// length alone, so it could not see the rows go at the recovery.
     #[test]
     fn a_rotation_that_fails_keeps_the_rotated_logs() {
         let dir = test_dir("rotate-fail");
         fs::create_dir_all(&dir).unwrap();
-        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
-        s.attach_dir(&dir).unwrap();
-        s.insert(doc(1)).unwrap();
-        // A rotated log a requeued seal put back: what the next freeze
-        // takes along, and must not lose when its own rotation fails.
-        s.unsealed_wals.push(dir.join("wal.000001.log"));
+        let key1 = sort_key(&coll(), &doc(1)).unwrap();
+        let key2 = sort_key(&coll(), &doc(2)).unwrap();
+        {
+            // A seal frozen and not installed when the process ended: its
+            // rows in the rotated log, which the open replays and lists
+            // for the next freeze to take along.
+            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), ShardOpts::default());
+            s.attach_dir(&dir).unwrap();
+            s.insert(doc(1)).unwrap();
+            assert!(s.seal_freeze().unwrap());
+            assert_eq!(s.pending_seals.len(), 1);
+        }
+        let mut s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &dir).unwrap();
+        assert_eq!(s.unsealed_wals, vec![dir.join("wal.000001.log")]);
+        assert!(s.get(&key1, MAX_TS).unwrap().is_some());
+        s.insert(doc(2)).unwrap();
+        let seq = s.wal_seq;
         durability_probe::fail_next(Op::WalSync, &dir.join("wal.log"));
         assert!(s.seal_freeze().is_err(), "the rotation's sync fails");
         assert_eq!(s.unsealed_wals.len(), 1, "the list survived the failed rotation");
-        // The failed sync poisoned the log; recovered, the next freeze
-        // takes the list along into its ticket.
+        assert_eq!(s.wal_seq, seq, "a number consumed for no log: a hole in the archive's chain");
+        assert!(s.get(&key1, MAX_TS).unwrap().is_some(), "and its rows are still read");
+        // The failed sync poisoned the log; recovered, the rotated log's
+        // rows are read, and the next freeze takes the list along into
+        // its ticket.
         assert!(s.recover_log().unwrap());
+        s.clock.recover();
         assert_eq!(s.unsealed_wals.len(), 1, "the recovery keeps the list too");
+        assert!(
+            s.get(&key1, MAX_TS).unwrap().is_some(),
+            "a row of the rotated log is gone from the recovered memtable"
+        );
+        assert!(s.get(&key2, MAX_TS).unwrap().is_some(), "a row of the live log");
+        assert_eq!(s.num_docs(MAX_TS), 2);
         assert!(s.seal_freeze().unwrap(), "the next freeze takes it along");
         assert!(s.unsealed_wals.is_empty(), "into the ticket");
+        assert_eq!(
+            s.pending_seals[0].wals,
+            vec![dir.join("wal.000001.log"), dir.join(format!("wal.{seq:06}.log"))],
+            "the number the failed rotation did not consume"
+        );
+        assert_eq!(s.num_docs(MAX_TS), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every `wal.*.log` in `dir`, sorted.
+    fn rotated_logs_in(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().to_string();
+                n.starts_with("wal.") && n.ends_with(".log") && n != "wal.log"
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A rotation whose header write fails after the rename is undone:
+    /// the `Wal` and its group are on the one file the appends go to,
+    /// under the live name again, no rotated log is left outside every
+    /// list, and the number is not consumed. Until 0.99.0 the `Wal` held
+    /// the fresh, empty file and the group the renamed one: a deferred
+    /// delete's settle fdatasync'd a file its record was not in and
+    /// acknowledged it, and the renamed log was in no list -- a hole in
+    /// the archive's chain until a restart.
+    #[test]
+    fn a_rotation_that_fails_after_the_rename_leaves_the_log_as_it_was() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = test_dir("rotate-header-fail");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut opts = ShardOpts::default();
+        opts.cipher = Some(Arc::new(crate::cipher::Cipher::generate().unwrap()));
+        let key1 = sort_key(&coll(), &doc(1)).unwrap();
+        let key2 = sort_key(&coll(), &doc(2)).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts.clone());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        s.insert(doc(2)).unwrap();
+        let seq = s.wal_seq;
+        durability_probe::start();
+        durability_probe::fail_next(Op::WalHeader, &log);
+        let e = s.seal_freeze().unwrap_err().to_string();
+        let ev = durability_probe::take();
+        assert!(e.contains("injected WalHeader failure"), "{e}");
+        // The `Wal` and its group on one file, under the live name: the
+        // rename aside was undone, and no rotated log is outside every list.
+        let w = s.wal.as_ref().unwrap();
+        let wal_ino = w.file.metadata().unwrap().ino();
+        let group_ino = w.group.lock().file.metadata().unwrap().ino();
+        assert_eq!(wal_ino, group_ino, "the appends go to one file and the group fsyncs another");
+        assert_eq!(fs::metadata(&log).unwrap().ino(), wal_ino, "and it is not the live log");
+        assert_eq!(rotated_logs_in(&dir), Vec::<PathBuf>::new(), "a rotated log in no list");
+        assert!(ev.at(Op::Rename, &dir.join("wal.000001.log")).is_some(), "{ev:?}");
+        assert!(w.group.failure().is_none(), "the undo needs no recovery");
+        assert!(!s.clock.failed());
+        assert_eq!(s.wal_seq, seq, "a number consumed for no log");
+        assert!(s.unsealed_wals.is_empty() && s.pending_seals.is_empty() && s.frozen.is_empty());
+        assert_eq!(s.num_docs(MAX_TS), 2);
+        // A deferred delete in the window: its settle fdatasyncs the file
+        // its record is in, and a reopen replays it.
+        s.defer_sync = true;
+        s.delete(&key1).unwrap();
+        let p = s.take_pending().pop().unwrap();
+        s.defer_sync = false;
+        p.log.settle(p.seq).unwrap();
+        // The next rotation goes through under the same number, and the
+        // ticket names every rotated log in the directory.
+        assert!(s.seal_freeze().unwrap());
+        assert_eq!(s.wal_seq, seq + 1);
+        assert_eq!(s.pending_seals[0].wals, rotated_logs_in(&dir));
+        assert_eq!(s.pending_seals[0].wals, vec![dir.join(format!("wal.{seq:06}.log"))]);
+        drop(s);
+        // Not installed: the reopen replays the rotated log, delete and all.
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), opts, &dir).unwrap();
+        assert!(s.get(&key1, MAX_TS).unwrap().is_none(), "the acknowledged delete was lost");
+        assert!(s.get(&key2, MAX_TS).unwrap().is_some());
+        assert_eq!(s.num_docs(MAX_TS), 1);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rotation that fails after the rename and cannot undo it -- the
+    /// directory took the rename aside and then stopped taking writes --
+    /// poisons the group and lists the log under its rotated name, so the
+    /// recovery in place replays it and the next seal takes it along and
+    /// removes it; the number is consumed, since a log exists under it.
+    #[test]
+    fn a_rotation_whose_undo_fails_strands_the_log_in_the_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("rotate-stranded");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("wal.log");
+        let mut opts = ShardOpts::default();
+        opts.cipher = Some(Arc::new(crate::cipher::Cipher::generate().unwrap()));
+        let key1 = sort_key(&coll(), &doc(1)).unwrap();
+        let key2 = sort_key(&coll(), &doc(2)).unwrap();
+        let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts.clone());
+        s.attach_dir(&dir).unwrap();
+        s.insert(doc(1)).unwrap();
+        s.insert(doc(2)).unwrap();
+        let seq = s.wal_seq;
+        // The directory stops taking writes once the fresh log is created
+        // -- after the rename aside, before the header -- and the header
+        // write fails: the undo's remove and rename back both fail.
+        let (d, l) = (dir.clone(), log.clone());
+        durability_probe::on_event(Some(Box::new(move |op: Op, path: &Path| {
+            if op == Op::WalCreate && path == l {
+                fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+        })));
+        durability_probe::fail_next(Op::WalHeader, &log);
+        let e = s.seal_freeze().unwrap_err().to_string();
+        durability_probe::on_event(None);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(e.contains("injected WalHeader failure"), "{e}");
+        let stranded = dir.join(format!("wal.{seq:06}.log"));
+        assert!(stranded.exists(), "the rename aside stood");
+        assert_eq!(s.unsealed_wals, vec![stranded.clone()], "the stranded log is in no list");
+        assert_eq!(s.wal_seq, seq + 1, "a log exists under the number");
+        let why = s.wal.as_ref().unwrap().group.failure().expect("the group is poisoned");
+        assert!(why.contains("could not be renamed back"), "{why}");
+        assert!(s.clock.failed(), "the next write must probe and recover");
+        assert!(s.insert(doc(3)).unwrap_err().to_string().contains("takes no more writes"));
+        assert!(s.frozen.is_empty() && s.pending_seals.is_empty());
+        // The recovery in place: the stranded log's rows are in the
+        // rebuilt memtable, the live log is fresh, writes go on.
+        assert!(s.recover_log().unwrap());
+        s.clock.recover();
+        assert!(s.get(&key1, MAX_TS).unwrap().is_some(), "a row of the stranded log");
+        assert!(s.get(&key2, MAX_TS).unwrap().is_some());
+        assert_eq!(s.num_docs(MAX_TS), 2);
+        s.insert(doc(3)).unwrap();
+        // The next seal takes the stranded log along and removes it.
+        assert!(s.seal_freeze().unwrap());
+        assert!(s.unsealed_wals.is_empty());
+        let t = s.seal_take().unwrap();
+        assert_eq!(t.wals, vec![stranded.clone(), dir.join(format!("wal.{:06}.log", seq + 1))]);
+        assert_eq!(t.wals, rotated_logs_in(&dir), "a rotated log outside the ticket");
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        assert!(rotated_logs_in(&dir).is_empty());
+        assert_eq!(s.num_docs(MAX_TS), 3);
+        drop(s);
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), opts, &dir).unwrap();
+        assert!(s.get(&key1, MAX_TS).unwrap().is_some());
+        assert_eq!(s.num_docs(MAX_TS), 3);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The rotation's directory fsync comes after the fresh log is
+    /// created, so one fsync publishes the rename aside and the new name
+    /// together, before the first record is acknowledged into the new
+    /// log. Before the create (0.99.0) the new entry was dirty metadata
+    /// until the seal's install fsynced the directory -- minutes, under a
+    /// background build -- and every record acknowledged meanwhile was
+    /// fdatasync'd into a file a power loss could leave unnamed.
+    #[test]
+    fn a_rotation_publishes_the_new_log_before_its_first_record_is_acknowledged() {
+        for cipher in [None, Some(Arc::new(crate::cipher::Cipher::generate().unwrap()))] {
+            let dir = test_dir("rotate-publish");
+            fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("wal.log");
+            let mut opts = ShardOpts::default();
+            opts.cipher = cipher;
+            let mut s = Shard::new(coll(), Arc::new(Hlc::new()), opts);
+            s.attach_dir(&dir).unwrap();
+            s.insert(doc(1)).unwrap();
+            // After `attach_dir`: the only creation of `wal.log` recorded
+            // is the rotation's.
+            durability_probe::start();
+            assert!(s.seal_freeze().unwrap());
+            s.insert(doc(2)).unwrap();
+            let ev = durability_probe::take();
+            let created = ev.at(Op::WalCreate, &log).expect("the rotation's create is recorded");
+            let published = ev
+                .at_after(Op::DirSync, &dir, created)
+                .unwrap_or_else(|| panic!("no directory fsync after the new log's create: {ev:?}"));
+            let synced = ev.at_after(Op::WalSync, &log, created).expect("the insert's sync");
+            assert!(
+                published < synced,
+                "the first record acknowledged into the new log was synced before its name was \
+                 durable: {ev:?}"
+            );
+            assert!(ev.unpublished_renames().is_empty(), "{:?}", ev.unpublished_renames());
+            drop(s);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// A rollback after a sync that failed never makes the log longer: a
@@ -9355,6 +9716,140 @@ mod background_seal_tests {
         s.flush().unwrap();
         assert!(!d.join("wal.000001.log").exists());
         assert_eq!(s.num_docs(s.clock.peek()), 10);
+        drop(s);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A recovery in place after an open that found a rotated log keeps
+    /// the rows of the seal frozen and not installed when the process last
+    /// ended: the open replayed them into the live memtable, and the
+    /// recovery replays the rotated logs it knows of before the live one,
+    /// as the open did. Rebuilt from the live log alone (0.97.0 to 0.99.0)
+    /// they read as absent at once, and the next seal removed their log:
+    /// acknowledged rows, gone for good.
+    #[test]
+    fn a_recovery_in_place_keeps_the_rows_of_the_rotated_logs_the_open_replayed() {
+        use super::durability_probe::{self, Op};
+        let d = dir("recover-rotated");
+        let clock = Arc::new(Hlc::new());
+        let mut opts = ShardOpts::default();
+        opts.background_seal = true;
+        {
+            let mut s = Shard::new(coll(), clock.clone(), opts.clone());
+            s.attach_dir(&d).unwrap();
+            for i in 0..10 {
+                s.insert(doc(i)).unwrap();
+            }
+            s.opts.thresholds.max_bytes = 1;
+            assert!(s.maybe_flush().unwrap());
+            s.opts.thresholds = FlushThresholds::default();
+            s.insert(doc(50)).unwrap();
+            assert_eq!(s.pending_seals.len(), 1, "frozen, never installed");
+        }
+        let mut s = Shard::open(coll(), clock, opts, &d).unwrap();
+        assert_eq!(s.unsealed_wals, vec![d.join("wal.000001.log")]);
+        let now = s.clock.peek();
+        assert!(s.get("d0003", now).unwrap().is_some());
+        assert_eq!(s.num_docs(now), 11);
+        // The live log's sync fails: the write is refused, the log takes
+        // no more, and the recovery runs where the next write runs it.
+        durability_probe::fail_next(Op::WalSync, &d.join("wal.log"));
+        assert!(s.insert(doc(51)).is_err(), "the injected failure was swallowed");
+        assert!(s.recover_log().unwrap());
+        s.clock.recover();
+        let now = s.clock.peek();
+        assert!(
+            s.get("d0003", now).unwrap().is_some(),
+            "a row of the rotated log is gone from the rebuilt memtable"
+        );
+        assert!(s.get("d0050", now).unwrap().is_some(), "a row of the live log");
+        assert!(s.get("d0051", now).unwrap().is_none(), "the refused write came back");
+        assert_eq!(s.num_docs(now), 11);
+        assert_eq!(s.unsealed_wals.len(), 1, "the list is kept for the next seal");
+        // The next seal, built and installed: the rows are in its segment,
+        // both logs are gone, and a reopen reads them from the segment.
+        assert!(s.seal_freeze().unwrap());
+        let t = s.seal_take().unwrap();
+        assert_eq!(t.wals.len(), 2, "the open's rotated log and this seal's");
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        assert!(!d.join("wal.000001.log").exists() && !d.join("wal.000002.log").exists());
+        let now = s.clock.peek();
+        assert!(s.get("d0003", now).unwrap().is_some());
+        assert_eq!(s.num_docs(now), 11);
+        drop(s);
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &d).unwrap();
+        let now = s.clock.peek();
+        assert!(s.get("d0003", now).unwrap().is_some(), "lost at the install");
+        assert!(s.get("d0050", now).unwrap().is_some());
+        assert_eq!(s.num_docs(now), 11);
+        drop(s);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The worse shape of the same loss: a key sealed into a segment and
+    /// updated in the rotated log. The open's replay marked the sealed
+    /// version superseded; a recovery that forgot the rotated log kept the
+    /// mark and lost the new version, so the key read as absent entirely
+    /// -- neither the old row nor the new one.
+    #[test]
+    fn a_recovery_in_place_keeps_an_update_in_a_rotated_log_over_its_sealed_version() {
+        use super::durability_probe::{self, Op};
+        let d = dir("recover-rotated-update");
+        let clock = Arc::new(Hlc::new());
+        let mut opts = ShardOpts::default();
+        opts.background_seal = true;
+        {
+            let mut s = Shard::new(coll(), clock.clone(), opts.clone());
+            s.attach_dir(&d).unwrap();
+            for i in 0..4 {
+                s.insert(doc(i)).unwrap();
+            }
+            // Sealed inline: the first version of every key is in a segment.
+            s.flush().unwrap();
+            assert_eq!(s.segments.len(), 1);
+            let mut updated = doc(2);
+            updated.set_path("body", Value::Str("updated".into())).unwrap();
+            s.insert(updated).unwrap();
+            for i in 10..16 {
+                s.insert(doc(i)).unwrap();
+            }
+            // Frozen, never installed: the update is in the rotated log.
+            s.opts.thresholds.max_bytes = 1;
+            assert!(s.maybe_flush().unwrap());
+            s.opts.thresholds = FlushThresholds::default();
+            s.insert(doc(50)).unwrap();
+            assert_eq!(s.pending_seals.len(), 1);
+        }
+        let mut s = Shard::open(coll(), clock, opts, &d).unwrap();
+        assert_eq!(s.unsealed_wals.len(), 1);
+        let body = |s: &Shard| {
+            s.get("d0002", s.clock.peek())
+                .unwrap()
+                .and_then(|v| v.path("body").and_then(|b| b.as_str()).map(str::to_string))
+        };
+        assert_eq!(body(&s).as_deref(), Some("updated"));
+        durability_probe::fail_next(Op::WalSync, &d.join("wal.log"));
+        assert!(s.insert(doc(51)).is_err(), "the injected failure was swallowed");
+        assert!(s.recover_log().unwrap());
+        s.clock.recover();
+        assert_eq!(
+            body(&s).as_deref(),
+            Some("updated"),
+            "the key's update in the rotated log was lost by the recovery, and with the sealed \
+             version still marked superseded the key reads as absent"
+        );
+        assert_eq!(s.num_docs(s.clock.peek()), 11, "4 sealed, 6 new, 1 live; the update is one");
+        // Sealed, installed, reopened: the update is what the key reads as.
+        assert!(s.seal_freeze().unwrap());
+        let t = s.seal_take().unwrap();
+        let built = Shard::seal_build(&t).unwrap();
+        s.seal_install(t, built).unwrap();
+        assert_eq!(body(&s).as_deref(), Some("updated"));
+        drop(s);
+        let s = Shard::open(coll(), Arc::new(Hlc::new()), ShardOpts::default(), &d).unwrap();
+        assert_eq!(body(&s).as_deref(), Some("updated"));
+        assert_eq!(s.num_docs(s.clock.peek()), 11);
         drop(s);
         let _ = fs::remove_dir_all(&d);
     }

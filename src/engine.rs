@@ -2783,6 +2783,21 @@ impl Db {
                  disk answers; a restart replays it\n"
             ));
         }
+        // The copies this node follows are not in `log_syncs`: each under
+        // its own lock, tried and not waited for, so a copy mid-batch
+        // holds nothing up and is not a failed one.
+        {
+            let g = self.followed.lock().unwrap_or_else(|p| p.into_inner());
+            for ((name, index), c) in g.iter() {
+                let Ok(f) = c.try_lock() else { continue };
+                if let Some(e) = f.shard.log_sync().and_then(|l| l.failure()) {
+                    out.push_str(&format!(
+                        "followed copy of shard {index} of `{name}`: its write-ahead log's sync \
+                         FAILED ({e}); the holder's next ship reopens it once the disk answers\n"
+                    ));
+                }
+            }
+        }
         out.push_str(&self.recovery_line());
         let lead = self.hlc_lead_micros();
         if lead > 1_000_000 {
@@ -12480,6 +12495,113 @@ mod tests {
         assert!(!copy.segments.is_empty(), "the copy has no sealed segment");
         assert_eq!(copy.num_docs(u64::MAX), 240);
         drop(g);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A followed copy whose sync failed is recovered in place by the next
+    /// ship, under its own lock: the batch after the refused one lands,
+    /// the rows before it still read, and where the copy says it stands
+    /// is honest throughout. Until 0.99.0 the node's recovery pass probed
+    /// the shards it held and not the copies it followed, so every later
+    /// ship was refused until a restart -- under `quorum` with two copies,
+    /// every write on the holder missed its deadline until then -- and
+    /// the node's health said nothing of it.
+    #[test]
+    fn a_followed_copy_whose_sync_failed_is_recovered_by_the_next_ship() {
+        use crate::replication::{ShipItem, SHIP_CAUGHT_UP, SHIP_INSERT};
+        let dir = tmp("copy-recover");
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        let mut db = Db::open(&dir, opts.clone()).unwrap();
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![Tablet {
+                node: "tcp://127.0.0.1:2".into(),
+                followers: vec!["tcp://127.0.0.1:1".into()],
+                ..Default::default()
+            }],
+        );
+        db.ensure_followed("items").unwrap();
+        db.persist_catalog().unwrap();
+        let (followed, held) = (db.followed(), db.held_terms());
+        let batch = |keys: &[&str], ts: u64| -> Vec<ShipItem> {
+            let mut v: Vec<ShipItem> = keys
+                .iter()
+                .map(|k| ShipItem {
+                    kind: SHIP_INSERT,
+                    key: k.to_string(),
+                    ts,
+                    doc: Some(crate::json::parse(&format!(r#"{{"id":"{k}","n":1}}"#)).unwrap()),
+                })
+                .collect();
+            v.push(ShipItem { kind: SHIP_CAUGHT_UP, key: String::new(), ts, doc: None });
+            v
+        };
+        let log = dir.join("collections/items/followed/shard-0000/wal.log");
+        assert!(log.exists());
+        let at = |followed: &Followed, held: &HeldTerms| {
+            follower_status(followed, held, "items", 0, 0).unwrap()
+        };
+        assert_eq!(
+            apply_shipped(&followed, &held, "items", 0, 0, &batch(&["a1", "a2"], 100)).unwrap(),
+            (true, 100)
+        );
+        durability_probe::fail_next(Op::WalSync, &log);
+        let e = apply_shipped(&followed, &held, "items", 0, 0, &batch(&["b1"], 200))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("injected WalSync failure"), "{e}");
+        assert_eq!(at(&followed, &held), (true, 100), "the refused batch moved the position");
+        // The disk answers: the next ship recovers the log in place and
+        // lands, where it used to be refused until a restart.
+        assert_eq!(
+            apply_shipped(&followed, &held, "items", 0, 0, &batch(&["c1"], 300)).unwrap(),
+            (true, 300),
+            "the ship after the refused one"
+        );
+        assert_eq!(at(&followed, &held), (true, 300));
+        // The node's health names a failed copy while it is one, and not
+        // after.
+        durability_probe::fail_next(Op::WalSync, &log);
+        assert!(apply_shipped(&followed, &held, "items", 0, 0, &batch(&["d1"], 400)).is_err());
+        let health = db.health_draft().out;
+        assert!(
+            health.contains("followed copy of shard 0 of `items`") && health.contains("FAILED"),
+            "{health}"
+        );
+        assert_eq!(at(&followed, &held), (true, 300));
+        assert_eq!(
+            apply_shipped(&followed, &held, "items", 0, 0, &batch(&["e1"], 500)).unwrap(),
+            (true, 500)
+        );
+        let health = db.health_draft().out;
+        assert!(!health.contains("FAILED"), "{health}");
+        let rows = |followed: &Followed| -> Vec<String> {
+            let c = followed.lock().unwrap().get(&("items".to_string(), 0)).cloned().unwrap();
+            let g = c.lock().unwrap();
+            let mut v: Vec<String> = ["a1", "a2", "b1", "c1", "d1", "e1"]
+                .iter()
+                .filter(|k| g.shard.get(k, u64::MAX).unwrap().is_some())
+                .map(|k| k.to_string())
+                .collect();
+            v.sort();
+            assert_eq!(g.shard.num_docs(u64::MAX), v.len());
+            v
+        };
+        assert_eq!(
+            rows(&followed),
+            vec!["a1", "a2", "c1", "e1"],
+            "a refused batch's row, or a lost one"
+        );
+        drop(db);
+        // And a reopen of the copy agrees.
+        let db = Db::open(&dir, opts).unwrap();
+        assert_eq!(rows(&db.followed()), vec!["a1", "a2", "c1", "e1"]);
+        assert_eq!(at(&db.followed(), &db.held_terms()), (true, 500));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
