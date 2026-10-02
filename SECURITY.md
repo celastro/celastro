@@ -289,7 +289,12 @@ the frame's index authenticated) under a key HKDF derives per file from
 one data key; the data key is drawn at the first open and kept in
 `<dir>/KEY` wrapped under the master key, which is never written. The
 same in-tree, unaudited primitives as the TLS. The master key rotates
-with `key rekey` (one small rewrap); the data key with `key rotate`
+with `key rekey` per directory (under the directory's lock, with the
+`KEY.next` of an interrupted rotation) and `key rekey-backups` per
+backup destination, or by a restart with the master it replaced in
+`CELASTRO_MASTER_KEY_PREVIOUS_FILE`, which rewraps `KEY` under the new
+one; the previous master is needed until every node, backup and export
+under it has been rewrapped. The data key rotates with `key rotate`
 (0.65.0: every file sealed again with the process stopped, resumable;
 0.66.0: an archived tier keeps the old key in a ring behind the new
 one until `key retire`), and `check` opens every frame and names what

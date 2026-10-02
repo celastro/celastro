@@ -401,6 +401,34 @@ impl Cipher {
         Err(Error::Storage("KEY is not a wrapped data key".into()))
     }
 
+    /// [`Cipher::unwrap`] under `current` or, failing that, under each of
+    /// `previous` in turn: what a rotation of the master key needs while a
+    /// `KEY` somewhere is still under the master it replaced. The bool says
+    /// it opened under a previous master, so the caller writes it back
+    /// under the current one -- the same `Cipher`, so `wrap` keeps the ring
+    /// and the legacy pin: the same form, under another master. Refused
+    /// saying how many masters were tried when none opens it.
+    pub fn unwrap_any(
+        key_file: &[u8],
+        current: &[u8; 32],
+        previous: &[&[u8; 32]],
+    ) -> Result<(Cipher, bool)> {
+        let e = match Cipher::unwrap(key_file, current) {
+            Ok(c) => return Ok((c, false)),
+            Err(e) if previous.is_empty() => return Err(e),
+            Err(e) => e,
+        };
+        for master in previous {
+            if let Ok(c) = Cipher::unwrap(key_file, master) {
+                return Ok((c, true));
+            }
+        }
+        Err(Error::Storage(format!(
+            "{e}; the {} previous master key(s) offered do not open it either",
+            previous.len()
+        )))
+    }
+
     /// Write under the identities and framing 0.83.0 reads, or not.
     pub fn set_legacy_writes(&mut self, on: bool) {
         self.legacy_writes = on;
@@ -1046,11 +1074,54 @@ pub fn new_master_hex() -> Result<String> {
 /// Rewrap the data key in the file `key` -- wrapped under `old` -- under
 /// `new`, in place and atomically. The data key does not change, so
 /// nothing under it is touched: a master key rotates in one small write.
-pub fn rekey_file(key: &std::path::Path, old: &[u8; 32], new: &[u8; 32]) -> Result<()> {
-    let wrapped =
-        std::fs::read(key).map_err(|e| Error::Storage(format!("{}: {e}", key.display())))?;
-    let rewrapped = Cipher::unwrap(&wrapped, old)?.wrap(new)?;
-    crate::shard::atomic_write(key, &rewrapped)
+///
+/// When `key` is a database directory's `KEY` (its parent holds `LOCK`,
+/// which every directory a node ever opened has, or `KEY.next`), the
+/// directory's lock is held for the duration -- a node serving it (a
+/// `RESTORE` writes `KEY`) or a `key rotate` running in it would write
+/// over this, and a refusal names the holder -- and a `KEY.next` an
+/// interrupted rotation left is rewrapped with it: it holds the only copy
+/// of the new data key, which already seals the recoded files, and left
+/// under the old master it was lost with that master. Both files are
+/// opened before either is written -- one under neither master is a third
+/// master's: refused naming it, nothing written -- then `KEY.next` is
+/// written, then `KEY`; a file already under `new` is taken as done, so a
+/// run cut between the two writes is finished by running it again. A bare
+/// file -- `key init`'s, the chart's Secret, an export's `KEY` -- is the
+/// one-file rewrap, and no `LOCK` is made beside it. The file keeps its
+/// mode (a 0600 key file stays 0600). Returns whether a `KEY.next` was
+/// rewrapped too.
+pub fn rekey_file(key: &std::path::Path, old: &[u8; 32], new: &[u8; 32]) -> Result<bool> {
+    let parent = match key.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let in_database = key.file_name().is_some_and(|n| n == "KEY")
+        && (parent.join("LOCK").exists() || parent.join(KEY_NEXT).exists());
+    let _lock = if in_database {
+        Some(
+            crate::dirlock::take(&parent)
+                .map_err(|e| Error::Storage(format!("{e}; stop the node first")))?,
+        )
+    } else {
+        None
+    };
+    let rewrap = |path: &std::path::Path| -> Result<Vec<u8>> {
+        let wrapped =
+            std::fs::read(path).map_err(|e| Error::Storage(format!("{}: {e}", path.display())))?;
+        let (cipher, _) = Cipher::unwrap_any(&wrapped, new, &[old])
+            .map_err(|e| Error::Storage(format!("{}: {e}", path.display())))?;
+        cipher.wrap(new)
+    };
+    let key_bytes = rewrap(key)?;
+    let next_path = parent.join(KEY_NEXT);
+    let next_bytes =
+        if in_database && next_path.exists() { Some(rewrap(&next_path)?) } else { None };
+    if let Some(bytes) = &next_bytes {
+        crate::shard::atomic_write_keeping_mode(&next_path, bytes)?;
+    }
+    crate::shard::atomic_write_keeping_mode(key, &key_bytes)?;
+    Ok(next_bytes.is_some())
 }
 
 /// A master key as a file or a variable holds it: 32 raw bytes, or 64 hex
@@ -1080,13 +1151,31 @@ pub fn parse_master(bytes: &[u8]) -> Result<[u8; 32]> {
 /// other. `None` when neither is set: the database is then plain, or
 /// refused if it is not.
 pub fn master_from_env(var: &dyn Fn(&str) -> Option<String>) -> Result<Option<[u8; 32]>> {
-    match (var("CELASTRO_MASTER_KEY_FILE"), var("CELASTRO_MASTER_KEY")) {
-        (Some(_), Some(_)) => Err(Error::Storage(
-            "CELASTRO_MASTER_KEY_FILE and CELASTRO_MASTER_KEY are both set; set one".into(),
-        )),
+    master_from_vars(var, "CELASTRO_MASTER_KEY_FILE", "CELASTRO_MASTER_KEY")
+}
+
+/// The master key the environment names as the one a rotation replaced:
+/// `CELASTRO_MASTER_KEY_PREVIOUS_FILE` or `CELASTRO_MASTER_KEY_PREVIOUS`,
+/// read as [`master_from_env`] reads the current one. A `KEY` that opens
+/// under it alone is rewritten under the current master by the open, so a
+/// cluster rotates its master by one restart of every node; a backup
+/// under it restores meanwhile. `None` when neither is set.
+pub fn previous_master_from_env(var: &dyn Fn(&str) -> Option<String>) -> Result<Option<[u8; 32]>> {
+    master_from_vars(var, "CELASTRO_MASTER_KEY_PREVIOUS_FILE", "CELASTRO_MASTER_KEY_PREVIOUS")
+}
+
+fn master_from_vars(
+    var: &dyn Fn(&str) -> Option<String>,
+    file_var: &str,
+    hex_var: &str,
+) -> Result<Option<[u8; 32]>> {
+    match (var(file_var), var(hex_var)) {
+        (Some(_), Some(_)) => {
+            Err(Error::Storage(format!("{file_var} and {hex_var} are both set; set one")))
+        }
         (Some(path), None) => {
             let mut bytes = std::fs::read(&path)
-                .map_err(|e| Error::Storage(format!("CELASTRO_MASTER_KEY_FILE {path}: {e}")))?;
+                .map_err(|e| Error::Storage(format!("{file_var} {path}: {e}")))?;
             let r = parse_master(&bytes).map(Some);
             wipe(&mut bytes);
             r
@@ -1763,8 +1852,14 @@ pub const KEY_NEXT: &str = "KEY.next";
 /// before carry their own `KEY` and open as they did; an index at the
 /// archived tier keeps the old key in a ring behind the new one, since
 /// its objects are under the old key where a rotation does not reach, and
-/// `retire_keys` drops the ring once they are not.
-pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walked> {
+/// `retire_keys` drops the ring once they are not. `previous` are the
+/// masters a rotation of the master replaced, for a `KEY` or `KEY.next`
+/// still under one of them.
+pub fn rotate_data_key(
+    dir: &std::path::Path,
+    master: &[u8; 32],
+    previous: &[&[u8; 32]],
+) -> Result<Walked> {
     // The directory's lock, held to the end: a node serving it meanwhile
     // would write under the old key past the walk, and those files would
     // never open again (0.97.0).
@@ -1773,12 +1868,25 @@ pub fn rotate_data_key(dir: &std::path::Path, master: &[u8; 32]) -> Result<Walke
     let wrapped = std::fs::read(&key_path).map_err(|e| {
         Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))
     })?;
-    let old = Cipher::unwrap(&wrapped, master)?;
+    // `KEY` under a previous master is left as it is: `KEY.next`, under
+    // the current one, is renamed over it at the end.
+    let (old, _) = Cipher::unwrap_any(&wrapped, master, previous)?;
     let next_path = dir.join(KEY_NEXT);
     let mut new = match crate::shard::read_optional(&next_path)? {
-        Some(next) => Cipher::unwrap(&next, master).map_err(|e| {
-            Error::Storage(format!("{}: {e}; the interrupted rotation's key", next_path.display()))
-        })?,
+        Some(next) => {
+            let (c, under_previous) = Cipher::unwrap_any(&next, master, previous).map_err(|e| {
+                Error::Storage(format!(
+                    "{}: {e}; the interrupted rotation's key",
+                    next_path.display()
+                ))
+            })?;
+            // The interrupted rotation's key, wrapped under a master since
+            // replaced: under the current one before it becomes `KEY`.
+            if under_previous {
+                crate::shard::atomic_write_keeping_mode(&next_path, &c.wrap(master)?)?;
+            }
+            c
+        }
         None => Cipher::generate()?,
     };
     // The catalog first: an index at the archived tier has objects the
@@ -2073,17 +2181,25 @@ pub fn reseal_archive(
     out
 }
 
-pub fn retire_keys(dir: &std::path::Path, master: &[u8; 32]) -> Result<usize> {
+pub fn retire_keys(
+    dir: &std::path::Path,
+    master: &[u8; 32],
+    previous: &[&[u8; 32]],
+) -> Result<usize> {
     let _lock = crate::dirlock::take(dir)?;
     let key_path = dir.join("KEY");
     let wrapped = std::fs::read(&key_path).map_err(|e| {
         Error::Storage(format!("{}: {e} (not an encrypted database?)", key_path.display()))
     })?;
-    let mut cipher = Cipher::unwrap(&wrapped, master)?;
+    let (mut cipher, under_previous) = Cipher::unwrap_any(&wrapped, master, previous)?;
     let n = cipher.previous_keys();
     if n > 0 {
         cipher.retire_previous();
-        crate::shard::atomic_write(&key_path, &cipher.wrap(master)?)?;
+    }
+    // Written back under the current master: with the ring dropped, or
+    // because it was under a previous one.
+    if n > 0 || under_previous {
+        crate::shard::atomic_write_keeping_mode(&key_path, &cipher.wrap(master)?)?;
     }
     Ok(n)
 }

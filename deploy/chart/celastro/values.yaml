@@ -82,6 +82,12 @@ tls:
 # and one that has written under a key refuses to start without it.
 encryption:
   existingSecret: ""
+  # Through a master-key rotation (the chart README's procedure): the
+  # Secret also carries the old master as `master-previous.key`, and a pod
+  # whose KEY is still under it opens, rewraps it under the new master and
+  # logs `key_master_rewrapped` at its restart. Off again once every pod
+  # has restarted and every backup and export is rewrapped.
+  previousMaster: false
 
 image:
   repository: ghcr.io/celastro/celastro

@@ -861,6 +861,15 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_dir_of(path)
 }
 
+/// `atomic_write` keeping the mode of the file it replaces: a key file
+/// written for its owner alone (0600) stays so through a rewrap, where
+/// the temp file `File::create` opens would come back at the umask's 0644.
+pub(crate) fn atomic_write_keeping_mode(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mode = fs::metadata(path).ok().map(|m| m.permissions());
+    publish_as(path, bytes, mode)?;
+    sync_dir_of(path)
+}
+
 /// `atomic_write` without the directory fsync: temp file, fsync, rename.
 ///
 /// For a caller publishing several files into the SAME directory, which can
@@ -869,9 +878,17 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// directory fsync before it may treat any of the names as published, and
 /// `Shard::persist_manifest` is the only caller.
 fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish_as(path, bytes, None)
+}
+
+/// `publish`, with the temp file given `mode` before the rename.
+fn publish_as(path: &Path, bytes: &[u8], mode: Option<fs::Permissions>) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
+        if let Some(mode) = mode {
+            f.set_permissions(mode)?;
+        }
         f.write_all(bytes)?;
         sync_file(&f, &tmp)?;
     }

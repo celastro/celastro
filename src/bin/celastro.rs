@@ -75,7 +75,12 @@ COMMANDS:
   key master <FILE>          write a new master key (64 hex digits) to FILE, readable by you only
   key init <FILE>            write a new data key to FILE, wrapped under the master key: the KEY
                              every node of an encrypted cluster starts with (CELASTRO_KEY_FILE)
-  key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER
+  key rekey <KEY> <MASTER>   rewrap the data key in KEY under the master key in the file MASTER;
+                             a database's KEY takes the directory's lock (stop the node first)
+                             and an interrupted rotation's KEY.next is rewrapped with it
+  key rekey-backups <DEST> <MASTER>
+                             rewrap every backup's KEY at DEST (named as BACKUP TO names it)
+                             under the master key in MASTER, and each record's hash of it
   key rotate <DIR>           a new data key for the database at DIR: every file sealed again,
                              KEY rewrapped; with no process serving DIR; resumable if interrupted
   key retire <DIR>           drop the previous data keys a rotation kept for the archived tier;
@@ -178,8 +183,12 @@ encrypted database -- every file under it, and every backup and export it
 writes, framed under a data key that `<DIR>/KEY` holds wrapped under the master
 -- and opens one made before; without the master an encrypted database is
 refused. A cluster's nodes share one data key: `key init` writes it, and
-CELASTRO_KEY_FILE names it at every node's first start. SECURITY.md has the
-rest.
+CELASTRO_KEY_FILE names it at every node's first start. When the master
+rotates, CELASTRO_MASTER_KEY_PREVIOUS_FILE (or CELASTRO_MASTER_KEY_PREVIOUS)
+names the one it replaced: a node whose KEY is still under it opens, rewraps
+KEY under the current master and logs it, so a cluster rotates its master by
+one restart of every node; a backup under it restores meanwhile. SECURITY.md
+has the rest.
 
 The `archived` tier is a local directory unless CELASTRO_ARCHIVE_ENDPOINT
 (`host:port`, plain HTTP) and CELASTRO_ARCHIVE_BUCKET name an S3-compatible
@@ -255,6 +264,12 @@ enum Cmd {
     },
     KeyRekey {
         key: PathBuf,
+        master: PathBuf,
+    },
+    /// `key rekey-backups <DEST> <MASTER>`: every backup's KEY at DEST
+    /// rewrapped under the master key in MASTER, with its record's hash.
+    KeyRekeyBackups {
+        dest: String,
         master: PathBuf,
     },
     /// `key rotate <DIR>`: a new data key for the database at DIR, every
@@ -531,15 +546,19 @@ fn parse_args<I: IntoIterator<Item = String>>(argv: I) -> Cli {
             (Some("rekey"), 3) => {
                 Cmd::KeyRekey { key: PathBuf::from(&rest[1]), master: PathBuf::from(&rest[2]) }
             }
+            (Some("rekey-backups"), 3) => {
+                Cmd::KeyRekeyBackups { dest: rest[1].clone(), master: PathBuf::from(&rest[2]) }
+            }
             _ => {
                 return Cli::Usage(
                     "`key master <FILE>`: write a new master key to FILE. `key init <FILE>`: write \
                      a new data key to FILE, wrapped under the master key in CELASTRO_MASTER_KEY_FILE \
                      or CELASTRO_MASTER_KEY. `key rekey <KEY> <MASTER>`: rewrap the data key in KEY \
-                     under the master key in the file MASTER. `key rotate <DIR>`: a new data key for \
-                     the database at DIR. `key retire <DIR> [--check] [--force]`: drop the ring a \
-                     rotation kept. `key reseal <DIR>`: seal the archived objects under the current \
-                     key and retire the ring"
+                     under the master key in the file MASTER. `key rekey-backups <DEST> <MASTER>`: \
+                     rewrap every backup's KEY at DEST under the master key in the file MASTER. \
+                     `key rotate <DIR>`: a new data key for the database at DIR. `key retire <DIR> \
+                     [--check] [--force]`: drop the ring a rotation kept. `key reseal <DIR>`: seal \
+                     the archived objects under the current key and retire the ring"
                         .to_string(),
                 )
             }
@@ -765,6 +784,9 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
     if let Cmd::KeyRekey { key, master } = cmd {
         return key_rekey(&key, &master, json);
     }
+    if let Cmd::KeyRekeyBackups { dest, master } = cmd {
+        return key_rekey_backups(&dest, &master, json);
+    }
     if let Cmd::KeyRotate { dir } = cmd {
         return key_rotate(&dir, json);
     }
@@ -814,6 +836,7 @@ fn run(dir: Option<PathBuf>, url: Option<String>, json: bool, cmd: Cmd) -> i32 {
         | Cmd::KeyMaster { .. }
         | Cmd::KeyInit { .. }
         | Cmd::KeyRekey { .. }
+        | Cmd::KeyRekeyBackups { .. }
         | Cmd::KeyRotate { .. }
         | Cmd::KeyRetire { .. }
         | Cmd::KeyReseal { .. }
@@ -985,6 +1008,7 @@ fn health(
 fn forget_secrets() {
     for v in [
         "CELASTRO_MASTER_KEY",
+        "CELASTRO_MASTER_KEY_PREVIOUS",
         celastro::serve::TOKEN_ENV,
         celastro::serve::SCOPED_TOKENS_ENV,
         celastro::wire::TOKEN_ENV,
@@ -1654,48 +1678,133 @@ fn key_init(file: &Path, json: bool) -> i32 {
 /// and written back in place. The data is untouched -- it is under the
 /// data key, which does not change -- so a master key rotates in the time
 /// it takes to write one small file, and every node then starts with the
-/// new master.
+/// new master. A database directory's KEY is rewrapped under the
+/// directory's lock (a served directory is refused: stop the node first),
+/// and the KEY.next of an interrupted `key rotate` with it.
 fn key_rekey(key: &Path, master: &Path, json: bool) -> i32 {
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let old = match celastro::cipher::master_from_env(&var) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            return fail(
-                json,
-                "`key rekey` opens the key under the current master: set \
-                 CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY",
-            )
-        }
-        Err(e) => return fail(json, &e.to_string()),
-    };
-    let new = match std::fs::read(master)
-        .map_err(|e| e.to_string())
-        .and_then(|b| celastro::cipher::parse_master(&b).map_err(|e| e.to_string()))
-    {
+    let old = match old_master_or_fail(json, "key rekey", "the key") {
         Ok(m) => m,
-        Err(e) => return fail(json, &format!("{}: {e}", master.display())),
+        Err(code) => return code,
     };
-    if let Err(e) = celastro::cipher::rekey_file(key, &old, &new) {
-        return fail(json, &format!("could not rekey {}: {e}", key.display()));
+    let new = match master_in_file(master) {
+        Ok(m) => m,
+        Err(e) => return fail(json, &e),
+    };
+    match celastro::cipher::rekey_file(key, &old, &new) {
+        Ok(true) => ack(
+            json,
+            &format!(
+                "{} and {} (an interrupted rotation; finish it with `key rotate`) are now wrapped \
+                 under the master key in {}",
+                key.display(),
+                key.with_file_name(celastro::cipher::KEY_NEXT).display(),
+                master.display()
+            ),
+        ),
+        Ok(false) => ack(
+            json,
+            &format!(
+                "{} is now wrapped under the master key in {}",
+                key.display(),
+                master.display()
+            ),
+        ),
+        Err(e) => return fail(json, &format!("could not rekey {}: {e}", key.display())),
     }
-    ack(
-        json,
-        &format!("{} is now wrapped under the master key in {}", key.display(), master.display()),
-    );
     EXIT_OK
 }
 
-/// The master key the environment names, or the reason there is none.
-fn master_or_fail(json: bool, what: &str) -> std::result::Result<[u8; 32], i32> {
+/// `key rekey-backups <DEST> <MASTER>`: every backup's KEY at DEST, opened
+/// under the environment's master key, rewrapped under the one in the file
+/// MASTER, and each sealed record's hash of it with it; a backup already
+/// under the new master is left as it is. DEST as `BACKUP TO` names it,
+/// so an `s3://` destination takes the CELASTRO_ARCHIVE_* variables.
+fn key_rekey_backups(dest: &str, master: &Path, json: bool) -> i32 {
+    let old = match old_master_or_fail(json, "key rekey-backups", "each backup's KEY") {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let new = match master_in_file(master) {
+        Ok(m) => m,
+        Err(e) => return fail(json, &e),
+    };
+    let o = match db_opts() {
+        Ok(o) => o,
+        Err(e) => return fail(json, &e),
+    };
+    match celastro::backup::rekey_backups(&o.archive, o.backup_dir.as_deref(), dest, &old, &new) {
+        Ok(r) => {
+            ack(
+                json,
+                &format!(
+                    "{} backup(s) of {} node(s) at {dest} rewrapped under the master key in {}, \
+                     {} already under it",
+                    r.rewrapped,
+                    r.nodes,
+                    master.display(),
+                    r.already
+                ),
+            );
+            EXIT_OK
+        }
+        Err(e) => fail(json, &format!("could not rekey the backups at {dest}: {e}")),
+    }
+}
+
+/// The master key the environment names as the one being replaced, for
+/// `key rekey` and `key rekey-backups`, or the reason there is none.
+fn old_master_or_fail(json: bool, what: &str, opens: &str) -> std::result::Result<[u8; 32], i32> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     match celastro::cipher::master_from_env(&var) {
         Ok(Some(m)) => Ok(m),
         Ok(None) => Err(fail(
             json,
-            &format!("`{what}` opens the database's KEY under its master: set CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY"),
+            &format!(
+                "`{what}` opens {opens} under the current master: set CELASTRO_MASTER_KEY_FILE \
+                 or CELASTRO_MASTER_KEY"
+            ),
         )),
         Err(e) => Err(fail(json, &e.to_string())),
     }
+}
+
+/// The master key in the file MASTER, as `key rekey` takes the new one.
+fn master_in_file(master: &Path) -> std::result::Result<[u8; 32], String> {
+    std::fs::read(master)
+        .map_err(|e| e.to_string())
+        .and_then(|b| celastro::cipher::parse_master(&b).map_err(|e| e.to_string()))
+        .map_err(|e| format!("{}: {e}", master.display()))
+}
+
+/// The master key the environment names, and the previous one when a
+/// rotation of the master is under way (`CELASTRO_MASTER_KEY_PREVIOUS[_FILE]`).
+struct Masters {
+    current: [u8; 32],
+    previous: Vec<[u8; 32]>,
+}
+
+impl Masters {
+    fn previous(&self) -> Vec<&[u8; 32]> {
+        self.previous.iter().collect()
+    }
+}
+
+/// The master keys the environment names, or the reason there is none.
+fn master_or_fail(json: bool, what: &str) -> std::result::Result<Masters, i32> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let current = match celastro::cipher::master_from_env(&var) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err(fail(
+            json,
+            &format!("`{what}` opens the database's KEY under its master: set CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY"),
+        )),
+        Err(e) => return Err(fail(json, &e.to_string())),
+    };
+    let previous = match celastro::cipher::previous_master_from_env(&var) {
+        Ok(p) => p.into_iter().collect(),
+        Err(e) => return Err(fail(json, &e.to_string())),
+    };
+    Ok(Masters { current, previous })
 }
 
 /// `key rotate <DIR>`: every file under DIR sealed again under a fresh data
@@ -1705,7 +1814,7 @@ fn key_rotate(dir: &Path, json: bool) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
-    match celastro::cipher::rotate_data_key(dir, &master) {
+    match celastro::cipher::rotate_data_key(dir, &master.current, &master.previous()) {
         Ok(w) => {
             ack(
                 json,
@@ -1850,8 +1959,8 @@ fn open_ring(dir: &Path, json: bool) -> std::result::Result<celastro::cipher::Ci
             ))
         }
     };
-    match celastro::cipher::Cipher::unwrap(&wrapped, &master) {
-        Ok(c) => Ok(c),
+    match celastro::cipher::Cipher::unwrap_any(&wrapped, &master.current, &master.previous()) {
+        Ok((c, _)) => Ok(c),
         Err(e) => Err(fail(json, &format!("{}: {e}", key_path.display()))),
     }
 }
@@ -1962,7 +2071,7 @@ fn key_retire(dir: &Path, check: bool, force: bool, json: bool) -> i32 {
             ),
         );
     }
-    match celastro::cipher::retire_keys(dir, &master) {
+    match celastro::cipher::retire_keys(dir, &master.current, &master.previous()) {
         Ok(n) => ack_ok(
             json,
             &format!("{}: {n} previous data key(s) dropped from KEY; {scope}", dir.display()),
@@ -2047,7 +2156,7 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
             ),
         );
     }
-    match celastro::cipher::retire_keys(dir, &master) {
+    match celastro::cipher::retire_keys(dir, &master.current, &master.previous()) {
         Ok(dropped) => ack_ok(
             json,
             &format!(
@@ -2085,10 +2194,11 @@ fn check_dir(dir: &Path, json: bool) -> i32 {
             )
         }
     };
-    let cipher = match celastro::cipher::Cipher::unwrap(&wrapped, &master) {
-        Ok(c) => c,
-        Err(e) => return fail(json, &e.to_string()),
-    };
+    let cipher =
+        match celastro::cipher::Cipher::unwrap_any(&wrapped, &master.current, &master.previous()) {
+            Ok((c, _)) => c,
+            Err(e) => return fail(json, &e.to_string()),
+        };
     match celastro::cipher::check_dir(dir, &cipher) {
         Ok(w) if w.failures.is_empty() => {
             ack(
@@ -2961,6 +3071,16 @@ fn db_opts() -> std::result::Result<DbOpts, String> {
     o.log_archive = var("CELASTRO_LOG_ARCHIVE");
     o.master_key =
         celastro::cipher::master_from_env(&var).map_err(|e| e.to_string())?.map(Into::into);
+    o.previous_master_keys = celastro::cipher::previous_master_from_env(&var)
+        .map_err(|e| e.to_string())?
+        .map(celastro::cipher::Secret::from)
+        .into_iter()
+        .collect();
+    if !o.previous_master_keys.is_empty() && o.master_key.is_none() {
+        return Err("CELASTRO_MASTER_KEY_PREVIOUS names the master a rotation replaced and needs \
+                    the current one: set CELASTRO_MASTER_KEY_FILE or CELASTRO_MASTER_KEY"
+            .into());
+    }
     o.key_file = var("CELASTRO_KEY_FILE").map(PathBuf::from);
     if o.key_file.is_some() && o.master_key.is_none() {
         return Err("CELASTRO_KEY_FILE needs the master key that wraps it: set \

@@ -180,10 +180,36 @@ under the one data key in `KEY`, wrapped under `master.key`, so a shard
 moves between pods and a backup restores on any of them; the Secret is
 mounted read-only at `/keys`. Set it at install: a pod that has written
 plain data refuses a master key, and one that has written under a key
-refuses to start without it. To rotate the master, `celastro key
-rekey ./KEY ./new-master.key` with the old master in the environment,
-then replace both keys in the Secret and restart the pods; the data is
-not touched.
+refuses to start without it.
+
+To rotate the master key, in this order (the data is not touched: every
+file stays under the data key, which does not change):
+
+1. `celastro key master ./new-master.key`.
+2. With the old master in the environment, `celastro key rekey ./KEY
+   ./new-master.key`. The Secret's `KEY` matters only at a pod's first
+   start: a pod that has started holds its own `/data/KEY`, and one that
+   was ever `key rotate`d holds a data key of its own.
+3. Replace the Secret: `master.key` = the new master, `KEY` = the
+   rewrapped one, plus `master-previous.key` = the old master; and set
+   `encryption.previousMaster=true`, which gives every pod
+   `CELASTRO_MASTER_KEY_PREVIOUS_FILE=/keys/master-previous.key`.
+4. Roll the pods. Each opens `/data/KEY` under the previous master,
+   rewraps it under the new one and logs `key_master_rewrapped`.
+5. With the old master in the environment, `celastro key rekey-backups
+   <dest> ./new-master.key` for every backup destination (the path under
+   `/archive/backups` from a pod with the archive mounted, or the
+   `s3://` destination with the `CELASTRO_ARCHIVE_*` variables), and
+   `celastro key rekey <export>/KEY ./new-master.key` for every export
+   kept.
+6. Only then: remove `master-previous.key` and the switch, roll the pods
+   once more, and destroy the old master.
+
+The old master is needed until every pod has restarted once with it as
+the previous master and every backup and export made under it has been
+rewrapped (or will never be restored). A pod restarted under the new
+master alone before step 4 reached it refuses to start, naming the
+masters it tried; nothing is lost while the old master exists.
 
 ### Backups, and the archived tier on a mount
 
@@ -380,6 +406,7 @@ later and has been restarted together.
 | `tls.existingSecret` | empty | a `Secret` with `tls.crt`, `tls.key` and `ca.crt` from `celastro tls init`, naming every pod, both Services and `localhost` |
 | `tls.certManager.issuerRef.name`, `.kind`, `.group` | empty, `ClusterIssuer`, `cert-manager.io` | with a name, a cert-manager `Certificate` (Ed25519) is emitted for it |
 | `encryption.existingSecret` | empty | a `Secret` with `master.key` (`celastro key master`) and `KEY` (`celastro key init`): encryption at rest on every pod under one shared data key |
+| `encryption.previousMaster` | `false` | through a master-key rotation: the Secret also carries the old master as `master-previous.key`, and a pod whose `KEY` is still under it rewraps it under the new one at its restart |
 | `tuning` | `{}` | `CELASTRO_*` performance variables set on every pod, e.g. `tuning.CELASTRO_INSERT_BATCH=5000`; the binary's `docs/tuning.md` lists them |
 | `probes.periodSeconds`, `probes.failureThreshold`, `probes.timeoutSeconds` | `10`, `3`, `5` | both probes; the timeout is above the default because a probe waits behind a statement that changes something |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | empty | passed through |

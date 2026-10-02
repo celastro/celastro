@@ -364,11 +364,11 @@ fn backups_across_a_key_rotation_each_restore_whole() {
     let m = ack(&mut db, &format!("BACKUP TO '{}'", dest.display()));
     let before: u64 = m.split_whitespace().nth(1).unwrap().parse().unwrap();
     drop(db);
-    let w = celastro::cipher::rotate_data_key(&d, &master(12)).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &master(12), &[]).unwrap();
     assert!(w.files > 0);
     // And the ring retired: the second backup's KEY holds the new key
     // alone, so its restore opens nothing under the old one.
-    assert_eq!(celastro::cipher::retire_keys(&d, &master(12)).unwrap(), 1);
+    assert_eq!(celastro::cipher::retire_keys(&d, &master(12), &[]).unwrap(), 1);
     let mut db = Db::open(&d, opts(Some(master(12)))).unwrap();
     db.insert("items", doc(200)).unwrap();
     ack(&mut db, "FLUSH items");
@@ -713,7 +713,7 @@ fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
     };
     let key_before = std::fs::read(d.join("KEY")).unwrap();
     let old = celastro::cipher::Cipher::unwrap(&key_before, &m).unwrap();
-    let w = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w.files > 5 && w.records >= 10 && w.already == 0, "{w:?}");
     assert!(w.failures.is_empty(), "{w:?}");
     let key_after = std::fs::read(d.join("KEY")).unwrap();
@@ -742,7 +742,7 @@ fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
     assert!(moved.files >= w.files && moved.already == 0, "{moved:?}");
     let e = Db::open(&d, opts(Some(m))).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("rotation was interrupted"), "{e}");
-    let w2 = celastro::cipher::rotate_data_key(&d, &m).unwrap();
+    let w2 = celastro::cipher::rotate_data_key(&d, &m, &[]).unwrap();
     assert!(w2.files == 0 && w2.records == 0 && w2.already == moved.files, "{w2:?}");
     assert!(!d.join("KEY.next").exists());
     {
@@ -757,7 +757,7 @@ fn a_data_key_rotation_reseals_every_file_and_a_cut_short_one_resumes() {
         let mut db = Db::open(&p, opts(None)).unwrap();
         setup(&mut db, 5);
     }
-    let e = celastro::cipher::rotate_data_key(&p, &m).unwrap_err().to_string();
+    let e = celastro::cipher::rotate_data_key(&p, &m, &[]).unwrap_err().to_string();
     assert!(e.contains("KEY"), "{e}");
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&p);
@@ -805,11 +805,251 @@ fn a_key_ring_with_no_archived_index_is_kept_by_the_open_and_retired_by_the_comm
     }
     // The command, with the database closed (it takes the directory lock):
     // nothing is under the previous key, so the ring goes.
-    assert_eq!(celastro::cipher::retire_keys(&d, &m).unwrap(), 1, "one key retired");
+    assert_eq!(celastro::cipher::retire_keys(&d, &m, &[]).unwrap(), 1, "one key retired");
     assert_eq!(ring_on_disk(), 0, "KEY on disk no longer keeps the ring");
     // The data is still there, which is the thing a wrong retirement breaks.
     let mut db = Db::open(&d, opts(Some(m))).unwrap();
     assert_eq!(db.data_key_ring_size(), 0);
     let out = db.execute("SELECT count(*) FROM docs").unwrap();
     assert!(format!("{out:?}").contains('1'), "{out:?}");
+}
+
+/// A master rotation across an interrupted data-key rotation locks nothing
+/// out. `key rekey` on a database's `KEY` takes the directory's lock and
+/// rewraps the `KEY.next` an interrupted `key rotate` left with it -- the
+/// only copy of the new data key, which already seals the recoded files --
+/// so once the old master is destroyed the rotation still finishes under
+/// the new one. Until 0.99.0 it rewrapped `KEY` alone, with no lock: the
+/// documented master rotation and the destruction of the old master left
+/// those files under a key no master opened.
+#[test]
+fn a_master_rotation_across_an_interrupted_data_key_rotation_locks_nothing_out() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let d = dir("rekey-across");
+    let (m1, m2, m3) = (master(31), master(32), master(33));
+    let read = |name: &str| std::fs::read(d.join(name)).unwrap();
+    let opens = |bytes: &[u8], m: &[u8; 32]| celastro::cipher::Cipher::unwrap(bytes, m).is_ok();
+    let all_before = {
+        let mut db = Db::open(&d, opts(Some(m1))).unwrap();
+        setup(&mut db, 40);
+        for i in 40..50 {
+            db.insert("items", doc(i)).unwrap();
+        }
+        ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100")
+    };
+    // The rotation cut short after every file moved and before KEY was
+    // replaced, as the rotation test builds it.
+    let old = celastro::cipher::Cipher::unwrap(&read("KEY"), &m1).unwrap();
+    let fresh = celastro::cipher::Cipher::generate().unwrap();
+    std::fs::write(d.join("KEY.next"), fresh.wrap(&m1).unwrap()).unwrap();
+    let moved = celastro::cipher::recode_dir(&d, &old, &fresh).unwrap();
+    assert!(moved.files > 0, "{moved:?}");
+    // The master rotation as documented: the directory's KEY to M2 with M1
+    // in hand. Both files come out under M2 and neither stays under M1.
+    let with_next = celastro::cipher::rekey_file(&d.join("KEY"), &m1, &m2).unwrap();
+    assert!(with_next, "KEY.next was rewrapped with KEY");
+    for name in ["KEY", "KEY.next"] {
+        let b = read(name);
+        assert!(opens(&b, &m2), "{name} is under the new master");
+        assert!(!opens(&b, &m1), "{name} is not under the old master");
+    }
+    // M1 destroyed: the node refuses only until the rotation is finished,
+    // and finishing it needs M2 alone.
+    let e = Db::open(&d, opts(Some(m2))).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("rotation was interrupted"), "{e}");
+    let w = celastro::cipher::rotate_data_key(&d, &m2, &[]).unwrap();
+    assert_eq!(w.already, moved.files, "{w:?}");
+    assert!(!d.join("KEY.next").exists());
+    {
+        let mut db = Db::open(&d, opts(Some(m2))).unwrap();
+        assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), all_before);
+    }
+    let c = celastro::cipher::check_dir(&d, &old).unwrap();
+    assert!(!c.failures.is_empty(), "nothing is under the old data key: {c:?}");
+    // A node serving the directory: refused at once, KEY untouched.
+    let key_before = read("KEY");
+    {
+        let _held = Db::open(&d, opts(Some(m2))).unwrap();
+        let e = celastro::cipher::rekey_file(&d.join("KEY"), &m2, &m3).unwrap_err().to_string();
+        assert!(e.contains("open in another process"), "{e}");
+        assert_eq!(read("KEY"), key_before, "nothing was written under the node");
+    }
+    // A KEY.next under a third master: refused naming it, neither written.
+    std::fs::write(d.join("KEY.next"), fresh.wrap(&m3).unwrap()).unwrap();
+    let next_before = read("KEY.next");
+    let e = celastro::cipher::rekey_file(&d.join("KEY"), &m2, &m1).unwrap_err().to_string();
+    assert!(e.contains("KEY.next") && e.contains("does not open"), "{e}");
+    assert_eq!(read("KEY"), key_before);
+    assert_eq!(read("KEY.next"), next_before);
+    std::fs::remove_file(d.join("KEY.next")).unwrap();
+    // A bare key file -- `key init`'s, the chart's Secret, an export's --
+    // is the one-file rewrap: no LOCK appears beside it, and its mode stays.
+    let bare = dir("rekey-bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let data_key = bare.join("data.key");
+    let wrapped = celastro::cipher::Cipher::generate().unwrap().wrap(&m1).unwrap();
+    std::fs::write(&data_key, &wrapped).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(!celastro::cipher::rekey_file(&data_key, &m1, &m2).unwrap());
+    assert!(opens(&std::fs::read(&data_key).unwrap(), &m2));
+    assert!(!bare.join("LOCK").exists(), "a bare file takes no directory lock");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&data_key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewrap keeps the file's mode");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&bare);
+}
+
+/// A node whose `KEY` is under the previous master opens and rewraps it.
+/// The chart's master rotation rekeys the Secret's `KEY`, but a pod that
+/// has started holds its own `/data/KEY`, read first and still under the
+/// old master: until 0.99.0 every pod then refused to start, and with the
+/// old master destroyed every volume was lost. With the old master offered
+/// as the previous one the open succeeds, rewraps `KEY` under the current
+/// master and logs it, so one rolling restart converges a cluster; without
+/// it the refusal stands.
+#[test]
+fn a_node_whose_key_is_under_the_previous_master_opens_and_rewraps_it() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (m1, m2) = (master(41), master(42));
+    let with = |current: [u8; 32], previous: Option<[u8; 32]>, key_file: &Path| {
+        let mut o = opts(Some(current));
+        o.previous_master_keys = previous.into_iter().map(Into::into).collect();
+        o.key_file = Some(key_file.to_path_buf());
+        o
+    };
+    let opens = |bytes: &[u8], m: &[u8; 32]| celastro::cipher::Cipher::unwrap(bytes, m).is_ok();
+    // The Secret's KEY, as `key init` writes it, and a pod's first start.
+    let key_file = dir("previous-keys").join("KEY");
+    std::fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+    let wrapped = celastro::cipher::Cipher::generate().unwrap().wrap(&m1).unwrap();
+    std::fs::write(&key_file, &wrapped).unwrap();
+    let d = dir("previous");
+    let before = {
+        let mut db = Db::open(&d, with(m1, None, &key_file)).unwrap();
+        setup(&mut db, 20);
+        ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100")
+    };
+    assert_eq!(std::fs::read(d.join("KEY")).unwrap(), wrapped);
+    // The Secret rekeyed to M2: the procedure's first step.
+    celastro::cipher::rekey_file(&key_file, &m1, &m2).unwrap();
+    // The pod restarted under M2 alone: refused, /data/KEY is under M1.
+    let e =
+        Db::open(&d, with(m2, None, &key_file)).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("does not open this database's KEY"), "{e}");
+    // With M1 as the previous master: opens, the rows as before, and KEY
+    // now under M2 and not under M1.
+    {
+        let mut db = Db::open(&d, with(m2, Some(m1), &key_file)).unwrap();
+        assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), before);
+    }
+    let key = std::fs::read(d.join("KEY")).unwrap();
+    assert!(opens(&key, &m2) && !opens(&key, &m1), "KEY was rewrapped under the current master");
+    // Converged: M2 alone opens it.
+    {
+        let mut db = Db::open(&d, with(m2, None, &key_file)).unwrap();
+        assert_eq!(ids(&mut db, "SELECT id FROM items ORDER BY id LIMIT 100"), before);
+    }
+    // A pod first started across the rotation, its Secret's KEY still
+    // under M1: adopted, and landing under M2.
+    std::fs::write(&key_file, &wrapped).unwrap();
+    let fresh = dir("previous-fresh");
+    drop(Db::open(&fresh, with(m2, Some(m1), &key_file)).unwrap());
+    let key = std::fs::read(fresh.join("KEY")).unwrap();
+    assert!(
+        opens(&key, &m2) && !opens(&key, &m1),
+        "the adopted KEY lands under the current master"
+    );
+    drop(Db::open(&fresh, with(m2, None, &key_file)).unwrap());
+    for p in [&d, &fresh, key_file.parent().unwrap()] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+/// A backup made under the old master restores under the new one. `key
+/// rekey-backups` rewraps every backup's `KEY` at a destination and the
+/// hash of it in each sealed record, so `RESTORE` and `VERIFY BACKUP` both
+/// pass under the new master and the old one opens nothing there; until
+/// then a restore accepts the previous master. Until 0.99.0 no command
+/// rewrapped a backup's `KEY`, and a rewrap by hand passed the restore and
+/// failed the verification on the record's hash: every backup needed the
+/// old master for good, and nothing said so.
+#[test]
+fn a_backup_under_the_old_master_restores_under_the_new_one_once_rekeyed() {
+    let (m1, m2) = (master(51), master(52));
+    let src = dir("rekey-backups-src");
+    let backups = dir("rekey-backups-dest");
+    let mut db = Db::open(&src, opts(Some(m1))).unwrap();
+    setup(&mut db, 20);
+    let before = ids(&mut db, "SELECT id FROM items LIMIT 200");
+    ack(&mut db, &format!("BACKUP TO '{}'", backups.display()));
+    drop(db);
+    let ts_dir = std::fs::read_dir(backups.join("nodes/local/backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .next()
+        .unwrap();
+    let key_before = std::fs::read(ts_dir.join("KEY")).unwrap();
+    let restore = |tag: &str, o: DbOpts| -> celastro::Result<bool> {
+        let d = dir(tag);
+        let mut db = Db::open(&d, o)?;
+        let r = db
+            .execute(&format!("RESTORE FROM '{}'", backups.display()))
+            .and_then(|out| out.finished());
+        let same = r.is_ok() && ids(&mut db, "SELECT id FROM items LIMIT 200") == before;
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        r.map(|_| same)
+    };
+    let verify = |o: DbOpts| -> celastro::Result<String> {
+        let d = dir("rekey-backups-verify");
+        let mut db = Db::open(&d, o)?;
+        let r = db
+            .execute(&format!("VERIFY BACKUP '{}'", backups.display()))
+            .and_then(|out| out.finished())
+            .map(|out| format!("{out:?}"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        r
+    };
+    let with_previous = || {
+        let mut o = opts(Some(m2));
+        o.previous_master_keys = vec![m1.into()];
+        o
+    };
+    // Before the rewrap: under M2 alone refused; with M1 as the previous
+    // master, restored whole.
+    let e = restore("rekey-backups-m2-early", opts(Some(m2))).unwrap_err().to_string();
+    assert!(e.contains("does not open under this master key"), "{e}");
+    assert!(restore("rekey-backups-m2-prev", with_previous()).unwrap(), "with the previous master");
+    // The rewrap: every backup at the destination, from M1 to M2.
+    let archive = celastro::objstore::ArchiveOpts::default();
+    let dest = backups.display().to_string();
+    let r = celastro::backup::rekey_backups(&archive, None, &dest, &m1, &m2).unwrap();
+    assert_eq!((r.rewrapped, r.already, r.nodes), (1, 0, 1), "{r:?}");
+    assert_ne!(std::fs::read(ts_dir.join("KEY")).unwrap(), key_before, "KEY was rewritten");
+    assert!(
+        !std::fs::read(ts_dir.join("BACKUP")).unwrap().starts_with(b"celastro backup"),
+        "the record is still sealed"
+    );
+    // Under M2 alone: restored whole, and every object as recorded.
+    assert!(restore("rekey-backups-m2", opts(Some(m2))).unwrap(), "under the new master alone");
+    let v = verify(opts(Some(m2))).unwrap();
+    assert!(v.contains("every one as recorded"), "{v}");
+    // Under M1 alone: nothing at the destination opens any more.
+    let e = verify(opts(Some(m1))).unwrap_err().to_string();
+    assert!(e.contains("does not open under this master key"), "{e}");
+    // A second run finds everything under M2 already.
+    let r = celastro::backup::rekey_backups(&archive, None, &dest, &m1, &m2).unwrap();
+    assert_eq!((r.rewrapped, r.already), (0, 1), "{r:?}");
+    for p in [&src, &backups] {
+        let _ = std::fs::remove_dir_all(p);
+    }
 }

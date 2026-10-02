@@ -118,6 +118,14 @@ Off until a master key is given. **`key master <FILE>`** writes one
 (64 hex digits, readable by you only); `CELASTRO_MASTER_KEY_FILE` on
 every start then encrypts every file under `--dir`, and every backup and
 export it writes. A database made with the key is refused without it.
+When the master rotates, `CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or
+`CELASTRO_MASTER_KEY_PREVIOUS`, the hex, removed from the environment
+once read as `CELASTRO_MASTER_KEY` is) names the one it replaced: a node
+whose `KEY` is still under the previous master opens, rewraps it under
+the current one and logs `key_master_rewrapped`, so a cluster rotates
+its master by one restart of every node; a backup under the previous
+master restores, and an export under it imports, meanwhile. A variable
+naming a missing file is an error, as the current master's is.
 
 ```sh
 celastro key master ./master.key
@@ -147,6 +155,24 @@ wrote a data key, wrapped under the master key, to ./data.key
 wrote a master key to ./master2.key
 ./data.key is now wrapped under the master key in ./master2.key
 ```
+
+When `KEY` is a database's (its directory holds `LOCK` or `KEY.next`),
+`key rekey` takes the directory's lock -- a served directory is refused:
+stop the node first -- and rewraps a `KEY.next` an interrupted `key
+rotate` left with it, both opened before either is written, so a master
+rotation across an interrupted data-key rotation leaves nothing under
+the old master. **`key rekey-backups <DEST> <MASTER>`** does the same
+for every backup at a destination (`DEST` as `BACKUP TO` names it, so an
+`s3://` destination takes the `CELASTRO_ARCHIVE_*` variables): each
+backup's `KEY` rewrapped and its sealed record's hash of it rewritten, a
+backup already under the new master left as it is, a run cut short
+finished by running it again; the ack counts them (`2 backup(s) of 1
+node(s) at ./backups rewrapped under the master key in ./master2.key, 0
+already under it`). A master rotation has to reach every node's `KEY`
+(by a restart with the previous master set, or `key rekey <DIR>/KEY`
+with the node stopped), every backup destination (`key rekey-backups`)
+and every export kept (`key rekey <EXPORT>/KEY`); the old master is
+needed until all of them are rewrapped, and destroyed only then.
 
 The data key itself rotates with **`key rotate <DIR>`**: every file and
 every log record under the directory is sealed again under a fresh data

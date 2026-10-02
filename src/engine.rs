@@ -462,6 +462,14 @@ pub struct DbOpts {
     /// (`CELASTRO_KEY_FILE`): how the pods of a cluster share one data key,
     /// so a shard moves between them and a backup restores on any of them.
     pub key_file: Option<PathBuf>,
+    /// The master keys a rotation of the master replaced
+    /// (`CELASTRO_MASTER_KEY_PREVIOUS_FILE`, or `CELASTRO_MASTER_KEY_PREVIOUS`
+    /// as hex): a `KEY` that opens under one of them alone is rewrapped
+    /// under `master_key` at the open and logged, so a cluster rotates its
+    /// master by one restart of every node, and a backup under one of them
+    /// restores. Set until every node, backup and export under the old
+    /// master is rewrapped, then removed. Never written anywhere.
+    pub previous_master_keys: Vec<crate::cipher::Secret<32>>,
     /// What this node is for: a data node holds shards and coordinates; a
     /// coordinator holds no shards, takes none from a placement, a
     /// rebalance or a move, and only coordinates (`CELASTRO_ROLE`).
@@ -531,6 +539,7 @@ impl Default for DbOpts {
             group_commit: false,
             master_key: None,
             key_file: None,
+            previous_master_keys: Vec::new(),
             role: Role::Data,
             replication_sync: true,
             steward: None,
@@ -2055,6 +2064,7 @@ impl Db {
             node.unwrap_or(&here),
             as_of,
             self.opts.master_key.as_deref(),
+            &previous_masters(&self.opts),
         )?;
         let slug = crate::backup::node_slug(node.unwrap_or(&here));
         Ok(Outcome::Deferred(crate::backup::verify_job(target, slug, fetched)))
@@ -2098,22 +2108,30 @@ impl Db {
             node.unwrap_or(&here),
             base.or(as_of),
             self.opts.master_key.as_deref(),
+            &previous_masters(&self.opts),
         )?;
         // The backup's key regime has to be this database's: its files are
         // copied as they are, so an encrypted backup needs the master that
         // wraps its data key, and a plain one cannot land in an encrypted
         // directory. The backup's KEY replaces the one made at open -- the
         // database is empty, nothing was written under that one -- so the
-        // files that follow open under it.
+        // files that follow open under it. A backup made under the previous
+        // master lands under the current one.
         self.cipher =
             match (&fetched.key, &self.opts.master_key) {
                 (Some(wrapped), Some(master)) => {
-                    let cipher = crate::cipher::Cipher::unwrap(wrapped, master).map_err(|e| {
+                    let (cipher, under_previous) = crate::cipher::Cipher::unwrap_any(
+                        wrapped,
+                        master,
+                        &previous_masters(&self.opts),
+                    )
+                    .map_err(|e| {
                         Error::Storage(format!(
                             "RESTORE: the backup's KEY does not open under this master key: {e}"
                         ))
                     })?;
-                    crate::shard::atomic_write(&dir.join("KEY"), wrapped)?;
+                    let bytes = if under_previous { cipher.wrap(master)? } else { wrapped.clone() };
+                    crate::shard::atomic_write(&dir.join("KEY"), &bytes)?;
                     Some(Arc::new(cipher))
                 }
                 (Some(_), None) => {
@@ -2302,7 +2320,14 @@ impl Db {
         // the export's cipher and sealed under this one as it is copied.
         let src = match crate::shard::read_optional(&from.join("KEY"))? {
             Some(wrapped) => match &self.opts.master_key {
-                Some(master) => Some(Arc::new(crate::cipher::Cipher::unwrap(&wrapped, master)?)),
+                Some(master) => Some(Arc::new(
+                    crate::cipher::Cipher::unwrap_any(
+                        &wrapped,
+                        master,
+                        &previous_masters(&self.opts),
+                    )?
+                    .0,
+                )),
                 None => {
                     return Err(Error::Storage(format!(
                         "{} is an encrypted export; set CELASTRO_MASTER_KEY_FILE (or \
@@ -10110,14 +10135,32 @@ fn open_key(dir: &Path, opts: &DbOpts) -> Result<crate::cipher::Shared> {
     }
     let key_path = dir.join("KEY");
     let key_file = crate::shard::read_optional(&key_path)?;
+    let previous = previous_masters(opts);
     match (key_file, &opts.master_key) {
         (Some(wrapped), Some(master)) => {
-            let cipher = crate::cipher::Cipher::unwrap(&wrapped, master)?;
+            let (cipher, under_previous) =
+                crate::cipher::Cipher::unwrap_any(&wrapped, master, &previous)?;
             // A ring in a form from before 0.87.0 is rewritten in the one
-            // whose entries name their place, once the key is in hand.
-            if crate::cipher::Cipher::ring_is_old(&wrapped) && !cipher.writes_legacy() {
-                crate::shard::atomic_write(&key_path, &cipher.wrap(master)?)?;
-                crate::log::info("key_ring_rewritten", &[("path", key_path.display().to_string())]);
+            // whose entries name their place, once the key is in hand; a
+            // KEY still under the master a rotation replaced is rewritten
+            // under the current one, which is how a master rotation reaches
+            // every node's volume by a restart. One write either way, under
+            // the directory's lock the open holds.
+            let ring_old = crate::cipher::Cipher::ring_is_old(&wrapped) && !cipher.writes_legacy();
+            if under_previous || ring_old {
+                crate::shard::atomic_write_keeping_mode(&key_path, &cipher.wrap(master)?)?;
+                if under_previous {
+                    crate::log::info(
+                        "key_master_rewrapped",
+                        &[("path", key_path.display().to_string())],
+                    );
+                }
+                if ring_old {
+                    crate::log::info(
+                        "key_ring_rewritten",
+                        &[("path", key_path.display().to_string())],
+                    );
+                }
             }
             Ok(Some(Arc::new(cipher)))
         }
@@ -10140,11 +10183,29 @@ fn open_key(dir: &Path, opts: &DbOpts) -> Result<crate::cipher::Shared> {
                     .map_err(|e| Error::Storage(format!("key file {}: {e}", p.display())))?,
                 None => crate::cipher::Cipher::generate()?.wrap(master)?,
             };
-            let cipher = crate::cipher::Cipher::unwrap(&wrapped, master)?;
-            crate::shard::atomic_write(&key_path, &wrapped)?;
+            // Adopted as given, byte for byte -- unless it is still under
+            // the master a rotation replaced (a Secret not yet rekeyed, a
+            // pod first started across the rotation): then under the
+            // current one, so no node's KEY ever lands under the old master.
+            let (cipher, under_previous) =
+                crate::cipher::Cipher::unwrap_any(&wrapped, master, &previous)?;
+            let bytes = if under_previous { cipher.wrap(master)? } else { wrapped };
+            crate::shard::atomic_write(&key_path, &bytes)?;
+            if under_previous {
+                crate::log::info(
+                    "key_master_rewrapped",
+                    &[("path", key_path.display().to_string())],
+                );
+            }
             Ok(Some(Arc::new(cipher)))
         }
     }
+}
+
+/// The previous master keys the options offer, as `Cipher::unwrap_any`
+/// takes them.
+fn previous_masters(opts: &DbOpts) -> Vec<&[u8; 32]> {
+    opts.previous_master_keys.iter().map(|s| &**s).collect()
 }
 
 /// The tablet index a shard directory's name carries: `shard-0003` is 3.

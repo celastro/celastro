@@ -87,6 +87,10 @@ spec:
               value: /keys/master.key
             - name: CELASTRO_KEY_FILE
               value: /keys/KEY
+            {{- if $r.Values.encryption.previousMaster }}
+            - name: CELASTRO_MASTER_KEY_PREVIOUS_FILE
+              value: /keys/master-previous.key
+            {{- end }}
             {{- end }}
             {{- if $networked }}
             - name: CELASTRO_TOKEN

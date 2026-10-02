@@ -910,6 +910,7 @@ pub(crate) fn fetch(
     node: &str,
     as_of: Option<u64>,
     master: Option<&[u8; 32]>,
+    previous: &[&[u8; 32]],
 ) -> Result<Fetched> {
     let slug = node_slug(node);
     let mine = format!("nodes/{slug}/");
@@ -971,9 +972,12 @@ pub(crate) fn fetch(
                     .into(),
             ));
         };
-        let cipher = crate::cipher::Cipher::unwrap(&wrapped, master).map_err(|e| {
-            Error::Storage(format!("the backup's KEY does not open under this master key: {e}"))
-        })?;
+        // Under the previous master too, while a rotation of the master
+        // has not reached this backup (`key rekey-backups`).
+        let (cipher, _) =
+            crate::cipher::Cipher::unwrap_any(&wrapped, master, previous).map_err(|e| {
+                Error::Storage(format!("the backup's KEY does not open under this master key: {e}"))
+            })?;
         open_record(&record, Some(&cipher), &format!("{own}BACKUP"))?
     };
     let files = record_entries(&record, &format!("{own}BACKUP at {}", target.display))?;
@@ -1080,6 +1084,105 @@ pub(crate) fn fetch(
         shard_entry.1.push((rest, key.clone(), *len, hash.clone()));
     }
     Ok(Fetched { ts, catalog, key, collections, files })
+}
+
+/// What `key rekey-backups` did at a destination.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RekeyedBackups {
+    /// Backups whose `KEY` was rewrapped (or whose record a run cut short
+    /// had left naming the old hash, repaired).
+    pub rewrapped: usize,
+    /// Backups already under the new master, left as they were.
+    pub already: usize,
+    /// Nodes with a backup at the destination.
+    pub nodes: usize,
+}
+
+/// `key rekey-backups <DEST> <MASTER>`: every backup's `KEY` at `dest`,
+/// wrapped under `old`, rewrapped under `new` -- and its record's hash of
+/// `KEY` with it, since the record names every object with its SHA-256
+/// and `VERIFY BACKUP` checks `KEY` against it. A backup's files are under
+/// its data key and are not touched. `dest` is resolved as `BACKUP TO`
+/// resolves it, so an `s3://` destination takes the archive's endpoint
+/// and credentials.
+///
+/// Per backup: a `KEY` that opens under `new` is done, unless the
+/// record's hash of it disagrees (a run cut short between the two writes
+/// below), when the record alone is rewritten; one under `old` is
+/// rewrapped and the record's line for it given the new hash, the record
+/// sealed again as it was (under the backup's own data key, with the
+/// object's key as its identity; a record in the clear stays in the
+/// clear; a version-1 record has no hash and is left). `KEY` is put
+/// first, so a restore works under `new` from that instant and only the
+/// verification names the one object until the record lands; a rerun
+/// repairs it. A backup without a record did not finish and is skipped;
+/// a `KEY` under neither master stops the run naming it.
+pub fn rekey_backups(
+    archive: &ArchiveOpts,
+    backup_dir: Option<&Path>,
+    dest: &str,
+    old: &[u8; 32],
+    new: &[u8; 32],
+) -> Result<RekeyedBackups> {
+    let target = target(archive, backup_dir, dest)?;
+    let mut out = RekeyedBackups::default();
+    let prefix = target.key("nodes/");
+    let mut owns: Vec<(String, String)> = Vec::new();
+    for key in target.store.list(&prefix)? {
+        let parts: Vec<&str> = key[prefix.len()..].split('/').collect();
+        if let [slug, "backups", ts, "KEY"] = parts.as_slice() {
+            owns.push(((*slug).to_string(), format!("nodes/{slug}/backups/{ts}/")));
+        }
+    }
+    let mut nodes: Vec<&str> = owns.iter().map(|(slug, _)| slug.as_str()).collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    out.nodes = nodes.len();
+    for (_, own) in &owns {
+        let key_key = format!("{own}KEY");
+        let record_key = format!("{own}BACKUP");
+        if target.store.size(&target.key(&record_key))?.is_none() {
+            continue;
+        }
+        let wrapped = target.store.get(&target.key(&key_key))?;
+        let (cipher, under_old) = crate::cipher::Cipher::unwrap_any(&wrapped, new, &[old])
+            .map_err(|e| Error::Storage(format!("{key_key} at {}: {e}", target.display)))?;
+        let record = target.store.get(&target.key(&record_key))?;
+        let sealed = !plain_record(&record);
+        let text =
+            String::from_utf8_lossy(&open_record(&record, Some(&cipher), &record_key)?).to_string();
+        let line = text.lines().find(|l| l.starts_with(&format!("{key_key}\t")));
+        let recorded = line.and_then(|l| l.splitn(3, '\t').nth(2));
+        // The record's line for KEY with `hash`, sealed as the record was.
+        let rewrite_record = |line: &str, hash: &str| -> Result<()> {
+            let mut fields: Vec<&str> = line.splitn(3, '\t').collect();
+            fields[2] = hash;
+            let text = text.replacen(line, &fields.join("\t"), 1);
+            let bytes = if sealed {
+                cipher.seal_file(&crate::cipher::Ids::same(&record_key), text.as_bytes())?
+            } else {
+                text.into_bytes()
+            };
+            target.store.put(&target.key(&record_key), &bytes)
+        };
+        if !under_old {
+            match (line, recorded) {
+                (Some(line), Some(hash)) if hash != hex(&sha256(&wrapped)) => {
+                    rewrite_record(line, &hex(&sha256(&wrapped)))?;
+                    out.rewrapped += 1;
+                }
+                _ => out.already += 1,
+            }
+            continue;
+        }
+        let rewrapped = cipher.wrap(new)?;
+        target.store.put(&target.key(&key_key), &rewrapped)?;
+        if let (Some(line), Some(_)) = (line, recorded) {
+            rewrite_record(line, &hex(&sha256(&rewrapped)))?;
+        }
+        out.rewrapped += 1;
+    }
+    Ok(out)
 }
 
 /// An object read back against its record: the size always, the SHA-256

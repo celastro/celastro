@@ -2257,7 +2257,17 @@ reached the random-nonce bound (2^32, RFC 8439's) in days (H8). The
 master (`CELASTRO_MASTER_KEY_FILE`, 32 bytes or 64 hex digits, or
 `CELASTRO_MASTER_KEY`, which the node removes from its environment once
 read, as it does the tokens) is never written, and `key rekey` rewraps
-`KEY` under a new one without touching a data file. A
+`KEY` under a new one without touching a data file -- a database's `KEY`
+under the directory's lock and with the `KEY.next` of an interrupted
+rotation, both opened before either is written, since that file holds
+the only copy of a data key that already seals the recoded files; `key
+rekey-backups` does the same for every backup's `KEY` at a destination
+and the hash of it in the sealed record; and a node started with the
+master a rotation replaced in `CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or
+`_PREVIOUS`, removed from the environment as the current one is) opens
+a `KEY` still under it and rewraps it under the current master at the
+open, which is how a cluster's volumes follow a master rotation by one
+restart of every node, `/data/KEY` being read before the Secret's. A
 directory with `KEY` and no master is refused, and so is a plain
 directory with data offered a master: encrypting in place would be a
 rewrite of every file behind a running database's back, and the export
