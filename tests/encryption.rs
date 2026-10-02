@@ -1050,6 +1050,220 @@ fn a_backup_under_the_old_master_restores_under_the_new_one_once_rekeyed() {
     let r = celastro::backup::rekey_backups(&archive, None, &dest, &m1, &m2).unwrap();
     assert_eq!((r.rewrapped, r.already), (0, 1), "{r:?}");
     for p in [&src, &backups] {
+
+/// A node of a test cluster: a `Db` on its directory, served on the wire
+/// from a thread, with the address its peers call it by.
+struct Served {
+    url: String,
+    port: u16,
+    dir: PathBuf,
+    db: Arc<RwLock<Db>>,
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Served {
+    /// Open `dir` with `opts(url)` and serve it on `port` -- 0 for any free
+    /// one; a node started again keeps its port, so its address stands.
+    fn start(dir: PathBuf, port: u16, opts: &dyn Fn(&str) -> DbOpts) -> Served {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("tcp://127.0.0.1:{port}");
+        let db = Arc::new(RwLock::new(Db::open(&dir, opts(&url)).unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (d, s) = (db.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            celastro::wire::serve(listener, d, TOKEN.to_string(), s, None).unwrap();
+        });
+        Served { url, port, dir, db, stop, thread }
+    }
+
+    /// A statement under the node's lock, the lock let go before its
+    /// deferred work runs: a move's copy holds nothing, and the target's
+    /// switch back here needs this lock.
+    fn exec(&self, sql: &str) -> std::result::Result<String, String> {
+        let out = self.db.write().unwrap().execute(sql).map_err(|e| e.to_string())?;
+        match out.finished().map_err(|e| e.to_string())? {
+            Outcome::Ack(m) => Ok(m),
+            other => Err(format!("{sql}: {other:?}")),
+        }
+    }
+
+    fn query(&self, sql: &str) -> Vec<String> {
+        ids(&mut self.db.write().unwrap(), sql)
+    }
+
+    /// Stop serving and let go of the database, once every connection
+    /// thread has: the directory's lock is free after this.
+    fn stop(self) -> (PathBuf, u16) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.join().unwrap();
+        let t = std::time::Instant::now();
+        while Arc::strong_count(&self.db) > 1 && t.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(Arc::strong_count(&self.db), 1, "a connection thread still holds the node");
+        drop(self.db);
+        (self.dir, self.port)
+    }
+}
+
+/// `doc(i)`'s keys for the tenant `t<n>`, as `ids` formats a partitioned
+/// collection's: the partition key, a separator, the id.
+fn tenant_ids(n: usize, count: usize) -> Vec<String> {
+    let mut out: Vec<String> = (0..count)
+        .filter(|i| i % 3 == n)
+        .map(|i| format!("{:?}", format!("t{n}\u{1}doc-{i:03}")))
+        .collect();
+    out.sort();
+    out
+}
+
+/// In a cluster every node puts its archived objects under the one
+/// prefix, so a node's `key reseal` walks its own shards alone -- the
+/// `shard-NNNN` directories its placement puts here, not a move's
+/// half-pulled `shard-NNNN.incoming` -- and the other node's objects stay
+/// under the key its ring holds: after this node's reseal and retire the
+/// other still reads its archived rows. Through 0.98.0 the walk was of
+/// every shard of the collection, and node A's reseal sealed node B's
+/// objects under a key only A's KEY held.
+#[test]
+fn a_reseal_on_a_shared_archive_prefix_walks_this_nodes_shards_alone() {
+    use celastro::objstore::ObjectStore;
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let m = master(13);
+    let key_file = dir("prefix-keys").join("KEY");
+    std::fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+    let wrapped = celastro::cipher::Cipher::generate().unwrap().wrap(&m).unwrap();
+    std::fs::write(&key_file, &wrapped).unwrap();
+    let store = dir("prefix-store");
+    const PREFIX: &str = "celastro/";
+    let node_opts = |url: &str| {
+        let mut o = opts(Some(m));
+        o.key_file = Some(key_file.clone());
+        o.node = Some(url.to_string());
+        o.archive.dir = Some(store.clone());
+        o.archive.prefix = PREFIX.into();
+        o
+    };
+    let a = Served::start(dir("prefix-a"), 0, &node_opts);
+    let b = Served::start(dir("prefix-b"), 0, &node_opts);
+    a.exec(&format!("ATTACH NODE '{}'", b.url)).unwrap();
+    a.exec(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, n INT) \
+         PARTITION BY (tenant) WITH (splits = ['t1', 't2'])",
+    )
+    .unwrap();
+    a.exec(INDEXES[0]).unwrap();
+    for i in 0..60usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    a.exec("FLUSH items").unwrap();
+    // The one index archived: every shard's segments go to the store,
+    // each node putting its own under `<prefix>items/<shard>/`.
+    a.exec("ALTER INDEX items_body ON items SET TIER 'archived'").unwrap();
+    let want = a.query("SELECT id FROM items LIMIT 200");
+    assert_eq!(want.len(), 60);
+    let shard_dirs = |n: &Served| -> Vec<usize> {
+        let mut v: Vec<usize> =
+            n.db.read().unwrap().shards("items").unwrap().iter().map(|s| s.index).collect();
+        v.sort();
+        v
+    };
+    let (on_a, on_b) = (shard_dirs(&a), shard_dirs(&b));
+    assert!(!on_a.is_empty() && !on_b.is_empty(), "spread over both: {on_a:?} {on_b:?}");
+    let dirname = |i: &usize| format!("shard-{i:04}");
+    let (a_url, b_url) = (a.url.clone(), b.url.clone());
+    let (a_dir, a_port) = a.stop();
+    let (b_dir, b_port) = b.stop();
+
+    let dir_store = celastro::objstore::DirStore::new(&store).unwrap();
+    let objects = |shard: &usize| -> Vec<String> {
+        dir_store.list(&format!("{PREFIX}items/{}/", dirname(shard))).unwrap()
+    };
+    for s in on_a.iter().chain(on_b.iter()) {
+        assert!(!objects(s).is_empty(), "shard {s} put nothing to the store");
+    }
+    let unwrap_key = |d: &Path| {
+        celastro::cipher::Cipher::unwrap(&std::fs::read(d.join("KEY")).unwrap(), &m).unwrap()
+    };
+    // Which key of `c`'s ring opens each object of a shard.
+    let opens_under = |shard: &usize, c: &celastro::cipher::Cipher| -> Vec<Option<(usize, bool)>> {
+        objects(shard)
+            .iter()
+            .map(|k| {
+                let (_, _, ids) = celastro::cipher::archived_seal_id(k).unwrap();
+                let head = dir_store.head(k, celastro::cipher::HEAD_BYTES as u64).unwrap().unwrap();
+                c.opening_key(&ids, &head, head.len() < celastro::cipher::HEAD_BYTES)
+            })
+            .collect()
+    };
+    let current = |v: &[Option<(usize, bool)>]| v.iter().all(|o| *o == Some((0, true)));
+
+    // A rotates: its ring is {K_A, K0}; B's KEY is K0 alone.
+    let w = celastro::cipher::rotate_data_key(&a_dir, &m).unwrap();
+    assert_eq!(w.kept_keys, 1, "{w:?}");
+    let (ca, cb) = (unwrap_key(&a_dir), unwrap_key(&b_dir));
+    // A move of one of B's shards onto A, cut short: not a shard of A's.
+    let incoming =
+        a_dir.join("collections").join("items").join(format!("{}.incoming", dirname(&on_b[0])));
+    std::fs::create_dir_all(incoming.join("segments")).unwrap();
+    let catalog_a = {
+        let bytes = std::fs::read(a_dir.join("CATALOG")).unwrap();
+        let plain = ca.open_file(&celastro::cipher::Ids::same("CATALOG"), &bytes).unwrap();
+        celastro::catalog::Catalog::decode(&plain).unwrap()
+    };
+    // Without the node's address the scope cannot be known: refused,
+    // naming the nodes and the variable.
+    let e =
+        celastro::cipher::archived_shards_here(&a_dir, &catalog_a, None).unwrap_err().to_string();
+    assert!(e.contains(&b_url) && e.contains("CELASTRO_NODE"), "{e}");
+    let here = celastro::cipher::archived_shards_here(&a_dir, &catalog_a, Some(&a_url)).unwrap();
+    let want_here: Vec<(String, String)> =
+        on_a.iter().map(|s| ("items".to_string(), dirname(s))).collect();
+    assert_eq!(here, want_here, "A's shards: not B's, not the half-pulled one");
+    let walk = celastro::cipher::walk_archive(&ca, &dir_store, PREFIX, &here).unwrap();
+    assert!(
+        walk.objects > 0 && walk.under_previous == walk.objects && walk.unopenable.is_empty(),
+        "{walk:?}"
+    );
+    let n = celastro::cipher::reseal_archive(
+        &ca,
+        &dir_store,
+        PREFIX,
+        &here,
+        &a_dir.join("reseal.scratch"),
+    )
+    .unwrap();
+    assert_eq!(n, walk.objects);
+    for s in &on_a {
+        assert!(current(&opens_under(s, &ca)), "shard {s}: A's objects under A's current key");
+    }
+    for s in &on_b {
+        assert!(current(&opens_under(s, &cb)), "shard {s}: B's objects were re-sealed");
+    }
+    let walk = celastro::cipher::walk_archive(&ca, &dir_store, PREFIX, &here).unwrap();
+    assert_eq!(walk.under_previous, 0, "{walk:?}");
+    assert_eq!(celastro::cipher::retire_keys(&a_dir, &m).unwrap(), 1);
+    std::fs::remove_dir_all(&incoming).unwrap();
+
+    // Both back on their addresses. Every row reads from the store: A's
+    // shards under A's new key, B's under the one key B's ring holds --
+    // by tenant, which routes to the one shard that owns it, and whole.
+    let a = Served::start(a_dir, a_port, &node_opts);
+    let b = Served::start(b_dir, b_port, &node_opts);
+    for (node, shards) in [(&a, &on_a), (&b, &on_b)] {
+        for s in shards.iter() {
+            let got = node.query(&format!("SELECT id FROM items WHERE tenant = 't{s}' LIMIT 100"));
+            assert_eq!(got, tenant_ids(*s, 60), "shard {s}'s archived rows");
+        }
+    }
+    assert_eq!(b.query("SELECT id FROM items LIMIT 200"), want);
+    assert_eq!(a.query("SELECT id FROM items LIMIT 200"), want);
+    let (a_dir, _) = a.stop();
+    let (b_dir, _) = b.stop();
+    for p in [&a_dir, &b_dir, &store, key_file.parent().unwrap()] {
         let _ = std::fs::remove_dir_all(p);
     }
 }

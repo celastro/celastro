@@ -2085,23 +2085,107 @@ pub fn backups_share_this_prefix(
     Ok(store.list(&format!("{prefix}nodes/"))?.iter().any(|k| k.ends_with("/LATEST")))
 }
 
-/// The archived objects of `colls`, and which key of the ring opens each.
-/// One ranged read of a frame per object; nothing is downloaded whole.
+/// The archived shards this directory holds, as `(collection, shard
+/// directory)` pairs: for every collection with an index at the archived
+/// tier, the directories under `collections/<coll>/` named exactly
+/// `shard-NNNN` -- not a move's half-pulled `shard-NNNN.incoming`, whose
+/// objects are the source's until the move ends -- that the catalog's
+/// placement puts on `node`: the tablet names it or follows it, names no
+/// node (a single node's database), or has no entry for the directory.
 ///
-/// It lists each collection's own prefix rather than the whole of
-/// `prefix`, so that nothing outside the tier is ever considered -- see
-/// [`backups_share_this_prefix`] for what else can be under there.
+/// **These and no others are what the key commands touch in the store.**
+/// In a cluster every node puts its objects under the one prefix, at
+/// `<prefix><coll>/<shard>/<id>.seg` with nothing naming the node, so the
+/// other nodes' shards lie beside this node's, sealed under keys only
+/// their rings hold once the nodes have rotated apart. A walk of the whole
+/// collection re-sealed them under this node's current key and `key
+/// retire` then dropped the ring: the other nodes opened and served, and
+/// could not read an archived segment (0.98.0).
+///
+/// `node` is this node's address as it is started (`CELASTRO_NODE`).
+/// Without it, a placement that names any node is refused rather than
+/// guessed at: a bare offline invocation cannot tell which shards are its
+/// own.
+pub fn archived_shards_here(
+    dir: &std::path::Path,
+    catalog: &crate::catalog::Catalog,
+    node: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut named = std::collections::BTreeSet::new();
+    for (name, c) in &catalog.collections {
+        if !c.indexes.iter().any(|i| i.tier == crate::residency::Tier::Archived) {
+            continue;
+        }
+        let tablets = catalog.placement.get(name);
+        if node.is_none() {
+            if let Some(t) = tablets {
+                named.extend(t.iter().map(|t| t.node.clone()).filter(|n| !n.is_empty()));
+            }
+        }
+        let cdir = dir.join("collections").join(name);
+        let mut entries: Vec<_> = match std::fs::read_dir(&cdir) {
+            Ok(rd) => rd.collect::<std::io::Result<_>>()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let dirname = e.file_name().to_string_lossy().to_string();
+            let Some(index) = dirname
+                .strip_prefix("shard-")
+                .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|d| d.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let here = match tablets.and_then(|t| t.get(index)) {
+                None => true,
+                Some(t) if t.node.is_empty() => true,
+                Some(t) => node.is_some_and(|n| t.node == n || t.followed_by(n)),
+            };
+            if here {
+                out.push((name.clone(), dirname));
+            }
+        }
+    }
+    if !named.is_empty() {
+        let nodes: Vec<&str> = named.iter().map(String::as_str).collect();
+        return Err(Error::Storage(format!(
+            "{}: the catalog places archived shards on {}, and without this node's address the \
+             command cannot tell which of them this directory is; set CELASTRO_NODE to the \
+             address the node is started with, so that only its own shards are touched",
+            dir.display(),
+            nodes.join(", ")
+        )));
+    }
+    Ok(out)
+}
+
+/// The archived objects of `shards` -- `(collection, shard directory)`
+/// pairs, as [`archived_shards_here`] gives them -- and which key of the
+/// ring opens each. One ranged read of a frame per object; nothing is
+/// downloaded whole.
+///
+/// It lists each shard's own prefix rather than the whole of `prefix` or
+/// of the collection's, so that nothing outside the tier and nothing of
+/// another node's is ever considered -- see [`backups_share_this_prefix`]
+/// for what else can be under there and [`archived_shards_here`] for
+/// whose the other shards are.
 pub fn walk_archive(
     cipher: &Cipher,
     store: &dyn crate::objstore::ObjectStore,
     prefix: &str,
-    colls: &[String],
+    shards: &[(String, String)],
 ) -> Result<ArchiveWalk> {
     let mut w = ArchiveWalk::default();
-    for name in colls {
-        for key in store.list(&format!("{prefix}{name}/"))? {
-            let Some((coll, _shard, ids)) = archived_seal_id(&key) else { continue };
-            if &coll != name {
+    for (name, dirname) in shards {
+        for key in store.list(&format!("{prefix}{name}/{dirname}/"))? {
+            let Some((coll, shard, ids)) = archived_seal_id(&key) else { continue };
+            if &coll != name || &shard != dirname {
                 continue;
             }
             // One request per object: whether it is there and what its
@@ -2122,9 +2206,10 @@ pub fn walk_archive(
     Ok(w)
 }
 
-/// Re-seal every archived object of `colls` that is not already under the
-/// current data key, so a rotation can be finished without moving the tier
-/// back.
+/// Re-seal every archived object of `shards` -- this node's, as
+/// [`archived_shards_here`] gives them -- that is not already under the
+/// current data key, so a rotation can be finished without moving the
+/// tier back.
 ///
 /// Object by object: a ranged read says which key seals it, an object that
 /// needs it is fetched, re-sealed a frame at a time into a scratch file and
@@ -2138,7 +2223,7 @@ pub fn reseal_archive(
     cipher: &Cipher,
     store: &dyn crate::objstore::ObjectStore,
     prefix: &str,
-    colls: &[String],
+    shards: &[(String, String)],
     scratch: &std::path::Path,
 ) -> Result<usize> {
     // A previous run cut short is the normal reason to be here.
@@ -2148,10 +2233,10 @@ pub fn reseal_archive(
     let tmp = scratch.join("object.part");
     let mut done = 0usize;
     let out = (|| -> Result<usize> {
-        for name in colls {
-            for key in store.list(&format!("{prefix}{name}/"))? {
-                let Some((coll, _shard, ids)) = archived_seal_id(&key) else { continue };
-                if &coll != name {
+        for (name, dirname) in shards {
+            for key in store.list(&format!("{prefix}{name}/{dirname}/"))? {
+                let Some((coll, shard, ids)) = archived_seal_id(&key) else { continue };
+                if &coll != name || &shard != dirname {
                     continue;
                 }
                 let Some(head) = store.head(&key, HEAD_BYTES as u64)? else { continue };
@@ -2470,8 +2555,9 @@ mod archive_ring_tests {
     use super::*;
     use crate::objstore::{DirStore, ObjectStore};
 
-    fn colls(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
+    /// The `(collection, shard directory)` pairs a walk is scoped to.
+    fn shards(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(c, s)| (c.to_string(), s.to_string())).collect()
     }
 
     fn temp(tag: &str) -> std::path::PathBuf {
@@ -2543,7 +2629,13 @@ mod archive_ring_tests {
             )
             .unwrap();
 
-        let w = walk_archive(&new, &store, "", &colls(&["docs", "logs"])).unwrap();
+        let w = walk_archive(
+            &new,
+            &store,
+            "",
+            &shards(&[("docs", "shard-0000"), ("docs", "shard-0001"), ("logs", "shard-0000")]),
+        )
+        .unwrap();
         assert_eq!(w.objects, 3);
         assert_eq!(w.under_previous, 2, "two were sealed under the old key");
         assert_eq!(
@@ -2552,6 +2644,11 @@ mod archive_ring_tests {
             "the walk names every collection with a stale object"
         );
         assert!(w.unopenable.is_empty());
+        // Scoped to one shard, the walk sees that shard's objects alone:
+        // another node's shard of the same collection, under the same
+        // prefix, is not this node's to judge or re-seal.
+        let w = walk_archive(&new, &store, "", &shards(&[("docs", "shard-0001")])).unwrap();
+        assert_eq!((w.objects, w.under_previous), (1, 0), "{w:?}");
     }
 
     /// An object no key in the ring opens is reported rather than passed
@@ -2569,7 +2666,7 @@ mod archive_ring_tests {
                 &stranger.seal_file(&Ids::of("docs", id), b"not mine").unwrap(),
             )
             .unwrap();
-        let w = walk_archive(&mine, &store, "", &colls(&["docs"])).unwrap();
+        let w = walk_archive(&mine, &store, "", &shards(&[("docs", "shard-0000")])).unwrap();
         assert_eq!(w.under_previous, 0);
         assert_eq!(w.unopenable, vec!["docs/shard-0000/0000000000000001.seg".to_string()]);
     }
@@ -2597,7 +2694,7 @@ mod archive_ring_tests {
         store.put(&format!("docs/{fresh_id}"), &fresh_bytes).unwrap();
 
         let tmp = temp("reseal-tmp");
-        let n = reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap();
+        let n = reseal_archive(&new, &store, "", &shards(&[("docs", "shard-0000")]), &tmp).unwrap();
         assert_eq!(n, 1, "only the stale object is rewritten");
         assert_eq!(
             store.get(&format!("docs/{fresh_id}")).unwrap(),
@@ -2605,7 +2702,7 @@ mod archive_ring_tests {
             "an object already under the current key is not touched"
         );
 
-        let after = walk_archive(&new, &store, "", &colls(&["docs"])).unwrap();
+        let after = walk_archive(&new, &store, "", &shards(&[("docs", "shard-0000")])).unwrap();
         assert_eq!(after.under_previous, 0, "nothing is under a previous key now");
         assert_eq!(after.objects, 2);
 
@@ -2667,12 +2764,15 @@ mod archive_ring_tests {
 
         // Even if it were not refused, scoping to the collection keeps the
         // walk off `pool/`: one object seen, not two.
-        let w = walk_archive(&new, &store, "", &colls(&["docs"])).unwrap();
+        let w = walk_archive(&new, &store, "", &shards(&[("docs", "shard-0000")])).unwrap();
         assert_eq!(w.objects, 1, "the backup's pool segment was walked as the tier's");
         assert_eq!(w.under_previous, 1);
 
         let tmp = temp("shared-tmp");
-        assert_eq!(reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(), 1);
+        assert_eq!(
+            reseal_archive(&new, &store, "", &shards(&[("docs", "shard-0000")]), &tmp).unwrap(),
+            1
+        );
         assert_eq!(
             store.get(&pool_key).unwrap(),
             pool_bytes,
@@ -2694,9 +2794,12 @@ mod archive_ring_tests {
             .put(&format!("docs/{id}"), &old.seal_file(&Ids::of("docs", id), b"rows").unwrap())
             .unwrap();
         let tmp = temp("again-tmp");
-        assert_eq!(reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(), 1);
         assert_eq!(
-            reseal_archive(&new, &store, "", &colls(&["docs"]), &tmp).unwrap(),
+            reseal_archive(&new, &store, "", &shards(&[("docs", "shard-0000")]), &tmp).unwrap(),
+            1
+        );
+        assert_eq!(
+            reseal_archive(&new, &store, "", &shards(&[("docs", "shard-0000")]), &tmp).unwrap(),
             0,
             "nothing left to do"
         );

@@ -1871,15 +1871,20 @@ fn archive_store(
 
 /// What the archived tier says about the ring, or `None` when there is no
 /// store to ask (the tier is local, and a rotation already re-sealed it).
-/// The collections with an index at the archived tier, read from the
-/// catalog in DIR. These and no others are what the key commands touch in
-/// the store: see `cipher::backups_share_this_prefix` for what else can be
-/// under the same prefix and why listing it whole would be wrong.
-fn archived_collections(
+/// The archived shards this directory holds -- `(collection, shard
+/// directory)` pairs: the shards of every collection with an index at the
+/// archived tier that are here and that the catalog in DIR places on this
+/// node, named by `CELASTRO_NODE` as the node is started. These and no
+/// others are what the key commands touch in the store: in a cluster every
+/// node puts its objects under the one prefix, so the other nodes' shards
+/// lie beside this node's and are theirs to re-seal (see
+/// `cipher::archived_shards_here`), and a backup can lie under it too (see
+/// `cipher::backups_share_this_prefix`).
+fn archived_shards(
     dir: &Path,
     cipher: &celastro::cipher::Cipher,
     json: bool,
-) -> std::result::Result<Vec<String>, i32> {
+) -> std::result::Result<Vec<(String, String)>, i32> {
     let bytes = match std::fs::read(dir.join("CATALOG")) {
         Ok(b) => b,
         // No catalog is a database with no collections, so no tier.
@@ -1893,12 +1898,9 @@ fn archived_collections(
         Ok(c) => c,
         Err(e) => return Err(fail(json, &format!("{}/CATALOG: {e}", dir.display()))),
     };
-    Ok(catalog
-        .collections
-        .iter()
-        .filter(|(_, c)| c.indexes.iter().any(|i| i.tier == celastro::residency::Tier::Archived))
-        .map(|(name, _)| name.clone())
-        .collect())
+    let node = std::env::var("CELASTRO_NODE").ok().filter(|v| !v.is_empty());
+    celastro::cipher::archived_shards_here(dir, &catalog, node.as_deref())
+        .map_err(|e| fail(json, &e.to_string()))
 }
 
 /// The store, refused when a backup has been written under the same
@@ -1934,8 +1936,8 @@ fn walk_or_report(
     json: bool,
 ) -> std::result::Result<Option<celastro::cipher::ArchiveWalk>, i32> {
     let Some(h) = archive_store_for_keys(dir, json)? else { return Ok(None) };
-    let colls = archived_collections(dir, cipher, json)?;
-    match celastro::cipher::walk_archive(cipher, h.store.as_ref(), &h.prefix, &colls) {
+    let shards = archived_shards(dir, cipher, json)?;
+    match celastro::cipher::walk_archive(cipher, h.store.as_ref(), &h.prefix, &shards) {
         Ok(w) => Ok(Some(w)),
         Err(e) => Err(fail(
             json,
@@ -2114,8 +2116,8 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
             ),
         );
     };
-    let colls = match archived_collections(dir, &cipher, json) {
-        Ok(c) => c,
+    let shards = match archived_shards(dir, &cipher, json) {
+        Ok(s) => s,
         Err(code) => return code,
     };
     let scratch = dir.join("reseal.scratch");
@@ -2123,7 +2125,7 @@ fn key_reseal(dir: &Path, json: bool) -> i32 {
         &cipher,
         h.store.as_ref(),
         &h.prefix,
-        &colls,
+        &shards,
         &scratch,
     ) {
         Ok(n) => n,

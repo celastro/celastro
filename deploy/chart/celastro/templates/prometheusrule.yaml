@@ -27,8 +27,11 @@ spec:
             summary: "{{ `{{ $labels.instance }}` }} is still keeping {{ `{{ $value }}` }} previous data key(s)"
             description: >-
               A data-key rotation was started and never finished, so objects
-              sealed under the old keys still need them. Run `celastro key
-              reseal` and then `key retire` on this node. It is not urgent
+              sealed under the old keys still need them. With this pod
+              stopped, run `celastro key reseal` on its volume with
+              CELASTRO_NODE set to the pod's address: the walk is of this
+              node's own shards, and every node of the cluster runs it for
+              its own, since the archive prefix is shared. It is not urgent
               and it does not go away on its own.
         - alert: CelastroCertificateExpiring
           expr: (celastro_tls_certificate_expiry_seconds - time()) < {{ mul .Values.monitoring.rules.certDays 86400 }}

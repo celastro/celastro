@@ -2703,9 +2703,11 @@ impl Db {
             if c.previous_keys() > 0 {
                 out.push_str(&format!(
                     "data key: {} previous key(s) kept in the ring so archived objects sealed \
-                     under them still open; `celastro key retire <DIR> --check` says whether any \
-                     still needs them, `celastro key reseal <DIR>` seals them under the current \
-                     key and retires the ring\n",
+                     under them still open; with this node stopped and CELASTRO_NODE set as it \
+                     is here, `celastro key retire <DIR> --check` says whether any object of \
+                     this node's shards still needs them and `celastro key reseal <DIR>` seals \
+                     those under the current key and retires the ring -- each node of a \
+                     cluster for its own shards, since the archive prefix is shared\n",
                     c.previous_keys()
                 ));
             }

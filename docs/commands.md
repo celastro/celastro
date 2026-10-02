@@ -194,7 +194,17 @@ rotation: it reads one frame of each archived object to see which key
 seals it, fetches only the ones still under an old key, seals them
 again under the current one, puts them back, and then drops the ring.
 It is resumable -- an object it has already moved is skipped, so
-running it again after a failure finishes the rest.
+running it again after a failure finishes the rest. Its walk is of
+**this node's shards alone**: the `shard-NNNN` directories under `DIR`
+that the catalog's placement puts on the node `CELASTRO_NODE` names (set
+it as the node is started), not a move's half-pulled
+`shard-NNNN.incoming`. Every node of a cluster puts its objects under
+the one prefix, so the other nodes' objects lie beside this node's,
+sealed under keys only their rings hold; each node runs the command for
+its own shards, stopped for its turn, and with the placement naming
+nodes and no `CELASTRO_NODE` it refuses rather than guess. (Through
+0.98.0 the walk was of every shard of the collection, and one node's
+reseal left the others unable to open their archived segments.)
 
 **`key retire <DIR>`** drops the ring on its own, and **refuses** while
 any archived object still needs it, naming the collections; `--check`
@@ -203,8 +213,9 @@ the cost of every object still under an old key. Both read the archived
 tier through the same `CELASTRO_ARCHIVE_*` settings a node uses, and a
 store they cannot reach is a refusal rather than a retirement.
 
-Both also look only at the collections the catalog says are at the
-archived tier, and both **refuse outright if a backup has been written
+Both also look only at this node's shards of the collections the
+catalog says are at the archived tier, and both **refuse outright if a
+backup has been written
 under the same prefix**. A backup keeps its segments at
 `pool/<collection>/<shard>/<id>.seg` and the tier keeps its own at
 `<prefix><collection>/<shard>/<id>.seg`: the same shape, and the
