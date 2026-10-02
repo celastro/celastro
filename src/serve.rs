@@ -782,8 +782,8 @@ fn metrics_text(db: &Db) -> String {
     line(
         "celastro_wal_sync_failed",
         "gauge",
-        "1 once a write-ahead log's sync failed: the node takes no writes on that shard and \
-         needs a restart.",
+        "1 while a write-ahead log's sync has failed: the shard takes no writes until the next \
+         attempt's probe finds the disk answering and reopens the log in place.",
         "",
         if failed.is_some() { "1" } else { "0" }.to_string(),
     );

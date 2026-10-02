@@ -6,6 +6,180 @@ from the point of view of upgrading INTO that version, so the paragraph under
 [crates.io](https://crates.io/crates/celastro); tags `vX.Y.Z` in this
 repository.
 
+## 0.99.0 — 2026-10-02
+
+**A master-key rotation reaches every `KEY`, and the chart's documented
+procedure now works.** Three things could be observed before. `key rekey`
+on a database directory's `KEY` rewrapped that one file with no lock on
+the directory: across a `key rotate` cut short, `KEY.next` -- the only
+copy of the new data key, already sealing the recoded files -- stayed
+under the old master, so the documented rotation followed by the
+destruction of the old master left the node refusing to open ("run
+`celastro key rotate`") and the rotation unable to finish; against a
+served directory the same rekey raced a `RESTORE`'s write of `KEY` while
+the ack said the file was under the new master. The chart README's
+one-sentence master rotation (rekey the Secret's `KEY`, replace both
+keys, restart the pods) could not work: a pod reads `/data/KEY` first and
+`CELASTRO_KEY_FILE` only into an empty volume, so every pod crash-looped
+on "does not open this database's KEY", and with the old master discarded
+every volume was lost. And every backup's `KEY` object stayed under the
+old master with no command to rewrap it; a rewrap by hand passed
+`RESTORE` and failed `VERIFY BACKUP` on the sealed record's hash, and
+nothing said the old master had to be kept. Now `key rekey` on a
+database's `KEY` takes the directory's lock (a served directory is
+refused: stop the node first) and rewraps `KEY.next` with it, both opened
+before either is written and `KEY.next` written first, so a run cut short
+is finished by running it again; a bare file (`key init`'s, the Secret's,
+an export's) rewraps as before, makes no `LOCK`, and keeps its 0600 (a
+rewrap used to hand it back at 0644). `CELASTRO_MASTER_KEY_PREVIOUS_FILE`
+(or `CELASTRO_MASTER_KEY_PREVIOUS`, removed from the environment once
+read as `CELASTRO_MASTER_KEY` is) names the master a rotation replaced: a
+node whose `KEY` is still under it opens, rewraps `KEY` under the current
+master and logs `key_master_rewrapped`, so a cluster rotates its master
+by one rolling restart; a backup under it restores and an export under it
+imports meanwhile; without it the refusal stands, naming the masters
+tried. The new `key rekey-backups <DEST> <MASTER>` rewraps every backup's
+`KEY` at a destination (`s3://` included) and the hash of it in each
+sealed record, so `RESTORE` and `VERIFY BACKUP` both pass under the new
+master and nothing there opens under the old one. `key rotate`, `key
+retire`, `key reseal` and `check` accept the previous master too. What an
+operator does differently: rotate the master in the chart README's order
+-- `key master`, `key rekey ./KEY`, the Secret with `master-previous.key`
+and `encryption.previousMaster=true`, roll the pods, `key rekey-backups`
+per backup destination and `key rekey` per export kept, then remove the
+previous master from the Secret and destroy it -- and keep the old master
+until every pod has restarted once with it as the previous master and
+every backup and export made under it has been rewrapped (or will never
+be restored). The 0.98.0 README's procedure was wrong and is replaced. In
+the library, `rotate_data_key` and `retire_keys` take the previous
+masters and `rekey_file` returns whether `KEY.next` was rewrapped too.
+Nothing on disk or on the wire changes: a rewrapped `KEY` is the same
+ring under another master, a rewritten record the same text with one
+hash, sealed as before; a 0.97.0 node reads both.
+
+**`key reseal` and `key retire` walk this node's shards alone.** In a
+cluster every node puts its archived objects under the one prefix (the
+chart's default), and nothing in an object's key names the node. The walk
+behind `key reseal` and `key retire --check` listed every shard of every
+archived collection, so after the documented node-by-node rotation one
+node's reseal sealed the other nodes' objects under a key only its own
+`KEY` held and retired the ring theirs had needed: they opened, served,
+and could not read an archived segment, with no command to give them the
+key. The alert, `SHOW HEALTH` and `docs/commands.md` sent the operator
+down that path. The walk is now of the `shard-NNNN` directories this
+directory holds that the catalog's placement puts on this node
+(`CELASTRO_NODE`, as the node is started; a tablet naming no node is this
+directory's), never a move's half-pulled `shard-NNNN.incoming`; with the
+placement naming nodes and no `CELASTRO_NODE`, both commands refuse
+naming the nodes rather than guess. Each node of a cluster runs the
+commands for its own shards, stopped for its turn, and the alert and the
+health line say so. Nothing on disk or in the store changes; a 0.97.0
+node reads the same objects.
+
+**A move onto a node whose key does not open the files is refused and
+leaves nothing behind, and a cluster rotates to one key with `key rotate
+--to`.** A move copies the source's files sealed as they lie. The target
+renamed the pulled directory in and recorded the placement naming itself
+before it opened a byte, so where the nodes' keys differed the move
+failed with `shard-NNNN` and the placement left on the target, and the
+target's next open failed on the shard it could not read. The 0.98.0 docs
+said a cluster's nodes "no longer need to share one data key once they
+hold their own copies"; that was false -- a move, a restore onto another
+node and a shared destination's `KEEP` all need one key -- and following
+it produced exactly this. The pulled files are now opened before the
+rename and before the catalog is touched; a refusal names the key
+mismatch and removes the directory, and any failure after the rename (a
+torn pull, a bad MANIFEST) puts the catalog back and removes it too. `key
+rotate <DIR> --to <KEY>` adopts the wrapped key `key init` wrote as the
+new current key, the previous kept behind it, so every node rotates to
+the same key. The rotation itself read every file only after writing
+`KEY.next`, so a log a crash left torn, or a leftover `shard-NNNN.incoming`,
+`<name>.restore.tmp`, `<name>.import.tmp` or `<name>.dropping` -- each
+taken for a shard or a collection of that name; the guard against a move
+in flight looked for a directory nothing writes -- stopped it with
+`CATALOG` and the shards sorted before it already under the new key, and
+a message, "nothing was changed", that read as if removing `KEY.next`
+undid the run. It did not: the key those files were under lived in
+`KEY.next` alone. Every file is now read before `KEY.next` is written,
+and a rotation that cannot finish refuses with the files named and
+"nothing was written" (a torn tail: open the database once to cut it,
+then rotate; a `.incoming`: finish or abort the move, or remove the
+directory if none is running); the staging and aside directories are
+passed over and counted; and the message once `KEY.next` exists says to
+keep it, since renaming it to `KEY` opens the database under both keys
+and a later rotation finishes under a fresh one. `celastro check` refuses
+a directory with a `KEY.next` as the open does, where it called every
+re-sealed file damaged. And `RESTORE ... AS OF` fsyncs each archived log
+it places: on the common path -- a backup taken with the live log empty,
+a restore to the archive's end -- the open rewrote no log, and the rows
+the `ok` named were in the page cache alone until the next seal. Nothing
+on disk or on the wire changes; `--to` is the one new input.
+
+**The key files are synced before the command answers.** `key master`,
+`key init` and `tls init` wrote their files and returned with no fsync of
+the file or of its directory entry, while the first open wrapped the data
+key under that master and wrote `KEY` durably. A power loss within the
+filesystem's commit interval of a scripted bootstrap -- master written,
+node started, rows acknowledged -- left a `KEY` no master opened. The
+file and its directory are fsynced now; `docs/commands.md` says the
+master key file belongs on durable storage, copied off before the first
+open.
+
+**A restore to an instant crosses a data-key rotation.** The log live at
+a `key rotate` was shipped under the old key and, once the rotation had
+recoded it, shipped again under the new one; the longer copy replaced
+the shorter, so the archive held those instants under the new key alone,
+while `RESTORE ... AS OF` an instant from the backup before the rotation
+held that backup's `KEY` alone, opened the copy to nothing and refused it
+as "cut: its trailer is missing". Every instant from that log's first
+record to the next backup was unreachable -- the instants before the
+rotation included -- and with the volume lost the new key existed in
+`<dir>/KEY` and nowhere else: 0.98.0's refusal of a log under another
+key, in place of a short replay, held and left the data unrecoverable. A
+node with `CELASTRO_LOG_ARCHIVE` now puts its wrapped `KEY` in the
+archive under `nodes/<node>/keys/<fingerprint>`, once per data key,
+before it ships anything under that key (and at the open of a directory
+with data in it; an archive that does not answer leaves it to the first
+ship, which puts it first or fails as any refused ship does). A restore
+unwraps every key there under its master, reads the archived logs under
+the backup's key and those, and rewrites a log under another key as it
+places it, so the restored directory stays under the backup's `KEY` and
+reopens under it. A log under no key the restore holds is refused saying
+so, not called cut. A 0.97.0 node restoring from the same archive passes
+over the `keys/` prefix.
+
+**A backup names a pool object by the key its bytes are under.** The pool
+object's name carried the fingerprint of the node's current data key, but
+a segment at the archived tier stays under the old key after `key rotate`
+until `key reseal`, and its bytes went into the pool under the new key's
+name; the reseal then rewrote the tier's object in place at the same
+length, so every later backup found the pool object present at that size,
+left it, and recorded the new bytes' hash against the old bytes: `VERIFY
+BACKUP` and `RESTORE` refused every backup after the reseal with "does not
+match its recorded checksum", for as long as the segment lived. 0.97.0's
+note that a resealed segment is another object, never trusted for its
+size alone, held only for the local files a rotation recodes. Under
+`CELASTRO_SEAL_IDENTITY` at 3 or lower the object is named by its id
+alone, and the same trust let the documented cadence -- rotate, a nightly
+backup with the ring held, `key retire`, the next backup -- leave old-key
+bytes behind a record whose `KEY` did not open them: `VERIFY` passed, and
+the restore failed at the attach with "frame 0 does not authenticate".
+The segment's first frame now says which key of the ring it is under and
+the object is named by that key's fingerprint; a segment no held key opens
+refuses the backup, since no copy of it could restore. Under the pin a
+present `<id>.seg` has its first frame read, and one under another key
+than the segment's sends the segment under its fingerprint name instead,
+which the reply says a node before 0.97.0 cannot restore -- lift the pin
+before rotating (`docs/tuning.md`). Nothing changes on the wire or in the
+name form: a 0.97.0 node restores a backup this writes. A destination
+already affected recovers by hand: delete the misnamed object --
+`pool/<collection>/shard-NNNN/<id>.<fingerprint>.seg` under the current
+key's fingerprint, the object `VERIFY BACKUP` names -- and run `BACKUP`
+again; the next backup finds it absent and puts the bytes every record
+since the reseal hashed, so those backups verify and restore again. If
+the volume is gone first, copy the tier's object into that pool slot
+instead.
+
 ## 0.98.0 — 2026-10-02
 
 **A write in flight at a seal, a compaction or a `FLUSH` keeps its

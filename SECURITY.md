@@ -294,11 +294,22 @@ with `key rekey` per directory (under the directory's lock, with the
 backup destination, or by a restart with the master it replaced in
 `CELASTRO_MASTER_KEY_PREVIOUS_FILE`, which rewraps `KEY` under the new
 one; the previous master is needed until every node, backup and export
-under it has been rewrapped. The data key rotates with `key rotate`
-(0.65.0: every file sealed again with the process stopped, resumable;
-0.66.0: an archived tier keeps the old key in a ring behind the new
-one until `key retire`), and `check` opens every frame and names what
-does not open.
+under it has been rewrapped, and the chart README has the steps in
+order (`docs/commands.md` for hosts). The data key rotates with `key
+rotate` (0.65.0: every file sealed again with the process stopped,
+resumable; 0.66.0: an archived tier keeps the old key in a ring behind
+the new one until `key retire`; 0.99.0: a cluster's nodes rotate to one
+key with `--to`, and `key reseal` and `key retire` walk each node's own
+shards, every node running them for its own), and `check` opens every
+frame and names what does not open. On 0.98.0 or earlier, two things
+not to do: in a cluster whose nodes share one archive prefix (the
+chart's default), run neither `key reseal` nor `key retire` -- the walk
+was of every node's shards, and one node's reseal left the others unable
+to open their archived segments -- and after a master rotation keep the
+old master, whatever that release's chart README said, until on this
+release every pod has restarted once with it as the previous master and
+every backup and export under it is rewrapped: a 0.98.0 pod could not
+open a rekeyed `KEY`, and nothing could rewrap a backup's.
 
 What it protects against: a copied volume, a lost disk, a bucket or a
 backup read by someone without the master key -- none of it is readable

@@ -188,8 +188,10 @@ file stays under the data key, which does not change):
 1. `celastro key master ./new-master.key`.
 2. With the old master in the environment, `celastro key rekey ./KEY
    ./new-master.key`. The Secret's `KEY` matters only at a pod's first
-   start: a pod that has started holds its own `/data/KEY`, and one that
-   was ever `key rotate`d holds a data key of its own.
+   start: a pod that has started holds its own `/data/KEY`, and a
+   cluster that has `key rotate`d since holds the key the rotation gave
+   every pod (`--to` the same new `KEY` on each, which then replaces the
+   Secret's, so that a pod added later starts on it).
 3. Replace the Secret: `master.key` = the new master, `KEY` = the
    rewrapped one, plus `master-previous.key` = the old master; and set
    `encryption.previousMaster=true`, which gives every pod

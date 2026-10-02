@@ -95,8 +95,13 @@ spec:
             description: >-
               An fdatasync of a shard's log failed. The write it covered was
               refused and taken back off the log; that shard takes no more
-              writes, and reads on the node stay at the instant before it.
-              A failed sync is not retried, since the page cache cannot be
-              trusted with a second one: restart the node, which replays
-              the log, after the disk is seen to.
+              writes, and reads on the node stay at the instant before it,
+              until the disk answers again. The failed sync itself is not
+              retried, since the page cache cannot be trusted with a second
+              one: see to the disk. The next write attempted on the shard
+              then probes the log, and when the probe lands the shard
+              reopens the log in place and goes on, as a restart would have
+              (0.97.0; before, only a restart, which replays the log,
+              recovered it); a probe that fails is refused naming both
+              failures.
 {{- end }}

@@ -2273,7 +2273,9 @@ master a rotation replaced in `CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or
 `_PREVIOUS`, removed from the environment as the current one is) opens
 a `KEY` still under it and rewraps it under the current master at the
 open, which is how a cluster's volumes follow a master rotation by one
-restart of every node, `/data/KEY` being read before the Secret's. A
+restart of every node, `/data/KEY` being read before the Secret's; the
+previous master is needed until every node's `KEY`, every backup and
+every export under it is rewrapped. A
 directory with `KEY` and no master is refused, and so is a plain
 directory with data offered a master: encrypting in place would be a
 rewrite of every file behind a running database's back, and the export
@@ -2584,7 +2586,10 @@ holds the current key and the previous ones; `open_file`,
 rotation under an archived tier keeps the old key rather than refusing,
 and `key retire` drops the ring. From 0.72.0 the ring is answerable
 rather than a standing reminder (K1). `key retire` walks the archived
-tier before it drops anything -- one ranged read of a frame per object,
+tier (this node's shards of it since 0.99.0: the `shard-NNNN`
+directories the placement puts on `CELASTRO_NODE`, every node of a
+cluster putting its objects under one prefix and each re-sealing its
+own) before it drops anything -- one ranged read of a frame per object,
 since a frame authenticates on its own, so the walk costs a `HEAD` and
 a few kilobytes an object rather than the objects -- and refuses while
 any of them still opens only under a previous key, naming the

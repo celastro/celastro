@@ -121,14 +121,6 @@ the first open, since every file the database writes from then on is
 under it and a lost master opens none of them. `CELASTRO_MASTER_KEY_FILE`
 on every start then encrypts every file under `--dir`, and every backup
 and export it writes. A database made with the key is refused without it.
-When the master rotates, `CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or
-`CELASTRO_MASTER_KEY_PREVIOUS`, the hex, removed from the environment
-once read as `CELASTRO_MASTER_KEY` is) names the one it replaced: a node
-whose `KEY` is still under the previous master opens, rewraps it under
-the current one and logs `key_master_rewrapped`, so a cluster rotates
-its master by one restart of every node; a backup under the previous
-master restores, and an export under it imports, meanwhile. A variable
-naming a missing file is an error, as the current master's is.
 
 ```sh
 celastro key master ./master.key
@@ -159,23 +151,34 @@ wrote a master key to ./master2.key
 ./data.key is now wrapped under the master key in ./master2.key
 ```
 
-When `KEY` is a database's (its directory holds `LOCK` or `KEY.next`),
-`key rekey` takes the directory's lock -- a served directory is refused:
-stop the node first -- and rewraps a `KEY.next` an interrupted `key
-rotate` left with it, both opened before either is written, so a master
-rotation across an interrupted data-key rotation leaves nothing under
-the old master. **`key rekey-backups <DEST> <MASTER>`** does the same
-for every backup at a destination (`DEST` as `BACKUP TO` names it, so an
-`s3://` destination takes the `CELASTRO_ARCHIVE_*` variables): each
-backup's `KEY` rewrapped and its sealed record's hash of it rewritten, a
-backup already under the new master left as it is, a run cut short
-finished by running it again; the ack counts them (`2 backup(s) of 1
-node(s) at ./backups rewrapped under the master key in ./master2.key, 0
-already under it`). A master rotation has to reach every node's `KEY`
-(by a restart with the previous master set, or `key rekey <DIR>/KEY`
-with the node stopped), every backup destination (`key rekey-backups`)
-and every export kept (`key rekey <EXPORT>/KEY`); the old master is
-needed until all of them are rewrapped, and destroyed only then.
+A master rotation has to reach every `KEY` the old master wraps: every
+node's, every backup's and every export's. A node's is reached with the
+node stopped by **`key rekey <DIR>/KEY`** -- on a database's `KEY` (its
+directory holds `LOCK` or `KEY.next`) the command takes the directory's
+lock, refusing a served directory, and rewraps a `KEY.next` an
+interrupted `key rotate` left with it, both opened before either is
+written, so a master rotation across an interrupted data-key rotation
+leaves nothing under the old master -- or by a restart with
+`CELASTRO_MASTER_KEY_PREVIOUS_FILE` (or `CELASTRO_MASTER_KEY_PREVIOUS`,
+the hex, removed from the environment once read as `CELASTRO_MASTER_KEY`
+is) naming the master the rotation replaced: a node whose `KEY` is still
+under it opens, rewraps it under the current one and logs
+`key_master_rewrapped`, which is how a cluster's nodes follow a master
+rotation by one restart each; a backup under the previous master
+restores, and an export under it imports, meanwhile; a variable naming a
+missing file is an error, as the current master's is. Every backup
+destination is reached by **`key rekey-backups <DEST> <MASTER>`** (`DEST`
+as `BACKUP TO` names it, so an `s3://` destination takes the
+`CELASTRO_ARCHIVE_*` variables): each backup's `KEY` rewrapped and its
+sealed record's hash of it rewritten, a backup already under the new
+master left as it is, a run cut short finished by running it again; the
+ack counts them (`2 backup(s) of 1 node(s) at ./backups rewrapped under
+the master key in ./master2.key, 0 already under it`). Every export kept
+is reached by `key rekey <EXPORT>/KEY`. The old master is needed until
+all of them are rewrapped, and destroyed only then. The chart README has
+the steps in order for pods (the old master in the Secret as
+`master-previous.key` and `encryption.previousMaster=true` through the
+rotation); a cluster on hosts takes the same steps by hand.
 
 The data key itself rotates with **`key rotate <DIR>`**: every file and
 every log record under the directory is sealed again under a fresh data
@@ -183,16 +186,17 @@ key and `KEY` rewrapped, with no process serving the directory. A
 cluster's nodes keep sharing one data key: a move, a restore onto
 another node and a shared backup destination's `KEEP` copy sealed files
 as they lie, so two nodes that each drew their own key can no longer
-move a shard between them (the move is refused, naming the key, and
-the target is left as it was). A cluster therefore rotates node by
-node, each stopped for its turn, **to the same key**: `key init`
-writes the new wrapped key once, and **`key rotate <DIR> --to <KEY>`**
-adopts it on each node, keeping the previous key behind it as any
-rotation does. (Through 0.98.0 this paragraph said the nodes no longer
-needed to share one; they do.) Before it writes anything the rotation
-reads every file it would re-seal and refuses, naming them, if one
-would stop it part way: a log a crash left torn (open the database
-once, which cuts it, then rotate) or a move's half-pulled
+move a shard between them (the move is refused naming the mismatch,
+and the target is left as it was). A cluster therefore rotates **to the
+same key**: `key init` writes the new wrapped key once, and **`key
+rotate <DIR> --to <KEY>`** adopts it on each node, keeping the previous
+key behind it as any rotation does; the key `KEY` already holds is
+refused, and an interrupted rotation finishes to the key it began with
+(`key rotate` without `--to` first). (Through 0.98.0 this page said the
+nodes no longer needed to share one; they do.) Before it writes anything
+the rotation reads every file it would re-seal and refuses, naming
+them, if one would stop it part way: a log a crash left torn (open the
+database once, which cuts it, then rotate) or a move's half-pulled
 `shard-NNNN.incoming` (finish or abort the move, or remove the
 directory if none is running); a restore's or an import's staging
 directory and a drop's `<name>.dropping` are passed over and counted.
@@ -219,11 +223,11 @@ that the catalog's placement puts on the node `CELASTRO_NODE` names (set
 it as the node is started), not a move's half-pulled
 `shard-NNNN.incoming`. Every node of a cluster puts its objects under
 the one prefix, so the other nodes' objects lie beside this node's,
-sealed under keys only their rings hold; each node runs the command for
-its own shards, stopped for its turn, and with the placement naming
-nodes and no `CELASTRO_NODE` it refuses rather than guess. (Through
-0.98.0 the walk was of every shard of the collection, and one node's
-reseal left the others unable to open their archived segments.)
+sealed under keys only their rings hold, and are theirs to re-seal; with
+the placement naming nodes and no `CELASTRO_NODE` the command refuses
+rather than guess. (Through 0.98.0 the walk was of every shard of the
+collection, and one node's reseal left the others unable to open their
+archived segments.)
 
 **`key retire <DIR>`** drops the ring on its own, and **refuses** while
 any archived object still needs it, naming the collections; `--check`
@@ -234,16 +238,27 @@ store they cannot reach is a refusal rather than a retirement.
 
 Both also look only at this node's shards of the collections the
 catalog says are at the archived tier, and both **refuse outright if a
-backup has been written
-under the same prefix**. A backup keeps its segments at
-`pool/<collection>/<shard>/<id>.seg` and the tier keeps its own at
-`<prefix><collection>/<shard>/<id>.seg`: the same shape, and the
+backup has been written under the same prefix**. A backup keeps its
+segments at `pool/<collection>/<shard>/<id>.seg` and the tier keeps its
+own at `<prefix><collection>/<shard>/<id>.seg`: the same shape, and the
 identity a file was sealed under is the same string read off either. A
 re-seal that mistook one for the other would leave every record naming
 it with a hash that no longer matches, so the archived tier and a backup
 destination want different prefixes, or different buckets. A ring
 that nothing can need -- no index is at the archived tier at all -- is
 dropped by the next open without being asked, and logged.
+
+In a cluster, then, a data-key rotation is: `key init` writes the new
+wrapped `KEY` once; each node in turn is stopped, `key rotate <DIR> --to
+<KEY>` run on it, and started; once every node is on the new key, each
+node in turn is stopped again for `key reseal <DIR>` with `CELASTRO_NODE`
+set as the node is started (or `key retire <DIR>`, where nothing of its
+shards is archived), and started; and the key file a new node starts
+from (`CELASTRO_KEY_FILE`, the chart's Secret) is replaced with the new
+`KEY`, so that a node added later starts on the key the others hold. The
+ring alert and the `data key` line of `SHOW HEALTH` say the same. The
+master rotates as above: the chart README's procedure, or its steps by
+hand on hosts.
 
 **`key rotate <DIR>`** keeps the previous key in the ring until `key
 retire` says nothing is under it (0.97.0; before, the ring was kept only
