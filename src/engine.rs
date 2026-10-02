@@ -1561,6 +1561,7 @@ impl Db {
             db.forget_collection(name);
         }
         Db::sweep_dropping(dir)?;
+        db.sweep_unnamed(dir)?;
         let names: Vec<String> = db.catalog.collections.keys().cloned().collect();
         let mut derived = false;
         for name in names {
@@ -2612,6 +2613,89 @@ impl Db {
         Ok(())
     }
 
+    /// The directories under `collections/` the catalog does not name,
+    /// once the drops are swept. A staging directory of an import or a
+    /// restore (`.import.tmp`, `.restore.tmp`) is never whole, and is
+    /// removed. A collection directory holding nothing but a pull's
+    /// `.incoming` is a move that died mid-copy, which the next pull starts
+    /// over, and is removed. Any other is set aside as `<name>.orphan-<n>`
+    /// and logged, never adopted and never written over: it is a restore's
+    /// or an import's rename made durable with the process gone before the
+    /// catalog's publication, so its data is kept where an operator finds
+    /// it, and `RESTORE` or `IMPORT` run again under the name. Until
+    /// 0.99.0 the open passed over all of these: the rerun import failed
+    /// on the populated directory, and `CREATE COLLECTION` of the name
+    /// built its shards over the orphan's.
+    fn sweep_unnamed(&self, dir: &Path) -> Result<()> {
+        let parent = dir.join("collections");
+        let Ok(entries) = fs::read_dir(&parent) else { return Ok(()) };
+        let mut changed = false;
+        for e in entries {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if self.catalog.collections.contains_key(&name) {
+                continue;
+            }
+            let path = e.path();
+            if name.ends_with(".import.tmp") || name.ends_with(".restore.tmp") {
+                fs::remove_dir_all(&path)?;
+                crate::log::warn("staging_dir_removed", &[("path", path.display().to_string())]);
+                changed = true;
+                continue;
+            }
+            // `.dropping` is swept above, `.orphan-<n>` is an earlier
+            // open's, and a name with a dot in it is no collection's.
+            if name.contains('.') {
+                continue;
+            }
+            let dead_pull = fs::read_dir(&path)?
+                .flatten()
+                .all(|c| c.file_name().to_string_lossy().ends_with(".incoming"));
+            if dead_pull {
+                fs::remove_dir_all(&path)?;
+                crate::log::warn(
+                    "collection_dir_removed",
+                    &[
+                        ("collection", name),
+                        ("why", "a pull that ended before the move adopted it".to_string()),
+                    ],
+                );
+                changed = true;
+                continue;
+            }
+            let mut n = 1;
+            let aside = loop {
+                let p = parent.join(format!("{name}.orphan-{n}"));
+                if !p.exists() {
+                    break p;
+                }
+                n += 1;
+            };
+            fs::rename(&path, &aside)?;
+            crate::log::warn(
+                "collection_dir_orphaned",
+                &[
+                    ("collection", name),
+                    ("moved_to", aside.display().to_string()),
+                    (
+                        "action",
+                        "a restore or an import the catalog never learned of: RESTORE or IMPORT \
+                         again under the name, or remove the directory"
+                            .to_string(),
+                    ),
+                ],
+            );
+            changed = true;
+        }
+        if changed {
+            crate::shard::sync_dir(&parent)?;
+        }
+        Ok(())
+    }
+
     /// Drop an index: the catalog no longer declares it, so the planner stops
     /// using it; its decoded component is released from every segment, its
     /// access clock and its statistics go, the memtables are rebuilt without
@@ -3489,7 +3573,14 @@ impl Db {
                     .as_bytes(),
                 )?;
                 sh.attach_dir(&fdir)?;
-                crate::shard::sync_dir(&dir.join("collections").join(collection))?;
+                // The copy's entry is in `followed/`, and `followed/` is in
+                // the collection's directory: each name fsynced in the
+                // directory that holds it. The collection's alone (0.99.0)
+                // left the copy's entry for a crash to take back, and the
+                // copy came back from nothing.
+                let cdir = dir.join("collections").join(collection);
+                crate::shard::sync_dir(&cdir.join("followed"))?;
+                crate::shard::sync_dir(&cdir)?;
             }
             self.followed.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 (collection.to_string(), *i),
@@ -4281,6 +4372,28 @@ impl Db {
             sh.index = i;
             if let Some(dir) = &self.dir {
                 let sdir = dir.join("collections").join(&coll.name).join(format!("shard-{i:04}"));
+                // A directory already holding a shard's data -- a MANIFEST,
+                // or a log with records in it -- is not this collection's
+                // to build over (0.99.0 did: the first seal published the
+                // empty set over the MANIFEST, and the next open reclaimed
+                // the segments as orphans). A RANGE and an empty log are a
+                // CREATE that ended before the catalog, written again.
+                let wal = sdir.join("wal.log");
+                let logged = wal.exists()
+                    && !crate::shard::Wal::replay(
+                        &wal,
+                        &self.cipher,
+                        &shard_file_ids(&coll.name, &format!("shard-{i:04}"), "wal.log"),
+                    )?
+                    .is_empty();
+                if sdir.join("MANIFEST").exists() || logged {
+                    return Err(Error::Storage(format!(
+                        "{}: a shard's data is already there and `{}` is not in the catalog to \
+                         own it; move the directory aside, or IMPORT it, and CREATE again",
+                        sdir.display(),
+                        coll.name
+                    )));
+                }
                 fs::create_dir_all(&sdir)?;
                 // The tablet map is the first thing a shard directory holds,
                 // and the CREATE COLLECTION that writes it is acknowledged
@@ -4829,6 +4942,14 @@ impl Db {
             drop(f);
             fs::rename(&part, &final_path)?;
         }
+        // The names the renames made are entries of `segments/` and
+        // `deletes/`, not of `incoming/`: each directory's own fsync, as a
+        // backup's `write_shard` and the tier move make them. Fsyncing
+        // `incoming/` alone (0.99.0) left a segment the pulled manifest
+        // names with an entry a crash could take back, and the open
+        // failing on it.
+        crate::shard::sync_dir(&incoming.join("segments"))?;
+        crate::shard::sync_dir(&incoming.join("deletes"))?;
         crate::shard::sync_dir(&incoming)?;
         Ok(incoming)
     }
@@ -5202,7 +5323,10 @@ impl Db {
                     // Immutable bytes as they lie: one more name for them.
                     (MoveFile::Path(p), None) => {
                         if fs::hard_link(p, &dest).is_err() {
+                            // The source's bytes were fsynced; the copy's
+                            // are the page cache's until they are too.
                             fs::copy(p, &dest)?;
+                            crate::shard::durable::sync_file(&fs::File::open(&dest)?, &dest)?;
                         }
                     }
                     (MoveFile::Path(p), Some(_)) => {
@@ -5238,6 +5362,10 @@ impl Db {
             &incoming.join("RANGE"),
             format!("{at}\n{hi_text}").as_bytes(),
         )?;
+        // The links and copies are entries of the subdirectories: as
+        // `pull_files` fsyncs them.
+        crate::shard::sync_dir(&incoming.join("segments"))?;
+        crate::shard::sync_dir(&incoming.join("deletes"))?;
         crate::shard::sync_dir(&incoming)?;
         self.adopt_shard(&coll, &new, next, &incoming)?;
         if let Some(sh) =
@@ -6237,7 +6365,12 @@ impl Db {
         }
         if from.exists() {
             fs::rename(&from, &to)?;
+            #[cfg(test)]
+            crate::shard::durability_probe::note_rename(&to);
         }
+        // The new name is an entry of `followed/`, the old name's removal
+        // one of the collection's directory: each fsynced where it is.
+        crate::shard::sync_dir(&cdir.join("followed"))?;
         crate::shard::sync_dir(&cdir)?;
         let term = self
             .catalog
@@ -12497,6 +12630,199 @@ mod tests {
         drop(g);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A collection directory the catalog does not name is set aside at
+    /// the open as `<name>.orphan-<n>` and logged, never adopted and never
+    /// built over; an import's or a restore's staging directory is
+    /// removed; a collection directory holding nothing but a dead pull's
+    /// `.incoming` is removed. And `CREATE COLLECTION` refuses a shard
+    /// directory already holding a shard's data. Until 0.99.0 the open
+    /// passed over all of them, and a CREATE of the name built its shards
+    /// over the orphan's: its first seal published the empty set over the
+    /// MANIFEST, and the next open reclaimed the segments as orphans.
+    #[test]
+    fn an_open_sets_aside_a_collection_directory_the_catalog_does_not_hold() {
+        let row = |k: &str| Value::obj(vec![("id".into(), Value::Str(k.into()))]);
+        let dir = tmp("orphan-collection");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("items", row("a")).unwrap();
+        db.execute("FLUSH items").unwrap();
+        db.insert("items", row("b")).unwrap();
+        drop(db);
+        let colls = dir.join("collections");
+        let items = colls.join("items").join("shard-0000");
+        // A restore's rename made durable and the catalog's not: a whole
+        // shard directory under a name the catalog does not hold.
+        let ghost = colls.join("ghost").join("shard-0000");
+        fs::create_dir_all(ghost.join("segments")).unwrap();
+        for f in ["MANIFEST", "RANGE", "wal.log"] {
+            fs::copy(items.join(f), ghost.join(f)).unwrap();
+        }
+        for e in fs::read_dir(items.join("segments")).unwrap().flatten() {
+            fs::copy(e.path(), ghost.join("segments").join(e.file_name())).unwrap();
+        }
+        fs::create_dir_all(colls.join("notes.import.tmp").join("shard-0000")).unwrap();
+        fs::create_dir_all(colls.join("notes.restore.tmp")).unwrap();
+        fs::create_dir_all(colls.join("moved").join("shard-0003.incoming").join("segments"))
+            .unwrap();
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        assert!(!colls.join("ghost").exists(), "the orphan was left under its name");
+        let aside = colls.join("ghost.orphan-1").join("shard-0000");
+        assert!(aside.join("MANIFEST").exists(), "set aside whole");
+        assert!(!colls.join("notes.import.tmp").exists(), "a staging directory");
+        assert!(!colls.join("notes.restore.tmp").exists(), "a staging directory");
+        assert!(!colls.join("moved").exists(), "a dead pull's directory");
+        assert!(db.catalog.get("ghost").is_err(), "adopted");
+        assert_eq!(db.query("SELECT id FROM items LIMIT 10").unwrap().rows.len(), 2);
+        // A CREATE of the name builds fresh shards; the orphan is untouched.
+        db.execute("CREATE COLLECTION ghost (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("ghost", row("g")).unwrap();
+        db.execute("FLUSH ghost").unwrap();
+        assert_eq!(db.query("SELECT id FROM ghost LIMIT 10").unwrap().rows.len(), 1);
+        assert_eq!(
+            fs::read(aside.join("MANIFEST")).unwrap(),
+            fs::read(items.join("MANIFEST")).unwrap(),
+            "the orphan's MANIFEST was written over"
+        );
+        // A CREATE over a shard directory that holds data is refused, with
+        // nothing changed: a MANIFEST, or a log with records in it.
+        let planted = colls.join("planted").join("shard-0000");
+        fs::create_dir_all(&planted).unwrap();
+        fs::copy(items.join("MANIFEST"), planted.join("MANIFEST")).unwrap();
+        let e =
+            db.execute("CREATE COLLECTION planted (id TEXT PRIMARY KEY)").unwrap_err().to_string();
+        assert!(e.contains("a shard's data is already there"), "{e}");
+        assert!(db.catalog.get("planted").is_err(), "the refused CREATE left the collection");
+        assert!(planted.join("MANIFEST").exists(), "the refusal removed the data");
+        let logged = colls.join("logged").join("shard-0000");
+        fs::create_dir_all(&logged).unwrap();
+        fs::copy(items.join("wal.log"), logged.join("wal.log")).unwrap();
+        let e =
+            db.execute("CREATE COLLECTION logged (id TEXT PRIMARY KEY)").unwrap_err().to_string();
+        assert!(e.contains("a shard's data is already there"), "{e}");
+        // A RANGE and an empty log -- a CREATE that ended before the
+        // catalog -- are built over.
+        let fresh = colls.join("fresh").join("shard-0000");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("RANGE"), b"\n").unwrap();
+        fs::write(fresh.join("wal.log"), b"").unwrap();
+        db.execute("CREATE COLLECTION fresh (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("fresh", row("f")).unwrap();
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A followed copy's directory entry is fsynced in `followed/`, the
+    /// directory that holds it: the copy `ensure_followed` makes from
+    /// nothing, and the one a demotion renames into place. Until 0.99.0
+    /// each fsynced the collection's directory alone, one level above the
+    /// new entry, which a crash could then take back.
+    #[test]
+    fn a_followed_copys_entry_is_fsynced_in_the_directory_that_holds_it() {
+        let dir = tmp("followed-entry");
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        let mut db = Db::open(&dir, opts).unwrap();
+        let mut coll = crate::catalog::Collection::new("items", "id", None);
+        coll.replicas = 2;
+        db.catalog.create(coll).unwrap();
+        db.catalog.placement.insert(
+            "items".into(),
+            vec![Tablet {
+                node: "tcp://127.0.0.1:2".into(),
+                followers: vec!["tcp://127.0.0.1:1".into()],
+                ..Default::default()
+            }],
+        );
+        let cdir = dir.join("collections").join("items");
+        let followed = cdir.join("followed");
+        durability_probe::start();
+        db.ensure_followed("items").unwrap();
+        let ev = durability_probe::take();
+        let created = ev.at(Op::WalCreate, &followed.join("shard-0000").join("wal.log")).unwrap();
+        assert!(
+            ev.at_after(Op::DirSync, &followed, created).is_some(),
+            "the copy's entry in `followed/` was never fsynced: {ev:?}"
+        );
+        assert!(ev.at_after(Op::DirSync, &cdir, created).is_some(), "{ev:?}");
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The demotion's leg of the same claim: the held shard renamed into
+    /// `followed/` has its new entry fsynced there.
+    #[test]
+    fn a_demotions_rename_into_followed_is_fsynced_there() {
+        let dir = tmp("demote-entry");
+        let mut opts = DbOpts::default();
+        opts.node = Some("tcp://127.0.0.1:1".into());
+        let mut db = Db::open(&dir, opts).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY)").unwrap();
+        db.insert("items", Value::obj(vec![("id".into(), Value::Str("a".into()))])).unwrap();
+        // The map says another node holds the shard now and this one
+        // follows: what the promoted node's word leaves this node to do.
+        let mut t = db.catalog.placement.get("items").unwrap().clone();
+        t[0].node = "tcp://127.0.0.1:2".into();
+        t[0].followers = vec!["tcp://127.0.0.1:1".into()];
+        db.catalog.placement.insert("items".into(), t);
+        let cdir = dir.join("collections").join("items");
+        let to = cdir.join("followed").join("shard-0000");
+        durability_probe::start();
+        db.demote_here("items", 0).unwrap();
+        let ev = durability_probe::take();
+        let renamed = ev.at(Op::Rename, &to).expect("the demotion's rename is recorded");
+        assert!(
+            ev.at_after(Op::DirSync, &cdir.join("followed"), renamed).is_some(),
+            "the copy's new entry in `followed/` was never fsynced: {ev:?}"
+        );
+        assert!(ev.at_after(Op::DirSync, &cdir, renamed).is_some(), "{ev:?}");
+        assert!(ev.unpublished_renames().is_empty(), "{:?}", ev.unpublished_renames());
+        assert!(db.followed().lock().unwrap().contains_key(&("items".to_string(), 0)));
+        assert!(!cdir.join("shard-0000").exists() && to.join("wal.log").exists());
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A split's new shard directory has its `segments/` and `deletes/`
+    /// fsynced before the catalog names the shard, as a move's pull does:
+    /// the links are entries of those directories, and the fsync of the
+    /// directory above them (0.99.0) published none of them.
+    #[test]
+    fn a_splits_new_shard_has_its_subdirectories_fsynced_before_the_catalog_names_it() {
+        let dir = tmp("split-subdirs");
+        let mut db = Db::open(&dir, DbOpts::default()).unwrap();
+        db.execute("CREATE COLLECTION items (id TEXT PRIMARY KEY, n INT)").unwrap();
+        for i in 0..40i64 {
+            db.insert(
+                "items",
+                Value::obj(vec![
+                    ("id".into(), Value::Str(format!("k{i:04}"))),
+                    ("n".into(), Value::Int(i)),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute("FLUSH items").unwrap();
+        let incoming = dir.join("collections").join("items").join("shard-0001.incoming");
+        durability_probe::start();
+        match db.execute("SPLIT SHARD 0 OF items AT 'k0020'").unwrap().finished().unwrap() {
+            Outcome::Ack(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let ev = durability_probe::take();
+        let catalog =
+            ev.at(Op::TempSync, &dir.join("CATALOG.tmp")).expect("the catalog names the shard");
+        for sub in ["segments", "deletes"] {
+            let synced = ev
+                .at(Op::DirSync, &incoming.join(sub))
+                .unwrap_or_else(|| panic!("`{sub}/` of the new shard was never fsynced: {ev:?}"));
+            assert!(synced < catalog, "`{sub}/` fsynced after the catalog named the shard: {ev:?}");
+        }
+        assert_eq!(db.query("SELECT id FROM items LIMIT 100").unwrap().rows.len(), 40);
+        drop(db);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A followed copy whose sync failed is recovered in place by the next
