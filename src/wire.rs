@@ -1685,8 +1685,14 @@ impl Node {
             .collect()
     }
 
-    pub fn abort_move(&self, collection: &str, shard: usize) -> Result<()> {
-        self.call(Call::AbortMove, collection, shard, &[]).map(|_| ())
+    /// Let the source go of its pin. `force` takes a fenced pin too: what
+    /// a target that holds nothing sends when it gives the move up after
+    /// the fence. A trailing byte a source from before it ignores, and a
+    /// caller from before it never sends.
+    pub fn abort_move(&self, collection: &str, shard: usize, force: bool) -> Result<()> {
+        let mut body = Vec::new();
+        put_bool(&mut body, force);
+        self.call(Call::AbortMove, collection, shard, &body).map(|_| ())
     }
 
     /// Tell the source its pinned shard is fenced: every file is here.
@@ -2678,8 +2684,40 @@ fn handle(
             // shard before this node takes its writes, or a scan planned on
             // the old map read the source's copy after a write landed here
             // and missed it. A source too old to know the fence keeps the
-            // old window, and is not waited for.
-            let _ = source.fence_move(&collection, shard);
+            // old window, and is not waited for. Any other answer -- the
+            // pin let go before the switch, an abort having landed first,
+            // or none -- and a budget run out here are a move this node
+            // does not finish: the files pulled go, and the source is told
+            // to let its pin go, fenced or not, since nothing here takes
+            // the map now. (The fence's answer used to be discarded and
+            // the adoption ran under a fresh budget of its own, so a
+            // target adopted after the source's pin was aborted, or after
+            // the coordinator had given the move up and aborted it: two
+            // holders, and the writes the source took meanwhile removed
+            // with its directory at the switch.)
+            let let_go = |why: String| -> String {
+                let _ = std::fs::remove_dir_all(&incoming);
+                let _deadline = crate::deadline::arm(Some(5_000));
+                let _ = source.abort_move(&collection, shard, true);
+                format!(
+                    "shard {shard} of `{collection}` was not taken here: {why}; the shard stays \
+                     whole on {from}"
+                )
+            };
+            match source.fence_move(&collection, shard) {
+                Ok(()) => {}
+                Err(Error::Storage(m)) if m == "wire: unknown call" => {}
+                Err(e) => {
+                    return Err(Error::Plan(let_go(format!(
+                        "the source did not fence its pin before the switch ({e})"
+                    ))))
+                }
+            }
+            if let Err(e) = crate::deadline::check() {
+                return Err(Error::Deadline(let_go(format!(
+                    "the move's budget ran out before the switch ({e})"
+                ))));
+            }
             let switch = db
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
@@ -2765,7 +2803,10 @@ fn handle(
         Call::AbortMove => {
             // By order: the operator's statement, or a coordinator whose
             // move failed, either way a target to hold off for the grace.
-            db.exclusive().abort_move_by_order(&collection, shard);
+            // The trailing byte forces a fenced pin; a caller from before
+            // it sends none.
+            let force = get_bool(body, &mut 0).unwrap_or(false);
+            db.exclusive().abort_move_by_order(&collection, shard, force)?;
         }
         Call::Hello => unreachable!("answered above"),
         Call::Catalog => {

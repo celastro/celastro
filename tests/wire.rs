@@ -1843,6 +1843,168 @@ fn a_move_whose_target_stops_answering_fails_at_its_deadline_and_releases_the_pi
     }
 }
 
+/// An `ABORT MOVE` once the target has fenced the source is past
+/// aborting: the target holds every file and has taken the map, so the
+/// abort is refused naming it and the switch is carried to the source
+/// instead, the move complete; a write meanwhile is refused or lands on
+/// the target, never acknowledged by the source and then lost at the
+/// switch. Until now the abort dropped the fenced pin, the source
+/// acknowledged writes at the old term, and the carry removed its
+/// directory with them.
+#[test]
+fn an_abort_of_a_fenced_move_is_refused_naming_the_target_and_loses_no_write() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("fenced-a");
+    let b = Node::start("fenced-b");
+    let c = Node::start("fenced-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..9usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    assert!(a.local_shards("items").contains(&0));
+    let count = |n: &Node| {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    assert_eq!(count(&c), 9);
+    // The move from the source itself, as an operator at the holder
+    // issues it; the target's carry stalls on its first peer for six
+    // seconds, and the source is fenced meanwhile, its own map still
+    // naming itself.
+    celastro::wire::fault::hold_next("statement", 6000);
+    let mover = {
+        let db = a.db.clone();
+        let sql = format!("MOVE SHARD 0 OF items TO '{}'", b.url);
+        std::thread::spawn(move || {
+            let out = db.write().unwrap().execute(&sql).map_err(|e| e.to_string())?;
+            out.finished_with(&db).map(|o| format!("{o:?}")).map_err(|e| e.to_string())
+        })
+    };
+    let fenced = || match a.query("SELECT count(*) AS n FROM items WHERE tenant = 't0'") {
+        Err(e) => e.to_string().contains("map is switching"),
+        Ok(_) => false,
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < until && !(fenced() && b.local_shards("items").contains(&0)) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(fenced(), "a was never fenced");
+    // Under the fence a write is refused naming the move.
+    let e = c.exec(&insert_sql(30)).and_then(|o| o.finished_with(&c.db)).unwrap_err().to_string();
+    assert!(e.contains("is moving to"), "{e}");
+    let abort = match c.exec("ABORT MOVE SHARD 0 OF items").and_then(|o| o.finished_with(&c.db)) {
+        Ok(o) => Ok(format!("{o:?}")),
+        Err(e) => Err(e.to_string()),
+    };
+    // A write after the abort: refused, or landed where it is read.
+    let landed = c.exec(&insert_sql(30)).and_then(|o| o.finished_with(&c.db)).is_ok();
+    let moved = mover.join().unwrap();
+    assert!(moved.as_deref().is_ok_and(|m| m.contains("map switched")), "{moved:?}");
+    for n in [&a, &b, &c] {
+        let g = n.db.read().unwrap();
+        let t = &g.catalog.placement["items"][0];
+        assert_eq!((t.node.as_str(), t.term), (b.url.as_str(), 1), "{}", n.url);
+    }
+    assert!(!a.local_shards("items").contains(&0), "{:?}", a.local_shards("items"));
+    assert_eq!(count(&b), 9 + i64::from(landed), "an acknowledged write was lost at the switch");
+    if landed {
+        let r = b.query("SELECT id FROM items WHERE id = 'doc-030'").unwrap();
+        assert_eq!(r.rows.len(), 1, "doc-030 was acknowledged and is on no holder");
+    }
+    let e = abort.expect_err("the abort of a fenced move was not refused");
+    assert!(e.contains(&b.url) && e.contains("not aborted") && e.contains("complete"), "{e}");
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// An abort landing between the target's last chunk and its fence: the
+/// fence is refused ("not pinned"), and the target fails the pull rather
+/// than adopt -- the files pulled removed, the source whole and taking
+/// writes, the move statement reporting the failure. Until now the
+/// fence's answer was discarded and the target adopted a shard whose
+/// source had let the pin go: two holders.
+#[test]
+fn an_abort_before_the_fence_fails_the_pull_and_leaves_the_shard_on_the_source() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let a = Node::start("prefence-a");
+    let b = Node::start("prefence-b");
+    let c = Node::start("prefence-c");
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(&format!("ATTACH NODE '{}'", c.url));
+    a.ack(CREATE);
+    for i in 0..9usize {
+        a.db.write().unwrap().insert("items", doc(i)).unwrap();
+    }
+    let count = |n: &Node| {
+        let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+        r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+    };
+    // The move from the source itself. The fence is held three seconds
+    // before it is sent: every file is on b by then, and the abort lands
+    // in between.
+    celastro::wire::fault::hold_next("fence_move", 3000);
+    let mover = {
+        let db = a.db.clone();
+        let sql = format!("MOVE SHARD 0 OF items TO '{}'", b.url);
+        std::thread::spawn(move || {
+            let out = db.write().unwrap().execute(&sql).map_err(|e| e.to_string())?;
+            out.finished_with(&db).map(|o| format!("{o:?}")).map_err(|e| e.to_string())
+        })
+    };
+    // Pinned: a write is refused naming the move (one that beats the pin
+    // lands, and is counted).
+    let mut landed_first = 0i64;
+    let mut pinned = false;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut i = 30usize;
+    while std::time::Instant::now() < until {
+        match c.exec(&insert_sql(i)).and_then(|o| o.finished_with(&c.db)) {
+            Err(e) if e.to_string().contains("is moving to") => {
+                pinned = true;
+                break;
+            }
+            Err(e) => panic!("{e}"),
+            Ok(_) => landed_first += 1,
+        }
+        i += 3;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(pinned, "the shard was never pinned");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let m = c.ack("ABORT MOVE SHARD 0 OF items");
+    assert!(m.contains("is aborted") && m.contains("released"), "{m}");
+    let moved = mover.join().unwrap();
+    assert!(moved.is_err(), "the move completed after the abort: {moved:?}");
+    let e = moved.unwrap_err();
+    assert!(e.contains("was not taken") && e.contains("did not fence"), "{e}");
+    assert!(!b.local_shards("items").contains(&0), "{:?}", b.local_shards("items"));
+    assert!(!b.dir.join("collections/items/shard-0000.incoming").exists());
+    assert!(!b.dir.join("collections/items/shard-0000").exists());
+    assert!(a.local_shards("items").contains(&0));
+    for n in [&a, &b, &c] {
+        let g = n.db.read().unwrap();
+        let t = &g.catalog.placement["items"][0];
+        assert_eq!((t.node.as_str(), t.term), (a.url.as_str(), 0), "{}", n.url);
+    }
+    // The pin is gone: a write lands, and the shard is whole.
+    c.ack(&insert_sql(60));
+    assert_eq!(count(&c), 10 + landed_first);
+    for n in [a, b, c] {
+        let d = n.dir.clone();
+        drop(n);
+        settle();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// `SHOW HEALTH` dials its peers holding no lock: with a peer that never
 /// answers, a write on this node lands while the report waits out the
 /// deadline. Until 0.98.0 the dials ran under the read lock, and one

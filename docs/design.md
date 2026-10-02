@@ -708,7 +708,19 @@ shard onto a node while the first runs is refused by name; the copy has
 a deadline, `CELASTRO_MOVE_TIMEOUT`, and `ABORT MOVE SHARD` releases the
 pin from any node, after which no move of the shard begins for thirty
 seconds, so a target that comes back late cannot pin it again; all
-0.98.0). A rebalance pins its moves and
+0.98.0). A fenced pin is past aborting: the target holds every file and
+takes the map next, so the source refuses the abort; the target itself
+fails its pull -- the files pulled removed, the pin released by force,
+since it takes nothing -- when the fence is refused (an abort landed
+first) or the move's budget ran out before the switch; and the node
+that issued the abort asks the target's catalog with no lock held,
+carrying the switch to the source when the target has taken the map
+(the move complete) and leaving the pin otherwise. (0.98.0 discarded
+the fence's answer and adopted under a fresh budget, so an abort during
+the switch -- the operator's, or the coordinator's at its deadline --
+left two holders, and the writes the source acknowledged after the
+abort went with its directory at the switch.) A rebalance pins its
+moves and
 copies them one after another the same way, applying only each move's
 entry to a target's map, since a plan's map is as of its pin. The drill's
 third-node move is the check, and a test with writes flowing through the

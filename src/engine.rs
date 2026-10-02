@@ -4730,22 +4730,49 @@ impl Db {
     /// whose move failed -- which also holds the aborted target off the
     /// shard for the grace: a target that stopped answering and comes
     /// back to pin it again is refused; a move to any other node goes.
-    pub fn abort_move_by_order(&mut self, collection: &str, shard: usize) {
+    /// A fenced pin is refused unless `force`: the target holds every
+    /// file and takes the map next, and the pin let go here would have
+    /// this node acknowledge writes the switch then removes with the
+    /// directory. Forced by the target itself when it gives the move up
+    /// after the fence, knowing it takes nothing.
+    pub fn abort_move_by_order(
+        &mut self,
+        collection: &str,
+        shard: usize,
+        force: bool,
+    ) -> Result<()> {
         let key = (collection.to_string(), shard);
-        let to =
-            self.moves.lock().unwrap_or_else(|p| p.into_inner()).remove(&key).map(|m| m.to.clone());
+        let to = {
+            let mut moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
+            let fenced = moves.get(&key).filter(|m| m.fenced()).map(|m| m.to.clone());
+            if let Some(to) = fenced {
+                if !force {
+                    return Err(Error::Plan(fence_refusal(collection, shard, &to)));
+                }
+            }
+            moves.remove(&key).map(|m| m.to.clone())
+        };
         if let Some(to) = to {
             self.recently_aborted.insert(key, (Instant::now(), to));
         }
         let grace = self.move_abort_grace;
         self.recently_aborted.retain(|_, (at, _)| at.elapsed() < grace);
+        Ok(())
     }
 
     /// `ABORT MOVE SHARD i OF c`, from wherever it is issued: the pin on
     /// the source released -- here when this node is the source, over the
     /// wire otherwise, as deferred work holding no lock -- so the shard
     /// takes writes again; the target's copy fails at its next read, and
-    /// no move of the shard begins within the grace.
+    /// no move of the shard begins within the grace. A pin the target has
+    /// fenced is past the word alone: the target holds every file and may
+    /// have taken the map, and the pin let go then would have the source
+    /// acknowledge writes the switch removes with the directory. The
+    /// target's catalog decides, asked with no lock held
+    /// (`settle_fenced_abort`): the move complete, the switch is carried
+    /// to the source and the abort refused saying so; the pin gone
+    /// meanwhile, aborted; else the pin stays and the refusal names the
+    /// target and the two ways out.
     pub fn abort_move_statement(&mut self, collection: &str, shard: usize) -> Result<Outcome> {
         let tablets = self.catalog.placement.get(collection).cloned().ok_or_else(|| {
             Error::Plan(format!("collection `{collection}` has no placement map"))
@@ -4767,16 +4794,61 @@ impl Db {
             if from.is_empty() { "this node" } else { &from },
             self.move_abort_grace.as_secs()
         );
+        let seen = t.term;
+        let dialer = self.dialer();
         if from.is_empty() || self.is_self(&from) {
-            self.abort_move_by_order(collection, shard);
-            return Ok(Outcome::Ack(note));
+            let refusal = match self.abort_move_by_order(collection, shard, false) {
+                Ok(()) => return Ok(Outcome::Ack(note)),
+                Err(e) => e,
+            };
+            let Some(to) = fenced_target(&refusal) else { return Err(refusal) };
+            // This node is the source: the target asked with the lock let
+            // go, the verdict applied under it again.
+            let moves = self.moves.clone();
+            let me = if from.is_empty() { "this node".to_string() } else { from };
+            let key = (collection.to_string(), shard);
+            let collection = collection.to_string();
+            return Ok(Outcome::Deferred(Deferred::then_under_lock(move || {
+                let _deadline = crate::deadline::arm(Some(10_000));
+                let pin_gone =
+                    || !moves.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&key);
+                let verdict =
+                    settle_fenced_abort(&dialer, &to, &me, &collection, shard, seen, &pin_gone);
+                Ok(Resume::new(move |db| match verdict {
+                    FencedVerdict::Complete(term) => {
+                        db.place_shard(&collection, shard, &to)?;
+                        Err(Error::Plan(move_completed(&collection, shard, &to, &me, term)))
+                    }
+                    FencedVerdict::Released => {
+                        db.abort_move_by_order(&collection, shard, false)?;
+                        Ok(Outcome::Ack(note))
+                    }
+                    FencedVerdict::Undecided(why) => Err(Error::Plan(why)),
+                }))
+            })));
         }
         let source = self.wire_node(&from)?;
         let (collection, shard_i) = (collection.to_string(), shard);
         Ok(Outcome::Deferred(Deferred::new(move || {
             let _deadline = crate::deadline::arm(Some(10_000));
-            source.abort_move(&collection, shard_i)?;
-            Ok(Outcome::Ack(note))
+            let refusal = match source.abort_move(&collection, shard_i, false) {
+                Ok(()) => return Ok(Outcome::Ack(note)),
+                Err(e) => e,
+            };
+            let Some(to) = fenced_target(&refusal) else { return Err(refusal) };
+            // The pin is gone once the source takes the abort.
+            let pin_gone = || source.abort_move(&collection, shard_i, false).is_ok();
+            match settle_fenced_abort(&dialer, &to, &from, &collection, shard_i, seen, &pin_gone) {
+                FencedVerdict::Complete(term) => {
+                    source.statement(
+                        &format!("LOCAL PLACE SHARD {shard_i} OF {collection} ON '{to}'"),
+                        &[],
+                    )?;
+                    Err(Error::Plan(move_completed(&collection, shard_i, &to, &from, term)))
+                }
+                FencedVerdict::Released => Ok(Outcome::Ack(note)),
+                FencedVerdict::Undecided(why) => Err(Error::Plan(why)),
+            }
         })))
     }
 
@@ -4908,10 +4980,12 @@ impl Db {
     }
 
     /// Let the source go of the pin, briefly: a source that does not answer
-    /// the abort is not waited for.
+    /// the abort is not waited for, and one that refuses it -- the pin
+    /// fenced, the target taking the map -- is a move completing without
+    /// this node: the switch, or the next reconcile, finishes it.
     fn move_abort(plan: &MovePlan) {
         let _deadline = crate::deadline::arm(Some(5_000));
-        let _ = plan.source.abort_move(&plan.collection, plan.shard);
+        let _ = plan.source.abort_move(&plan.collection, plan.shard, false);
     }
 
     /// The target's half of a move, on this node: pull every file of the
@@ -11818,6 +11892,100 @@ pub fn fenced_message(collection: &str, shard: usize, to: &str) -> String {
     format!(
         "shard {shard} of `{collection}` is moving to {to} and its map is switching; a read of \
          it here would miss the writes landing there -- retry"
+    )
+}
+
+/// What an abort of a fenced pin is refused with: the target holds every
+/// file and takes the map next. Names the target, for the node that
+/// issued the abort to ask it (`fenced_target`).
+pub fn fence_refusal(collection: &str, shard: usize, to: &str) -> String {
+    format!(
+        "shard {shard} of `{collection}`: its move to {to} is past aborting here; {to} holds \
+         every file and the map is switching, so the pin stays until the switch reaches this \
+         node (a node restarted while fenced comes back unpinned)"
+    )
+}
+
+/// The target a fenced pin's refusal names, when the error is one.
+fn fenced_target(e: &Error) -> Option<String> {
+    let Error::Plan(m) = e else { return None };
+    let rest = m.split_once(": its move to ")?.1;
+    Some(rest.split_once(" is past aborting here")?.0.to_string())
+}
+
+/// What an `ABORT MOVE` finds once the source refused it for a fenced pin.
+enum FencedVerdict {
+    /// The target's map names the target, at this term: the move is
+    /// complete, and the switch is carried to the source.
+    Complete(u64),
+    /// The pin went while asking: the target gave the move up and forced
+    /// it open itself, or the switch reached the source.
+    Released,
+    /// Nothing decided within the budget, and why: the pin stays.
+    Undecided(String),
+}
+
+/// The target asked, holding no lock, within the statement's budget: its
+/// catalog naming itself at a term past the one this node saw is the move
+/// complete; naming the source still, the target is about to take the
+/// map, or has given the move up and let the pin go itself (which
+/// `pin_gone` sees) -- asked again until one shows; not answering,
+/// nothing is decided and the pin stays. Never forced from here: a live
+/// target that has not taken the map yet takes it next, and a pin forced
+/// open before that is the window the fence closes.
+fn settle_fenced_abort(
+    dialer: &Dialer,
+    to: &str,
+    from: &str,
+    collection: &str,
+    shard: usize,
+    seen: u64,
+    pin_gone: &dyn Fn() -> bool,
+) -> FencedVerdict {
+    let started = Instant::now();
+    let ways_out = format!(
+        "a node restarted while fenced comes back unpinned, so a restart of {from} drops the pin \
+         once {to} is gone for good"
+    );
+    loop {
+        let cat = match dialer.dial(to).and_then(|n| n.catalog()) {
+            Ok(cat) => cat,
+            Err(e) => {
+                return FencedVerdict::Undecided(format!(
+                    "the move of shard {shard} of `{collection}` to {to} is not aborted: {from} \
+                     has fenced it ({to} holds every file and the map is switching) and {to} does \
+                     not answer ({e}); the pin stays. Retry once {to} answers: it has taken the \
+                     map by then, or given the move up; {ways_out}"
+                ));
+            }
+        };
+        if let Some(t) = cat.placement.get(collection).and_then(|v| v.get(shard)) {
+            if t.node == to && t.term > seen {
+                return FencedVerdict::Complete(t.term);
+            }
+        }
+        if pin_gone() {
+            return FencedVerdict::Released;
+        }
+        if crate::deadline::remaining_ms().unwrap_or(0) < 1_500 {
+            return FencedVerdict::Undecided(format!(
+                "the move of shard {shard} of `{collection}` to {to} is not aborted: {from} has \
+                 fenced it ({to} holds every file and the map is switching) and {to} had not \
+                 taken the map after {} s; the pin stays. Retry: {to} takes the map or gives the \
+                 move up next, and the move is then complete or aborted; {ways_out}",
+                started.elapsed().as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// What the abort of a move already complete says.
+fn move_completed(collection: &str, shard: usize, to: &str, from: &str, term: u64) -> String {
+    format!(
+        "the move of shard {shard} of `{collection}` to {to} is not aborted: {to} holds every \
+         file and has taken the map at term {term}; the switch is carried to {from} instead, and \
+         the move is complete"
     )
 }
 

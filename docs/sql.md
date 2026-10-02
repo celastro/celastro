@@ -659,6 +659,13 @@ issued, releases the pin at once -- the shard takes writes again, the
 target's copy fails at its next read -- and no move of the shard to the
 aborted target begins within thirty seconds of the abort, so a target
 that comes back late cannot pin it again; a move to another node goes.
+Once the target holds every file and has fenced the source (a read of
+the shard there says its map is switching), the abort is past: the
+statement asks the target and finds the move complete -- the switch is
+carried to the source, and the abort is refused saying so -- or the
+target still to take the map, in which case the pin stays and the
+statement says to retry; a target that does not answer leaves the pin
+too, and a source restarted while fenced comes back unpinned.
 
 ```
 shard 2 of `notes` moved from tcp://127.0.0.1:7879 to tcp://127.0.0.1:7877; 3 file(s), map switched here and on tcp://127.0.0.1:7878, tcp://127.0.0.1:7879
