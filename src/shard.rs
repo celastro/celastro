@@ -295,6 +295,16 @@ impl<'a> Searchable<'a> {
         }
     }
 
+    /// The commit instant of the version at `ord`: the identity a
+    /// `DELETE ... WHERE` carries back to the holder, so that it deletes
+    /// the version its select read and no other.
+    pub fn commit_ts(&self, ord: u32) -> Timestamp {
+        match self {
+            Searchable::Mem(m) => m.ordinals.commit_ts[ord as usize],
+            Searchable::Seg(h) => h.segment.ordinals.commit_ts[ord as usize],
+        }
+    }
+
     /// `(loads, fault-ins)` so far, for attributing decode and archive I/O to
     /// the unit that caused it.
     pub fn io_counters(&self) -> Option<(u64, u64)> {
@@ -3009,6 +3019,23 @@ impl Shard {
         best
     }
 
+    /// The commit instant of the version at `loc`, wherever it is.
+    fn commit_ts_at(&self, loc: Loc) -> Option<Timestamp> {
+        match loc {
+            Loc::Mem(ord) => self.memtable.ordinals.commit_ts.get(ord as usize).copied(),
+            Loc::Frozen(gen, ord) => self
+                .frozen
+                .iter()
+                .find(|f| f.gen == gen)
+                .and_then(|f| f.ordinals.commit_ts.get(ord as usize).copied()),
+            Loc::Seg(sid, ord) => self
+                .segments
+                .iter()
+                .find(|h| h.id() == sid)
+                .and_then(|h| h.segment.ordinals.commit_ts.get(ord as usize).copied()),
+        }
+    }
+
     /// A supersede mark for a record whose sync is deferred: placed now,
     /// and kept with the record's sequence until a sync covers it, so a
     /// sync that fails can take the mark back (`recover_log`) as the cut
@@ -3403,26 +3430,53 @@ impl Shard {
     /// [`Shard::retain_from`]. A row that is merely *deleted* is not in that
     /// class at the default: an unpinned seal still writes it, so a snapshot
     /// below the delete keeps reading it until a compaction collects.
+    /// `delete_many_at` for keys whatever their live version: the bare form
+    /// the holder's batch took before each key carried its instant, kept
+    /// for the tests of the log contract below.
+    #[cfg(test)]
+    pub(crate) fn delete_many(&mut self, keys: &[String]) -> Result<Vec<(String, Timestamp)>> {
+        let bare: Vec<(&str, Option<Timestamp>)> =
+            keys.iter().map(|k| (k.as_str(), None)).collect();
+        Ok(self.delete_many_at(&bare)?.0)
+    }
+
     /// `keys` deleted as one: every one live at the instant has its record
     /// appended, one sync for them all -- or one pending sync under a
     /// deferring caller -- and is then marked dead, as `delete` marks one.
     /// All or nothing on the log, as `insert_many` is. A key named twice
-    /// is deleted once; a key not there is not counted. The keys that were
-    /// there, with their instants.
-    pub(crate) fn delete_many(&mut self, keys: &[String]) -> Result<Vec<(String, Timestamp)>> {
+    /// is deleted once; a key not there is not counted. A key that comes
+    /// with the instant of the version its caller read is deleted only
+    /// while that is still its live version: one written since is left
+    /// alone and counted, not deleted. That is what a `DELETE ... WHERE`
+    /// carries to a holder on another node, so that a row a second client
+    /// wrote between its select and this call survives it. Equality and not
+    /// order, because the holders' clocks are not one clock, and the one
+    /// version the predicate admitted is the one that was read. The keys
+    /// deleted, with their instants, and how many were left alone.
+    pub(crate) fn delete_many_at(
+        &mut self,
+        keys: &[(&str, Option<Timestamp>)],
+    ) -> Result<(Vec<(String, Timestamp)>, usize)> {
         let mut unsynced = None;
         self.holders_check()?;
         self.writes.fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
         let mut seen = BTreeSet::new();
+        let mut skipped = 0usize;
         let mut prepared: Vec<(WalRecord, Loc)> = Vec::new();
-        for key in keys {
-            if !seen.insert(key.as_str()) {
+        for (key, at) in keys {
+            if !seen.insert(*key) {
                 continue;
             }
             let Some(prev) = self.locate(key, MAX_TS) else { continue };
+            if let Some(at) = at {
+                if self.commit_ts_at(prev) != Some(*at) {
+                    skipped += 1;
+                    continue;
+                }
+            }
             let record = WalRecord {
                 kind: WAL_DELETE,
-                key: key.clone(),
+                key: key.to_string(),
                 ts: self.clock.now(),
                 doc: None,
                 supersedes: true,
@@ -3431,7 +3485,7 @@ impl Shard {
             prepared.push((record, prev));
         }
         if prepared.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), skipped));
         }
         let defer = self.defer_sync;
         if let Some(w) = self.wal.as_mut() {
@@ -3474,7 +3528,7 @@ impl Shard {
             self.note_write(record.ts);
             out.push((record.key, record.ts));
         }
-        Ok(out)
+        Ok((out, skipped))
     }
 
     pub fn get(&self, key: &str, t: Timestamp) -> Result<Option<Value>> {

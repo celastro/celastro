@@ -367,6 +367,27 @@ a `DELETE ... WHERE` delivered again after a write it did not see, which
 takes the new rows too, because a predicate is evaluated when it runs; a
 client that cannot know nothing wrote in between deletes by key.
 
+A `DELETE ... WHERE` whose rows are on other nodes deletes the versions
+its select read (0.100.0). The predicate is evaluated once, at the
+select's instant; the keys on this node are deleted under the lock the
+select ran under, and the keys on another holder are carried to it after
+the lock is let go -- until 0.99.0 by key alone, so the holder deleted
+whatever version was live, and a row a second client rewrote and was
+acknowledged between the select and the carry was gone, counted in the
+acknowledgement, and had matched the predicate at no instant. The select
+now returns each row's version instant (wire version 8 carries it with
+every scan hit), the carry sends each key with it (`delete_many_at`),
+and the holder deletes a key only while that is still its live version:
+a key rewritten since is left alone and the acknowledgement counts it
+(`2 document(s) deleted, 1 skipped: rewritten since the select`), for a
+second statement to take if it still matches. Equality on the instant,
+not order: the holders' clocks are not one clock, and a rewrite stamped
+below the select's instant on a lagging holder would pass an order test.
+A holder on wire version 7 answers a scan without the instants, and one
+too old to know the call answers "unknown call": its keys are deleted as
+before, and the acknowledgement says how many were deleted unchecked on
+an older node. The keys on this node needed no change.
+
 Mixed versions were drilled on kind: three pods on 0.45.0, one upgraded to
 0.46.0 by a partitioned rollout, DDL from each side, a move each way, the
 rollout finished, then a rollback attempted. DDL worked both ways, since the
@@ -2567,11 +2588,13 @@ know the call is fed one at a time from where the batch stopped.
 Before 0.79.0 the holder wrote a batch one row at a time: one sync a
 row unless group commit folded them. A statement's deletes for another
 holder go the same way (`delete_many`, 0.80.0; one call and one sync a
-key before). And a call that writes -- a row, a batch, a delete, a
-forwarded statement -- is sent once: failed after its frame was
-written, it is not sent again over a fresh connection as a read is,
-since it may have landed and again it would land twice; its caller
-hears "after the call was sent: it may have landed there", and the
+key before; `delete_many_at` since 0.100.0, each key with the instant of
+the version the select read, which is the one the holder deletes -- the
+retry contract above says why). And a call that writes -- a row, a
+batch, a delete, a forwarded statement -- is sent once: failed after
+its frame was written, it is not sent again over a fresh connection as
+a read is, since it may have landed and again it would land twice; its
+caller hears "after the call was sent: it may have landed there", and the
 coordinator's acknowledgement names the rows to retry; and it goes out
 on a connection shown live within the last quarter second -- an idle
 one is asked with a hello first, so a process gone since is a redial,
@@ -3024,6 +3047,7 @@ guarantee:
 | a node away through DDL catches up when it reattaches: the index made and the one dropped while it was away, a collection created without it whose shard it then builds, a re-creation younger than its tombstone kept, and a drop flowing the other way; an `ALTER` is still refused naming the node | `wire::a_node_away_through_ddl_catches_up_when_it_reattaches` |
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
+| a `DELETE ... WHERE` across nodes deletes the versions its select read: a row rewritten on its holder between the select and the carry survives on every node and is counted as skipped; a holder too old for the checked call gets the bare one and the acknowledgement says how many went unchecked; a holder on the previous wire version's scan answer is read right | `wire::a_delete_by_predicate_leaves_a_row_rewritten_after_its_select_alone_and_says_so` (fails on 0.99.0: the acknowledged row is gone and counted), `wire::a_holder_that_knows_no_checked_delete_gets_the_bare_one_and_the_ack_says_unchecked`, `wire::a_holder_on_the_previous_wire_version_is_read_right_and_its_keys_are_deleted_unchecked`, `wire::tests::statistics_and_answers_survive_the_codec` (the scan answer with and without the instants) |
 | a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
 | a shard moves between nodes with no row lost or duplicated, every node agrees on the map, a pinned shard refuses writes naming the move, and an emptied node detaches | `wire::a_shard_moves_between_nodes_and_every_node_agrees` (source and target both elsewhere, target here, source here; answers on every node equal one process's after each; the refusal on a pinned shard and the write after the abort; `REBALANCE`; `DETACH` refused with the plan and accepted once empty; the map after a restart) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |

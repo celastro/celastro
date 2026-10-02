@@ -116,7 +116,13 @@ DELETE FROM notes WHERE topic = 'search';
 Every write is on disk before it is acknowledged. A `DELETE ... WHERE`
 whose predicate is a cut prefix (`text_match(body, 'a*')` past the
 expansion cap) is refused with nothing deleted, since it would not
-delete what it describes.
+delete what it describes. A `DELETE ... WHERE` whose rows are on other
+nodes deletes the versions its select read: a document another client
+rewrote between the select and the delete is left alone, and the reply
+counts it -- `2 document(s) deleted, 1 skipped: rewritten since the
+select` -- for a second statement to take if it still matches. A node on
+the previous release checks nothing, and the reply says how many
+documents were `deleted unchecked on an older node`.
 
 ## Reading
 

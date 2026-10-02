@@ -74,7 +74,11 @@ pub const WIRE_VERSION: u8 = 4;
 /// at that address (the zombie fence's server half). A node sends 5 only
 /// to a peer whose hello said it accepts 5, and accepts 4 from anyone, so
 /// a rolling upgrade across the bump still talks in both directions.
-pub const WIRE_VERSION_MAX: u8 = 7;
+/// Version 8 carries, in a scan's answer, the commit instant of each
+/// hit's version, which a `DELETE ... WHERE` carries back to the holder
+/// (`DeleteManyAt`); framed at 7 a scan answers without them, and the
+/// coordinator deletes those keys unchecked, as before.
+pub const WIRE_VERSION_MAX: u8 = 8;
 /// The environment variable both ends read the token from.
 pub const TOKEN_ENV: &str = "CELASTRO_WIRE_TOKEN";
 /// The port a node serves its shards on when none is given: `tcp://host`
@@ -185,6 +189,13 @@ enum Call {
     /// A holder too old to know the call answers "unknown call" and is
     /// fed one at a time.
     DeleteMany = 28,
+    /// `DeleteMany` with, beside each key, the commit instant of the version
+    /// the coordinator's select read: the holder deletes a key only while
+    /// that is still its live version, so a row another client rewrote
+    /// between the select and this call survives it, and the answer counts
+    /// those skipped beside those gone. A holder too old to know the call
+    /// answers "unknown call" and is sent `DeleteMany`, which checks nothing.
+    DeleteManyAt = 29,
     /// The node's catalog as it persists it: what a coordinator pulls at
     /// `ATTACH` so it plans over collections made before it was there.
     Catalog = 19,
@@ -248,6 +259,36 @@ pub mod fault {
             _ => None,
         }
     }
+    static UNKNOWN_NEXT: Mutex<Option<String>> = Mutex::new(None);
+    /// Answer the next call named `call` that reaches this process's
+    /// listener with "unknown call", as a node of a release before the
+    /// call would: what a caller's fallback for such a holder is tested
+    /// against.
+    pub fn unknown_call_next(call: &str) {
+        *UNKNOWN_NEXT.lock().unwrap_or_else(|p| p.into_inner()) = Some(call.to_string());
+    }
+    pub(super) fn take_unknown(call: Call) -> bool {
+        let mut g = UNKNOWN_NEXT.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_deref() == Some(call.name()) {
+            *g = None;
+            true
+        } else {
+            false
+        }
+    }
+    static WIRE_MAX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    /// Say in every hello from now on that this process speaks wire version
+    /// `v` at most (0 to stop saying so): what a holder of an older release
+    /// looks like to a coordinator, which then frames its calls at `v`.
+    pub fn advertise_wire_max(v: u8) {
+        WIRE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn wire_max() -> u8 {
+        match WIRE_MAX.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => super::WIRE_VERSION_MAX,
+            v => v,
+        }
+    }
 }
 
 impl Call {
@@ -261,6 +302,7 @@ impl Call {
                 | Call::InsertMany
                 | Call::Delete
                 | Call::DeleteMany
+                | Call::DeleteManyAt
                 | Call::Statement
                 | Call::CreateCollection
                 | Call::BeginMove
@@ -294,6 +336,7 @@ impl Call {
             26 => Call::Query,
             27 => Call::InsertMany,
             28 => Call::DeleteMany,
+            29 => Call::DeleteManyAt,
             15 => Call::BeginMove,
             16 => Call::ReadFile,
             17 => Call::PullShard,
@@ -328,6 +371,7 @@ impl Call {
             Call::Query => "query",
             Call::InsertMany => "insert_many",
             Call::DeleteMany => "delete_many",
+            Call::DeleteManyAt => "delete_many_at",
             Call::BeginMove => "begin_move",
             Call::ReadFile => "read_file",
             Call::PullShard => "pull_shard",
@@ -740,7 +784,9 @@ fn get_candidates(b: &[u8], i: &mut usize) -> Result<ShardCandidates> {
     Ok(ShardCandidates { per_source, explain, timed_out })
 }
 
-fn put_scan(out: &mut Vec<u8>, a: &ShardScan) {
+/// A scan's answer. `instants`, from wire version 8: each hit's version
+/// instant after its parent, zero for none; a frame at 7 carries none.
+fn put_scan(out: &mut Vec<u8>, a: &ShardScan, instants: bool) {
     put_uvarint(out, a.hits.len() as u64);
     for h in &a.hits {
         put_values(out, &h.sort);
@@ -761,12 +807,15 @@ fn put_scan(out: &mut Vec<u8>, a: &ShardScan) {
             }
             None => put_bool(out, false),
         }
+        if instants {
+            put_ts(out, h.ts.unwrap_or(0));
+        }
     }
     put_explain(out, &a.explain);
     put_bool(out, a.timed_out);
 }
 
-fn get_scan(b: &[u8], i: &mut usize) -> Result<ShardScan> {
+fn get_scan(b: &[u8], i: &mut usize, instants: bool) -> Result<ShardScan> {
     let n = get_count(b, i)?;
     let mut hits = Vec::with_capacity(n);
     for _ in 0..n {
@@ -780,7 +829,8 @@ fn get_scan(b: &[u8], i: &mut usize) -> Result<ShardScan> {
         } else {
             None
         };
-        hits.push(ScanHit { sort, key, doc, handle: (ui, ord), parent });
+        let ts = if instants { Some(get_ts(b, i)?).filter(|t| *t != 0) } else { None };
+        hits.push(ScanHit { sort, key, doc, handle: (ui, ord), parent, ts });
     }
     let explain = get_explain(b, i)?;
     let timed_out = get_bool(b, i)?;
@@ -1068,13 +1118,24 @@ impl Node {
     /// holder, so a connection the holder closed while idle costs nothing.
     /// A request frame: the head every call carries, then the body.
     fn request(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Vec<u8> {
+        self.request_at(self.frame_version(), call, collection, shard, body)
+    }
+
+    /// `request` framed at `version`, which the caller fixed (see `call_at`).
+    fn request_at(
+        &self,
+        version: u8,
+        call: Call,
+        collection: &str,
+        shard: usize,
+        body: &[u8],
+    ) -> Vec<u8> {
         // Version 5 to a peer that accepts it, when this node has an
         // identity to carry; 4 otherwise, and to a peer not asked yet.
-        let five = self.identity.is_some() && self.peer_wire.load(Ordering::Relaxed) >= 5;
-        let mut req = vec![self.frame_version()];
+        let mut req = vec![version];
         put_str(&mut req, &self.token);
-        if five {
-            let (node, epoch) = self.identity.as_ref().expect("checked");
+        if version >= 5 {
+            let (node, epoch) = self.identity.as_ref().expect("a frame past 4 carries an identity");
             put_str(&mut req, node);
             put_u64(&mut req, epoch.load(Ordering::Relaxed));
         }
@@ -1133,8 +1194,23 @@ impl Node {
     }
 
     fn call(&self, call: Call, collection: &str, shard: usize, body: &[u8]) -> Result<Vec<u8>> {
+        self.call_at(self.frame_version(), call, collection, shard, body)
+    }
+
+    /// `call` framed at `version`, fixed by the caller: a call whose answer's
+    /// shape depends on the version reads the answer by the one its frame
+    /// carried, not by a second look at the peer's hello, which another
+    /// connection may have refreshed in between.
+    fn call_at(
+        &self,
+        version: u8,
+        call: Call,
+        collection: &str,
+        shard: usize,
+        body: &[u8],
+    ) -> Result<Vec<u8>> {
         let deadline_ms = crate::deadline::remaining_ms();
-        let req = self.request(call, collection, shard, body);
+        let req = self.request_at(version, call, collection, shard, body);
         // A free slot, or the wait for one within the deadline.
         let started = Instant::now();
         let mut slot = loop {
@@ -1505,6 +1581,29 @@ impl Node {
         Ok((gone, stopped))
     }
 
+    /// `delete_many` with each key's version instant: how many were there
+    /// at that version and are gone, how many were left alone because their
+    /// live version was another, and the error that stopped it, if one did.
+    /// A holder too old to know the call answers "unknown call".
+    pub fn delete_many_at(
+        &self,
+        collection: &str,
+        keys: &[(String, Timestamp)],
+    ) -> Result<(usize, usize, Result<()>)> {
+        let mut body = Vec::new();
+        put_uvarint(&mut body, keys.len() as u64);
+        for (k, ts) in keys {
+            put_str(&mut body, k);
+            put_ts(&mut body, *ts);
+        }
+        let b = self.call(Call::DeleteManyAt, collection, 0, &body)?;
+        let mut i = 0;
+        let gone = get_num(&b, &mut i)?;
+        let skipped = get_num(&b, &mut i)?;
+        let stopped = get_stop(&b, &mut i)?;
+        Ok((gone, skipped, stopped))
+    }
+
     /// Run a statement on the node, which must carry its `LOCAL` prefix so
     /// that it does not fan out again from there.
     pub fn statement(&self, sql: &str, params: &[Value]) -> Result<String> {
@@ -1768,7 +1867,12 @@ impl Remote {
     }
 
     fn call(&self, call: Call, body: &[u8]) -> Result<Vec<u8>> {
-        match self.node.call(call, &self.collection, self.index, body) {
+        self.call_at(self.node.frame_version(), call, body)
+    }
+
+    /// `call` framed at `version`; see [`Node::call_at`].
+    fn call_at(&self, version: u8, call: Call, body: &[u8]) -> Result<Vec<u8>> {
+        match self.node.call_at(version, call, &self.collection, self.index, body) {
             // A holder that does not have the collection is a shard that is
             // not there -- a node back on an empty volume, which adopts
             // nothing older than its directory -- and to a statement that
@@ -1879,8 +1983,10 @@ impl ShardService for Remote {
                 self.index, self.collection
             )));
         }
-        let b = self.call(Call::Scan, &body)?;
-        get_scan(&b, &mut 0)
+        // Framed at the version the answer is read by: from 8 it carries
+        // each hit's version instant.
+        let b = self.call_at(version, Call::Scan, &body)?;
+        get_scan(&b, &mut 0, version >= 8)
     }
 
     fn documents(
@@ -2415,6 +2521,9 @@ fn handle(
     }
     let call = Call::from_u8(get_u8(frame, &mut i)?)
         .ok_or_else(|| Error::Storage("wire: unknown call".into()))?;
+    if fault::take_unknown(call) {
+        return Err(Error::Storage("wire: unknown call".into()));
+    }
     let collection = get_string(frame, &mut i)?;
     let shard = get_num(frame, &mut i)?;
     let deadline_ms = if get_bool(frame, &mut i)? {
@@ -2609,7 +2718,7 @@ fn handle(
         put_u64(&mut out, clock);
         put_u64(&mut out, epoch);
         out.push(CATALOG_VERSION);
-        out.push(WIRE_VERSION_MAX);
+        out.push(fault::wire_max());
         // The region, trailing: a peer from before it reads none.
         put_str(&mut out, identity.region.as_deref().unwrap_or(""));
         return Ok(out);
@@ -2721,6 +2830,29 @@ fn handle(
                 confirm.wait()?;
             }
             put_uvarint(&mut out, gone as u64);
+            put_stop(&mut out, stopped.as_ref());
+            return Ok(out);
+        }
+        Call::DeleteManyAt => {
+            let mut j = 0;
+            let n = get_count(body, &mut j)?;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let key = get_string(body, &mut j)?;
+                keys.push((key, get_ts(body, &mut j)?));
+            }
+            let (gone, skipped, stopped, confirm) = {
+                let d = db.exclusive();
+                let (gone, skipped, stopped) =
+                    d.deferring(|d| d.delete_many_here_at(&collection, keys))?;
+                (gone, skipped, stopped, d.confirmation())
+            };
+            drop(db);
+            if gone > 0 {
+                confirm.wait()?;
+            }
+            put_uvarint(&mut out, gone as u64);
+            put_uvarint(&mut out, skipped as u64);
             put_stop(&mut out, stopped.as_ref());
             return Ok(out);
         }
@@ -2911,7 +3043,7 @@ fn handle(
                         params: &params,
                         frontiers: &frontiers,
                     };
-                    put_scan(&mut out, &local.scan(&req)?);
+                    put_scan(&mut out, &local.scan(&req)?, version >= 8);
                 }
                 Call::Documents => {
                     let mv = get_u64(body, &mut j).ok_or_else(truncated)?;
@@ -3309,11 +3441,13 @@ mod tests {
             )])),
             handle: (1, 2),
             parent: Some(vec![1, 2, 3]),
+            ts: Some(5),
         };
         let mut scan = Vec::new();
         put_scan(
             &mut scan,
             &ShardScan { hits: vec![hit], explain: ShardExplain::default(), timed_out: true },
+            true,
         );
         let mut cands = Vec::new();
         put_candidates(
@@ -3342,7 +3476,7 @@ mod tests {
         let mut pairs = Vec::new();
         put_pairs(&mut pairs, &[("k".into(), "v".into())]);
         crate::fuzz::sweep(21, &[scan], 5000, |b| {
-            let _ = get_scan(b, &mut 0);
+            let _ = get_scan(b, &mut 0, true);
         });
         crate::fuzz::sweep(22, &[cands], 5000, |b| {
             let _ = get_candidates(b, &mut 0);
@@ -3418,21 +3552,29 @@ mod tests {
             doc: Some(Value::Str("d".into())),
             handle: (2, 9),
             parent: Some(vec![1, 2]),
+            ts: Some(77),
         };
         let mut sx = ShardExplain::default();
         sx.index = 4;
         sx.manifest_version = 11;
         let a = ShardScan { hits: vec![hit], explain: sx, timed_out: true };
         let mut out = Vec::new();
-        put_scan(&mut out, &a);
-        let back = get_scan(&out, &mut 0).unwrap();
+        put_scan(&mut out, &a, true);
+        let back = get_scan(&out, &mut 0, true).unwrap();
         assert_eq!(back.hits.len(), 1);
         assert_eq!(back.hits[0].key, "k");
         assert_eq!(back.hits[0].handle, (2, 9));
         assert_eq!(back.hits[0].parent, Some(vec![1, 2]));
+        assert_eq!(back.hits[0].ts, Some(77));
         assert!(back.timed_out);
         assert_eq!((back.explain.index, back.explain.manifest_version), (4, 11));
         assert!(back.explain.rendered.is_some(), "the holder renders its own block");
+        // Framed at 7 the instant stays home, and the reader expects none.
+        let mut seven = Vec::new();
+        put_scan(&mut seven, &a, false);
+        let back = get_scan(&seven, &mut 0, false).unwrap();
+        assert_eq!((back.hits[0].key.as_str(), back.hits[0].ts), ("k", None));
+        assert!(back.timed_out);
     }
 
     #[test]

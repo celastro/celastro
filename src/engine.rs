@@ -7175,9 +7175,34 @@ impl Db {
         collection: &str,
         keys: Vec<String>,
     ) -> Result<(usize, Option<Error>)> {
+        let bare = keys.into_iter().map(|k| (k, None)).collect();
+        let (gone, _, stopped) = self.delete_keys_here(collection, bare)?;
+        Ok((gone, stopped))
+    }
+
+    /// `delete_many_here` with each key's version instant (the wire's
+    /// `DeleteManyAt`): a key is deleted only while that is its live
+    /// version, and how many were left alone for having another comes back
+    /// beside how many are gone.
+    pub fn delete_many_here_at(
+        &mut self,
+        collection: &str,
+        keys: Vec<(String, Timestamp)>,
+    ) -> Result<(usize, usize, Option<Error>)> {
+        let at = keys.into_iter().map(|(k, ts)| (k, Some(ts))).collect();
+        self.delete_keys_here(collection, at)
+    }
+
+    /// Both of the above: how many are gone, how many were left alone, and
+    /// the error that stopped it.
+    fn delete_keys_here(
+        &mut self,
+        collection: &str,
+        keys: Vec<(String, Option<Timestamp>)>,
+    ) -> Result<(usize, usize, Option<Error>)> {
         self.catalog.get(collection)?;
-        let mut here: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        for (i, key) in keys.into_iter().enumerate() {
+        let mut here: BTreeMap<usize, Vec<(String, Option<Timestamp>)>> = BTreeMap::new();
+        for (i, (key, at)) in keys.into_iter().enumerate() {
             let checked = (|| -> Result<usize> {
                 if let Some(url) = self.owner_of(collection, &key)? {
                     return Err(Error::Plan(format!(
@@ -7195,21 +7220,23 @@ impl Db {
                     .ok_or_else(|| Error::Plan(format!("no shard owns key `{key}`")))
             })();
             match checked {
-                Ok(idx) => here.entry(idx).or_default().push(key),
-                Err(e) => return Ok((0, Some(e.prefixed(&format!("key {i}: "))))),
+                Ok(idx) => here.entry(idx).or_default().push((key, at)),
+                Err(e) => return Ok((0, 0, Some(e.prefixed(&format!("key {i}: "))))),
             }
         }
         if let Err(e) = self.lease_check() {
-            return Ok((0, Some(e)));
+            return Ok((0, 0, Some(e)));
         }
-        let mut gone = 0usize;
+        let (mut gone, mut skipped) = (0usize, 0usize);
         for (idx, batch) in here {
-            let (deleted, index) = {
+            let batch: Vec<(&str, Option<Timestamp>)> =
+                batch.iter().map(|(k, at)| (k.as_str(), *at)).collect();
+            let (deleted, left, index) = {
                 let shards = self.shards.get_mut(collection).expect("checked above");
                 let (defer, pending) = (self.defer_syncs, &mut self.pending_syncs);
-                match Db::on_shard(defer, pending, &mut shards[idx], |s| s.delete_many(&batch)) {
-                    Ok(deleted) => (deleted, shards[idx].index),
-                    Err(e) => return Ok((gone, Some(e))),
+                match Db::on_shard(defer, pending, &mut shards[idx], |s| s.delete_many_at(&batch)) {
+                    Ok((deleted, left)) => (deleted, left, shards[idx].index),
+                    Err(e) => return Ok((gone, skipped, Some(e))),
                 }
             };
             let mut last = 0;
@@ -7221,8 +7248,9 @@ impl Db {
                 self.recent_writes.push((collection.to_string(), index, last));
             }
             gone += deleted.len();
+            skipped += left;
         }
-        Ok((gone, None))
+        Ok((gone, skipped, None))
     }
 
     pub fn flush(&mut self, collection: &str) -> Result<usize> {
@@ -8093,7 +8121,7 @@ impl Db {
     /// A delete by predicate: the keys it selects, then each deleted here
     /// or carried to its holder. Under the lock, as every statement.
     fn delete_where(&mut self, d: DeleteStmt, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let (keys, cut): (Vec<String>, Vec<String>) = match &d.predicate {
+        let (keys, cut): (Vec<(String, Option<Timestamp>)>, Vec<String>) = match &d.predicate {
             None => {
                 return Err(Error::Plan(
                     "DELETE without WHERE is refused; add a predicate or drop the \
@@ -8109,7 +8137,17 @@ impl Db {
                 // statement shape where a short answer does write
                 // work.
                 let r = self.run_select(&sel, sql, params, false)?;
-                (r.rows.iter().map(|x| x.key.clone()).collect(), r.truncated_prefixes.clone())
+                // Each key with the instant of the version the select read,
+                // for its holder to check against the live one. A holder
+                // that did not say (one on a wire version before 8) has its
+                // keys deleted unchecked, as before.
+                let keys = r
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (x.key.clone(), r.version_instants.get(i).copied().flatten()))
+                    .collect();
+                (keys, r.truncated_prefixes.clone())
             }
         };
         // REFUSED, and before a single `delete_key`. The choice is
@@ -8164,8 +8202,8 @@ impl Db {
             )));
         }
         let mut n = 0;
-        let mut away: Away<String> = BTreeMap::new();
-        for k in keys {
+        let mut away: Away<(String, Option<Timestamp>)> = BTreeMap::new();
+        for (k, at) in keys {
             match self.owner_of(&d.collection, &k)? {
                 None => {
                     if self.delete_key_here(&d.collection, &k)? {
@@ -8174,7 +8212,7 @@ impl Db {
                 }
                 Some(url) => {
                     let conn = self.node_conn(&url)?;
-                    away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push(k);
+                    away.entry(url).or_insert_with(|| (conn, Vec::new())).1.push((k, at));
                 }
             }
         }
@@ -8189,8 +8227,8 @@ impl Db {
         Ok(Outcome::Deferred(Deferred::new(move || {
             // This node's syncs before the carry, as an insert's: see there.
             confirm.wait()?;
-            let n = n + carry_deletes(&collection, away, remaining, &dialer, chunk)?;
-            Ok(Outcome::Ack(format!("{n} document(s) deleted")))
+            let carried = carry_deletes(&collection, away, remaining, &dialer, chunk)?;
+            Ok(Outcome::Ack(delete_ack(n + carried.deleted, carried.skipped, carried.unchecked)))
         })))
     }
 
@@ -11160,31 +11198,149 @@ fn delete_many_in_chunks(
     Ok((gone, sent, Ok(())))
 }
 
+/// `delete_many_in_chunks` with each key's version instant: how many are
+/// gone, how many the holder left alone as rewritten since, how many keys
+/// were sent, and the error that stopped it, if one did.
+fn delete_many_at_in_chunks(
+    n: &crate::wire::Node,
+    collection: &str,
+    keys: &[(String, Timestamp)],
+    chunk: usize,
+) -> Result<(usize, usize, usize, Result<()>)> {
+    let (mut gone, mut skipped, mut sent) = (0usize, 0usize, 0usize);
+    for part in keys.chunks(chunk.max(1)) {
+        let (g, s, stopped) = n.delete_many_at(collection, part)?;
+        gone += g;
+        skipped += s;
+        if let Err(e) = stopped {
+            return Ok((gone, skipped, sent, Err(e)));
+        }
+        sent += part.len();
+    }
+    Ok((gone, skipped, sent, Ok(())))
+}
+
+/// What a carry left on the holders: the keys gone, the keys left alone
+/// because their live version was not the one the select read, and the
+/// keys deleted with no check made -- on a holder too old to make one.
+#[derive(Default, Clone, Copy)]
+struct Carried {
+    deleted: usize,
+    skipped: usize,
+    unchecked: usize,
+}
+
+/// The acknowledgement of a `DELETE ... WHERE`: the count, then what it
+/// leaves out and what it could not vouch for.
+fn delete_ack(deleted: usize, skipped: usize, unchecked: usize) -> String {
+    let mut m = format!("{deleted} document(s) deleted");
+    if skipped > 0 {
+        m = format!("{m}, {skipped} skipped: rewritten since the select");
+    }
+    if unchecked > 0 {
+        m = format!("{m}, {unchecked} deleted unchecked on an older node");
+    }
+    m
+}
+
+/// Each holder's keys deleted there, one thread a holder. The keys whose
+/// version instant the select gave are checked on the holder
+/// (`DeleteManyAt`), and a key rewritten since is left alone and counted;
+/// the rest -- from a holder too old to say, or for one too old to know the
+/// call -- are deleted as before, and counted as deleted unchecked.
 fn carry_deletes(
     collection: &str,
-    away: Away<String>,
+    away: Away<(String, Option<Timestamp>)>,
     remaining: Option<u64>,
     dialer: &Dialer,
     chunk: usize,
-) -> Result<usize> {
-    let answers: Vec<Result<usize>> = std::thread::scope(|scope| {
+) -> Result<Carried> {
+    let answers: Vec<Result<Carried>> = std::thread::scope(|scope| {
         let handles: Vec<_> = away
             .values()
             .map(|(n, keys)| {
                 let n = n.clone();
                 scope.spawn(move || {
                     let _deadline = crate::deadline::arm(remaining);
-                    let mut n_deleted = 0;
+                    let mut tally = Carried::default();
                     let mut moved = Moved::default();
-                    // The holder's keys in calls of a chunk each; a holder
-                    // too old to know the call, or a shard that moved under
-                    // the batch, is fed one key at a time from where the
-                    // batch stopped -- a key already gone is gone.
+                    let mut at: Vec<(String, Timestamp)> = Vec::new();
+                    let mut bare: Vec<String> = Vec::new();
+                    for (k, ts) in keys {
+                        match ts {
+                            Some(ts) => at.push((k.clone(), *ts)),
+                            None => bare.push(k.clone()),
+                        }
+                    }
+                    // The checked keys in calls of a chunk each. A shard that
+                    // moved under the batch has the rest sent one at a time,
+                    // each to where its holder says it went, still checked;
+                    // a holder too old to know the call -- here or there --
+                    // gets them as `DeleteMany` gets them, and they are
+                    // counted as deleted unchecked.
                     let mut from = 0;
-                    match delete_many_in_chunks(&n, collection, keys, chunk) {
-                        Ok((gone, _, Ok(()))) => return Ok(gone),
+                    match delete_many_at_in_chunks(&n, collection, &at, chunk) {
+                        Ok((gone, skipped, sent, stopped)) => {
+                            tally.deleted += gone;
+                            tally.skipped += skipped;
+                            match stopped {
+                                Ok(()) => from = at.len(),
+                                Err(e) if moved_to(&e).is_some() => from = sent,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Err(e) if e.to_string().contains("unknown call") => {
+                            bare.extend(at.drain(..).map(|(k, _)| k));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    for pair in at.iter().skip(from) {
+                        let one = std::slice::from_ref(pair);
+                        let there = match n.delete_many_at(collection, one) {
+                            Ok((gone, skipped, Ok(()))) => {
+                                tally.deleted += gone;
+                                tally.skipped += skipped;
+                                continue;
+                            }
+                            Ok((_, _, Err(e))) => match moved_to(&e) {
+                                Some(url) => moved.dial(dialer, &url)?,
+                                None => return Err(e),
+                            },
+                            Err(e) if e.to_string().contains("unknown call") => {
+                                bare.push(pair.0.clone());
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        match there.delete_many_at(collection, one) {
+                            Ok((gone, skipped, Ok(()))) => {
+                                tally.deleted += gone;
+                                tally.skipped += skipped;
+                            }
+                            Ok((_, _, Err(e))) => return Err(e),
+                            Err(e) if e.to_string().contains("unknown call") => {
+                                if there.delete(collection, &pair.0)? {
+                                    tally.deleted += 1;
+                                    tally.unchecked += 1;
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // The bare keys in calls of a chunk each; a holder too
+                    // old to know the call, or a shard that moved under the
+                    // batch, is fed one key at a time from where the batch
+                    // stopped -- a key already gone is gone.
+                    let mut from = 0;
+                    match delete_many_in_chunks(&n, collection, &bare, chunk) {
+                        Ok((gone, _, Ok(()))) => {
+                            tally.deleted += gone;
+                            tally.unchecked += gone;
+                            from = bare.len();
+                        }
                         Ok((gone, sent, Err(e))) => {
-                            n_deleted = gone;
+                            tally.deleted += gone;
+                            tally.unchecked += gone;
                             from = sent;
                             if moved_to(&e).is_none() {
                                 return Err(e);
@@ -11193,7 +11349,7 @@ fn carry_deletes(
                         Err(e) if e.to_string().contains("unknown call") => {}
                         Err(e) => return Err(e),
                     }
-                    for k in keys.iter().skip(from) {
+                    for k in bare.iter().skip(from) {
                         let gone = match n.delete(collection, k) {
                             Ok(gone) => gone,
                             Err(e) => match moved_to(&e) {
@@ -11202,20 +11358,24 @@ fn carry_deletes(
                             },
                         };
                         if gone {
-                            n_deleted += 1;
+                            tally.deleted += 1;
+                            tally.unchecked += 1;
                         }
                     }
-                    Ok(n_deleted)
+                    Ok(tally)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("a carrier thread panicked")).collect()
     });
-    let mut n = 0;
+    let mut all = Carried::default();
     for r in answers {
-        n += r?;
+        let c = r?;
+        all.deleted += c.deleted;
+        all.skipped += c.skipped;
+        all.unchecked += c.unchecked;
     }
-    Ok(n)
+    Ok(all)
 }
 
 /// What dials a holder outside the lock: the token, the TLS and this node's

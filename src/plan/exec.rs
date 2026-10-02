@@ -217,6 +217,12 @@ pub struct QueryResult {
     /// the cap left, and says so here on every path, not only in the plan.
     pub cut_walks: Vec<String>,
     pub next_cursor: Option<String>,
+    /// The commit instant of the version each row is, one for one with
+    /// `rows` when filled: the unranked path fills it, the ranked one
+    /// leaves it empty, and a holder that did not say (one on a wire
+    /// version before 8) leaves `None`. What a `DELETE ... WHERE` carries
+    /// to the holders, so that each deletes the version the select read.
+    pub(crate) version_instants: Vec<Option<Timestamp>>,
 }
 
 impl QueryResult {
@@ -233,6 +239,7 @@ impl QueryResult {
             truncated_prefixes: Vec::new(),
             cut_walks: Vec::new(),
             next_cursor: None,
+            version_instants: Vec::new(),
         }
     }
 }
@@ -694,20 +701,21 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         // can say `more`: the scan holds `offset + k + 1` at most.
         let ask = if input.capped { k.saturating_add(1) } else { k };
         let mut out = scan(&input, &prefix, ask, &mut ex)?;
-        let more = input.capped && out.0.len() > k;
-        out.0.truncate(k);
+        let more = input.capped && out.rows.len() > k;
+        out.rows.truncate(k);
+        out.instants.truncate(k);
         ex.total_micros = t0.elapsed().as_micros();
         let cut = truncated_prefixes(input.stats);
         ex.notes.extend(cut.iter().cloned());
         ex.notes.extend(input.cut_walks.iter().cloned());
-        let mut rows = out.0;
+        let mut rows = out.rows;
         project(&input, &mut rows);
         if !sel.with.partial_results {
             deadline::check()?;
         }
         let facets = facets_for(&input, &prefix, t0)?;
         let mut missing = input.walk_missing.clone();
-        missing.extend(out.1);
+        missing.extend(out.missing);
         ex.missing = missing.clone();
         return Ok(QueryResult {
             more,
@@ -718,6 +726,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
             truncated_prefixes: cut,
             cut_walks: input.cut_walks.clone(),
             next_cursor: None,
+            version_instants: out.instants,
         });
     }
 
@@ -1026,6 +1035,7 @@ pub fn run_select(input: ExecInput<'_>) -> Result<QueryResult> {
         truncated_prefixes: cut,
         cut_walks: input.cut_walks.clone(),
         next_cursor,
+        version_instants: Vec::new(),
     })
 }
 
@@ -1498,6 +1508,7 @@ fn aggregate_select(
         cut_walks: input.cut_walks.clone(),
         facets: Vec::new(),
         next_cursor: None,
+        version_instants: Vec::new(),
     })
 }
 
@@ -1762,6 +1773,7 @@ pub(crate) fn aggregate_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> R
             doc: Some(Value::obj(vec![(AGG_FIELD.to_string(), Value::Array(acc))])),
             handle: (0, 0),
             parent: None,
+            ts: None,
         })
         .collect();
     Ok(ShardScan { hits, explain: sx, timed_out })
@@ -2272,7 +2284,7 @@ fn scan(
     prefix: &Option<String>,
     k: usize,
     ex: &mut Explain,
-) -> Result<(Vec<Row>, Vec<String>)> {
+) -> Result<Scanned> {
     let sel = input.select;
     let partial = sel.with.partial_results;
     // Rows past `offset + k` are thrown away at the end, so they are never
@@ -2345,7 +2357,7 @@ fn scan(
                         Some(d) => Payload::Doc(d),
                         None => Payload::Deferred(si, h.handle.0, h.handle.1),
                     };
-                    retained.insert(rank, payload, h.parent);
+                    retained.insert(rank, payload, h.parent, h.ts);
                 }
             }
             Err(Error::Deadline(e)) => {
@@ -2367,10 +2379,10 @@ fn scan(
     }
     // The page, then the documents its deferred rows need: one call per
     // shard, so a transport pays one round trip per shard and not per row.
-    let page: Vec<(Rank, Payload)> =
+    let page: Vec<(Rank, Payload, Option<Timestamp>)> =
         retained.into_sorted().into_iter().skip(sel.offset).take(k).collect();
     let mut wanted: BTreeMap<usize, Vec<(usize, u32)>> = BTreeMap::new();
-    for (_, p) in &page {
+    for (_, p, _) in &page {
         if let Payload::Deferred(si, ui, ord) = p {
             wanted.entry(*si).or_default().push((*ui, *ord));
         }
@@ -2404,7 +2416,10 @@ fn scan(
         }
     }
     let mut rows: Vec<Row> = Vec::new();
-    for (rank, payload) in page {
+    // Each row's version instant beside it, for the one statement that
+    // carries them back to the holders (a `DELETE ... WHERE`).
+    let mut instants: Vec<Option<Timestamp>> = Vec::new();
+    for (rank, payload, ts) in page {
         let doc = match payload {
             Payload::Doc(doc) => doc,
             Payload::Deferred(si, ui, ord) => match fetched.remove(&(si, ui, ord)) {
@@ -2415,11 +2430,20 @@ fn scan(
             },
         };
         rows.push(Row { key: rank.key, doc, score: None, distance: None });
+        instants.push(ts);
     }
     ex.fetched_payloads = rows.len();
     missing.sort();
     missing.dedup();
-    Ok((rows, missing))
+    Ok(Scanned { rows, missing, instants })
+}
+
+/// What the coordinator's unranked scan hands back: the page's rows, the
+/// shards that did not answer, and each row's version instant beside it.
+struct Scanned {
+    rows: Vec<Row>,
+    missing: Vec<String>,
+    instants: Vec<Option<Timestamp>>,
 }
 
 /// The shard's half of an unranked scan: its best `keep` rows over every
@@ -2486,10 +2510,15 @@ pub(crate) fn scan_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result
                     .and_then(|p| doc.path(p))
                     .filter(|v| !v.is_null())
                     .map(crate::variant::encode_to_vec);
-                retained.insert(rank, Payload::Doc(doc), parent);
+                retained.insert(rank, Payload::Doc(doc), parent, Some(unit.commit_ts(ord)));
             } else {
                 let rank = Rank::new(Vec::new(), key, &retained.asc);
-                retained.insert(rank, Payload::Deferred(si, ui, ord), None);
+                retained.insert(
+                    rank,
+                    Payload::Deferred(si, ui, ord),
+                    None,
+                    Some(unit.commit_ts(ord)),
+                );
             }
         }
         if let (Some((l0, f0)), Some((l1, f1))) = (io0, unit.io_counters()) {
@@ -2514,12 +2543,19 @@ pub(crate) fn scan_on(shard: &Shard, si: usize, req: &ScanRequest<'_>) -> Result
     let hits = retained
         .into_sorted_with_parents()
         .into_iter()
-        .map(|(rank, payload, parent)| {
-            let (doc, handle) = match payload {
+        .map(|(rank, kept)| {
+            let (doc, handle) = match kept.payload {
                 Payload::Doc(d) => (Some(d), (0, 0)),
                 Payload::Deferred(_, ui, ord) => (None, (ui, ord)),
             };
-            ScanHit { sort: rank.vals, key: rank.key, doc, handle, parent }
+            ScanHit {
+                sort: rank.vals,
+                key: rank.key,
+                doc,
+                handle,
+                parent: kept.parent,
+                ts: kept.ts,
+            }
         })
         .collect();
     Ok(ShardScan { hits, explain: sx, timed_out })
@@ -2715,8 +2751,16 @@ impl Ord for Rank {
 struct Retained {
     cap: usize,
     asc: std::sync::Arc<[bool]>,
-    entries: BTreeMap<Rank, (Payload, Option<Vec<u8>>)>,
+    entries: BTreeMap<Rank, Kept>,
     by_parent: BTreeMap<Vec<u8>, Rank>,
+}
+
+/// A retained row: its payload, its collapse parent, and the commit
+/// instant of the version it is.
+struct Kept {
+    payload: Payload,
+    parent: Option<Vec<u8>>,
+    ts: Option<Timestamp>,
 }
 
 impl Retained {
@@ -2724,7 +2768,13 @@ impl Retained {
         Retained { cap, asc: asc.into(), entries: BTreeMap::new(), by_parent: BTreeMap::new() }
     }
 
-    fn insert(&mut self, rank: Rank, payload: Payload, parent: Option<Vec<u8>>) {
+    fn insert(
+        &mut self,
+        rank: Rank,
+        payload: Payload,
+        parent: Option<Vec<u8>>,
+        ts: Option<Timestamp>,
+    ) {
         if self.cap == 0 {
             return;
         }
@@ -2749,9 +2799,9 @@ impl Retained {
         if let Some(p) = &parent {
             self.by_parent.insert(p.clone(), rank.clone());
         }
-        self.entries.insert(rank, (payload, parent));
+        self.entries.insert(rank, Kept { payload, parent, ts });
         if self.entries.len() > self.cap {
-            if let Some((_, (_, Some(p)))) = self.entries.pop_last() {
+            if let Some((_, Kept { parent: Some(p), .. })) = self.entries.pop_last() {
                 self.by_parent.remove(&p);
             }
         }
@@ -2762,12 +2812,12 @@ impl Retained {
         self.entries.len()
     }
 
-    fn into_sorted(self) -> Vec<(Rank, Payload)> {
-        self.entries.into_iter().map(|(r, (p, _))| (r, p)).collect()
+    fn into_sorted(self) -> Vec<(Rank, Payload, Option<Timestamp>)> {
+        self.entries.into_iter().map(|(r, k)| (r, k.payload, k.ts)).collect()
     }
 
-    fn into_sorted_with_parents(self) -> Vec<(Rank, Payload, Option<Vec<u8>>)> {
-        self.entries.into_iter().map(|(r, (p, parent))| (r, p, parent)).collect()
+    fn into_sorted_with_parents(self) -> Vec<(Rank, Kept)> {
+        self.entries.into_iter().collect()
     }
 }
 
@@ -3329,9 +3379,9 @@ mod tests {
         let mut r = Retained::new(cap, Vec::new());
         for (key, doc) in rows {
             let p = doc.path(parent).filter(|v| !v.is_null()).map(crate::variant::encode_to_vec);
-            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(doc), p);
+            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(doc), p, None);
         }
-        r.into_sorted().into_iter().map(|(rank, _)| rank.key).collect()
+        r.into_sorted().into_iter().map(|(rank, _, _)| rank.key).collect()
     }
 
     /// The retained set is never larger than the page, whatever arrives and in
@@ -3383,10 +3433,10 @@ mod tests {
         let mut r = Retained::new(7, Vec::new());
         for (key, d) in rows {
             let p = d.path("parent_id").filter(|v| !v.is_null()).map(crate::variant::encode_to_vec);
-            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(d), p);
+            r.insert(Rank::new(Vec::new(), key, &r.asc.clone()), Payload::Doc(d), p, None);
             assert!(r.len() <= 7, "the collector held {} rows for a page of 7", r.len());
         }
-        let got: Vec<String> = r.into_sorted().into_iter().map(|(rank, _)| rank.key).collect();
+        let got: Vec<String> = r.into_sorted().into_iter().map(|(rank, _, _)| rank.key).collect();
         assert_eq!(got, expected);
     }
 }

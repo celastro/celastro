@@ -3147,6 +3147,141 @@ fn a_delete_over_three_holders_goes_as_one_call_each() {
     }
 }
 
+/// Two nodes sharing `items`, split at 'm': keys below it on the first
+/// node's shard, the rest on the second's; three rows with `status 'old'`,
+/// `a1` on the first node and `x1`, `x2` on the second.
+fn two_holders_of_old_rows(tag: &str) -> (Node, Node) {
+    let a = Node::start(&format!("{tag}-a"));
+    let b = Node::start(&format!("{tag}-b"));
+    a.ack(&format!("ATTACH NODE '{}'", b.url));
+    a.ack(
+        "CREATE COLLECTION items (id TEXT PRIMARY KEY, status TEXT) WITH (splits = ['m'], nodes = ['{a}', '{b}'])"
+            .replace("{a}", &a.url)
+            .replace("{b}", &b.url)
+            .as_str(),
+    );
+    settle();
+    a.ack(
+        r#"INSERT INTO items VALUES ('{"id":"a1","status":"old"}'), ('{"id":"x1","status":"old"}'), ('{"id":"x2","status":"old"}')"#,
+    );
+    (a, b)
+}
+
+fn items_on(n: &Node) -> i64 {
+    let r = n.query("SELECT count(*) AS n FROM items").unwrap();
+    r.rows[0].doc.path("n").and_then(|v| v.as_i64()).unwrap()
+}
+
+/// A `DELETE ... WHERE` deletes the versions its select read: a row on
+/// another holder that a second client rewrote between the select and the
+/// carry is left alone, on every node, and the acknowledgement counts it
+/// as skipped rather than deleted.
+#[test]
+fn a_delete_by_predicate_leaves_a_row_rewritten_after_its_select_alone_and_says_so() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let (a, b) = two_holders_of_old_rows("delat");
+    // The carry to b is held before its frame goes: the window between the
+    // select and the delete, made wide enough to write into.
+    celastro::wire::fault::hold_next("delete_many_at", 2000);
+    let sql = "DELETE FROM items WHERE status = 'old'";
+    let out = a.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let db = a.db.clone();
+    let finishing = std::thread::spawn(move || out.finished_with(&db));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let m = b.ack(r#"INSERT INTO items VALUES ('{"id":"x1","status":"new"}')"#);
+    assert!(m.starts_with("1 document(s) written"), "{m}");
+    let m = match finishing.join().unwrap().unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        Outcome::Ack(m) => m,
+        other => panic!("{sql}: {other:?}"),
+    };
+    // The row the second client wrote is on every node, and the count
+    // leaves it out and says why.
+    for n in [&a, &b] {
+        let r = n.query("SELECT * FROM items WHERE id = 'x1'").unwrap();
+        assert_eq!(r.rows.len(), 1, "x1 on {}", n.url);
+        assert_eq!(r.rows[0].doc.path("status").and_then(|v| v.as_str()), Some("new"), "{}", n.url);
+        assert_eq!(items_on(n), 1, "{}", n.url);
+    }
+    assert_eq!(m, "2 document(s) deleted, 1 skipped: rewritten since the select");
+    let dirs = [a.dir.clone(), b.dir.clone()];
+    drop((a, b));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A holder too old to know the checked delete answers "unknown call" and
+/// is sent the bare one: its keys go as before, every one, and the
+/// acknowledgement says how many were deleted with no check made.
+#[test]
+fn a_holder_that_knows_no_checked_delete_gets_the_bare_one_and_the_ack_says_unchecked() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    let (a, b) = two_holders_of_old_rows("delold");
+    // The holder answers the checked call as a node of the release before
+    // it would, once; the carry falls back to the bare call for its keys.
+    celastro::wire::fault::unknown_call_next("delete_many_at");
+    let m = a.ack("DELETE FROM items WHERE status = 'old'");
+    assert_eq!(m, "3 document(s) deleted, 2 deleted unchecked on an older node");
+    for n in [&a, &b] {
+        assert_eq!(items_on(n), 0, "{}", n.url);
+    }
+    let dirs = [a.dir.clone(), b.dir.clone()];
+    drop((a, b));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A holder on the previous wire version answers a scan without the
+/// version instants and is read right; the coordinator deletes its keys
+/// unchecked, as the previous release did -- a row rewritten in the window
+/// goes with the rest -- and the acknowledgement says so. A cluster across
+/// the bump keeps deleting.
+#[test]
+fn a_holder_on_the_previous_wire_version_is_read_right_and_its_keys_are_deleted_unchecked() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::set_var(celastro::wire::TOKEN_ENV, TOKEN);
+    // Every hello in this process says 7 until the guard drops, so the
+    // coordinator frames its calls at 7, as it would to a holder of the
+    // release before this one.
+    struct Spoken;
+    impl Drop for Spoken {
+        fn drop(&mut self) {
+            celastro::wire::fault::advertise_wire_max(0);
+        }
+    }
+    let _spoken = Spoken;
+    celastro::wire::fault::advertise_wire_max(7);
+    let (a, b) = two_holders_of_old_rows("delv7");
+    // Framed at 7 the select learns no instants, so the carry is the bare
+    // call; held, so that a rewrite lands in the window.
+    celastro::wire::fault::hold_next("delete_many", 2000);
+    let sql = "DELETE FROM items WHERE status = 'old'";
+    let out = a.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let db = a.db.clone();
+    let finishing = std::thread::spawn(move || out.finished_with(&db));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    b.ack(r#"INSERT INTO items VALUES ('{"id":"x1","status":"new"}')"#);
+    let m = match finishing.join().unwrap().unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        Outcome::Ack(m) => m,
+        other => panic!("{sql}: {other:?}"),
+    };
+    assert_eq!(m, "3 document(s) deleted, 2 deleted unchecked on an older node");
+    for n in [&a, &b] {
+        assert_eq!(items_on(n), 0, "{}", n.url);
+    }
+    let dirs = [a.dir.clone(), b.dir.clone()];
+    drop((a, b));
+    settle();
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A plain `count(*)` is the sum of the holders' live counts, no scan:
 /// it answers what the scanning shape answers, after deletes too, and
 /// the plan says the shards were counted rather than scanned.

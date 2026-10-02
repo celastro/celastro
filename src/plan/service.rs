@@ -109,6 +109,11 @@ pub struct ScanHit {
     pub doc: Option<Value>,
     pub handle: (usize, u32),
     pub parent: Option<Vec<u8>>,
+    /// The commit instant of the version this row is: what a `DELETE ...
+    /// WHERE` carries back to the holder, which then deletes that version
+    /// and no other. `None` for an aggregate's row, which is no document's,
+    /// and from a holder on a wire version before 8, which does not say.
+    pub ts: Option<Timestamp>,
 }
 
 /// A shard's answer to an unranked scan: its best `keep` rows. Unlike the
