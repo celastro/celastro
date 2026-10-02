@@ -542,8 +542,11 @@ rows and the cut left rows behind (0.96.0).
 `attached` how many peers it has verified (`answering` how many answer
 now), and `busy:true` that the
 database lock was held when it was asked (alive, not ready). It says
-`ok:false` when the data directory is gone, or when a write-ahead log
-failed to sync (the next write recovers it once the disk answers, or a restart does). `/api/metrics` is the text
+`ok:false` when the data directory is gone, or when a held shard's
+write-ahead log failed to sync (the next write recovers it once the disk
+answers, or a restart does; a followed copy's failed sync is recovered by
+the holder's next ship instead, and `SHOW HEALTH` names it meanwhile, but
+it does not make the probe say `ok:false`). `/api/metrics` is the text
 format a Prometheus scraper reads: statements and their time by kind,
 refusals, answers short of a shard and the shards they missed
 (`celastro_shards_missing_total`), compactions, connections,

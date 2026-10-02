@@ -48,13 +48,28 @@ refuse than acknowledge a write on one disk while a follower is away
 (0.94.0); `nodes_of` says an edge
 collection points into a node collection; `undirected = true` follows
 its edges both ways; `prefix_expansion` caps how many dictionary terms a
-`text_match` prefix expands to (512).
+`text_match` prefix expands to (512). A `CREATE COLLECTION` whose shard
+directory already holds a shard's data -- a `MANIFEST`, or a log with
+records in it -- is refused naming the directory: move it aside, or
+`IMPORT` it, and create again. (The open sets such a directory aside on
+its own when the catalog does not name it, as `<name>.orphan-<n>`, and
+logs where it went: a restore or an import whose process ended before
+the catalog was published; `RESTORE` or `IMPORT` again under the name,
+or remove it.)
 
 Four kinds of index. A `fulltext` index takes an `analyzer`
 (`standard`, `english`); a `vector` index needs `dims` and a `metric`
 (`cosine`, `l2`, `dot`); a `secondary` index serves equality and range
 predicates on a path; an `adjacency` index over `(src, dst)` serves the
-graph walk. An index may be created on a `tier` other than `active`.
+graph walk. An index may be created on a `tier` other than `active`. A
+`vector` index checks every row it is created over -- sealed or not, the
+copies this node follows included -- and is refused naming the first
+that does not fit: `` `embedding` of `n3` has 3 dimensions but the index
+declares 4: fix the row first, or delete it and flush the collection ``
+(a sealed row's says `fix or delete the row first`; a non-finite
+component is refused the same way). A refused `CREATE INDEX` leaves
+every node as it was: a shard that cannot take the index undoes it on
+the catalog and on every shard that took it.
 
 ```sql
 CREATE INDEX notes_body ON notes USING fulltext (body) WITH (analyzer = 'english');
@@ -543,7 +558,18 @@ clock against this one, whether an older process still answers at its
 address, every shard with whether its holder does, the steward, every
 follower of a shard held here with its state (`live`, `catching up`,
 `asking` -- and `DEGRADED` when a follower away leaves a write on this
-disk alone), and every copy this node follows. Its `recovery:` line is
+disk alone), and every copy this node follows. While it is so, it also
+says that a held shard's write-ahead log had a sync `FAILED` (the shard
+takes no writes and reads are held below the failed write until the
+next write finds the disk answering), that a copy this node follows had
+one (`` followed copy of shard 1 of `notes`: its write-ahead log's sync
+FAILED (...); the holder's next ship reopens it once the disk answers ``),
+that a shard's `RANGE` was repaired at the open to the map's range and
+how many rows it holds outside it (`` shard 0 of `notes`: RANGE repaired
+at the open to the map's [, m); 20 row(s) outside it are invisible and
+dropped at the next compaction ``, until a compaction drops them), and
+that a collection a peer's map puts on this node is `NOT ADOPTED`
+because its data is not in this directory. Its `recovery:` line is
 what a restore could reach if this node were lost now: the last backup
 this process completed and how far the archived logs of the shards held
 here reach (the least over them, as this process shipped them -- a seal's
@@ -597,7 +623,13 @@ takes the rest on the same node, no row moving -- the remedy for a hot
 shard, which a move can only relocate; `MOVE SHARD` then spreads it.
 Without `AT` the holder splits at the middle of the shard's keys and
 the answer names it. The rows a split leaves outside a range stay on
-disk, invisible and counted as dead, until the next compaction. `MERGE
+disk, invisible and counted as dead, until the next compaction. A
+shard's range is the map's: a split or a merge cut between its two
+writes -- the catalog's map and the shard directory's `RANGE` -- is
+reconciled at the next open, `RANGE` rewritten to the map's and the
+repair logged (`range_repaired`, with both ranges and the rows left
+outside), and `SHOW HEALTH` counts those rows on every report until a
+compaction drops them. `MERGE
 SHARDS a AND b OF c` is the way back: two adjacent shards on one node
 become one, shard `b`'s rows rebuilt into shard `a` (name the larger
 first) and `b`'s entry left as a marker that owns no key, so nothing

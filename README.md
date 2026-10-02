@@ -123,8 +123,9 @@ other nodes; the sections that follow have each option's details.
 | **hosts and VMs** | the release binary, then `celastro install --node ... --attach ...` on each host: a systemd service with its user, directory and settings; cloud-init, an Ansible role and playbook, a script that does it over ssh and a podman quadlet in [deploy/](deploy/README.md) | `/var/lib/celastro` per host | any node, or a balancer over them with `/api/health` as its check | [Installing on hosts](#installing-on-hosts) |
 | **Kubernetes** | `helm install celastro deploy/chart/celastro --set replicas=N` | a volume per pod | `<release>-console` with `console.expose`, port-forward, or an ingress | one Secret per concern: console token, wire token, TLS, keys; CronJob backups; [chart README](deploy/chart/celastro/README.md) |
 
-Upgrades roll one node at a time: two releases with one wire version
-talk, DDL and moves work both ways, and a newer node sends an older one
+Upgrades roll one node at a time: two adjacent releases talk -- a node
+sends a peer the newest frame the peer's hello says it accepts -- DDL,
+moves and deletes work both ways, and a newer node sends an older one
 its catalog in the newest format the older reads. What does not roll
 back is the data directory: a release that raised the catalog format
 (the changelog says when) writes a file the previous release refuses to

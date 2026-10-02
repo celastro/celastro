@@ -454,7 +454,10 @@ ship's answer and on an ask's alike; a wait that reaches the statement's
 deadline is an error saying the write is on this disk. After an `ok` a
 read on this node sees the write, within the deadline; a log whose sync
 failed holds reads below the failed write and takes no writes until the
-next write finds the disk answering and reopens it in place. The
+next write finds the disk answering and reopens it in place -- a
+followed copy's, until the holder's next ship does (0.100.0; before it
+nothing but a restart recovered a copy, and every ship meanwhile was
+refused). The
 embedded `Db::insert` returns once durable on this disk; the followers'
 confirmation is the caller's through `Db::confirmation().wait()`.
 
@@ -613,7 +616,21 @@ past which the write path builds inline: backpressure, as with compaction
 debt. A build that fails is requeued with the rows still readable in the
 frozen memtable and durable in the rotated log, counted as a seal failure;
 a process that ends between freeze and install replays the rotated log
-with the live one at the next open. The check writes 20,000 vectors
+with the live one at the next open, and a recovery in place replays it
+the same way (0.100.0; before it the recovery rebuilt the memtable from
+`wal.log` alone, so after a restart that found a rotated log one failed
+sync, with the disk answering, read that log's rows as absent and the
+next install removed their file). The rotation itself is all or nothing
+(0.100.0): everything after the rename aside -- the fresh `wal.log`, the
+directory fsync, the header, the group's handle -- is adopted only once
+all of it succeeded, a failure before that undoes the rename and leaves
+the log exactly as it was, and an undo that fails too poisons the group
+and lists the rotated log for the recovery to replay and the next seal
+to remove; a log number is consumed only once a log exists under it, so
+a failed rotation leaves no hole in the archive's chain; and one
+directory fsync publishes the rename aside and the new log together,
+before the first record is acknowledged into it, where before the new
+name was dirty metadata until the seal's install. The check writes 20,000 vectors
 through the console and answers point lookups while the graph builds: 22 s
 of build, 106 lookups meanwhile, the slowest 67 ms. Its first run found the
 maintenance step deadlocked on itself -- the lock guard taken to reserve
@@ -806,6 +823,31 @@ memtable makes such a unit on purpose. Compaction does the backfill: a
 segment lacking a region for a declared index is a rewrite job of its own
 (`Reason::IndexBackfill`), oldest first, one per pass, so `COMPACT` after
 `CREATE INDEX` is the rolling rebuild and no size-tier accident is needed.
+A `CREATE INDEX ... USING vector` checks every row it is created over
+before the catalog takes it -- the sealed rows, and since 0.100.0 the
+newest version of every key in each shard's memtable and frozen
+memtables and in the followed copies' shards -- and refuses naming the
+row: `` `embedding` of `k` has 3 dimensions but the index declares 2:
+fix the row first, or delete it and flush the collection `` (a
+non-finite component the same way; a deleted unsealed row is refused
+too, since a seal writes the tombstoned version for the compaction to
+collect, which is why the message says to flush). Through 0.99.0 the
+check walked the sealed rows alone: a memtable row of another width
+passed, the shard's seal under the new definition refused it and rolled
+back, the catalog did not, the next persist wrote the index to `CATALOG`
+although the statement had reported a failure, and the next open failed
+replaying the row, with `DROP INDEX` not there to run. A shard that
+cannot take the index for any other reason -- a disk that refuses the
+segment -- undoes it everywhere: the catalog's definition, version and
+activity clock go back, every shard and followed copy that adopted takes
+the previous definition again with its memtable rebuilt for it (an undo
+that fails is logged, `index_undo_failed`), and `CATALOG` is written
+only after every shard has adopted, so it never carries an index a shard
+refused -- which is also what keeps `ALTER INDEX ... TIER` from pushing
+one into the shards. A refused `CREATE INDEX` leaves the node exactly as
+it was. A directory already in the old state -- an index in `CATALOG`
+that a row in a shard's log does not fit -- does not open under this
+version either.
 
 The catalog format is version 4 for the node list and the placement, and 5
 for the edge-collection fields of the section after this one; a 3 is read
@@ -819,7 +861,12 @@ goes away under it, and from that instant writes to the shard are refused
 naming the move), the target pulls the files in chunks and adopts the
 directory (`Db::pull_here`, `adopt_shard`: the incoming directory is
 complete before it is renamed into place, `MANIFEST` last, so a pull that
-stops short leaves nothing a reopen mistakes for a shard), and the map
+stops short leaves nothing a reopen mistakes for a shard; the pulled
+files' names are entries of its `segments/` and `deletes/`, and each of
+those is fsynced before `incoming/` is -- 0.100.0; `incoming/` alone was,
+the one path that differed from a backup's write and the tier move, so a
+crash after the adopt could take back a segment the manifest named, with
+the source's copy already gone), and the map
 switches by `LOCAL PLACE SHARD` on every holder -- target first, others,
 source last, so the source's copy is dropped only once everyone else can
 find the new one. The pin is shared with the wire server outside the
@@ -846,7 +893,10 @@ memtable sealed into one more segment, a manifest -- written into the
 new shard's directory: linked when the directory is in the clear, since
 a segment is immutable and one more name costs nothing; read and
 re-sealed under the new name when it is encrypted, since every file is
-sealed under the shard's directory name. What makes it a split is the
+sealed under the shard's directory name; either way the new directory's
+`segments/` and `deletes/` are fsynced before the catalog names the
+shard, as a pull's are (0.100.0), and the plain copy a link cannot make
+has its bytes fsynced too. What makes it a split is the
 range: a shard answers only the keys inside its own, the memtable by
 key and every segment by an ordinal mask (`[a, b)` of its sorted keys,
 folded into the visibility bitmap and its cache's epoch), so the two
@@ -890,6 +940,31 @@ design. The peer's-word rule of the reconciliation covers ranges as
 well as holders since this: a shard the peer holds in both maps with a
 range that differs takes the peer's, so a split or a merge made across
 a partition arrives with the next sweep.
+
+**`RANGE` and the map agree at the open, and the map wins (0.100.0).** A
+split or a merge writes two records of what a shard owns: the shard
+directory's `RANGE` and the catalog's map; a merge writes `RANGE` first,
+a split the map. Through 0.99.0 the open trusted `RANGE`, so a crash
+between the two writes -- or the second write failing with the node
+running on -- left two shards owning the same keys: a scan answered the
+merged shard's rows twice, a `DELETE` of one of them landed on one copy
+and the key came back from the other, an `INSERT` above a fresh split
+landed in the source shard, where the map routes no node to look for it,
+and a retried `MERGE SHARDS` absorbed the rows a second time, for good;
+`SHOW HEALTH` compared nothing. (The 0.98.0 merge order, the catalog
+before the directory's removal, covers a different pair of writes and
+stands.) Now the open gives every placed shard, and every followed copy,
+the map's range, which is what every other node routes by: when `RANGE`
+disagrees it is rewritten to the map's and `range_repaired` is logged
+with both ranges and the number of live rows the shard holds outside the
+new one. Those rows are invisible from then on and dropped by the next
+compaction -- none in a crash between the two writes, but a node that
+ran on in the diverged state wrote rows to the wrong shard, and `SHOW
+HEALTH` says the count on every report while the shard still holds any.
+A shard adopted by a move or a split and a promoted copy take the map's
+range the same way; a map from before placement existed is derived from
+`RANGE` and agrees with it. `RANGE` keeps its form, so a repaired
+directory opens under 0.97.0, and nothing on the wire changes.
 
 **A shard has a follower, and a follower becomes the holder.** Until
 0.58.0 there was no replication, by decision, so a node down was its
@@ -1890,8 +1965,24 @@ shard takes no more writes, reads stay below the failed write, and the
 health says so. The next write probes the disk with the sync that failed
 and, when it answers, reopens the log in place (`Shard::recover_log`: a
 fresh group over the file as the cut left it, the memtable rebuilt from
-what the log holds), which is what a restart did and still does; a read
-never probes, it is held, not refused. A record reaches the
+the rotated logs the shard knows of and then the live one, as the open
+does), which is what a restart did and still does; a read never probes,
+it is held, not refused; and a scan handle taken before a recovery
+reports its snapshot gone rather than another unit's row. Through
+0.99.0 the rebuild read `wal.log` alone, so after a restart that found a
+rotated log -- a seal frozen and not installed when the process last
+ended, which a stop during a background build leaves on purpose -- one
+failed sync on that shard, with the disk answering, read the rotated
+log's rows as absent at once (a key updated over a sealed version as
+absent entirely), and the next seal's install removed their log, so
+acknowledged rows were gone for good with nothing logged. A copy this
+node follows is recovered the same way, under its own lock, at the
+holder's next ship (0.100.0): the recovery pass probes the shards a node
+holds and not the copies it follows, so a followed copy whose sync
+failed was recovered by nothing but a restart, every ship meanwhile
+refused, and under `confirm = 'quorum'` with two copies every write on
+the holder missed its deadline; `SHOW HEALTH` names a followed copy
+whose sync failed while it is one. A record reaches the
 followers only once its sync has made it durable here, in the log's
 order whichever settle made the sync (`Wal::ship_after_sync`): 0.76.0
 pushed it to the shipper at the append, so a follower could hold a row a
@@ -2431,7 +2522,35 @@ to prove it -- including the tier move that relocates a segment between
 `segments/` and `archive/`, which used to be the one rename outside the
 publication path: the manifest names the segment by id and looks for it in
 both directories, so a rename whose entries a crash took back was a segment
-the manifest named and neither directory held.
+the manifest named and neither directory held. Two more renames stood
+outside it through 0.99.0, under a strict reading of the contract and not
+on the journaled filesystems the docs ship to: a move's pull and a split
+fsynced the new shard's `incoming/` and not the `segments/` and `deletes/`
+its files were renamed or linked into, so a crash after the adopt could
+take back a segment the manifest named with the source's copy already
+gone; and `ensure_followed` and a demotion published a followed copy's
+`shard-NNNN` entry one level too high, fsyncing the collection's
+directory and not `followed/`, so a crash could lose the copy, which came
+back from nothing. Both subdirectories are fsynced before `incoming/` now,
+and `followed/` in both places (0.100.0). The open also reconciles
+`collections/` with the catalog since then: an import's or a restore's
+staging directory (`.import.tmp`, `.restore.tmp`) is removed, a collection
+directory holding nothing but a dead pull's `shard-NNNN.incoming` is
+removed, and any other directory the catalog does not name -- a restore's
+or an import's rename made durable with the process gone before the
+catalog was published -- is set aside as `<name>.orphan-<n>` and logged
+(`collection_dir_orphaned`, naming where it went and what to do: `RESTORE`
+or `IMPORT` again under the name, or remove the directory), never refused,
+so a pull that died cannot stop a node starting and a restore's data is
+kept where an operator finds it. Through 0.99.0 the open passed over all
+of these: the rerun import failed on the populated directory, and `CREATE
+COLLECTION` of the name built its shards over the orphan's, the first seal
+publishing an empty manifest over its `MANIFEST` and the next open
+reclaiming its segments. `CREATE COLLECTION` now refuses a `shard-NNNN`
+that already holds a `MANIFEST` or a log with records in it, naming the
+directory and the way out (move it aside, or `IMPORT` it, and create
+again); a `RANGE` and an empty log are a `CREATE` that ended before the
+catalog, written again.
 
 **Compaction runs itself in `serve`, and stays scheduled and visible.**
 Until 0.36.0 nothing ran a job unless `COMPACT` was said, and 0.33.0's
@@ -3048,6 +3167,10 @@ guarantee:
 | a data node restarted from an empty directory does not grow empty shards for a collection older than the directory; it says so once, `SHOW HEALTH` says so until it is settled, a younger collection is adopted, and a coordinator adopts everything | `wire::a_fresh_directory_does_not_grow_empty_shards_for_an_older_collection` |
 | a collection spread over three nodes, written through any of them, answers on every node what one process answers, and DDL reaches every holder | `wire::a_collection_spread_over_three_nodes_answers_what_one_process_answers` (placement by attach order, routed writes, bit-identical answers on every node against a single-process reference, the plan with remote blocks, partition pruning across nodes, DELETE by predicate, FLUSH and DROP INDEX fanning out and `LOCAL` not, DETACH refused while a node holds a shard, export refused, placement surviving a restart, DROP COLLECTION reaching every holder), `catalog::tests::catalog_round_trips` (the node list and the placement) |
 | a `DELETE ... WHERE` across nodes deletes the versions its select read: a row rewritten on its holder between the select and the carry survives on every node and is counted as skipped; a holder too old for the checked call gets the bare one and the acknowledgement says how many went unchecked; a holder on the previous wire version's scan answer is read right | `wire::a_delete_by_predicate_leaves_a_row_rewritten_after_its_select_alone_and_says_so` (fails on 0.99.0: the acknowledged row is gone and counted), `wire::a_holder_that_knows_no_checked_delete_gets_the_bare_one_and_the_ack_says_unchecked`, `wire::a_holder_on_the_previous_wire_version_is_read_right_and_its_keys_are_deleted_unchecked`, `wire::tests::statistics_and_answers_survive_the_codec` (the scan answer with and without the instants) |
+| a `CREATE INDEX ... USING vector` is refused by an unsealed row of another width, naming the row, and the node reopens; an index one shard cannot take is undone on the catalog and on every shard that took it, and `CATALOG` never carries it | `engine::tests::a_vector_index_refused_by_an_unsealed_row_leaves_a_node_that_reopens` (fails on 0.99.0: the open fails replaying the row), `engine::tests::a_vector_index_one_shard_cannot_take_is_undone_on_the_catalog_and_the_shards_that_took_it` |
+| a merge cut between `RANGE` and the map, and a split cut between the map and `RANGE`, are reconciled at the open: the map's range taken, `RANGE` rewritten, the rows outside it counted for `SHOW HEALTH` and dropped by the next compaction, no key answered twice | `engine::tests::a_merge_cut_between_range_and_the_map_is_reconciled_at_the_open`, `engine::tests::a_split_cut_between_the_map_and_range_is_reconciled_at_the_open` |
+| a recovery in place keeps the rows of the rotated logs the open replayed, an update in a rotated log over its sealed version included; a followed copy whose sync failed is recovered by the next ship and named by `SHOW HEALTH` meanwhile; a rotation that fails after the rename leaves the log as it was, one whose undo fails too strands the rotated log in the list for the recovery, and the new log is published before its first record is acknowledged | `shard::background_seal_tests::a_recovery_in_place_keeps_the_rows_of_the_rotated_logs_the_open_replayed`, `shard::background_seal_tests::a_recovery_in_place_keeps_an_update_in_a_rotated_log_over_its_sealed_version`, `engine::tests::a_followed_copy_whose_sync_failed_is_recovered_by_the_next_ship`, `shard::tests::a_rotation_that_fails_after_the_rename_leaves_the_log_as_it_was`, `shard::tests::a_rotation_whose_undo_fails_strands_the_log_in_the_list`, `shard::tests::a_rotation_publishes_the_new_log_before_its_first_record_is_acknowledged` |
+| a split's new shard has its `segments/` and `deletes/` fsynced before the catalog names it; a followed copy's entry is fsynced in `followed/`, on `ensure_followed` and on a demotion; the open sets aside a collection directory the catalog does not hold as `<name>.orphan-<n>`, removes a staging directory and a dead pull's, and `CREATE COLLECTION` refuses a shard directory that holds data | `engine::tests::a_splits_new_shard_has_its_subdirectories_fsynced_before_the_catalog_names_it`, `engine::tests::a_followed_copys_entry_is_fsynced_in_the_directory_that_holds_it`, `engine::tests::a_demotions_rename_into_followed_is_fsynced_there`, `engine::tests::an_open_sets_aside_a_collection_directory_the_catalog_does_not_hold` (the staging directories removed, the dead pull removed, the orphan set aside under `.orphan-1`, and the `CREATE` over a `MANIFEST` and over a log with records each refused) |
 | a node that does not answer is a deadline and nothing quieter, and the wire refuses the wrong token and the wrong version by name | `wire::a_node_that_does_not_answer_is_a_deadline_and_nothing_quieter`, `wire::tests::*` (addresses, the codec, the token comparison) |
 | a shard moves between nodes with no row lost or duplicated, every node agrees on the map, a pinned shard refuses writes naming the move, and an emptied node detaches | `wire::a_shard_moves_between_nodes_and_every_node_agrees` (source and target both elsewhere, target here, source here; answers on every node equal one process's after each; the refusal on a pinned shard and the write after the abort; `REBALANCE`; `DETACH` refused with the plan and accepted once empty; the map after a restart) |
 | the console offers the source of the running version | `serve::tests::the_console_offers_the_source_of_the_running_version` (on the page, absolute, naming the version and the licence, and on the health endpoint for a client that never renders the page) |
