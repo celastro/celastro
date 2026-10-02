@@ -52,7 +52,11 @@ holder shipped from there: what the copy had taken from the old holder
 past the new one's position at the promotion stayed in it, on no other
 node, and would have come back had that copy been promoted in turn. A
 followed copy whose term changes under it is dropped and refilled from
-the new holder.
+the new holder. (The term also moves on `REPLACE COPY` and `ALTER ...
+SET replicas`, where the holder does not change, so there the surviving
+followers refill from nothing and the holder's disk is the only copy
+meanwhile; the reset is narrowed to a change of holder in the next
+release.)
 
 **A catch-up that overflows continues from where it reached.** At the
 backlog's cap a running catch-up was dropped and the follower asked
@@ -75,9 +79,11 @@ descriptor table, a connection aborted before it was taken), for the
 life of the process, the console still green; and the console's own
 loop, giving up after a run of such errors, left the maintenance
 threads looping and the process alive with no listener. The wire backs
-off and retries as the console does, and a loop that gives up sets the
-stop flag: the process ends through the normal shutdown, and the probe
-that restarts it sees why.
+off and retries as the console does, and the console's loop, giving up,
+sets the stop flag so the process ends through the normal shutdown. (The
+wire's give-up still sets a flag nothing reads, so a node whose wire has
+died stays up with its health green; that half is fixed in the next
+release.)
 
 **Readiness as a majority, and a startup allowance.** The chart's
 readiness demanded every peer since start, so one dead pod kept every
@@ -185,11 +191,15 @@ A critical extension this reader does not take -- a delta indicator, an
 issuing distribution point, a certificate issuer on an entry -- is
 refused by name, where it was passed over and the list read as whole.
 
-**The archive client reads the head before the body.** An answer was
-buffered whole before its framing was looked at, so an endpoint that
-streamed past its length cost the client that much memory; the head is
-read first, bounded at 64 KiB, then exactly the body it frames, bounded
-at 256 MiB, refused as soon as a bound is passed.
+**The command line's HTTP client reads the head before the body.** The
+client behind `celastro send` and `celastro tls secret` buffered an
+answer whole before its framing was looked at, so an endpoint that
+streamed past its length cost it that much memory; the head is read
+first, bounded at 64 KiB, then exactly the body it frames, bounded at
+256 MiB, refused as soon as a bound is passed. (An earlier draft of this
+note said the archive client; the archive client was not changed and
+still buffers an answer up to 4 GiB before the head. That is fixed in
+the next release.)
 
 **The cryptography module's headers** say what each file does today
 (SHA-384, P-384, the Barrett reducer), the doubled comments are one, and
