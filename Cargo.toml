@@ -1,0 +1,16 @@
+[package]
+name = "celastro"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "A minimal single-node document database"
+license = "AGPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/celastro/celastro"
+# Not published to a registry: a release is the tag and the binaries on its
+# GitHub release.
+publish = false
+
+[profile.release]
+codegen-units = 1
+lto = true
